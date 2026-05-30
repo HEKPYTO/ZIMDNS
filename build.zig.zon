@@ -1,0 +1,17 @@
+.{
+    .name = .gcli_dns,
+    .version = "0.0.0",
+    .fingerprint = 0x84e0094856bdb4,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "README.md",
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "docs",
+        "examples",
+        "test",
+        "tools",
+    },
+}

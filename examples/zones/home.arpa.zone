@@ -1,0 +1,15 @@
+$ORIGIN home.arpa.
+$TTL 3600
+
+@ IN SOA ns1.home.arpa. hostmaster.home.arpa. (
+    2026053001 ; serial
+    3600       ; refresh
+    900        ; retry
+    1209600    ; expire
+    3600       ; minimum
+)
+
+@   IN NS ns1.home.arpa.
+ns1 IN A  192.168.1.1
+dns IN A  192.168.1.1
+

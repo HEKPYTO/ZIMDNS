@@ -1,0 +1,8 @@
+.zig-cache/
+zig-out/
+.DS_Store
+*.log
+*.tmp
+data/
+config/
+

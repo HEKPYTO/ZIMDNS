@@ -1,0 +1,15 @@
+name: simple-a-query
+rfc: RFC 1035 section 4.1
+phase: 1
+description: Standard query for example.com A.
+input_hex:
+  12 34 01 00 00 01 00 00 00 00 00 00
+  07 65 78 61 6d 70 6c 65 03 63 6f 6d 00
+  00 01 00 01
+expect:
+  parse_ok: true
+  id: 0x1234
+  qname: example.com.
+  qtype: A
+  qclass: IN
+
