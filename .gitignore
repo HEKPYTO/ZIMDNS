@@ -4,5 +4,4 @@ zig-out/
 *.log
 *.tmp
 data/
-config/
-
+/config/

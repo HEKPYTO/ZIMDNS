@@ -53,4 +53,22 @@ pub fn build(b: *std.Build) void {
 
     const golden_step = b.step("test-golden", "Run DNS wire-format golden tests");
     golden_step.dependOn(&run_golden_tests.step);
+
+    const config_test_module = b.createModule(.{
+        .root_source_file = b.path("test/config/config_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    config_test_module.addImport("gcli_dns", b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
+    const config_tests = b.addTest(.{
+        .root_module = config_test_module,
+    });
+    const run_config_tests = b.addRunArtifact(config_tests);
+
+    const config_step = b.step("test-config", "Run config file integration tests");
+    config_step.dependOn(&run_config_tests.step);
 }

@@ -1,6 +1,5 @@
 # gcli-dns example configuration.
-# The server runtime is not implemented yet; this file documents the intended
-# strict line-oriented format used by the upcoming config parser.
+# Strict line-oriented configuration loaded by the current parser.
 
 listen dns udp 0.0.0.0:1053
 listen dns tcp 0.0.0.0:1053
@@ -17,4 +16,4 @@ cache max-entries 100000
 cache serve-stale on
 cache serve-stale-ttl 3600
 
-zone home.arpa primary /etc/gcli-dns/zones/home.arpa.zone
+zone home.arpa primary examples/zones/home.arpa.zone

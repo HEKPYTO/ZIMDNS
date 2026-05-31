@@ -15,11 +15,25 @@ pub fn serveUdpOnce(socket: *const std.Io.net.Socket, io: std.Io, runtime: *cons
     try socket.send(io, &incoming.from, response);
 }
 
+pub fn serveUdpCount(socket: *const std.Io.net.Socket, io: std.Io, runtime: *const Runtime, count: usize) !void {
+    var served: usize = 0;
+    while (served < count) : (served += 1) {
+        try serveUdpOnce(socket, io, runtime);
+    }
+}
+
 pub fn serveUdpOnceOnPort(io: std.Io, runtime: *const Runtime, port: u16) !void {
     var addr: std.Io.net.IpAddress = .{ .ip4 = .unspecified(port) };
     var socket = try std.Io.net.IpAddress.bind(&addr, io, .{ .mode = .dgram, .protocol = .udp });
     defer socket.close(io);
     try serveUdpOnce(&socket, io, runtime);
+}
+
+pub fn serveUdpCountOnPort(io: std.Io, runtime: *const Runtime, port: u16, count: usize) !void {
+    var addr: std.Io.net.IpAddress = .{ .ip4 = .unspecified(port) };
+    var socket = try std.Io.net.IpAddress.bind(&addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer socket.close(io);
+    try serveUdpCount(&socket, io, runtime, count);
 }
 
 pub fn serveTcpStreamOnce(stream: std.Io.net.Stream, io: std.Io, runtime: *const Runtime) !void {
@@ -74,6 +88,37 @@ test "UDP listener serves one authoritative datagram over loopback sockets" {
     const response = try @import("../dns/message.zig").Message.parse(incoming.data);
     try std.testing.expect(response.header.qr);
     try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+}
+
+test "UDP listener serves a bounded batch of authoritative datagrams" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const runtime = try Runtime.fromZoneText(test_zone);
+    var server_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server_socket = try std.Io.net.IpAddress.bind(&server_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer server_socket.close(io);
+
+    var client_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var client_socket = try std.Io.net.IpAddress.bind(&client_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer client_socket.close(io);
+
+    try client_socket.send(io, &server_socket.address, simple_a_query);
+    try client_socket.send(io, &server_socket.address, simple_a_query);
+    try serveUdpCount(&server_socket, io, &runtime, 2);
+
+    var response_buffer: [512]u8 = undefined;
+    const first = try client_socket.receiveTimeout(io, &response_buffer, .{ .duration = .{
+        .raw = .fromMilliseconds(500),
+        .clock = .awake,
+    } });
+    const first_response = try @import("../dns/message.zig").Message.parse(first.data);
+    try std.testing.expectEqual(@as(u16, 1), first_response.header.answer_count);
+
+    const second = try client_socket.receiveTimeout(io, &response_buffer, .{ .duration = .{
+        .raw = .fromMilliseconds(500),
+        .clock = .awake,
+    } });
+    const second_response = try @import("../dns/message.zig").Message.parse(second.data);
+    try std.testing.expectEqual(@as(u16, 1), second_response.header.answer_count);
 }
 
 test "TCP handler serves one length-prefixed DNS query on a stream" {

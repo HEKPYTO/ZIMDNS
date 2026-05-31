@@ -1,0 +1,11 @@
+listen dns udp 0.0.0.0:1053
+listen dns tcp 0.0.0.0:1053
+admin socket /run/gcli-dns/admin.sock
+recursion deny 0.0.0.0/0
+recursion deny ::/0
+forwarder default udp 9.9.9.9
+cache max-entries 100000
+cache serve-stale on
+cache serve-stale-ttl 3600
+zone home.arpa primary examples/zones/home.arpa.zone
+
