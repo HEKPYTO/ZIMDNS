@@ -91,23 +91,23 @@ pub const RData = union(enum) {
     pub fn parse(rrtype: RecordType, message: []const u8, offset: usize, len: usize) Error!RData {
         if (offset > message.len or message.len - offset < len) return Error.EndOfInput;
         const end = offset + len;
-        return switch (rrtype) {
-            .A => blk: {
+        return switch (rrtype.code()) {
+            RecordType.A.value => blk: {
                 if (len != 4) return Error.InvalidLength;
                 var bytes: [4]u8 = undefined;
                 @memcpy(&bytes, message[offset..end]);
                 break :blk .{ .A = bytes };
             },
-            .AAAA => blk: {
+            RecordType.AAAA.value => blk: {
                 if (len != 16) return Error.InvalidLength;
                 var bytes: [16]u8 = undefined;
                 @memcpy(&bytes, message[offset..end]);
                 break :blk .{ .AAAA = bytes };
             },
-            .NS => .{ .NS = try parseNameOnly(message, offset, end) },
-            .CNAME => .{ .CNAME = try parseNameOnly(message, offset, end) },
-            .PTR => .{ .PTR = try parseNameOnly(message, offset, end) },
-            .SOA => blk: {
+            RecordType.NS.value => .{ .NS = try parseNameOnly(message, offset, end) },
+            RecordType.CNAME.value => .{ .CNAME = try parseNameOnly(message, offset, end) },
+            RecordType.PTR.value => .{ .PTR = try parseNameOnly(message, offset, end) },
+            RecordType.SOA.value => blk: {
                 const mname_result = Name.parse(message, offset) catch return Error.BadName;
                 const rname_result = Name.parse(message, mname_result.next_offset) catch return Error.BadName;
                 if (end - rname_result.next_offset != 20) return Error.InvalidLength;
@@ -122,14 +122,14 @@ pub const RData = union(enum) {
                     .minimum = reader.readU32() catch return Error.EndOfInput,
                 } };
             },
-            .MX => blk: {
+            RecordType.MX.value => blk: {
                 if (len < 3) return Error.InvalidLength;
                 const preference = std.mem.readInt(u16, message[offset..][0..2], .big);
                 const exchange_result = Name.parse(message, offset + 2) catch return Error.BadName;
                 if (exchange_result.next_offset != end) return Error.TrailingData;
                 break :blk .{ .MX = .{ .preference = preference, .exchange = exchange_result.name } };
             },
-            .SRV => blk: {
+            RecordType.SRV.value => blk: {
                 if (len < 7) return Error.InvalidLength;
                 const priority = std.mem.readInt(u16, message[offset..][0..2], .big);
                 const weight = std.mem.readInt(u16, message[offset + 2 ..][0..2], .big);
@@ -143,7 +143,7 @@ pub const RData = union(enum) {
                     .target = target_result.name,
                 } };
             },
-            .TXT => blk: {
+            RecordType.TXT.value => blk: {
                 if (len == 0) return Error.InvalidLength;
                 const text_len = message[offset];
                 if (text_len > max_txt_len) return Error.TextTooLong;
@@ -152,7 +152,7 @@ pub const RData = union(enum) {
                 @memcpy(txt.data[0..text_len], message[offset + 1 .. end]);
                 break :blk .{ .TXT = txt };
             },
-            .CAA => blk: {
+            RecordType.CAA.value => blk: {
                 if (len < 2) return Error.InvalidLength;
                 const flags = message[offset];
                 const tag_len = message[offset + 1];
@@ -304,6 +304,6 @@ test "rdata parses SOA, SRV, and CAA records" {
 }
 
 test "rdata preserves unknown record bytes" {
-    const unknown = try RData.parse(.unknown, &.{ 1, 2, 3, 4 }, 0, 4);
+    const unknown = try RData.parse(RecordType.fromCode(65280), &.{ 1, 2, 3, 4 }, 0, 4);
     try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, unknown.Unknown.bytes());
 }

@@ -1,75 +1,59 @@
-pub const Class = enum(u16) {
-    IN = 1,
-    unknown = 0xffff,
+const std = @import("std");
+
+pub const Class = struct {
+    value: u16,
+
+    pub const IN = Class{ .value = 1 };
 
     pub fn fromCode(value: u16) Class {
-        return switch (value) {
-            1 => .IN,
-            else => .unknown,
-        };
+        return .{ .value = value };
     }
 
     pub fn code(self: Class) u16 {
-        return switch (self) {
-            .IN => 1,
-            .unknown => 0xffff,
-        };
+        return self.value;
+    }
+
+    pub fn eql(self: Class, other: Class) bool {
+        return self.value == other.value;
     }
 };
 
-pub const RecordType = enum(u16) {
-    A = 1,
-    NS = 2,
-    CNAME = 5,
-    SOA = 6,
-    PTR = 12,
-    MX = 15,
-    TXT = 16,
-    AAAA = 28,
-    SRV = 33,
-    OPT = 41,
-    CAA = 257,
-    unknown = 0xffff,
+pub const RecordType = struct {
+    value: u16,
+
+    pub const A = RecordType{ .value = 1 };
+    pub const NS = RecordType{ .value = 2 };
+    pub const CNAME = RecordType{ .value = 5 };
+    pub const SOA = RecordType{ .value = 6 };
+    pub const PTR = RecordType{ .value = 12 };
+    pub const MX = RecordType{ .value = 15 };
+    pub const TXT = RecordType{ .value = 16 };
+    pub const AAAA = RecordType{ .value = 28 };
+    pub const SRV = RecordType{ .value = 33 };
+    pub const OPT = RecordType{ .value = 41 };
+    pub const CAA = RecordType{ .value = 257 };
 
     pub fn fromCode(value: u16) RecordType {
-        return switch (value) {
-            1 => .A,
-            2 => .NS,
-            5 => .CNAME,
-            6 => .SOA,
-            12 => .PTR,
-            15 => .MX,
-            16 => .TXT,
-            28 => .AAAA,
-            33 => .SRV,
-            41 => .OPT,
-            257 => .CAA,
-            else => .unknown,
-        };
+        return .{ .value = value };
     }
 
     pub fn code(self: RecordType) u16 {
-        return switch (self) {
-            .A => 1,
-            .NS => 2,
-            .CNAME => 5,
-            .SOA => 6,
-            .PTR => 12,
-            .MX => 15,
-            .TXT => 16,
-            .AAAA => 28,
-            .SRV => 33,
-            .OPT => 41,
-            .CAA => 257,
-            .unknown => 0xffff,
-        };
+        return self.value;
+    }
+
+    pub fn eql(self: RecordType, other: RecordType) bool {
+        return self.value == other.value;
     }
 };
 
 test "record type and class codes round trip for phase-one values" {
-    const testing = @import("std").testing;
-    try testing.expectEqual(RecordType.A, RecordType.fromCode(1));
-    try testing.expectEqual(@as(u16, 28), RecordType.AAAA.code());
-    try testing.expectEqual(Class.IN, Class.fromCode(1));
-    try testing.expectEqual(@as(u16, 1), Class.IN.code());
+    try std.testing.expectEqual(RecordType.A, RecordType.fromCode(1));
+    try std.testing.expectEqual(@as(u16, 28), RecordType.AAAA.code());
+    try std.testing.expectEqual(Class.IN, Class.fromCode(1));
+    try std.testing.expectEqual(@as(u16, 1), Class.IN.code());
+}
+
+test "unknown record type and class preserve raw wire codes" {
+    try std.testing.expectEqual(@as(u16, 65280), RecordType.fromCode(65280).code());
+    try std.testing.expectEqual(@as(u16, 1232), Class.fromCode(1232).code());
 }

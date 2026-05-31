@@ -83,11 +83,11 @@ pub const Fixture = struct {
         }
         if (self.expect_qtype) |qtype| {
             const question = parsed.question orelse return Error.MismatchedQType;
-            if (question.qtype != qtype) return Error.MismatchedQType;
+            if (!question.qtype.eql(qtype)) return Error.MismatchedQType;
         }
         if (self.expect_qclass) |qclass| {
             const question = parsed.question orelse return Error.MismatchedQClass;
-            if (question.qclass != qclass) return Error.MismatchedQClass;
+            if (!question.qclass.eql(qclass)) return Error.MismatchedQClass;
         }
     }
 
@@ -150,12 +150,12 @@ fn parseRecordType(text: []const u8) RecordType {
     if (std.mem.eql(u8, text, "SOA")) return .SOA;
     if (std.mem.eql(u8, text, "MX")) return .MX;
     if (std.mem.eql(u8, text, "TXT")) return .TXT;
-    return .unknown;
+    return RecordType.fromCode(0xffff);
 }
 
 fn parseClass(text: []const u8) Class {
     if (std.mem.eql(u8, text, "IN")) return .IN;
-    return .unknown;
+    return Class.fromCode(0xffff);
 }
 
 test "golden fixture parser loads simple A query fixture" {

@@ -31,12 +31,20 @@ pub const RecordSection = struct {
     }
 };
 
+pub const EdnsState = struct {
+    udp_payload_size: u16,
+    extended_rcode: u8,
+    version: u8,
+    dnssec_ok: bool,
+};
+
 pub const Message = struct {
     header: header_mod.Header,
     question: ?question_mod.Question = null,
     answers: RecordSection = .{},
     authorities: RecordSection = .{},
     additionals: RecordSection = .{},
+    edns: ?EdnsState = null,
 
     pub fn parse(bytes: []const u8) !Message {
         var reader = Reader.init(bytes);
@@ -55,7 +63,7 @@ pub const Message = struct {
 
         try parseSection(bytes, &reader, header.answer_count, &message.answers);
         try parseSection(bytes, &reader, header.authority_count, &message.authorities);
-        try parseSection(bytes, &reader, header.additional_count, &message.additionals);
+        try parseAdditionalSection(bytes, &reader, header.additional_count, &message);
 
         if (reader.position() != bytes.len) return Error.TrailingData;
         return message;
@@ -87,6 +95,24 @@ fn parseSection(bytes: []const u8, reader: *Reader, count: u16, section: *Record
     while (index < count) : (index += 1) {
         const parsed_record = record_mod.ResourceRecord.parse(bytes, reader.position()) catch return Error.BadRecord;
         try section.append(parsed_record.record);
+        reader.offset = parsed_record.next_offset;
+    }
+}
+
+fn parseAdditionalSection(bytes: []const u8, reader: *Reader, count: u16, message: *Message) Error!void {
+    if (count > max_section_records) return Error.TooManyRecords;
+    var index: u16 = 0;
+    while (index < count) : (index += 1) {
+        const parsed_record = record_mod.ResourceRecord.parse(bytes, reader.position()) catch return Error.BadRecord;
+        try message.additionals.append(parsed_record.record);
+        if (parsed_record.record.rrtype.eql(.OPT)) {
+            message.edns = .{
+                .udp_payload_size = parsed_record.record.class.code(),
+                .extended_rcode = @intCast((parsed_record.record.ttl >> 24) & 0xff),
+                .version = @intCast((parsed_record.record.ttl >> 16) & 0xff),
+                .dnssec_ok = (parsed_record.record.ttl & 0x8000) != 0,
+            };
+        }
         reader.offset = parsed_record.next_offset;
     }
 }
@@ -132,4 +158,20 @@ test "message parses response sections with compressed answer owner" {
     try std.testing.expectEqual(@as(usize, 1), parsed.authorities.len);
     try std.testing.expectEqual(@as(u32, 3600), parsed.answers.items[0].ttl);
     try std.testing.expectEqualSlices(u8, &.{ 192, 0, 2, 1 }, &parsed.answers.items[0].rdata.A);
+}
+
+test "message extracts EDNS OPT state from additional section" {
+    const bytes = [_]u8{
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        7,    'e',  'x',  'a',  'm',  'p',  'l',  'e',  3,    'c',  'o',  'm',
+        0,    0x00, 0x01, 0x00, 0x01, 0,    0x00, 0x29, 0x04, 0xd0, 0x00, 0x00,
+        0x80, 0x00, 0x00, 0x00,
+    };
+
+    const parsed = try Message.parse(&bytes);
+    try std.testing.expect(parsed.edns != null);
+    try std.testing.expectEqual(@as(u16, 1232), parsed.edns.?.udp_payload_size);
+    try std.testing.expectEqual(@as(u8, 0), parsed.edns.?.version);
+    try std.testing.expect(parsed.edns.?.dnssec_ok);
+    try std.testing.expectEqual(@as(usize, 1), parsed.additionals.len);
 }
