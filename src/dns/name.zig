@@ -31,6 +31,32 @@ pub const Name = struct {
         return name;
     }
 
+    pub fn fromText(text: []const u8) Error!Name {
+        if (std.mem.eql(u8, text, ".")) return Name.root();
+        var name = Name{ .wire_len = 0 };
+        var start: usize = 0;
+        while (start < text.len) {
+            const dot_index = std.mem.indexOfScalarPos(u8, text, start, '.') orelse return Error.EndOfInput;
+            const label = text[start..dot_index];
+            if (label.len == 0) {
+                if (dot_index == text.len - 1) {
+                    try name.pushByte(0);
+                    return name;
+                }
+                return Error.EndOfInput;
+            }
+            if (label.len > max_label_len) return Error.LabelTooLong;
+            try name.pushByte(@intCast(label.len));
+            for (label) |byte| try name.pushByte(std.ascii.toLower(byte));
+            start = dot_index + 1;
+            if (start == text.len) {
+                try name.pushByte(0);
+                return name;
+            }
+        }
+        return Error.EndOfInput;
+    }
+
     pub fn asWire(self: *const Name) []const u8 {
         return self.wire[0..self.wire_len];
     }
@@ -179,4 +205,10 @@ test "name encodes without compression" {
     var writer = Writer.init(&output);
     try parsed.name.encode(&writer);
     try std.testing.expectEqualSlices(u8, &bytes, writer.written());
+}
+
+test "name builds from presentation text" {
+    const name = try Name.fromText("Example.COM.");
+    var text: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("example.com.", try name.toText(&text));
 }
