@@ -7,5 +7,5 @@ forwarder default udp 9.9.9.9
 cache max-entries 100000
 cache serve-stale on
 cache serve-stale-ttl 3600
+blocklist file examples/blocklists/ads.txt
 zone home.arpa primary examples/zones/home.arpa.zone
-

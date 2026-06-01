@@ -40,6 +40,11 @@ pub fn formatResponse(response: dns_message.Message, buffer: []u8) ![]const u8 {
     var value_buffer: [256]u8 = undefined;
 
     if (response.answers.len == 0) {
+        if (response.header.rcode != .no_error) {
+            try writer.writeBytes("rcode ");
+            try writer.writeBytes(rcodeName(response.header.rcode));
+            try writer.writeBytes("\n");
+        }
         try writer.writeBytes("no answers\n");
         return writer.written();
     }
@@ -82,6 +87,17 @@ pub fn formatResponse(response: dns_message.Message, buffer: []u8) ![]const u8 {
         try writer.writeBytes("\n");
     }
     return writer.written();
+}
+
+fn rcodeName(rcode: dns_header.Rcode) []const u8 {
+    return switch (rcode) {
+        .no_error => "NOERROR",
+        .formerr => "FORMERR",
+        .servfail => "SERVFAIL",
+        .nxdomain => "NXDOMAIN",
+        .notimp => "NOTIMP",
+        .refused => "REFUSED",
+    };
 }
 
 pub fn sendUdpQuery(socket: *const std.Io.net.Socket, io: std.Io, server: *const std.Io.net.IpAddress, query: []const u8) !void {
@@ -167,6 +183,17 @@ test "query formatter prints A and CNAME answers" {
     try std.testing.expect(std.mem.indexOf(u8, text, "www.example.") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "CNAME example.") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "A 192.0.2.1") != null);
+}
+
+test "query formatter prints response code when there are no answers" {
+    const response = try dns_message.Message.parse(&.{
+        0x12, 0x34, 0x81, 0x05, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        3,    'a',  'd',  's',  4,    'h',  'o',  'm',  'e',  4,    'a',  'r',
+        'p',  'a',  0,    0x00, 0x01, 0x00, 0x01,
+    });
+    var output: [256]u8 = undefined;
+    const text = try formatResponse(response, &output);
+    try std.testing.expectEqualStrings("rcode REFUSED\nno answers\n", text);
 }
 
 test "UDP query client talks to authoritative listener socket" {

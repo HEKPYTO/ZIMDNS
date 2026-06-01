@@ -74,6 +74,14 @@ pub const Zone = struct {
     }
 };
 
+pub const BlocklistFile = struct {
+    path: Text = .{},
+
+    pub fn pathText(self: *const BlocklistFile) []const u8 {
+        return self.path.text();
+    }
+};
+
 fn List(comptime T: type) type {
     return struct {
         items: [max_items]T = undefined,
@@ -94,6 +102,7 @@ pub const Config = struct {
     forwarders: List(Forwarder) = .{},
     cache: CacheConfig = .{},
     zones: List(Zone) = .{},
+    blocklists: List(BlocklistFile) = .{},
 
     pub fn parse(text: []const u8) !Config {
         var config = Config{};
@@ -116,6 +125,7 @@ pub const Config = struct {
         if (std.mem.eql(u8, first, "forwarder")) return self.parseForwarder(&tokens);
         if (std.mem.eql(u8, first, "cache")) return self.parseCache(&tokens);
         if (std.mem.eql(u8, first, "zone")) return self.parseZone(&tokens);
+        if (std.mem.eql(u8, first, "blocklist")) return self.parseBlocklist(&tokens);
         return Error.UnknownDirective;
     }
 
@@ -171,6 +181,13 @@ pub const Config = struct {
         try zone.file.set(tokens.next() orelse return Error.BadDirective);
         try self.zones.append(zone);
     }
+
+    fn parseBlocklist(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        if (!std.mem.eql(u8, tokens.next() orelse return Error.BadDirective, "file")) return Error.BadDirective;
+        var file = BlocklistFile{};
+        try file.path.set(tokens.next() orelse return Error.BadDirective);
+        try self.blocklists.append(file);
+    }
 };
 
 fn parseTransport(text: []const u8) !Transport {
@@ -205,6 +222,7 @@ test "config parser loads documented directives" {
         \\cache serve-stale on
         \\cache serve-stale-ttl 3600
         \\zone home.arpa primary /etc/gcli-dns/zones/home.arpa.zone
+        \\blocklist file /etc/gcli-dns/blocklists/ads.txt
         \\
     ;
 
@@ -220,6 +238,8 @@ test "config parser loads documented directives" {
     try std.testing.expectEqual(@as(u32, 3600), config.cache.serve_stale_ttl);
     try std.testing.expectEqual(@as(usize, 1), config.zones.len);
     try std.testing.expectEqualStrings("home.arpa", config.zones.items[0].nameText());
+    try std.testing.expectEqual(@as(usize, 1), config.blocklists.len);
+    try std.testing.expectEqualStrings("/etc/gcli-dns/blocklists/ads.txt", config.blocklists.items[0].pathText());
 }
 
 test "config parser rejects unknown and malformed directives" {

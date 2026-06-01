@@ -1,6 +1,7 @@
 const std = @import("std");
 const config_parser = @import("config/parser.zig");
 const zone_parser = @import("zone/parser.zig");
+const blocklist = @import("blocklist.zig");
 
 const max_issues = 32;
 
@@ -10,6 +11,7 @@ pub const IssueKind = enum {
     invalid_listener_port,
     missing_recursion_default_deny,
     invalid_zone,
+    invalid_blocklist,
 };
 
 pub const Report = struct {
@@ -57,6 +59,13 @@ pub fn inspectZoneText(name: []const u8, text: []const u8, report: *Report) !voi
     };
 }
 
+pub fn inspectBlocklistText(text: []const u8, report: *Report) !void {
+    _ = blocklist.Blocklist.parse(text) catch {
+        try report.add(.invalid_blocklist);
+        return;
+    };
+}
+
 pub fn issueName(kind: IssueKind) []const u8 {
     return switch (kind) {
         .missing_listener => "missing-listener",
@@ -64,6 +73,7 @@ pub fn issueName(kind: IssueKind) []const u8 {
         .invalid_listener_port => "invalid-listener-port",
         .missing_recursion_default_deny => "missing-recursion-default-deny",
         .invalid_zone => "invalid-zone",
+        .invalid_blocklist => "invalid-blocklist",
     };
 }
 

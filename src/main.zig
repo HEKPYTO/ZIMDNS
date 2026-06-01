@@ -10,8 +10,15 @@ pub const cli_query = @import("cli/query.zig");
 pub const config_parser = @import("config/parser.zig");
 pub const doctor = @import("doctor.zig");
 pub const cache_store = @import("cache/store.zig");
+pub const metrics = @import("metrics.zig");
+pub const blocklist = @import("blocklist.zig");
+pub const admin_protocol = @import("admin/protocol.zig");
+pub const admin_service = @import("admin/service.zig");
+pub const admin_socket = @import("admin/socket.zig");
+pub const backup_manifest = @import("backup/manifest.zig");
 
 const ServerRunMode = enum { none, udp_once, tcp_once };
+const version_text = "0.0.0";
 
 test {
     _ = @import("dns/reader.zig");
@@ -33,6 +40,12 @@ test {
     _ = config_parser;
     _ = doctor;
     _ = cache_store;
+    _ = metrics;
+    _ = blocklist;
+    _ = admin_protocol;
+    _ = admin_service;
+    _ = admin_socket;
+    _ = backup_manifest;
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -56,7 +69,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, command, "--version")) {
-        try stdout.print("gcli-dns 0.0.0\n", .{});
+        try stdout.print("gcli-dns {s}\n", .{version_text});
         return;
     }
 
@@ -75,6 +88,11 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, command, "backup")) {
+        try handleBackup(args, io, arena, stdout);
+        return;
+    }
+
     try stdout.print("error: command '{s}' is not implemented yet\n\n", .{command});
     try printHelp(stdout);
     try exitUsage(stdout);
@@ -90,13 +108,15 @@ fn printHelp(writer: *std.Io.Writer) !void {
         \\  gcli-dns server run
         \\  gcli-dns server run --config examples/config.gdns --once-udp
         \\  gcli-dns server run --zone-file examples/zones/home.arpa.zone --once-udp 1053
-        \\  gcli-dns server run --zone-file examples/zones/home.arpa.zone --once-udp 1053 --max-queries 2
+        \\  gcli-dns server run --zone-file examples/zones/home.arpa.zone --once-udp 1053 --max-queries 2 --print-metrics
         \\  gcli-dns server run --zone-file examples/zones/home.arpa.zone --once-tcp 1053
+        \\  gcli-dns server admin --config examples/config.gdns --once
         \\  gcli-dns query @127.0.0.1 -p 1053 example.com A
         \\  gcli-dns zone list
         \\  gcli-dns record list <zone>
         \\  gcli-dns cache stats
         \\  gcli-dns doctor --config examples/config.gdns
+        \\  gcli-dns backup manifest --config examples/config.gdns
         \\  gcli-dns metrics
         \\
         \\Implemented now:
@@ -199,8 +219,13 @@ fn queryTcp(io: std.Io, server: *const std.Io.net.IpAddress, query: []const u8, 
 }
 
 fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocator, writer: *std.Io.Writer) !void {
-    if (args.len < 3 or !std.mem.eql(u8, args[2], "run")) {
-        try writer.writeAll("error: expected 'server run'\n");
+    if (args.len < 3) {
+        try writer.writeAll("error: expected 'server run' or 'server admin'\n");
+        try exitUsage(writer);
+    }
+    if (std.mem.eql(u8, args[2], "admin")) return handleServerAdmin(args, io, allocator, writer);
+    if (!std.mem.eql(u8, args[2], "run")) {
+        try writer.writeAll("error: expected 'server run' or 'server admin'\n");
         try exitUsage(writer);
     }
 
@@ -210,6 +235,7 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
     var port_set = false;
     var port: u16 = 1053;
     var max_queries: usize = 1;
+    var print_metrics = false;
 
     var index: usize = 3;
     while (index < args.len) {
@@ -258,6 +284,8 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
                 try writer.writeAll("error: invalid max query count\n");
                 try exitUsage(writer);
             };
+        } else if (std.mem.eql(u8, arg, "--print-metrics")) {
+            print_metrics = true;
         } else {
             try writer.print("error: unknown server option '{s}'\n", .{arg});
             try exitUsage(writer);
@@ -266,6 +294,7 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
     }
 
     var parsed_config: ?config_parser.Config = null;
+    var runtime_blocklist = blocklist.Blocklist{};
     if (config_file) |path| {
         const config_text = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
         parsed_config = try config_parser.Config.parse(config_text);
@@ -274,6 +303,13 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
         }
         if (!port_set) {
             if (findListenerPort(&parsed_config.?, mode)) |config_port| port = config_port;
+        }
+        var blocklist_index: usize = 0;
+        while (blocklist_index < parsed_config.?.blocklists.len) : (blocklist_index += 1) {
+            const blocklist_path = parsed_config.?.blocklists.items[blocklist_index].pathText();
+            const blocklist_text = try std.Io.Dir.cwd().readFileAlloc(io, blocklist_path, allocator, .limited(1024 * 1024));
+            const parsed_blocklist = try blocklist.Blocklist.parse(blocklist_text);
+            try runtime_blocklist.appendAll(parsed_blocklist);
         }
     }
 
@@ -287,7 +323,8 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
     }
 
     const zone_text = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
-    const runtime = try auth_runtime.Runtime.fromZoneText(zone_text);
+    const runtime = try auth_runtime.Runtime.fromZoneTextWithBlocklist(zone_text, runtime_blocklist);
+    var counters = metrics.Counters{};
 
     switch (mode) {
         .udp_once => {
@@ -295,15 +332,87 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
                 try writer.writeAll("error: --max-queries must be greater than zero\n");
                 try exitUsage(writer);
             }
-            if (max_queries == 1) {
+            if (print_metrics) {
+                try listener.serveUdpCountOnPortWithMetrics(io, &runtime, port, max_queries, &counters);
+            } else if (max_queries == 1) {
                 try listener.serveUdpOnceOnPort(io, &runtime, port);
             } else {
                 try listener.serveUdpCountOnPort(io, &runtime, port, max_queries);
             }
         },
-        .tcp_once => try listener.serveTcpOnceOnPort(io, &runtime, port),
+        .tcp_once => {
+            if (print_metrics) {
+                try writer.writeAll("error: --print-metrics is currently supported for UDP runs\n");
+                try exitUsage(writer);
+            }
+            try listener.serveTcpOnceOnPort(io, &runtime, port);
+        },
         .none => unreachable,
     }
+
+    if (print_metrics) {
+        var metrics_buffer: [512]u8 = undefined;
+        const text = try metrics.formatPrometheus(counters, &metrics_buffer);
+        try writer.writeAll(text);
+    }
+}
+
+fn handleServerAdmin(args: []const []const u8, io: std.Io, allocator: std.mem.Allocator, writer: *std.Io.Writer) !void {
+    var config_file: ?[]const u8 = null;
+    var once = false;
+    var now_seconds: u64 = 0;
+
+    var index: usize = 3;
+    while (index < args.len) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--config")) {
+            index += 1;
+            if (index >= args.len) {
+                try writer.writeAll("error: --config requires a path\n");
+                try exitUsage(writer);
+            }
+            config_file = args[index];
+        } else if (std.mem.eql(u8, arg, "--once")) {
+            once = true;
+        } else if (std.mem.eql(u8, arg, "--now")) {
+            index += 1;
+            if (index >= args.len) {
+                try writer.writeAll("error: --now requires seconds\n");
+                try exitUsage(writer);
+            }
+            now_seconds = std.fmt.parseInt(u64, args[index], 10) catch {
+                try writer.writeAll("error: invalid --now value\n");
+                try exitUsage(writer);
+            };
+        } else {
+            try writer.print("error: unknown server admin option '{s}'\n", .{arg});
+            try exitUsage(writer);
+        }
+        index += 1;
+    }
+
+    if (!once) {
+        try writer.writeAll("error: server admin currently requires --once\n");
+        try exitUsage(writer);
+    }
+    const config_path = config_file orelse {
+        try writer.writeAll("error: server admin requires --config\n");
+        try exitUsage(writer);
+    };
+    const config_text = try std.Io.Dir.cwd().readFileAlloc(io, config_path, allocator, .limited(1024 * 1024));
+    const parsed_config = try config_parser.Config.parse(config_text);
+    const socket_path = parsed_config.admin_socket.pathText();
+    if (socket_path.len == 0) {
+        try writer.writeAll("error: config must define admin socket\n");
+        try exitUsage(writer);
+    }
+
+    const service = admin_service.Service{
+        .version = version_text,
+        .started_at_seconds = now_seconds,
+        .metrics = .{},
+    };
+    try admin_socket.serveUnixOnce(socket_path, io, service, now_seconds);
 }
 
 fn handleDoctor(args: []const []const u8, io: std.Io, allocator: std.mem.Allocator, writer: *std.Io.Writer) !void {
@@ -345,6 +454,16 @@ fn handleDoctor(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
         try doctor.inspectZoneText(zone.nameText(), zone_text, &report);
     }
 
+    var blocklist_index: usize = 0;
+    while (blocklist_index < parsed_config.blocklists.len) : (blocklist_index += 1) {
+        const blocklist_file = parsed_config.blocklists.items[blocklist_index];
+        const blocklist_text = std.Io.Dir.cwd().readFileAlloc(io, blocklist_file.pathText(), allocator, .limited(1024 * 1024)) catch {
+            try report.add(.invalid_blocklist);
+            continue;
+        };
+        try doctor.inspectBlocklistText(blocklist_text, &report);
+    }
+
     if (report.ok()) {
         try writer.writeAll("doctor: ok\n");
         return;
@@ -356,6 +475,40 @@ fn handleDoctor(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
         try writer.print("- {s}\n", .{doctor.issueName(report.issues[issue_index])});
     }
     try exitFailure(writer);
+}
+
+fn handleBackup(args: []const []const u8, io: std.Io, allocator: std.mem.Allocator, writer: *std.Io.Writer) !void {
+    if (args.len < 3 or !std.mem.eql(u8, args[2], "manifest")) {
+        try writer.writeAll("error: expected 'backup manifest'\n");
+        try exitUsage(writer);
+    }
+
+    var config_file: ?[]const u8 = null;
+    var index: usize = 3;
+    while (index < args.len) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--config")) {
+            index += 1;
+            if (index >= args.len) {
+                try writer.writeAll("error: --config requires a path\n");
+                try exitUsage(writer);
+            }
+            config_file = args[index];
+        } else {
+            try writer.print("error: unknown backup manifest option '{s}'\n", .{arg});
+            try exitUsage(writer);
+        }
+        index += 1;
+    }
+
+    const config_path = config_file orelse {
+        try writer.writeAll("error: backup manifest requires --config\n");
+        try exitUsage(writer);
+    };
+    const manifest = try backup_manifest.Manifest.fromConfigFile(std.Io.Dir.cwd(), io, config_path, allocator);
+    var manifest_buffer: [4096]u8 = undefined;
+    const text = try manifest.render(&manifest_buffer);
+    try writer.writeAll(text);
 }
 
 fn findListenerPort(config: *const config_parser.Config, mode: ServerRunMode) ?u16 {

@@ -1,5 +1,6 @@
 const std = @import("std");
 const Runtime = @import("../auth/runtime.zig").Runtime;
+const metrics = @import("../metrics.zig");
 
 pub const Error = error{
     QueryTooLarge,
@@ -15,10 +16,25 @@ pub fn serveUdpOnce(socket: *const std.Io.net.Socket, io: std.Io, runtime: *cons
     try socket.send(io, &incoming.from, response);
 }
 
+pub fn serveUdpOnceWithMetrics(socket: *const std.Io.net.Socket, io: std.Io, runtime: *const Runtime, counters: *metrics.Counters) !void {
+    var request_buffer: [512]u8 = undefined;
+    const incoming = try socket.receive(io, &request_buffer);
+    var response_buffer: [512]u8 = undefined;
+    const response = try runtime.answerWithMetrics(incoming.data, &response_buffer, counters);
+    try socket.send(io, &incoming.from, response);
+}
+
 pub fn serveUdpCount(socket: *const std.Io.net.Socket, io: std.Io, runtime: *const Runtime, count: usize) !void {
     var served: usize = 0;
     while (served < count) : (served += 1) {
         try serveUdpOnce(socket, io, runtime);
+    }
+}
+
+pub fn serveUdpCountWithMetrics(socket: *const std.Io.net.Socket, io: std.Io, runtime: *const Runtime, count: usize, counters: *metrics.Counters) !void {
+    var served: usize = 0;
+    while (served < count) : (served += 1) {
+        try serveUdpOnceWithMetrics(socket, io, runtime, counters);
     }
 }
 
@@ -34,6 +50,13 @@ pub fn serveUdpCountOnPort(io: std.Io, runtime: *const Runtime, port: u16, count
     var socket = try std.Io.net.IpAddress.bind(&addr, io, .{ .mode = .dgram, .protocol = .udp });
     defer socket.close(io);
     try serveUdpCount(&socket, io, runtime, count);
+}
+
+pub fn serveUdpCountOnPortWithMetrics(io: std.Io, runtime: *const Runtime, port: u16, count: usize, counters: *metrics.Counters) !void {
+    var addr: std.Io.net.IpAddress = .{ .ip4 = .unspecified(port) };
+    var socket = try std.Io.net.IpAddress.bind(&addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer socket.close(io);
+    try serveUdpCountWithMetrics(&socket, io, runtime, count, counters);
 }
 
 pub fn serveTcpStreamOnce(stream: std.Io.net.Stream, io: std.Io, runtime: *const Runtime) !void {
@@ -119,6 +142,26 @@ test "UDP listener serves a bounded batch of authoritative datagrams" {
     } });
     const second_response = try @import("../dns/message.zig").Message.parse(second.data);
     try std.testing.expectEqual(@as(u16, 1), second_response.header.answer_count);
+}
+
+test "UDP listener records metrics for a bounded datagram batch" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const runtime = try Runtime.fromZoneText(test_zone);
+    var server_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server_socket = try std.Io.net.IpAddress.bind(&server_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer server_socket.close(io);
+
+    var client_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var client_socket = try std.Io.net.IpAddress.bind(&client_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer client_socket.close(io);
+
+    var counters = metrics.Counters{};
+    try client_socket.send(io, &server_socket.address, simple_a_query);
+    try serveUdpCountWithMetrics(&server_socket, io, &runtime, 1, &counters);
+
+    try std.testing.expectEqual(@as(u64, 1), counters.queries_total);
+    try std.testing.expectEqual(@as(u64, 1), counters.responses_total);
+    try std.testing.expectEqual(@as(u64, 0), counters.bad_queries_total);
 }
 
 test "TCP handler serves one length-prefixed DNS query on a stream" {

@@ -1,0 +1,4 @@
+# Exact-name blocklist loaded by examples/config.gdns.
+ads.home.arpa
+tracker.home.arpa.
+

@@ -9,6 +9,8 @@ test "config parser loads bundled example config" {
     try std.testing.expectEqual(@as(usize, 2), config.listeners.len);
     try std.testing.expectEqual(@as(usize, 1), config.zones.len);
     try std.testing.expectEqualStrings("examples/zones/home.arpa.zone", config.zones.items[0].fileText());
+    try std.testing.expectEqual(@as(usize, 1), config.blocklists.len);
+    try std.testing.expectEqualStrings("examples/blocklists/ads.txt", config.blocklists.items[0].pathText());
 }
 
 test "doctor accepts locked down config with valid authoritative zone" {
@@ -40,4 +42,14 @@ test "doctor reports sparse unsafe config" {
     try std.testing.expect(report.has(.missing_zone));
     try std.testing.expect(report.has(.missing_recursion_default_deny));
     try std.testing.expectEqualStrings("missing-listener", doctor.issueName(.missing_listener));
+}
+
+test "doctor reports invalid blocklist text" {
+    var report = doctor.Report{};
+    var long_name: [260]u8 = undefined;
+    @memset(&long_name, 'a');
+    try doctor.inspectBlocklistText(&long_name, &report);
+
+    try std.testing.expect(!report.ok());
+    try std.testing.expect(report.has(.invalid_blocklist));
 }
