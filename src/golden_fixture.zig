@@ -66,7 +66,10 @@ pub const Fixture = struct {
     }
 
     pub fn run(self: *const Fixture) !void {
-        const parsed = Message.parse(self.input[0..self.input_len]) catch {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+
+        const parsed = Message.parse(arena.allocator(), self.input[0..self.input_len]) catch {
             if (self.expect_parse_ok == false) return;
             return Error.ParseFailed;
         };

@@ -79,7 +79,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, command, "query")) {
-        try handleQuery(args, io, stdout);
+        try handleQuery(args, io, arena, stdout);
         return;
     }
 
@@ -125,7 +125,7 @@ fn printHelp(writer: *std.Io.Writer) !void {
     );
 }
 
-fn handleQuery(args: []const []const u8, io: std.Io, writer: *std.Io.Writer) !void {
+fn handleQuery(args: []const []const u8, io: std.Io, allocator: std.mem.Allocator, writer: *std.Io.Writer) !void {
     var server_text: []const u8 = "127.0.0.1";
     var port: u16 = 1053;
     var use_tcp = false;
@@ -176,9 +176,9 @@ fn handleQuery(args: []const []const u8, io: std.Io, writer: *std.Io.Writer) !vo
 
     var response_buffer: [512]u8 = undefined;
     const response = if (use_tcp)
-        try queryTcp(io, &server, query, &response_buffer)
+        try queryTcp(allocator, io, &server, query, &response_buffer)
     else
-        try queryUdp(io, &server, query, &response_buffer);
+        try queryUdp(allocator, io, &server, query, &response_buffer);
     var text_buffer: [2048]u8 = undefined;
     const text = try cli_query.formatResponse(response, &text_buffer);
     try writer.writeAll(text);
@@ -203,19 +203,19 @@ fn ensureAbsoluteName(name: []const u8, buffer: []u8) ![]const u8 {
     return buffer[0 .. name.len + 1];
 }
 
-fn queryUdp(io: std.Io, server: *const std.Io.net.IpAddress, query: []const u8, response_buffer: []u8) !@import("dns/message.zig").Message {
+fn queryUdp(allocator: std.mem.Allocator, io: std.Io, server: *const std.Io.net.IpAddress, query: []const u8, response_buffer: []u8) !@import("dns/message.zig").Message {
     var client_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     var socket = try std.Io.net.IpAddress.bind(&client_addr, io, .{ .mode = .dgram, .protocol = .udp });
     defer socket.close(io);
     try cli_query.sendUdpQuery(&socket, io, server, query);
-    return cli_query.receiveUdpResponse(&socket, io, response_buffer, 0x1234);
+    return cli_query.receiveUdpResponse(allocator, &socket, io, response_buffer, 0x1234);
 }
 
-fn queryTcp(io: std.Io, server: *const std.Io.net.IpAddress, query: []const u8, response_buffer: []u8) !@import("dns/message.zig").Message {
+fn queryTcp(allocator: std.mem.Allocator, io: std.Io, server: *const std.Io.net.IpAddress, query: []const u8, response_buffer: []u8) !@import("dns/message.zig").Message {
     var stream = try std.Io.net.IpAddress.connect(server, io, .{ .mode = .stream, .protocol = .tcp });
     defer stream.close(io);
     try cli_query.sendTcpQuery(stream, io, query);
-    return cli_query.receiveTcpResponse(stream, io, response_buffer, 0x1234);
+    return cli_query.receiveTcpResponse(allocator, stream, io, response_buffer, 0x1234);
 }
 
 fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocator, writer: *std.Io.Writer) !void {

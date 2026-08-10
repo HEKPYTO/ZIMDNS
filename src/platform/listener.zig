@@ -91,6 +91,9 @@ pub fn serveTcpOnceOnPort(io: std.Io, runtime: *const Runtime, port: u16) !void 
 
 test "UDP listener serves one authoritative datagram over loopback sockets" {
     const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
     const runtime = try Runtime.fromZoneText(test_zone);
     var server_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     var server_socket = try std.Io.net.IpAddress.bind(&server_addr, io, .{ .mode = .dgram, .protocol = .udp });
@@ -108,13 +111,16 @@ test "UDP listener serves one authoritative datagram over loopback sockets" {
         .raw = .fromMilliseconds(500),
         .clock = .awake,
     } });
-    const response = try @import("../dns/message.zig").Message.parse(incoming.data);
+    const response = try @import("../dns/message.zig").Message.parse(arena.allocator(), incoming.data);
     try std.testing.expect(response.header.qr);
     try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
 }
 
 test "UDP listener serves a bounded batch of authoritative datagrams" {
     const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
     const runtime = try Runtime.fromZoneText(test_zone);
     var server_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     var server_socket = try std.Io.net.IpAddress.bind(&server_addr, io, .{ .mode = .dgram, .protocol = .udp });
@@ -133,14 +139,14 @@ test "UDP listener serves a bounded batch of authoritative datagrams" {
         .raw = .fromMilliseconds(500),
         .clock = .awake,
     } });
-    const first_response = try @import("../dns/message.zig").Message.parse(first.data);
+    const first_response = try @import("../dns/message.zig").Message.parse(arena.allocator(), first.data);
     try std.testing.expectEqual(@as(u16, 1), first_response.header.answer_count);
 
     const second = try client_socket.receiveTimeout(io, &response_buffer, .{ .duration = .{
         .raw = .fromMilliseconds(500),
         .clock = .awake,
     } });
-    const second_response = try @import("../dns/message.zig").Message.parse(second.data);
+    const second_response = try @import("../dns/message.zig").Message.parse(arena.allocator(), second.data);
     try std.testing.expectEqual(@as(u16, 1), second_response.header.answer_count);
 }
 
@@ -166,6 +172,9 @@ test "UDP listener records metrics for a bounded datagram batch" {
 
 test "TCP handler serves one length-prefixed DNS query on a stream" {
     const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
     const runtime = try Runtime.fromZoneText(test_zone);
 
     var listen_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
@@ -193,7 +202,7 @@ test "TCP handler serves one length-prefixed DNS query on a stream" {
     const response_len_bytes = try client_reader.interface.takeArray(2);
     const response_len = std.mem.readInt(u16, response_len_bytes, .big);
     const response_bytes = try client_reader.interface.take(response_len);
-    const response = try @import("../dns/message.zig").Message.parse(response_bytes);
+    const response = try @import("../dns/message.zig").Message.parse(arena.allocator(), response_bytes);
     try std.testing.expect(response.header.qr);
     try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
 }

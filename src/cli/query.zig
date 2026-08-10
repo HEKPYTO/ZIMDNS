@@ -104,12 +104,12 @@ pub fn sendUdpQuery(socket: *const std.Io.net.Socket, io: std.Io, server: *const
     try socket.send(io, server, query);
 }
 
-pub fn receiveUdpResponse(socket: *const std.Io.net.Socket, io: std.Io, buffer: []u8, expected_id: u16) !dns_message.Message {
+pub fn receiveUdpResponse(allocator: std.mem.Allocator, socket: *const std.Io.net.Socket, io: std.Io, buffer: []u8, expected_id: u16) !dns_message.Message {
     const incoming = try socket.receiveTimeout(io, buffer, .{ .duration = .{
         .raw = .fromMilliseconds(1000),
         .clock = .awake,
     } });
-    const response = try dns_message.Message.parse(incoming.data);
+    const response = try dns_message.Message.parse(allocator, incoming.data);
     if (response.header.id != expected_id) return Error.BadResponse;
     return response;
 }
@@ -124,7 +124,7 @@ pub fn sendTcpQuery(stream: std.Io.net.Stream, io: std.Io, query: []const u8) !v
     try writer.interface.flush();
 }
 
-pub fn receiveTcpResponse(stream: std.Io.net.Stream, io: std.Io, buffer: []u8, expected_id: u16) !dns_message.Message {
+pub fn receiveTcpResponse(allocator: std.mem.Allocator, stream: std.Io.net.Stream, io: std.Io, buffer: []u8, expected_id: u16) !dns_message.Message {
     var read_buffer: [1024]u8 = undefined;
     var reader = stream.reader(io, &read_buffer);
     const len_bytes = try reader.interface.takeArray(2);
@@ -132,7 +132,7 @@ pub fn receiveTcpResponse(stream: std.Io.net.Stream, io: std.Io, buffer: []u8, e
     if (response_len == 0 or response_len > buffer.len) return Error.BadResponse;
     const response_bytes = try reader.interface.take(response_len);
     @memcpy(buffer[0..response_bytes.len], response_bytes);
-    const response = try dns_message.Message.parse(buffer[0..response_bytes.len]);
+    const response = try dns_message.Message.parse(allocator, buffer[0..response_bytes.len]);
     if (response.header.id != expected_id) return Error.BadResponse;
     return response;
 }
@@ -162,16 +162,22 @@ const TextWriter = struct {
 };
 
 test "query builder encodes standard A query" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
     var buffer: [512]u8 = undefined;
     const packet = try buildQueryPacket(&buffer, 0x1234, "example.com.", .A);
-    const parsed = try dns_message.Message.parseQuery(packet);
+    const parsed = try dns_message.Message.parseQuery(arena.allocator(), packet);
     try std.testing.expectEqual(@as(u16, 0x1234), parsed.header.id);
     try std.testing.expect(parsed.header.recursion_desired);
     try std.testing.expect(parsed.question.?.qtype.eql(.A));
 }
 
 test "query formatter prints A and CNAME answers" {
-    const response = try dns_message.Message.parse(&.{
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const response = try dns_message.Message.parse(arena.allocator(), &.{
         0x12, 0x34, 0x85, 0x00, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
         3,    'w',  'w',  'w',  7,    'e',  'x',  'a',  'm',  'p',  'l',  'e',
         0,    0x00, 0x01, 0x00, 0x01, 0xc0, 0x0c, 0x00, 0x05, 0x00, 0x01, 0x00,
@@ -186,7 +192,10 @@ test "query formatter prints A and CNAME answers" {
 }
 
 test "query formatter prints response code when there are no answers" {
-    const response = try dns_message.Message.parse(&.{
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const response = try dns_message.Message.parse(arena.allocator(), &.{
         0x12, 0x34, 0x81, 0x05, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         3,    'a',  'd',  's',  4,    'h',  'o',  'm',  'e',  4,    'a',  'r',
         'p',  'a',  0,    0x00, 0x01, 0x00, 0x01,
@@ -198,6 +207,9 @@ test "query formatter prints response code when there are no answers" {
 
 test "UDP query client talks to authoritative listener socket" {
     const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
     const runtime = try Runtime.fromZoneText(test_zone);
     var server_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     var server_socket = try std.Io.net.IpAddress.bind(&server_addr, io, .{ .mode = .dgram, .protocol = .udp });
@@ -212,12 +224,15 @@ test "UDP query client talks to authoritative listener socket" {
     try sendUdpQuery(&client_socket, io, &server_socket.address, query);
     try listener.serveUdpOnce(&server_socket, io, &runtime);
     var response_buffer: [512]u8 = undefined;
-    const response = try receiveUdpResponse(&client_socket, io, &response_buffer, 0x9999);
+    const response = try receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, 0x9999);
     try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
 }
 
 test "TCP query client talks to authoritative stream handler" {
     const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
     const runtime = try Runtime.fromZoneText(test_zone);
     var listen_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     var server = try std.Io.net.IpAddress.listen(&listen_addr, io, .{ .reuse_address = true });
@@ -233,7 +248,7 @@ test "TCP query client talks to authoritative stream handler" {
     try sendTcpQuery(client_stream, io, query);
     try listener.serveTcpStreamOnce(server_stream, io, &runtime);
     var response_buffer: [512]u8 = undefined;
-    const response = try receiveTcpResponse(client_stream, io, &response_buffer, 0x999a);
+    const response = try receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, 0x999a);
     try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
 }
 

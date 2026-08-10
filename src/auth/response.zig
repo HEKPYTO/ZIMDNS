@@ -24,6 +24,7 @@ pub fn buildResponse(request: dns_message.Message, zone: *const zone_index.Zone)
     const lookup = zone.lookup(qname_text, q.qtype);
 
     var response = dns_message.Message{
+        .allocator = request.allocator,
         .header = .{
             .id = request.header.id,
             .qr = true,
@@ -38,7 +39,11 @@ pub fn buildResponse(request: dns_message.Message, zone: *const zone_index.Zone)
             .question_count = 1,
         },
         .question = q,
+        .answers = try dns_message.RecordSection.init(request.allocator, 0),
+        .authorities = try dns_message.RecordSection.init(request.allocator, 0),
+        .additionals = try dns_message.RecordSection.init(request.allocator, 0),
     };
+    errdefer response.deinit();
 
     switch (lookup.kind) {
         .answer, .cname => {
@@ -53,10 +58,18 @@ pub fn buildResponse(request: dns_message.Message, zone: *const zone_index.Zone)
         .not_authoritative => {},
     }
 
+    try setHeaderCounts(&response);
+    return response;
+}
+
+fn setHeaderCounts(response: *dns_message.Message) Error!void {
+    const max_count = @as(usize, std.math.maxInt(u16));
+    if (response.answers.len > max_count or response.authorities.len > max_count or response.additionals.len > max_count) {
+        return Error.TooManyRecords;
+    }
     response.header.answer_count = @intCast(response.answers.len);
     response.header.authority_count = @intCast(response.authorities.len);
     response.header.additional_count = @intCast(response.additionals.len);
-    return response;
 }
 
 fn toResourceRecord(record: zone_parser.ZoneRecord) !dns_record.ResourceRecord {
@@ -187,7 +200,10 @@ fn parseSoa(text: []const u8) !dns_rdata.Soa {
 }
 
 test "authoritative response builder answers exact A query" {
-    const request = try dns_message.Message.parseQuery(&.{
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const request = try dns_message.Message.parseQuery(arena.allocator(), &.{
         0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         3,    'd',  'n',  's',  4,    'h',  'o',  'm',  'e',  4,    'a',  'r',
         'p',  'a',  0,    0x00, 0x01, 0x00, 0x01,
@@ -213,13 +229,16 @@ test "authoritative response builder answers exact A query" {
     var encoded: [512]u8 = undefined;
     var writer = @import("../dns/writer.zig").Writer.init(&encoded);
     try response.encode(&writer);
-    const round_trip = try dns_message.Message.parse(writer.written());
+    const round_trip = try dns_message.Message.parse(arena.allocator(), writer.written());
     try std.testing.expectEqual(@as(u16, 0x1234), round_trip.header.id);
     try std.testing.expectEqual(@as(u16, 1), round_trip.header.answer_count);
     try std.testing.expectEqualSlices(u8, &.{ 192, 168, 1, 1 }, &round_trip.answers.items[0].rdata.A);
 }
 
 test "authoritative response builder returns CNAME and SOA-backed negatives" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
     const zone_file = try zone_parser.ZoneFile.parse(
         \\$ORIGIN home.arpa.
         \\$TTL 3600
@@ -231,7 +250,7 @@ test "authoritative response builder returns CNAME and SOA-backed negatives" {
     );
     const zone = try zone_index.Zone.fromZoneFile(zone_file);
 
-    const cname_request = try dns_message.Message.parseQuery(&.{
+    const cname_request = try dns_message.Message.parseQuery(arena.allocator(), &.{
         0x12, 0x35, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         5,    'a',  'l',  'i',  'a',  's',  4,    'h',  'o',  'm',  'e',  4,
         'a',  'r',  'p',  'a',  0,    0x00, 0x01, 0x00, 0x01,
@@ -240,7 +259,7 @@ test "authoritative response builder returns CNAME and SOA-backed negatives" {
     try std.testing.expectEqual(@as(u16, 1), cname_response.header.answer_count);
     try std.testing.expect(cname_response.answers.items[0].rrtype.eql(.CNAME));
 
-    const missing_request = try dns_message.Message.parseQuery(&.{
+    const missing_request = try dns_message.Message.parseQuery(arena.allocator(), &.{
         0x12, 0x36, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         7,    'm',  'i',  's',  's',  'i',  'n',  'g',  4,    'h',  'o',  'm',
         'e',  4,    'a',  'r',  'p',  'a',  0,    0x00, 0x01, 0x00, 0x01,
@@ -251,6 +270,9 @@ test "authoritative response builder returns CNAME and SOA-backed negatives" {
 }
 
 test "authoritative response builder converts phase-one zone record types" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
     const zone_file = try zone_parser.ZoneFile.parse(
         \\$ORIGIN example.test.
         \\$TTL 3600
@@ -265,7 +287,7 @@ test "authoritative response builder converts phase-one zone record types" {
     );
     const zone = try zone_index.Zone.fromZoneFile(zone_file);
 
-    const txt_request = try dns_message.Message.parseQuery(&.{
+    const txt_request = try dns_message.Message.parseQuery(arena.allocator(), &.{
         0xab, 0xcd, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         3,    't',  'x',  't',  7,    'e',  'x',  'a',  'm',  'p',  'l',  'e',
         4,    't',  'e',  's',  't',  0,    0x00, 0x10, 0x00, 0x01,
@@ -281,4 +303,11 @@ test "authoritative response builder converts phase-one zone record types" {
     try std.testing.expectEqual(@as(u16, 8443), srv_record.rdata.SRV.port);
     const caa_record = try toResourceRecord(zone.records.items[6]);
     try std.testing.expectEqualStrings("issue", caa_record.rdata.CAA.tagText());
+}
+
+test "rejects response section counts beyond the DNS wire limit" {
+    var response = dns_message.Message{ .header = .{ .id = 0x1234 } };
+    response.answers.len = @as(usize, std.math.maxInt(u16)) + 1;
+
+    try std.testing.expectError(Error.TooManyRecords, setHeaderCounts(&response));
 }

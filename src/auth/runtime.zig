@@ -30,7 +30,10 @@ pub const Runtime = struct {
     }
 
     pub fn answer(self: *const Runtime, query_bytes: []const u8, output: []u8) ![]const u8 {
-        const query = dns_message.Message.parseQuery(query_bytes) catch return Error.BadQuery;
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+
+        const query = dns_message.Message.parseQuery(arena.allocator(), query_bytes) catch return Error.BadQuery;
         const message = try self.buildMessage(query);
         var writer = dns_writer.Writer.init(output);
         message.encode(&writer) catch return Error.EncodeFailed;
@@ -39,7 +42,10 @@ pub const Runtime = struct {
 
     pub fn answerWithMetrics(self: *const Runtime, query_bytes: []const u8, output: []u8, counters: *metrics.Counters) ![]const u8 {
         counters.queries_total += 1;
-        const query = dns_message.Message.parseQuery(query_bytes) catch {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+
+        const query = dns_message.Message.parseQuery(arena.allocator(), query_bytes) catch {
             counters.bad_queries_total += 1;
             return Error.BadQuery;
         };
@@ -75,6 +81,9 @@ pub const Runtime = struct {
 };
 
 test "authoritative runtime answers raw query bytes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
     const runtime = try Runtime.fromZoneText(
         \\$ORIGIN home.arpa.
         \\$TTL 3600
@@ -91,7 +100,7 @@ test "authoritative runtime answers raw query bytes" {
         'p',  'a',  0,    0x00, 0x01, 0x00, 0x01,
     }, &output);
 
-    const parsed = try dns_message.Message.parse(response_bytes);
+    const parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
     try std.testing.expect(parsed.header.qr);
     try std.testing.expectEqual(@as(u16, 1), parsed.header.answer_count);
     try std.testing.expectEqualSlices(u8, &.{ 192, 168, 1, 1 }, &parsed.answers.items[0].rdata.A);
@@ -123,6 +132,9 @@ test "authoritative runtime records metrics for successful and bad queries" {
 }
 
 test "authoritative runtime refuses exact blocklisted names" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
     const blocklist = try @import("../blocklist.zig").Blocklist.parse("ads.home.arpa.\n");
     const runtime = try Runtime.fromZoneTextWithBlocklist(
         \\$ORIGIN home.arpa.
@@ -140,7 +152,7 @@ test "authoritative runtime refuses exact blocklisted names" {
         'p',  'a',  0,    0x00, 0x01, 0x00, 0x01,
     }, &output);
 
-    const parsed = try dns_message.Message.parse(response_bytes);
+    const parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
     try std.testing.expectEqual(@import("../dns/header.zig").Rcode.refused, parsed.header.rcode);
     try std.testing.expectEqual(@as(u16, 0), parsed.header.answer_count);
 }

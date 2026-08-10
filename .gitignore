@@ -1,6 +1,7 @@
 .zig-cache/
 zig-out/
 .DS_Store
+.worktrees/
 *.log
 *.tmp
 data/
