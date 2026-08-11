@@ -55,6 +55,12 @@ jobs:
       - name: Run config tests
         run: zig build test-config
 
+      - name: Run parser fuzz tests
+        run: zig build test-fuzz
+
+      - name: Run socket integration tests
+        run: zig build test-integration
+
       - name: Scan tracked sources
         shell: bash
         run: |

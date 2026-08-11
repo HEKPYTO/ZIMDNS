@@ -11,16 +11,11 @@ pub const listener = @import("platform/listener.zig");
 pub const cli_query = @import("cli/query.zig");
 pub const config_parser = @import("config/parser.zig");
 pub const config_loader = @import("config/loader.zig");
-pub const doctor = @import("doctor.zig");
-pub const cache_store = @import("cache/store.zig");
 pub const metrics = @import("metrics.zig");
 pub const blocklist = @import("blocklist.zig");
-pub const admin_protocol = @import("admin/protocol.zig");
-pub const admin_service = @import("admin/service.zig");
-pub const admin_socket = @import("admin/socket.zig");
-pub const backup_manifest = @import("backup/manifest.zig");
+pub const resolver = @import("resolver.zig");
 
-const ServerRunMode = enum { none, udp_once, tcp_once };
+const ServerRunMode = enum { none, udp_once, tcp_once, udp_loop, tcp_loop };
 const version_text = "0.0.0";
 
 test {
@@ -42,14 +37,9 @@ test {
     _ = cli_query;
     _ = config_parser;
     _ = config_loader;
-    _ = doctor;
-    _ = cache_store;
     _ = metrics;
     _ = blocklist;
-    _ = admin_protocol;
-    _ = admin_service;
-    _ = admin_socket;
-    _ = backup_manifest;
+    _ = resolver;
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -87,16 +77,6 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    if (std.mem.eql(u8, command, "doctor")) {
-        try handleDoctor(args, io, arena, stdout);
-        return;
-    }
-
-    if (std.mem.eql(u8, command, "backup")) {
-        try handleBackup(args, io, arena, stdout);
-        return;
-    }
-
     try stdout.print("error: command '{s}' is not implemented yet\n\n", .{command});
     try printHelp(stdout);
     try exitUsage(stdout);
@@ -114,17 +94,11 @@ fn printHelp(writer: *std.Io.Writer) !void {
         \\  zimdns server run --zone-file examples/zones/home.arpa.zone --once-udp 1053
         \\  zimdns server run --zone-file examples/zones/home.arpa.zone --once-udp 1053 --max-queries 2 --print-metrics
         \\  zimdns server run --zone-file examples/zones/home.arpa.zone --once-tcp 1053
-        \\  zimdns server admin --config examples/config.gdns --once
+        \\  zimdns server run --config examples/config.gdns --serve-udp --max-requests 2
         \\  zimdns query @127.0.0.1 -p 1053 example.com A
-        \\  zimdns zone list
-        \\  zimdns record list <zone>
-        \\  zimdns cache stats
-        \\  zimdns doctor --config examples/config.gdns
-        \\  zimdns backup manifest --config examples/config.gdns
-        \\  zimdns metrics
         \\
         \\Implemented now:
-        \\  --help, --version, server run --once-udp/--once-tcp, query, doctor
+        \\  --help, --version, server run, query
         \\
     );
 }
@@ -171,14 +145,17 @@ fn handleQuery(args: []const []const u8, io: std.Io, allocator: std.mem.Allocato
     var absolute_name_buffer: [256]u8 = undefined;
     const absolute_name = try ensureAbsoluteName(query_name, &absolute_name_buffer);
 
+    var query_id_bytes: [2]u8 = undefined;
+    io.random(&query_id_bytes);
+    const query_id = std.mem.readInt(u16, &query_id_bytes, .big);
     var packet_buffer: [512]u8 = undefined;
-    const query = try cli_query.buildQueryPacket(&packet_buffer, 0x1234, absolute_name, qtype);
+    const query = try cli_query.buildQueryPacket(&packet_buffer, query_id, absolute_name, qtype);
     const server = std.Io.net.IpAddress.parse(server_text, port) catch {
         try writer.writeAll("error: query server must be an IP address for now\n");
         try exitUsage(writer);
     };
 
-    var response_buffer: [512]u8 = undefined;
+    var response_buffer: [listener.UDP_RESPONSE_BUFFER_SIZE]u8 = undefined;
     const response = if (use_tcp)
         try queryTcp(allocator, io, &server, query, &response_buffer)
     else
@@ -208,28 +185,24 @@ fn ensureAbsoluteName(name: []const u8, buffer: []u8) ![]const u8 {
 }
 
 fn queryUdp(allocator: std.mem.Allocator, io: std.Io, server: *const std.Io.net.IpAddress, query: []const u8, response_buffer: []u8) !@import("dns/message.zig").Message {
-    var client_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var client_addr = cli_query.udpClientBindAddress(server);
     var socket = try std.Io.net.IpAddress.bind(&client_addr, io, .{ .mode = .dgram, .protocol = .udp });
     defer socket.close(io);
     try cli_query.sendUdpQuery(&socket, io, server, query);
-    return cli_query.receiveUdpResponse(allocator, &socket, io, response_buffer, 0x1234);
+    return cli_query.receiveUdpResponse(allocator, &socket, io, response_buffer, server, query);
 }
 
 fn queryTcp(allocator: std.mem.Allocator, io: std.Io, server: *const std.Io.net.IpAddress, query: []const u8, response_buffer: []u8) !@import("dns/message.zig").Message {
-    var stream = try std.Io.net.IpAddress.connect(server, io, .{ .mode = .stream, .protocol = .tcp });
-    defer stream.close(io);
-    try cli_query.sendTcpQuery(stream, io, query);
-    return cli_query.receiveTcpResponse(allocator, stream, io, response_buffer, 0x1234);
+    return cli_query.exchangeTcpQuery(allocator, io, server, query, response_buffer);
 }
 
 fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocator, writer: *std.Io.Writer) !void {
     if (args.len < 3) {
-        try writer.writeAll("error: expected 'server run' or 'server admin'\n");
+        try writer.writeAll("error: expected 'server run'\n");
         try exitUsage(writer);
     }
-    if (std.mem.eql(u8, args[2], "admin")) return handleServerAdmin(args, io, allocator, writer);
     if (!std.mem.eql(u8, args[2], "run")) {
-        try writer.writeAll("error: expected 'server run' or 'server admin'\n");
+        try writer.writeAll("error: expected 'server run'\n");
         try exitUsage(writer);
     }
 
@@ -238,7 +211,9 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
     var mode: ServerRunMode = .none;
     var port_set = false;
     var port: u16 = 1053;
+    var configured_address: ?std.Io.net.IpAddress = null;
     var max_queries: usize = 1;
+    var max_requests: ?usize = null;
     var print_metrics = false;
 
     var index: usize = 3;
@@ -278,6 +253,10 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
                 };
                 port_set = true;
             }
+        } else if (std.mem.eql(u8, arg, "--serve-udp")) {
+            mode = .udp_loop;
+        } else if (std.mem.eql(u8, arg, "--serve-tcp")) {
+            mode = .tcp_loop;
         } else if (std.mem.eql(u8, arg, "--max-queries")) {
             index += 1;
             if (index >= args.len) {
@@ -286,6 +265,16 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
             }
             max_queries = std.fmt.parseInt(usize, args[index], 10) catch {
                 try writer.writeAll("error: invalid max query count\n");
+                try exitUsage(writer);
+            };
+        } else if (std.mem.eql(u8, arg, "--max-requests")) {
+            index += 1;
+            if (index >= args.len) {
+                try writer.writeAll("error: --max-requests requires a count\n");
+                try exitUsage(writer);
+            }
+            max_requests = std.fmt.parseInt(usize, args[index], 10) catch {
+                try writer.writeAll("error: invalid max request count\n");
                 try exitUsage(writer);
             };
         } else if (std.mem.eql(u8, arg, "--print-metrics")) {
@@ -304,7 +293,10 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
     if (config_file) |path| {
         server_context = try config_loader.ServerContext.load(std.Io.Dir.cwd(), io, path, allocator);
         if (!port_set) {
-            if (findListenerPort(&server_context.?.config, mode)) |config_port| port = config_port;
+            if (try findListenerAddress(&server_context.?.config, mode)) |address| {
+                configured_address = address;
+                port = address.getPort();
+            }
         }
     }
 
@@ -319,7 +311,7 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
             try writer.writeAll("error: server run requires --zone-file or --config with a zone\n");
             try exitUsage(writer);
         }
-        runtime = try server_context.?.takePrimaryRuntime();
+        runtime = try server_context.?.takeRuntime(io);
     } else {
         const path = zone_file orelse {
             try writer.writeAll("error: server run requires --zone-file or --config with a zone\n");
@@ -341,12 +333,23 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
                 try writer.writeAll("error: --max-queries must be greater than zero\n");
                 try exitUsage(writer);
             }
-            if (print_metrics) {
-                try listener.serveUdpCountOnPortWithMetrics(io, &runtime, port, max_queries, &counters);
+            if (configured_address) |*address| {
+                if (print_metrics) {
+                    try listener.serveUdpCountOnAddressWithMetrics(io, &runtime, address, max_queries, &counters);
+                } else if (max_queries == 1) {
+                    try listener.serveUdpOnceOnAddress(io, &runtime, address);
+                } else {
+                    try listener.serveUdpCountOnAddress(io, &runtime, address, max_queries);
+                }
+            } else if (print_metrics) {
+                var address = defaultListenerAddress(port);
+                try listener.serveUdpCountOnAddressWithMetrics(io, &runtime, &address, max_queries, &counters);
             } else if (max_queries == 1) {
-                try listener.serveUdpOnceOnPort(io, &runtime, port);
+                var address = defaultListenerAddress(port);
+                try listener.serveUdpOnceOnAddress(io, &runtime, &address);
             } else {
-                try listener.serveUdpCountOnPort(io, &runtime, port, max_queries);
+                var address = defaultListenerAddress(port);
+                try listener.serveUdpCountOnAddress(io, &runtime, &address, max_queries);
             }
         },
         .tcp_once => {
@@ -354,11 +357,47 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
                 try writer.writeAll("error: --print-metrics is currently supported for UDP runs\n");
                 try exitUsage(writer);
             }
-            if (max_queries == 0 or max_queries > listener.TCP_MAX_MESSAGES_PER_CONNECTION) {
-                try writer.print("error: TCP --max-queries must be between 1 and {d}\n", .{listener.TCP_MAX_MESSAGES_PER_CONNECTION});
+            if (max_queries != 1) {
+                try writer.writeAll("error: TCP accepts exactly one query per connection\n");
                 try exitUsage(writer);
             }
-            try listener.serveTcpCountOnPort(io, &runtime, port, max_queries);
+            if (configured_address) |*address| {
+                try listener.serveTcpOnceOnAddress(io, &runtime, address);
+            } else {
+                var address = defaultListenerAddress(port);
+                try listener.serveTcpOnceOnAddress(io, &runtime, &address);
+            }
+        },
+        .udp_loop => {
+            if (max_requests) |count| if (count == 0) {
+                try writer.writeAll("error: --max-requests must be greater than zero\n");
+                try exitUsage(writer);
+            };
+            if (print_metrics) {
+                if (configured_address) |*address| {
+                    try listener.serveUdpLoopOnAddressWithMetrics(io, &runtime, address, max_requests, &counters);
+                } else {
+                    var address = defaultListenerAddress(port);
+                    try listener.serveUdpLoopOnAddressWithMetrics(io, &runtime, &address, max_requests, &counters);
+                }
+            } else if (configured_address) |*address| {
+                try listener.serveUdpLoopOnAddress(io, &runtime, address, max_requests);
+            } else {
+                var address = defaultListenerAddress(port);
+                try listener.serveUdpLoopOnAddress(io, &runtime, &address, max_requests);
+            }
+        },
+        .tcp_loop => {
+            if (print_metrics) {
+                try writer.writeAll("error: --print-metrics is currently supported for UDP runs\n");
+                try exitUsage(writer);
+            }
+            if (configured_address) |*address| {
+                try listener.serveTcpLoopOnAddress(io, &runtime, address, max_requests);
+            } else {
+                var address = defaultListenerAddress(port);
+                try listener.serveTcpLoopOnAddress(io, &runtime, &address, max_requests);
+            }
         },
         .none => unreachable,
     }
@@ -370,171 +409,45 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
     }
 }
 
-fn handleServerAdmin(args: []const []const u8, io: std.Io, allocator: std.mem.Allocator, writer: *std.Io.Writer) !void {
-    var config_file: ?[]const u8 = null;
-    var once = false;
-    var now_seconds: u64 = 0;
-
-    var index: usize = 3;
-    while (index < args.len) {
-        const arg = args[index];
-        if (std.mem.eql(u8, arg, "--config")) {
-            index += 1;
-            if (index >= args.len) {
-                try writer.writeAll("error: --config requires a path\n");
-                try exitUsage(writer);
-            }
-            config_file = args[index];
-        } else if (std.mem.eql(u8, arg, "--once")) {
-            once = true;
-        } else if (std.mem.eql(u8, arg, "--now")) {
-            index += 1;
-            if (index >= args.len) {
-                try writer.writeAll("error: --now requires seconds\n");
-                try exitUsage(writer);
-            }
-            now_seconds = std.fmt.parseInt(u64, args[index], 10) catch {
-                try writer.writeAll("error: invalid --now value\n");
-                try exitUsage(writer);
-            };
-        } else {
-            try writer.print("error: unknown server admin option '{s}'\n", .{arg});
-            try exitUsage(writer);
-        }
-        index += 1;
-    }
-
-    if (!once) {
-        try writer.writeAll("error: server admin currently requires --once\n");
-        try exitUsage(writer);
-    }
-    const config_path = config_file orelse {
-        try writer.writeAll("error: server admin requires --config\n");
-        try exitUsage(writer);
-    };
-    const config_text = try std.Io.Dir.cwd().readFileAlloc(io, config_path, allocator, .limited(1024 * 1024));
-    const parsed_config = try config_parser.Config.parse(config_text);
-    const socket_path = parsed_config.admin_socket.pathText();
-    if (socket_path.len == 0) {
-        try writer.writeAll("error: config must define admin socket\n");
-        try exitUsage(writer);
-    }
-
-    const service = admin_service.Service{
-        .version = version_text,
-        .started_at_seconds = now_seconds,
-        .metrics = .{},
-    };
-    try admin_socket.serveUnixOnce(socket_path, io, service, now_seconds);
-}
-
-fn handleDoctor(args: []const []const u8, io: std.Io, allocator: std.mem.Allocator, writer: *std.Io.Writer) !void {
-    var config_file: ?[]const u8 = null;
-    var index: usize = 2;
-    while (index < args.len) {
-        const arg = args[index];
-        if (std.mem.eql(u8, arg, "--config")) {
-            index += 1;
-            if (index >= args.len) {
-                try writer.writeAll("error: --config requires a path\n");
-                try exitUsage(writer);
-            }
-            config_file = args[index];
-        } else {
-            try writer.print("error: unknown doctor option '{s}'\n", .{arg});
-            try exitUsage(writer);
-        }
-        index += 1;
-    }
-
-    const config_path = config_file orelse {
-        try writer.writeAll("error: doctor requires --config\n");
-        try exitUsage(writer);
-    };
-
-    const config_text = try std.Io.Dir.cwd().readFileAlloc(io, config_path, allocator, .limited(1024 * 1024));
-    const parsed_config = try config_parser.Config.parse(config_text);
-    var report = doctor.Report{};
-    try doctor.inspectParsedConfig(&parsed_config, &report);
-
-    var zone_index_value: usize = 0;
-    while (zone_index_value < parsed_config.zones.len) : (zone_index_value += 1) {
-        const zone = parsed_config.zones.items[zone_index_value];
-        const zone_text = std.Io.Dir.cwd().readFileAlloc(io, zone.fileText(), allocator, .limited(1024 * 1024)) catch {
-            try report.add(.invalid_zone);
-            continue;
-        };
-        try doctor.inspectZoneText(zone.nameText(), zone_text, &report);
-    }
-
-    var blocklist_index: usize = 0;
-    while (blocklist_index < parsed_config.blocklists.len) : (blocklist_index += 1) {
-        const blocklist_file = parsed_config.blocklists.items[blocklist_index];
-        const blocklist_text = std.Io.Dir.cwd().readFileAlloc(io, blocklist_file.pathText(), allocator, .limited(1024 * 1024)) catch {
-            try report.add(.invalid_blocklist);
-            continue;
-        };
-        try doctor.inspectBlocklistText(blocklist_text, &report);
-    }
-
-    if (report.ok()) {
-        try writer.writeAll("doctor: ok\n");
-        return;
-    }
-
-    try writer.writeAll("doctor: failed\n");
-    var issue_index: usize = 0;
-    while (issue_index < report.issue_count) : (issue_index += 1) {
-        try writer.print("- {s}\n", .{doctor.issueName(report.issues[issue_index])});
-    }
-    try exitFailure(writer);
-}
-
-fn handleBackup(args: []const []const u8, io: std.Io, allocator: std.mem.Allocator, writer: *std.Io.Writer) !void {
-    if (args.len < 3 or !std.mem.eql(u8, args[2], "manifest")) {
-        try writer.writeAll("error: expected 'backup manifest'\n");
-        try exitUsage(writer);
-    }
-
-    var config_file: ?[]const u8 = null;
-    var index: usize = 3;
-    while (index < args.len) {
-        const arg = args[index];
-        if (std.mem.eql(u8, arg, "--config")) {
-            index += 1;
-            if (index >= args.len) {
-                try writer.writeAll("error: --config requires a path\n");
-                try exitUsage(writer);
-            }
-            config_file = args[index];
-        } else {
-            try writer.print("error: unknown backup manifest option '{s}'\n", .{arg});
-            try exitUsage(writer);
-        }
-        index += 1;
-    }
-
-    const config_path = config_file orelse {
-        try writer.writeAll("error: backup manifest requires --config\n");
-        try exitUsage(writer);
-    };
-    const manifest = try backup_manifest.Manifest.fromConfigFile(std.Io.Dir.cwd(), io, config_path, allocator);
-    var manifest_buffer: [4096]u8 = undefined;
-    const text = try manifest.render(&manifest_buffer);
-    try writer.writeAll(text);
-}
-
-fn findListenerPort(config: *const config_parser.Config, mode: ServerRunMode) ?u16 {
+fn findListenerAddress(config: *const config_parser.Config, mode: ServerRunMode) !?std.Io.net.IpAddress {
     const want: config_parser.Transport = switch (mode) {
-        .udp_once => .udp,
-        .tcp_once => .tcp,
+        .udp_once, .udp_loop => .udp,
+        .tcp_once, .tcp_loop => .tcp,
         .none => return null,
     };
     var index: usize = 0;
     while (index < config.listeners.len) : (index += 1) {
-        if (config.listeners.items[index].transport == want) return config.listeners.items[index].port;
+        const configured_listener = config.listeners.items[index];
+        if (configured_listener.transport != want) continue;
+        const address = try std.Io.net.IpAddress.parse(configured_listener.addressText(), configured_listener.port);
+        return @as(?std.Io.net.IpAddress, address);
     }
     return null;
+}
+
+fn defaultListenerAddress(port: u16) std.Io.net.IpAddress {
+    return .{ .ip4 = .loopback(port) };
+}
+
+test "configured loop modes use their transport listener endpoint" {
+    const config = try config_parser.Config.parse(
+        \\listen dns udp 127.0.0.1:12053
+        \\listen dns tcp 127.0.0.1:12054
+        \\
+    );
+    const expected_udp = try std.Io.net.IpAddress.parse("127.0.0.1", 12053);
+    const udp = try findListenerAddress(&config, .udp_loop) orelse return error.TestExpectedEqual;
+    try std.testing.expect(udp.eql(&expected_udp));
+
+    const expected_tcp = try std.Io.net.IpAddress.parse("127.0.0.1", 12054);
+    const tcp = try findListenerAddress(&config, .tcp_loop) orelse return error.TestExpectedEqual;
+    try std.testing.expect(tcp.eql(&expected_tcp));
+}
+
+test "no-config listener default is loopback" {
+    const address = defaultListenerAddress(1053);
+    const expected = std.Io.net.IpAddress{ .ip4 = .loopback(1053) };
+    try std.testing.expect(address.eql(&expected));
 }
 
 fn exitUsage(writer: *std.Io.Writer) !noreturn {

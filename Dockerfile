@@ -32,13 +32,16 @@ RUN addgroup -S -g 10001 zimdns \
 
 COPY --from=build /workspace/zig-out/bin/zimdns /usr/local/bin/zimdns
 COPY examples/config.gdns /etc/zimdns/config.gdns
+COPY examples/blocklists /examples/blocklists
+COPY examples/zones /examples/zones
 
 USER 10001:10001
-EXPOSE 1053/udp 1053/tcp 853/tcp 8443/tcp 8853/udp
+WORKDIR /
+EXPOSE 1053/udp
 VOLUME ["/etc/zimdns", "/var/lib/zimdns"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-    CMD ["/usr/local/bin/zimdns", "--help"]
+    CMD ["/usr/local/bin/zimdns", "query", "@127.0.0.1", "-p", "1053", "dns.home.arpa.", "A"]
 
 ENTRYPOINT ["/usr/local/bin/zimdns"]
-CMD ["--help"]
+CMD ["server", "run", "--config", "/etc/zimdns/config.gdns", "--serve-udp"]

@@ -12,7 +12,7 @@ const name_mod = @import("name.zig");
 
 pub const Error = error{
     EndOfInput,
-    UnsupportedOpcode,
+    ResponseNotQuery,
     UnsupportedQuestionCount,
     BadRecord,
     AllocationBudgetExceeded,
@@ -84,10 +84,7 @@ pub const Message = struct {
 
     pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !Message {
         var reader = Reader.init(bytes);
-        const header = header_mod.Header.parse(&reader) catch |err| switch (err) {
-            header_mod.Error.EndOfInput => return Error.EndOfInput,
-            header_mod.Error.UnsupportedOpcode => return Error.UnsupportedOpcode,
-        };
+        const header = header_mod.Header.parse(&reader) catch return Error.EndOfInput;
         if (header.question_count > 1) return Error.UnsupportedQuestionCount;
 
         var message = Message{ .allocator = allocator, .header = header };
@@ -113,6 +110,10 @@ pub const Message = struct {
 
     pub fn parseQuery(allocator: std.mem.Allocator, bytes: []const u8) !Message {
         var message = try Message.parse(allocator, bytes);
+        if (message.header.qr) {
+            message.deinit();
+            return Error.ResponseNotQuery;
+        }
         if (message.header.question_count != 1) {
             message.deinit();
             return Error.UnsupportedQuestionCount;
@@ -216,15 +217,29 @@ test "message parses one-question A query" {
     try std.testing.expectEqualSlices(u8, &bytes, writer.written());
 }
 
-test "message rejects unsupported opcode and unsupported question count" {
+test "message accepts unassigned opcode and rejects unsupported question count" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    try std.testing.expectError(Error.UnsupportedOpcode, Message.parseQuery(arena.allocator(), &.{
-        0x12, 0x34, 0x78, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    }));
+    const unassigned = try Message.parseQuery(arena.allocator(), &.{
+        0x12, 0x34, 0x78, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        7,    'e',  'x',  'a',  'm',  'p',  'l',  'e',  3,    'c',  'o',  'm',
+        0,    0x00, 0x01, 0x00, 0x01,
+    });
+    try std.testing.expectEqual(@as(@TypeOf(unassigned.header.opcode), .unassigned_15), unassigned.header.opcode);
     try std.testing.expectError(Error.UnsupportedQuestionCount, Message.parseQuery(arena.allocator(), &.{
         0x12, 0x34, 0x01, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    }));
+}
+
+test "message rejects response packets as queries" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try std.testing.expectError(Error.ResponseNotQuery, Message.parseQuery(arena.allocator(), &.{
+        0x12, 0x34, 0x81, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        7,    'e',  'x',  'a',  'm',  'p',  'l',  'e',  3,    'c',  'o',  'm',
+        0,    0x00, 0x01, 0x00, 0x01,
     }));
 }
 

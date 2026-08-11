@@ -1,0 +1,18 @@
+name: authoritative-semantics
+rfc: RFC 4592 sections 2 and 4
+phase: 9
+description: Exact wildcard response with synthesized owner and backwards compression.
+input_hex:
+  20 01 01 00 00 01 00 00 00 00 00 00
+  05 6f 74 68 65 72 07 65 78 61 6d 70 6c 65 00
+  00 01 00 01
+response_hex:
+  20 01 85 00 00 01 00 01 00 00 00 00
+  05 6f 74 68 65 72 07 65 78 61 6d 70 6c 65 00 00 01 00 01
+  c0 0c 00 01 00 01 00 00 0e 10 00 04 c0 00 02 03
+expect:
+  parse_ok: true
+  id: 0x2001
+  qname: other.example.
+  qtype: A
+  qclass: IN

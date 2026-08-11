@@ -1,6 +1,6 @@
 # ZIMDNS
 
-ZIMDNS is a minimal, local-first DNS server and CLI written in Zig. The declared first-release profile is one scriptable binary with a small authoritative path, safe forwarding over DNS/UDP and DNS/TCP, and standards evidence for every advertised behavior. There is no web UI or remote administration surface in this profile.
+ZIMDNS is a minimal, local-first DNS server and CLI written in Zig. The current profile is one scriptable binary with a small authoritative path, safe DNS/UDP and DNS/TCP transport, and standards evidence for every advertised behavior. There is no web UI or remote administration surface in this profile.
 
 The [RFC standards matrix](docs/standards-matrix.md) is the source of truth for what is implemented, partial, planned, or out of scope. A roadmap item is not a supported feature, and a `partial` row names only its tested subset.
 
@@ -8,7 +8,7 @@ The internal quality goal is to make this declared profile explicit, test-backed
 
 ## Current status
 
-The repository is a Phase 1 foundation and wire-core slice. It currently contains DNS message/name/RDATA parsing, a bounded authoritative runtime, UDP/TCP one-exchange listeners, a CLI query client, configuration/zone/blocklist parsers, a cache helper, metrics, a local admin socket, backup manifest support, and `doctor` checks. These pieces are not the complete first-release profile; consult the matrix for each boundary and its evidence.
+The repository contains the bounded authoritative and forwarding profile. It currently has DNS message/name/RDATA parsing, continuous authoritative UDP listeners, fail-closed authoritative TCP ingress, opt-in UDP forwarding with source/ID/question checks and TC-to-TCP upstream fallback only where upstream TCP deadlines are available (TC fails closed otherwise), bounded positive/negative caching with serve-stale, EDE diagnostics, DNS Cookie validation, a CLI query client, and strict configuration/zone/blocklist parsers. Forwarding is disabled unless both an explicit recursion ACL and a forwarder are configured; consult the matrix for each exact boundary and its evidence.
 
 Key documents:
 
@@ -25,13 +25,16 @@ zig build
 zig build test
 zig build test-golden
 zig build test-config
+zig build test-fuzz
+zig build test-integration
 ```
 
 ## Security defaults
 
 - Recursion is denied unless explicit client ACLs enable it; the process is not an open resolver by accident.
 - Listeners use loopback/high ports by default. Privileged binding and non-loopback exposure require explicit configuration.
-- Administration is local Unix socket only, with restrictive filesystem permissions.
-- ECS forwarding, full packet logging, and secret/cookie logging are disabled by default.
+- No administrative socket or remote control plane is exposed.
+- Forwarding is disabled by default and requires explicit recursion ACLs plus a configured forwarder.
+- Full packet logging and secret/cookie logging are disabled by default.
 - The Docker runtime is non-root.
 - DNS semantics stay in this repository. Vetted crypto, TLS, HTTP, QUIC, or platform dependencies require a recorded dependency decision.

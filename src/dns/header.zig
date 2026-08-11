@@ -9,8 +9,19 @@ pub const Opcode = enum(u4) {
     query = 0,
     iquery = 1,
     status = 2,
+    unassigned_3 = 3,
     notify = 4,
     update = 5,
+    unassigned_6 = 6,
+    unassigned_7 = 7,
+    unassigned_8 = 8,
+    unassigned_9 = 9,
+    unassigned_10 = 10,
+    unassigned_11 = 11,
+    unassigned_12 = 12,
+    unassigned_13 = 13,
+    unassigned_14 = 14,
+    unassigned_15 = 15,
 };
 
 pub const Rcode = enum(u4) {
@@ -20,11 +31,12 @@ pub const Rcode = enum(u4) {
     nxdomain = 3,
     notimp = 4,
     refused = 5,
+    yxdomain = 6,
+    badcookie = 7,
 };
 
 pub const Error = error{
     EndOfInput,
-    UnsupportedOpcode,
 };
 
 pub const Header = struct {
@@ -52,14 +64,7 @@ pub const Header = struct {
         const ar = reader.readU16() catch return Error.EndOfInput;
 
         const opcode_code: u4 = @intCast((flags >> 11) & 0x0f);
-        const opcode = switch (opcode_code) {
-            0 => Opcode.query,
-            1 => Opcode.iquery,
-            2 => Opcode.status,
-            4 => Opcode.notify,
-            5 => Opcode.update,
-            else => return Error.UnsupportedOpcode,
-        };
+        const opcode: Opcode = @enumFromInt(opcode_code);
 
         const rcode_code: u4 = @intCast(flags & 0x0f);
         const rcode = switch (rcode_code) {
@@ -69,6 +74,8 @@ pub const Header = struct {
             3 => Rcode.nxdomain,
             4 => Rcode.notimp,
             5 => Rcode.refused,
+            6 => Rcode.yxdomain,
+            7 => Rcode.badcookie,
             else => Rcode.servfail,
         };
 
@@ -136,10 +143,11 @@ test "header encodes response flags" {
     try std.testing.expectEqualSlices(u8, &.{ 0x12, 0x34, 0x85, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00 }, writer.written());
 }
 
-test "header rejects short input and unsupported opcode" {
+test "header rejects short input and preserves unassigned opcode" {
     var short = Reader.init(&.{0x12});
     try std.testing.expectError(Error.EndOfInput, Header.parse(&short));
 
     var unsupported = Reader.init(&.{ 0x12, 0x34, 0x78, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 });
-    try std.testing.expectError(Error.UnsupportedOpcode, Header.parse(&unsupported));
+    const parsed = try Header.parse(&unsupported);
+    try std.testing.expectEqual(Opcode.unassigned_15, parsed.opcode);
 }

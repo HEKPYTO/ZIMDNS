@@ -1,28 +1,33 @@
-/// Contract: Serves bounded DNS UDP/TCP request streams through an authoritative Runtime.
+/// Contract: Serves bounded DNS UDP/TCP request streams through Runtime; UDP may use
+/// its explicit forwarding policy after authoritative selection, while TCP stays authoritative-only.
 /// Ownership: Runtime is borrowed; socket streams are consumed/closed by the listener; wire buffers are local.
 /// Errors: DNS failures are typed; socket read/write and bind failures propagate as I/O errors.
 const std = @import("std");
+const builtin = @import("builtin");
 const Runtime = @import("../auth/runtime.zig").Runtime;
 const metrics = @import("../metrics.zig");
 const response_mod = @import("../auth/response.zig");
+const tcp_deadline = @import("tcp_deadline.zig");
 
 pub const UDP_CLASSIC_MESSAGE_SIZE: usize = response_mod.CLASSIC_UDP_MESSAGE_SIZE;
-pub const UDP_REQUEST_BUFFER_SIZE: usize = UDP_CLASSIC_MESSAGE_SIZE;
+pub const UDP_REQUEST_BUFFER_SIZE: usize = response_mod.DEFAULT_EDNS_UDP_PAYLOAD_SIZE;
 pub const UDP_RESPONSE_BUFFER_SIZE: usize = std.math.maxInt(u16);
 pub const TCP_MAX_FRAME_SIZE: usize = std.math.maxInt(u16);
-// ceiling: two sequential frames per connection; raise only with stream deadlines and a reuse contract.
-pub const TCP_MAX_MESSAGES_PER_CONNECTION: usize = 2;
-// ceiling: UDP has a standard-library deadline; Zig 0.16 Stream has no read/write timeout seam.
 pub const UDP_IDLE_TIMEOUT: std.Io.Timeout = .{ .duration = .{
     .raw = .fromSeconds(5),
     .clock = .awake,
 } };
+const TcpIoTimeout = tcp_deadline.Timeout;
+pub const TCP_IO_TIMEOUT = TcpIoTimeout{ .seconds = 5 };
+pub const TCP_DEADLINES_SUPPORTED = switch (builtin.os.tag) {
+    .linux, .macos => true,
+    else => false,
+};
 
 pub const Error = error{
-    QueryTooLarge,
     ResponseTooLarge,
     BadTcpFrame,
-    InvalidTcpMessageCount,
+    UnsupportedPlatform,
 };
 
 pub fn validateTcpFrameLength(length: usize) Error!void {
@@ -38,114 +43,159 @@ pub fn readTcpFrame(reader: *std.Io.Reader, frame_buffer: []u8) ![]const u8 {
     return frame_buffer[0..request_len];
 }
 
-pub fn serveUdpOnce(socket: *const std.Io.net.Socket, io: std.Io, runtime: *const Runtime) !void {
+fn serveUdpOnceWithTimeout(socket: *const std.Io.net.Socket, io: std.Io, runtime: *Runtime, timeout: std.Io.Timeout) !void {
     var request_buffer: [UDP_REQUEST_BUFFER_SIZE]u8 = undefined;
-    const incoming = try socket.receiveTimeout(io, &request_buffer, UDP_IDLE_TIMEOUT);
+    const incoming = try socket.receiveTimeout(io, &request_buffer, timeout);
     var response_buffer: [UDP_RESPONSE_BUFFER_SIZE]u8 = undefined;
     var classic_response_buffer: [UDP_RESPONSE_BUFFER_SIZE]u8 = undefined;
-    const response_bytes = try runtime.answer(incoming.data, &response_buffer);
+    const response_bytes = try runtime.answerFrom(incoming.data, &response_buffer, &incoming.from);
     const response_data = try response_mod.truncateClassicUdpResponse(response_bytes, &classic_response_buffer);
     try socket.send(io, &incoming.from, response_data);
 }
 
-pub fn serveUdpOnceWithMetrics(socket: *const std.Io.net.Socket, io: std.Io, runtime: *const Runtime, counters: *metrics.Counters) !void {
+pub fn serveUdpOnce(socket: *const std.Io.net.Socket, io: std.Io, runtime: *Runtime) !void {
+    return serveUdpOnceWithTimeout(socket, io, runtime, UDP_IDLE_TIMEOUT);
+}
+
+fn serveUdpOnceWithMetricsTimeout(socket: *const std.Io.net.Socket, io: std.Io, runtime: *Runtime, counters: *metrics.Counters, timeout: std.Io.Timeout) !void {
     var request_buffer: [UDP_REQUEST_BUFFER_SIZE]u8 = undefined;
-    const incoming = try socket.receiveTimeout(io, &request_buffer, UDP_IDLE_TIMEOUT);
+    const incoming = try socket.receiveTimeout(io, &request_buffer, timeout);
     var response_buffer: [UDP_RESPONSE_BUFFER_SIZE]u8 = undefined;
     var classic_response_buffer: [UDP_RESPONSE_BUFFER_SIZE]u8 = undefined;
-    const response_bytes = try runtime.answerWithMetrics(incoming.data, &response_buffer, counters);
+    const response_bytes = try runtime.answerFromWithMetrics(incoming.data, &response_buffer, &incoming.from, counters);
     const response_data = try response_mod.truncateClassicUdpResponse(response_bytes, &classic_response_buffer);
     try socket.send(io, &incoming.from, response_data);
 }
 
-pub fn serveUdpCount(socket: *const std.Io.net.Socket, io: std.Io, runtime: *const Runtime, count: usize) !void {
+pub fn serveUdpOnceWithMetrics(socket: *const std.Io.net.Socket, io: std.Io, runtime: *Runtime, counters: *metrics.Counters) !void {
+    return serveUdpOnceWithMetricsTimeout(socket, io, runtime, counters, UDP_IDLE_TIMEOUT);
+}
+
+pub fn serveUdpCount(socket: *const std.Io.net.Socket, io: std.Io, runtime: *Runtime, count: usize) !void {
     var served: usize = 0;
     while (served < count) : (served += 1) {
         try serveUdpOnce(socket, io, runtime);
     }
 }
 
-pub fn serveUdpCountWithMetrics(socket: *const std.Io.net.Socket, io: std.Io, runtime: *const Runtime, count: usize, counters: *metrics.Counters) !void {
+pub fn serveUdpCountWithMetrics(socket: *const std.Io.net.Socket, io: std.Io, runtime: *Runtime, count: usize, counters: *metrics.Counters) !void {
     var served: usize = 0;
     while (served < count) : (served += 1) {
         try serveUdpOnceWithMetrics(socket, io, runtime, counters);
     }
 }
 
-pub fn serveUdpOnceOnPort(io: std.Io, runtime: *const Runtime, port: u16) !void {
-    var addr: std.Io.net.IpAddress = .{ .ip4 = .unspecified(port) };
-    var socket = try std.Io.net.IpAddress.bind(&addr, io, .{ .mode = .dgram, .protocol = .udp });
+pub fn serveUdpLoop(socket: *const std.Io.net.Socket, io: std.Io, runtime: *Runtime, max_requests: ?usize) !void {
+    return serveUdpLoopWithTimeout(socket, io, runtime, max_requests, UDP_IDLE_TIMEOUT);
+}
+
+fn serveUdpLoopWithTimeout(socket: *const std.Io.net.Socket, io: std.Io, runtime: *Runtime, max_requests: ?usize, timeout: std.Io.Timeout) !void {
+    var served: usize = 0;
+    while (max_requests == null or served < max_requests.?) {
+        serveUdpOnceWithTimeout(socket, io, runtime, timeout) catch |err| {
+            if (isRecoverableRequestError(err)) continue;
+            return err;
+        };
+        served += 1;
+    }
+}
+
+pub fn serveUdpLoopWithMetrics(socket: *const std.Io.net.Socket, io: std.Io, runtime: *Runtime, max_requests: ?usize, counters: *metrics.Counters) !void {
+    return serveUdpLoopWithMetricsTimeout(socket, io, runtime, max_requests, counters, UDP_IDLE_TIMEOUT);
+}
+
+fn serveUdpLoopWithMetricsTimeout(socket: *const std.Io.net.Socket, io: std.Io, runtime: *Runtime, max_requests: ?usize, counters: *metrics.Counters, timeout: std.Io.Timeout) !void {
+    var served: usize = 0;
+    while (max_requests == null or served < max_requests.?) {
+        serveUdpOnceWithMetricsTimeout(socket, io, runtime, counters, timeout) catch |err| {
+            if (isRecoverableRequestError(err)) continue;
+            return err;
+        };
+        served += 1;
+    }
+}
+
+pub fn serveUdpOnceOnAddress(io: std.Io, runtime: *Runtime, address: *const std.Io.net.IpAddress) !void {
+    var bind_address = address.*;
+    var socket = try std.Io.net.IpAddress.bind(&bind_address, io, .{ .mode = .dgram, .protocol = .udp });
     defer socket.close(io);
     try serveUdpOnce(&socket, io, runtime);
 }
 
-pub fn serveUdpCountOnPort(io: std.Io, runtime: *const Runtime, port: u16, count: usize) !void {
-    var addr: std.Io.net.IpAddress = .{ .ip4 = .unspecified(port) };
-    var socket = try std.Io.net.IpAddress.bind(&addr, io, .{ .mode = .dgram, .protocol = .udp });
+pub fn serveUdpLoopOnAddress(io: std.Io, runtime: *Runtime, address: *const std.Io.net.IpAddress, max_requests: ?usize) !void {
+    var bind_address = address.*;
+    var socket = try std.Io.net.IpAddress.bind(&bind_address, io, .{ .mode = .dgram, .protocol = .udp });
+    defer socket.close(io);
+    try serveUdpLoop(&socket, io, runtime, max_requests);
+}
+
+pub fn serveUdpCountOnAddress(io: std.Io, runtime: *Runtime, address: *const std.Io.net.IpAddress, count: usize) !void {
+    var bind_address = address.*;
+    var socket = try std.Io.net.IpAddress.bind(&bind_address, io, .{ .mode = .dgram, .protocol = .udp });
     defer socket.close(io);
     try serveUdpCount(&socket, io, runtime, count);
 }
 
-pub fn serveUdpCountOnPortWithMetrics(io: std.Io, runtime: *const Runtime, port: u16, count: usize, counters: *metrics.Counters) !void {
-    var addr: std.Io.net.IpAddress = .{ .ip4 = .unspecified(port) };
-    var socket = try std.Io.net.IpAddress.bind(&addr, io, .{ .mode = .dgram, .protocol = .udp });
+pub fn serveUdpCountOnAddressWithMetrics(io: std.Io, runtime: *Runtime, address: *const std.Io.net.IpAddress, count: usize, counters: *metrics.Counters) !void {
+    var bind_address = address.*;
+    var socket = try std.Io.net.IpAddress.bind(&bind_address, io, .{ .mode = .dgram, .protocol = .udp });
     defer socket.close(io);
     try serveUdpCountWithMetrics(&socket, io, runtime, count, counters);
 }
 
+pub fn serveUdpLoopOnAddressWithMetrics(io: std.Io, runtime: *Runtime, address: *const std.Io.net.IpAddress, max_requests: ?usize, counters: *metrics.Counters) !void {
+    var bind_address = address.*;
+    var socket = try std.Io.net.IpAddress.bind(&bind_address, io, .{ .mode = .dgram, .protocol = .udp });
+    defer socket.close(io);
+    try serveUdpLoopWithMetrics(&socket, io, runtime, max_requests, counters);
+}
+
 pub fn serveTcpStreamOnce(stream: std.Io.net.Stream, io: std.Io, runtime: *const Runtime) !void {
-    return serveTcpStreamCount(stream, io, runtime, 1);
+    return serveTcpStreamOnceWithTimeout(stream, io, runtime, TCP_IO_TIMEOUT, null);
 }
 
 pub fn serveTcpStreamOnceWithMetrics(stream: std.Io.net.Stream, io: std.Io, runtime: *const Runtime, counters: *metrics.Counters) !void {
-    return serveTcpStreamCountWithMetrics(stream, io, runtime, 1, counters);
+    return serveTcpStreamOnceWithTimeout(stream, io, runtime, TCP_IO_TIMEOUT, counters);
 }
 
-pub fn serveTcpStreamCount(stream: std.Io.net.Stream, io: std.Io, runtime: *const Runtime, message_count: usize) !void {
-    return serveTcpStreamCountWithMetrics(stream, io, runtime, message_count, null);
+fn serveTcpStreamOnceWithTimeout(stream: std.Io.net.Stream, io: std.Io, runtime: *const Runtime, timeout: TcpIoTimeout, counters: ?*metrics.Counters) !void {
+    if (comptime !TCP_DEADLINES_SUPPORTED) return Error.UnsupportedPlatform;
+    return unix_tcp_deadlines.serve(stream, io, runtime, timeout, counters);
 }
 
-fn serveTcpStreamCountWithMetrics(stream: std.Io.net.Stream, io: std.Io, runtime: *const Runtime, message_count: usize, counters: ?*metrics.Counters) !void {
-    if (message_count == 0 or message_count > TCP_MAX_MESSAGES_PER_CONNECTION) {
-        return Error.InvalidTcpMessageCount;
-    }
+pub fn serveTcpLoop(server: anytype, io: std.Io, runtime: *const Runtime, max_requests: ?usize) !void {
+    return serveTcpLoopWithTimeout(server, io, runtime, max_requests, TCP_IO_TIMEOUT);
+}
 
-    var read_buffer: [1024]u8 = undefined;
-    var reader = stream.reader(io, &read_buffer);
-    var request_buffer: [TCP_MAX_FRAME_SIZE]u8 = undefined;
-    var response_buffer: [TCP_MAX_FRAME_SIZE]u8 = undefined;
-
-    var write_buffer: [1024]u8 = undefined;
-    var writer = stream.writer(io, &write_buffer);
-
+fn serveTcpLoopWithTimeout(server: anytype, io: std.Io, runtime: *const Runtime, max_requests: ?usize, timeout: TcpIoTimeout) !void {
     var served: usize = 0;
-    while (served < message_count) : (served += 1) {
-        const request = try readTcpFrame(&reader.interface, &request_buffer);
-        const response_bytes = if (counters) |value|
-            try runtime.answerWithMetrics(request, &response_buffer, value)
-        else
-            try runtime.answer(request, &response_buffer);
-        if (response_bytes.len > TCP_MAX_FRAME_SIZE) return Error.ResponseTooLarge;
-
-        var prefix: [2]u8 = undefined;
-        std.mem.writeInt(u16, &prefix, @intCast(response_bytes.len), .big);
-        try writer.interface.writeAll(&prefix);
-        try writer.interface.writeAll(response_bytes);
-        try writer.interface.flush();
+    while (max_requests == null or served < max_requests.?) {
+        const stream = try server.accept(io);
+        {
+            defer stream.close(io);
+            serveTcpStreamOnceWithTimeout(stream, io, runtime, timeout, null) catch |err| {
+                if (isRecoverableRequestError(err)) continue;
+                return err;
+            };
+        }
+        served += 1;
     }
 }
 
-pub fn serveTcpOnceOnPort(io: std.Io, runtime: *const Runtime, port: u16) !void {
-    return serveTcpCountOnPort(io, runtime, port, 1);
+pub fn serveTcpLoopOnAddress(io: std.Io, runtime: *const Runtime, address: *const std.Io.net.IpAddress, max_requests: ?usize) !void {
+    var bind_address = address.*;
+    var server = try std.Io.net.IpAddress.listen(&bind_address, io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    try serveTcpLoop(&server, io, runtime, max_requests);
 }
 
-pub fn serveTcpCountOnPort(io: std.Io, runtime: *const Runtime, port: u16, message_count: usize) !void {
-    var addr: std.Io.net.IpAddress = .{ .ip4 = .unspecified(port) };
-    var server = try std.Io.net.IpAddress.listen(&addr, io, .{ .reuse_address = true });
+pub fn serveTcpOnceOnAddress(io: std.Io, runtime: *const Runtime, address: *const std.Io.net.IpAddress) !void {
+    var bind_address = address.*;
+    var server = try std.Io.net.IpAddress.listen(&bind_address, io, .{ .reuse_address = true });
     defer server.deinit(io);
     const stream = try server.accept(io);
     defer stream.close(io);
-    try serveTcpStreamCount(stream, io, runtime, message_count);
+    try serveTcpStreamOnce(stream, io, runtime);
 }
 
 test "UDP listener serves one authoritative datagram over loopback sockets" {
@@ -173,6 +223,34 @@ test "UDP listener serves one authoritative datagram over loopback sockets" {
     } });
     const response = try @import("../dns/message.zig").Message.parse(arena.allocator(), incoming.data);
     try std.testing.expect(response.header.qr);
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+}
+
+test "UDP listener accepts a valid EDNS query above the classic limit" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+    var server_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server_socket = try std.Io.net.IpAddress.bind(&server_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer server_socket.close(io);
+    var client_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var client_socket = try std.Io.net.IpAddress.bind(&client_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer client_socket.close(io);
+
+    var query_buffer: [response_mod.DEFAULT_EDNS_UDP_PAYLOAD_SIZE]u8 = undefined;
+    const query = try buildLargeEdnsQuery(&query_buffer, 0x6e6e);
+    try std.testing.expect(query.len > UDP_CLASSIC_MESSAGE_SIZE);
+    try client_socket.send(io, &server_socket.address, query);
+    try serveUdpOnce(&server_socket, io, &runtime);
+
+    var response_buffer: [UDP_CLASSIC_MESSAGE_SIZE]u8 = undefined;
+    const incoming = try client_socket.receiveTimeout(io, &response_buffer, UDP_IDLE_TIMEOUT);
+    const response = try @import("../dns/message.zig").Message.parse(arena.allocator(), incoming.data);
+    try std.testing.expectEqual(@as(u16, 0x6e6e), response.header.id);
+    try std.testing.expect(response.edns != null);
     try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
 }
 
@@ -209,6 +287,54 @@ test "UDP listener serves a bounded batch of authoritative datagrams" {
     } });
     const second_response = try @import("../dns/message.zig").Message.parse(arena.allocator(), second.data);
     try std.testing.expectEqual(@as(u16, 1), second_response.header.answer_count);
+}
+
+test "UDP listener serves a count-bounded continuous loop" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+    var server_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server_socket = try std.Io.net.IpAddress.bind(&server_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer server_socket.close(io);
+
+    var client_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var client_socket = try std.Io.net.IpAddress.bind(&client_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer client_socket.close(io);
+
+    try client_socket.send(io, &server_socket.address, simple_a_query);
+    try client_socket.send(io, &server_socket.address, simple_a_query);
+    try serveUdpLoop(&server_socket, io, &runtime, 2);
+}
+
+test "UDP loop ignores malformed and idle datagrams before a valid query" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+
+    var server_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server_socket = try std.Io.net.IpAddress.bind(&server_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer server_socket.close(io);
+    var client_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var client_socket = try std.Io.net.IpAddress.bind(&client_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer client_socket.close(io);
+
+    try client_socket.send(io, &server_socket.address, &.{ 0x12, 0x34 });
+    try client_socket.send(io, &server_socket.address, simple_a_query);
+    try serveUdpLoopWithTimeout(&server_socket, io, &runtime, 1, .{ .duration = .{
+        .raw = .fromMilliseconds(1),
+        .clock = .awake,
+    } });
+
+    var response_buffer: [512]u8 = undefined;
+    const incoming = try client_socket.receiveTimeout(io, &response_buffer, .{ .duration = .{
+        .raw = .fromMilliseconds(500),
+        .clock = .awake,
+    } });
+    const response = try @import("../dns/message.zig").Message.parse(arena.allocator(), incoming.data);
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
 }
 
 test "UDP listener records metrics for a bounded datagram batch" {
@@ -346,7 +472,7 @@ test "TCP framing rejects zero and over-limit lengths" {
     try std.testing.expectError(Error.BadTcpFrame, validateTcpFrameLength(TCP_MAX_FRAME_SIZE + 1));
 }
 
-test "TCP handler serves two sequential requests on one connection" {
+test "TCP loop ignores malformed and idle connections before a valid query" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -358,35 +484,25 @@ test "TCP handler serves two sequential requests on one connection" {
     var server = try std.Io.net.IpAddress.listen(&listen_addr, io, .{ .reuse_address = true });
     defer server.deinit(io);
 
-    var client_stream = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
-    defer client_stream.close(io);
-    const server_stream = try server.accept(io);
-    defer server_stream.close(io);
+    var idle_client = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer idle_client.close(io);
+    var malformed_client = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer malformed_client.close(io);
+    var malformed_writer_buffer: [8]u8 = undefined;
+    var malformed_writer = malformed_client.writer(io, &malformed_writer_buffer);
+    try malformed_writer.interface.writeAll(&.{ 0, 0 });
+    try malformed_writer.interface.flush();
+    var valid_client = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer valid_client.close(io);
+    var query_buffer: [512]u8 = undefined;
+    const query = try @import("../cli/query.zig").buildQueryPacket(&query_buffer, 0x3434, "dns.home.arpa.", .A);
+    try @import("../cli/query.zig").sendTcpQuery(valid_client, io, query);
 
-    var client_write_buffer: [512]u8 = undefined;
-    var client_writer = client_stream.writer(io, &client_write_buffer);
-    var prefix: [2]u8 = undefined;
-    var index: usize = 0;
-    while (index < 2) : (index += 1) {
-        std.mem.writeInt(u16, &prefix, simple_a_query.len, .big);
-        try client_writer.interface.writeAll(&prefix);
-        try client_writer.interface.writeAll(simple_a_query);
-    }
-    try client_writer.interface.flush();
+    try serveTcpLoopWithTimeout(&server, io, &runtime, 1, .{ .seconds = 0, .microseconds = 1_000 });
 
-    try serveTcpStreamCount(server_stream, io, &runtime, 2);
-
-    var client_read_buffer: [512]u8 = undefined;
-    var client_reader = client_stream.reader(io, &client_read_buffer);
-    index = 0;
-    while (index < 2) : (index += 1) {
-        const response_len_bytes = try client_reader.interface.takeArray(2);
-        const response_len = std.mem.readInt(u16, response_len_bytes, .big);
-        const response_bytes = try client_reader.interface.take(response_len);
-        const parsed = try @import("../dns/message.zig").Message.parse(arena.allocator(), response_bytes);
-        try std.testing.expect(parsed.header.qr);
-        try std.testing.expectEqual(@as(u16, 1), parsed.header.answer_count);
-    }
+    var response_buffer: [512]u8 = undefined;
+    const response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), valid_client, io, &response_buffer, query);
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
 }
 
 const test_zone =
@@ -397,6 +513,93 @@ const test_zone =
     \\dns IN A 192.168.1.1
     \\
 ;
+
+fn buildLargeEdnsQuery(buffer: []u8, id: u16) ![]const u8 {
+    const base = try @import("../cli/query.zig").buildQueryPacket(buffer, id, "dns.home.arpa.", .A);
+    const option_data_len = 480;
+    const opt_len = 11 + 4 + option_data_len;
+    if (base.len + opt_len > buffer.len) return error.BufferTooSmall;
+    std.mem.writeInt(u16, buffer[10..12], 1, .big);
+
+    var offset = base.len;
+    buffer[offset] = 0;
+    offset += 1;
+    std.mem.writeInt(u16, buffer[offset..][0..2], 41, .big);
+    offset += 2;
+    std.mem.writeInt(u16, buffer[offset..][0..2], response_mod.DEFAULT_EDNS_UDP_PAYLOAD_SIZE, .big);
+    offset += 2;
+    std.mem.writeInt(u32, buffer[offset..][0..4], 0, .big);
+    offset += 4;
+    std.mem.writeInt(u16, buffer[offset..][0..2], 4 + option_data_len, .big);
+    offset += 2;
+    std.mem.writeInt(u16, buffer[offset..][0..2], 65000, .big);
+    offset += 2;
+    std.mem.writeInt(u16, buffer[offset..][0..2], option_data_len, .big);
+    offset += 2;
+    @memset(buffer[offset .. offset + option_data_len], 0);
+    return buffer[0 .. offset + option_data_len];
+}
+
+const unix_tcp_deadlines = if (TCP_DEADLINES_SUPPORTED) struct {
+    fn serve(stream: std.Io.net.Stream, io: std.Io, runtime: *const Runtime, timeout: TcpIoTimeout, counters: ?*metrics.Counters) !void {
+        const posix_timeout: std.posix.timeval = .{
+            .sec = @intCast(timeout.seconds),
+            .usec = @intCast(timeout.microseconds),
+        };
+        try setSocketTimeout(stream, posix_timeout);
+
+        var request_buffer: [TCP_MAX_FRAME_SIZE]u8 = undefined;
+        var response_buffer: [TCP_MAX_FRAME_SIZE]u8 = undefined;
+        const read_deadline = tcp_deadline.deadline(io, timeout);
+        const request = try readFrame(stream.socket.handle, io, &request_buffer, read_deadline);
+        const response_bytes = if (counters) |value|
+            try runtime.answerWithMetrics(request, &response_buffer, value)
+        else
+            try runtime.answer(request, &response_buffer);
+        if (response_bytes.len > TCP_MAX_FRAME_SIZE) return Error.ResponseTooLarge;
+
+        var prefix: [2]u8 = undefined;
+        std.mem.writeInt(u16, &prefix, @intCast(response_bytes.len), .big);
+        const write_deadline = tcp_deadline.deadline(io, timeout);
+        try tcp_deadline.writeExact(stream.socket.handle, io, &prefix, write_deadline);
+        try tcp_deadline.writeExact(stream.socket.handle, io, response_bytes, write_deadline);
+    }
+
+    fn setSocketTimeout(stream: std.Io.net.Stream, timeout: std.posix.timeval) !void {
+        const timeout_bytes = std.mem.asBytes(&timeout);
+        try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, timeout_bytes);
+        try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, timeout_bytes);
+    }
+
+    fn readFrame(fd: std.posix.fd_t, io: std.Io, frame_buffer: []u8, frame_deadline: std.Io.Clock.Timestamp) ![]const u8 {
+        var len_bytes: [2]u8 = undefined;
+        try tcp_deadline.readExact(fd, io, &len_bytes, frame_deadline);
+        const request_len = std.mem.readInt(u16, &len_bytes, .big);
+        try validateTcpFrameLength(request_len);
+        if (request_len > frame_buffer.len) return Error.BadTcpFrame;
+        try tcp_deadline.readExact(fd, io, frame_buffer[0..request_len], frame_deadline);
+        return frame_buffer[0..request_len];
+    }
+} else struct {};
+
+fn isRecoverableRequestError(err: anyerror) bool {
+    return switch (err) {
+        error.BadQuery,
+        error.EncodeFailed,
+        error.BadTcpFrame,
+        error.ResponseTooLarge,
+        error.Timeout,
+        error.ReadFailed,
+        error.WriteFailed,
+        error.EndOfStream,
+        error.ConnectionResetByPeer,
+        error.SocketUnconnected,
+        error.WouldBlock,
+        error.InputOutput,
+        => true,
+        else => false,
+    };
+}
 
 const simple_a_query = &[_]u8{
     0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,

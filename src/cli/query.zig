@@ -6,6 +6,9 @@ const dns_question = @import("../dns/question.zig");
 const dns_types = @import("../dns/types.zig");
 const dns_writer = @import("../dns/writer.zig");
 const listener = @import("../platform/listener.zig");
+const resolver = @import("../resolver.zig");
+const tcp_deadline = @import("../platform/tcp_deadline.zig");
+const builtin = @import("builtin");
 const Runtime = @import("../auth/runtime.zig").Runtime;
 
 pub const Error = error{
@@ -13,6 +16,13 @@ pub const Error = error{
     BadName,
     UnsupportedType,
     BadResponse,
+    UnsupportedPlatform,
+};
+
+pub const TCP_IO_TIMEOUT = tcp_deadline.Timeout{ .seconds = 5 };
+pub const TCP_DEADLINES_SUPPORTED = switch (builtin.os.tag) {
+    .linux, .macos => true,
+    else => false,
 };
 
 pub fn buildQueryPacket(buffer: []u8, id: u16, name_text: []const u8, qtype: dns_types.RecordType) ![]const u8 {
@@ -97,6 +107,8 @@ fn rcodeName(rcode: dns_header.Rcode) []const u8 {
         .nxdomain => "NXDOMAIN",
         .notimp => "NOTIMP",
         .refused => "REFUSED",
+        .yxdomain => "YXDOMAIN",
+        .badcookie => "BADCOOKIE",
     };
 }
 
@@ -104,14 +116,37 @@ pub fn sendUdpQuery(socket: *const std.Io.net.Socket, io: std.Io, server: *const
     try socket.send(io, server, query);
 }
 
-pub fn receiveUdpResponse(allocator: std.mem.Allocator, socket: *const std.Io.net.Socket, io: std.Io, buffer: []u8, expected_id: u16) !dns_message.Message {
-    const incoming = try socket.receiveTimeout(io, buffer, .{ .duration = .{
-        .raw = .fromMilliseconds(1000),
-        .clock = .awake,
-    } });
-    const response = try dns_message.Message.parse(allocator, incoming.data);
-    if (response.header.id != expected_id) return Error.BadResponse;
-    return response;
+pub fn validateResponse(response: dns_message.Message, expected_id: u16, expected_opcode: dns_header.Opcode, expected_question: dns_question.Question) Error!void {
+    if (!response.header.qr or response.header.id != expected_id or response.header.opcode != expected_opcode or response.header.question_count != 1) return Error.BadResponse;
+    const actual_question = response.question orelse return Error.BadResponse;
+    if (!actual_question.name.eql(&expected_question.name) or
+        !actual_question.qtype.eql(expected_question.qtype) or
+        !actual_question.qclass.eql(expected_question.qclass)) return Error.BadResponse;
+}
+
+pub fn udpClientBindAddress(server: *const std.Io.net.IpAddress) std.Io.net.IpAddress {
+    return switch (server.*) {
+        .ip4 => .{ .ip4 = .unspecified(0) },
+        .ip6 => .{ .ip6 = .unspecified(0) },
+    };
+}
+
+pub fn receiveUdpResponse(allocator: std.mem.Allocator, socket: *const std.Io.net.Socket, io: std.Io, buffer: []u8, expected_server: *const std.Io.net.IpAddress, query: []const u8) !dns_message.Message {
+    var expected = dns_message.Message.parseQuery(allocator, query) catch return Error.BadResponse;
+    defer expected.deinit();
+    const deadline = tcp_deadline.deadlineFromTimeout(io, resolver.UDP_TIMEOUT) orelse return error.Timeout;
+    while (true) {
+        const remaining = deadline.durationFromNow(io);
+        if (remaining.raw.nanoseconds <= 0) return error.Timeout;
+        const incoming = try socket.receiveTimeout(io, buffer, .{ .duration = remaining });
+        if (!incoming.from.eql(expected_server)) continue;
+        var response = dns_message.Message.parse(allocator, incoming.data) catch continue;
+        validateResponse(response, expected.header.id, expected.header.opcode, expected.question.?) catch {
+            response.deinit();
+            continue;
+        };
+        return response;
+    }
 }
 
 pub fn sendTcpQuery(stream: std.Io.net.Stream, io: std.Io, query: []const u8) !void {
@@ -124,7 +159,9 @@ pub fn sendTcpQuery(stream: std.Io.net.Stream, io: std.Io, query: []const u8) !v
     try writer.interface.flush();
 }
 
-pub fn receiveTcpResponse(allocator: std.mem.Allocator, stream: std.Io.net.Stream, io: std.Io, buffer: []u8, expected_id: u16) !dns_message.Message {
+pub fn receiveTcpResponse(allocator: std.mem.Allocator, stream: std.Io.net.Stream, io: std.Io, buffer: []u8, query: []const u8) !dns_message.Message {
+    var expected = dns_message.Message.parseQuery(allocator, query) catch return Error.BadResponse;
+    defer expected.deinit();
     var read_buffer: [1024]u8 = undefined;
     var reader = stream.reader(io, &read_buffer);
     const len_bytes = try reader.interface.takeArray(2);
@@ -133,9 +170,60 @@ pub fn receiveTcpResponse(allocator: std.mem.Allocator, stream: std.Io.net.Strea
     const response_bytes = try reader.interface.take(response_len);
     @memcpy(buffer[0..response_bytes.len], response_bytes);
     const response = try dns_message.Message.parse(allocator, buffer[0..response_bytes.len]);
-    if (response.header.id != expected_id) return Error.BadResponse;
+    try validateResponse(response, expected.header.id, expected.header.opcode, expected.question.?);
     return response;
 }
+
+pub fn exchangeTcpQuery(allocator: std.mem.Allocator, io: std.Io, server: *const std.Io.net.IpAddress, query: []const u8, response_buffer: []u8) !dns_message.Message {
+    if (comptime !TCP_DEADLINES_SUPPORTED) return Error.UnsupportedPlatform;
+    return unix_tcp_query.exchange(allocator, io, server, query, response_buffer);
+}
+
+const unix_tcp_query = if (TCP_DEADLINES_SUPPORTED) struct {
+    fn exchange(allocator: std.mem.Allocator, io: std.Io, server: *const std.Io.net.IpAddress, query: []const u8, response_buffer: []u8) !dns_message.Message {
+        var expected = dns_message.Message.parseQuery(allocator, query) catch return Error.BadResponse;
+        defer expected.deinit();
+        if (query.len == 0 or query.len > std.math.maxInt(u16)) return Error.BadResponse;
+
+        var stream = resolver.connectTcpWithTimeout(io, server, .{
+            .mode = .stream,
+            .protocol = .tcp,
+            .timeout = .{ .duration = .{
+                .raw = .fromSeconds(TCP_IO_TIMEOUT.seconds),
+                .clock = .awake,
+            } },
+        }) catch return Error.BadResponse;
+        defer stream.close(io);
+
+        const frame_deadline = tcp_deadline.deadline(io, TCP_IO_TIMEOUT);
+        setSocketTimeout(stream, TCP_IO_TIMEOUT);
+
+        var prefix: [2]u8 = undefined;
+        std.mem.writeInt(u16, &prefix, @intCast(query.len), .big);
+        try tcp_deadline.writeExact(stream.socket.handle, io, &prefix, frame_deadline);
+        try tcp_deadline.writeExact(stream.socket.handle, io, query, frame_deadline);
+
+        var response_len_bytes: [2]u8 = undefined;
+        try tcp_deadline.readExact(stream.socket.handle, io, &response_len_bytes, frame_deadline);
+        const response_len = std.mem.readInt(u16, &response_len_bytes, .big);
+        if (response_len == 0 or response_len > response_buffer.len) return Error.BadResponse;
+        try tcp_deadline.readExact(stream.socket.handle, io, response_buffer[0..response_len], frame_deadline);
+
+        const response = try dns_message.Message.parse(allocator, response_buffer[0..response_len]);
+        try validateResponse(response, expected.header.id, expected.header.opcode, expected.question.?);
+        return response;
+    }
+
+    fn setSocketTimeout(stream: std.Io.net.Stream, timeout: tcp_deadline.Timeout) void {
+        const posix_timeout: std.posix.timeval = .{
+            .sec = @intCast(timeout.seconds),
+            .usec = @intCast(timeout.microseconds),
+        };
+        const timeout_bytes = std.mem.asBytes(&posix_timeout);
+        _ = std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, timeout_bytes) catch {};
+        _ = std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, timeout_bytes) catch {};
+    }
+} else struct {};
 
 const TextWriter = struct {
     buffer: []u8,
@@ -173,6 +261,47 @@ test "query builder encodes standard A query" {
     try std.testing.expect(parsed.question.?.qtype.eql(.A));
 }
 
+test "response validation requires QR and the exact question" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var query_buffer: [512]u8 = undefined;
+    const query = try buildQueryPacket(&query_buffer, 0x1234, "example.com.", .A);
+    const expected = try dns_message.Message.parseQuery(arena.allocator(), query);
+    const question = expected.question.?;
+
+    const response = try dns_message.Message.parse(arena.allocator(), &.{
+        0x12, 0x34, 0x85, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        7,    'e',  'x',  'a',  'm',  'p',  'l',  'e',  3,    'c',  'o',  'm',
+        0,    0x00, 0x01, 0x00, 0x01,
+    });
+    try validateResponse(response, expected.header.id, expected.header.opcode, question);
+
+    var not_response = response;
+    not_response.header.qr = false;
+    try std.testing.expectError(Error.BadResponse, validateResponse(not_response, expected.header.id, expected.header.opcode, question));
+
+    const wrong_id = response;
+    try std.testing.expectError(Error.BadResponse, validateResponse(wrong_id, expected.header.id + 1, expected.header.opcode, question));
+
+    var other_question = question;
+    other_question.qtype = .AAAA;
+    try std.testing.expectError(Error.BadResponse, validateResponse(response, expected.header.id, expected.header.opcode, other_question));
+
+    var wrong_opcode = response;
+    wrong_opcode.header.opcode = .status;
+    try std.testing.expectError(Error.BadResponse, validateResponse(wrong_opcode, expected.header.id, expected.header.opcode, question));
+}
+
+test "UDP client bind address uses an unspecified ephemeral endpoint per server family" {
+    const ip4 = std.Io.net.IpAddress{ .ip4 = .loopback(53) };
+    const ip6 = std.Io.net.IpAddress{ .ip6 = .loopback(53) };
+    const expected_ip4 = std.Io.net.IpAddress{ .ip4 = .unspecified(0) };
+    const expected_ip6 = std.Io.net.IpAddress{ .ip6 = .unspecified(0) };
+    try std.testing.expect(udpClientBindAddress(&ip4).eql(&expected_ip4));
+    try std.testing.expect(udpClientBindAddress(&ip6).eql(&expected_ip6));
+}
+
 test "query formatter prints A and CNAME answers" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -205,7 +334,7 @@ test "query formatter prints response code when there are no answers" {
     try std.testing.expectEqualStrings("rcode REFUSED\nno answers\n", text);
 }
 
-test "UDP query client talks to authoritative listener socket" {
+test "UDP query client ignores invalid datagrams before a valid response" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -220,12 +349,22 @@ test "UDP query client talks to authoritative listener socket" {
     var client_socket = try std.Io.net.IpAddress.bind(&client_addr, io, .{ .mode = .dgram, .protocol = .udp });
     defer client_socket.close(io);
 
+    var attacker_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var attacker_socket = try std.Io.net.IpAddress.bind(&attacker_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer attacker_socket.close(io);
+
     var query_buffer: [512]u8 = undefined;
     const query = try buildQueryPacket(&query_buffer, 0x9999, "dns.home.arpa.", .A);
+
+    // The first datagram has the wrong source. The second has the expected
+    // source but is a query (QR=0), so both must be ignored before the real
+    // response is accepted.
+    try attacker_socket.send(io, &client_socket.address, query);
+    try server_socket.send(io, &client_socket.address, query);
     try sendUdpQuery(&client_socket, io, &server_socket.address, query);
     try listener.serveUdpOnce(&server_socket, io, &runtime);
     var response_buffer: [512]u8 = undefined;
-    const response = try receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, 0x9999);
+    const response = try receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
     try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
 }
 
@@ -250,7 +389,7 @@ test "TCP query client talks to authoritative stream handler" {
     try sendTcpQuery(client_stream, io, query);
     try listener.serveTcpStreamOnce(server_stream, io, &runtime);
     var response_buffer: [512]u8 = undefined;
-    const response = try receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, 0x999a);
+    const response = try receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query);
     try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
 }
 

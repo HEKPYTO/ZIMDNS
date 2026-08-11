@@ -10,12 +10,13 @@ pub const Error = error{
     UnknownDirective,
     BadDirective,
     BadPort,
+    BadAddress,
+    BadCidr,
     TextTooLong,
     TooManyItems,
 };
 
 pub const Transport = enum { udp, tcp };
-pub const RecursionAction = enum { allow, deny };
 
 const Text = struct {
     bytes: [max_text]u8 = undefined,
@@ -36,31 +37,84 @@ pub const Listener = struct {
     transport: Transport,
     address: Text = .{},
     port: u16,
-};
 
-pub const AdminSocket = struct {
-    path: Text = .{},
-
-    pub fn pathText(self: *const AdminSocket) []const u8 {
-        return self.path.text();
+    pub fn addressText(self: *const Listener) []const u8 {
+        return self.address.text();
     }
 };
 
-pub const RecursionRule = struct {
-    action: RecursionAction,
-    cidr: Text = .{},
+pub const Cidr = struct {
+    raw: Text = .{},
+    bytes: [16]u8 = @splat(0),
+    prefix: u8 = 0,
+    v6: bool = false,
+
+    pub fn parse(value: []const u8) Error!Cidr {
+        const slash = std.mem.lastIndexOfScalar(u8, value, '/') orelse return Error.BadCidr;
+        if (slash == 0 or slash + 1 >= value.len) return Error.BadCidr;
+        const address_text = value[0..slash];
+        const prefix = std.fmt.parseInt(u8, value[slash + 1 ..], 10) catch return Error.BadCidr;
+        const address = std.Io.net.IpAddress.parse(address_text, 0) catch return Error.BadAddress;
+        var cidr = Cidr{ .prefix = prefix };
+        try cidr.raw.set(value);
+        switch (address) {
+            .ip4 => |ip4| {
+                if (prefix > 32) return Error.BadCidr;
+                cidr.bytes[0..4].* = ip4.bytes;
+            },
+            .ip6 => |ip6| {
+                if (prefix > 128) return Error.BadCidr;
+                cidr.v6 = true;
+                cidr.bytes = ip6.bytes;
+            },
+        }
+        return cidr;
+    }
+
+    pub fn text(self: *const Cidr) []const u8 {
+        return self.raw.text();
+    }
+
+    pub fn contains(self: *const Cidr, address: *const std.Io.net.IpAddress) bool {
+        return switch (address.*) {
+            .ip4 => |ip4| if (self.v6) false else maskedEqual(self.bytes[0..4], &ip4.bytes, self.prefix),
+            .ip6 => |ip6| if (!self.v6) false else maskedEqual(&self.bytes, &ip6.bytes, self.prefix),
+        };
+    }
 };
+
+fn maskedEqual(left: []const u8, right: []const u8, prefix: u8) bool {
+    const whole = @as(usize, prefix) / 8;
+    const remainder = prefix % 8;
+    if (!std.mem.eql(u8, left[0..whole], right[0..whole])) return false;
+    if (remainder == 0) return true;
+    const mask: u8 = @as(u8, 0xff) << @intCast(8 - remainder);
+    return (left[whole] & mask) == (right[whole] & mask);
+}
 
 pub const Forwarder = struct {
-    name: Text = .{},
-    transport: Transport,
     address: Text = .{},
+    port: u16,
+
+    pub fn addressText(self: *const Forwarder) []const u8 {
+        return self.address.text();
+    }
 };
 
-pub const CacheConfig = struct {
-    max_entries: u32 = 0,
-    serve_stale: bool = false,
-    serve_stale_ttl: u32 = 0,
+pub const CookieConfig = struct {
+    enabled: bool = false,
+    current: Text = .{},
+    previous: Text = .{},
+    has_previous: bool = false,
+
+    pub fn currentText(self: *const CookieConfig) []const u8 {
+        return self.current.text();
+    }
+
+    pub fn previousText(self: *const CookieConfig) ?[]const u8 {
+        if (!self.has_previous) return null;
+        return self.previous.text();
+    }
 };
 
 pub const Zone = struct {
@@ -100,10 +154,9 @@ fn List(comptime T: type) type {
 
 pub const Config = struct {
     listeners: List(Listener) = .{},
-    admin_socket: AdminSocket = .{},
-    recursion_rules: List(RecursionRule) = .{},
-    forwarders: List(Forwarder) = .{},
-    cache: CacheConfig = .{},
+    recursion_allow: List(Cidr) = .{},
+    forwarder: ?Forwarder = null,
+    cookies: CookieConfig = .{},
     zones: List(Zone) = .{},
     blocklists: List(BlocklistFile) = .{},
 
@@ -123,10 +176,9 @@ pub const Config = struct {
         var tokens = std.mem.tokenizeAny(u8, line, " \t");
         const first = tokens.next() orelse return;
         if (std.mem.eql(u8, first, "listen")) return self.parseListen(&tokens);
-        if (std.mem.eql(u8, first, "admin")) return self.parseAdmin(&tokens);
         if (std.mem.eql(u8, first, "recursion")) return self.parseRecursion(&tokens);
         if (std.mem.eql(u8, first, "forwarder")) return self.parseForwarder(&tokens);
-        if (std.mem.eql(u8, first, "cache")) return self.parseCache(&tokens);
+        if (std.mem.eql(u8, first, "cookies")) return self.parseCookies(&tokens);
         if (std.mem.eql(u8, first, "zone")) return self.parseZone(&tokens);
         if (std.mem.eql(u8, first, "blocklist")) return self.parseBlocklist(&tokens);
         return Error.UnknownDirective;
@@ -136,6 +188,7 @@ pub const Config = struct {
         if (!std.mem.eql(u8, tokens.next() orelse return Error.BadDirective, "dns")) return Error.BadDirective;
         const transport = try parseTransport(tokens.next() orelse return Error.BadDirective);
         const endpoint = tokens.next() orelse return Error.BadDirective;
+        try requireNoTrailingTokens(tokens);
         var listener = Listener{ .transport = transport, .port = undefined };
         const parsed = try parseEndpoint(endpoint);
         try listener.address.set(parsed.address);
@@ -143,45 +196,47 @@ pub const Config = struct {
         try self.listeners.append(listener);
     }
 
-    fn parseAdmin(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
-        if (!std.mem.eql(u8, tokens.next() orelse return Error.BadDirective, "socket")) return Error.BadDirective;
-        try self.admin_socket.path.set(tokens.next() orelse return Error.BadDirective);
-    }
-
     fn parseRecursion(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
-        const action_text = tokens.next() orelse return Error.BadDirective;
-        var rule = RecursionRule{
-            .action = if (std.mem.eql(u8, action_text, "allow")) .allow else if (std.mem.eql(u8, action_text, "deny")) .deny else return Error.BadDirective,
-        };
-        try rule.cidr.set(tokens.next() orelse return Error.BadDirective);
-        try self.recursion_rules.append(rule);
+        if (!std.mem.eql(u8, tokens.next() orelse return Error.BadDirective, "allow")) return Error.BadDirective;
+        const cidr = try Cidr.parse(tokens.next() orelse return Error.BadDirective);
+        try requireNoTrailingTokens(tokens);
+        try self.recursion_allow.append(cidr);
     }
 
     fn parseForwarder(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
-        var forwarder = Forwarder{ .transport = undefined };
-        try forwarder.name.set(tokens.next() orelse return Error.BadDirective);
-        forwarder.transport = try parseTransport(tokens.next() orelse return Error.BadDirective);
-        try forwarder.address.set(tokens.next() orelse return Error.BadDirective);
-        try self.forwarders.append(forwarder);
+        const endpoint = tokens.next() orelse return Error.BadDirective;
+        try requireNoTrailingTokens(tokens);
+        const parsed = try parseEndpoint(endpoint);
+        var forwarder = Forwarder{ .port = parsed.port };
+        try forwarder.address.set(parsed.address);
+        if (self.forwarder != null) return Error.BadDirective;
+        self.forwarder = forwarder;
     }
 
-    fn parseCache(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
-        const key = tokens.next() orelse return Error.BadDirective;
-        const value = tokens.next() orelse return Error.BadDirective;
-        if (std.mem.eql(u8, key, "max-entries")) {
-            self.cache.max_entries = std.fmt.parseInt(u32, value, 10) catch return Error.BadDirective;
-        } else if (std.mem.eql(u8, key, "serve-stale")) {
-            self.cache.serve_stale = if (std.mem.eql(u8, value, "on")) true else if (std.mem.eql(u8, value, "off")) false else return Error.BadDirective;
-        } else if (std.mem.eql(u8, key, "serve-stale-ttl")) {
-            self.cache.serve_stale_ttl = std.fmt.parseInt(u32, value, 10) catch return Error.BadDirective;
-        } else return Error.BadDirective;
+    fn parseCookies(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        if (self.cookies.enabled) return Error.BadDirective;
+        if (!std.mem.eql(u8, tokens.next() orelse return Error.BadDirective, "validate")) return Error.BadDirective;
+        const current = tokens.next() orelse return Error.BadDirective;
+        var cookies = CookieConfig{ .enabled = true };
+        if (current.len == 0) return Error.BadDirective;
+        try cookies.current.set(current);
+        if (tokens.next()) |previous| {
+            if (previous.len == 0) return Error.BadDirective;
+            try cookies.previous.set(previous);
+            cookies.has_previous = true;
+        }
+        try requireNoTrailingTokens(tokens);
+        self.cookies = cookies;
     }
 
     fn parseZone(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
         var zone = Zone{};
         try zone.name.set(tokens.next() orelse return Error.BadDirective);
-        try zone.kind.set(tokens.next() orelse return Error.BadDirective);
+        const kind = tokens.next() orelse return Error.BadDirective;
+        if (!std.mem.eql(u8, kind, "primary")) return Error.BadDirective;
+        try zone.kind.set(kind);
         try zone.file.set(tokens.next() orelse return Error.BadDirective);
+        try requireNoTrailingTokens(tokens);
         try self.zones.append(zone);
     }
 
@@ -189,9 +244,14 @@ pub const Config = struct {
         if (!std.mem.eql(u8, tokens.next() orelse return Error.BadDirective, "file")) return Error.BadDirective;
         var file = BlocklistFile{};
         try file.path.set(tokens.next() orelse return Error.BadDirective);
+        try requireNoTrailingTokens(tokens);
         try self.blocklists.append(file);
     }
 };
+
+fn requireNoTrailingTokens(tokens: *std.mem.TokenIterator(u8, .any)) Error!void {
+    if (tokens.next() != null) return Error.BadDirective;
+}
 
 fn parseTransport(text: []const u8) !Transport {
     if (std.mem.eql(u8, text, "udp")) return .udp;
@@ -200,9 +260,22 @@ fn parseTransport(text: []const u8) !Transport {
 }
 
 fn parseEndpoint(text: []const u8) !struct { address: []const u8, port: u16 } {
-    const colon = std.mem.lastIndexOfScalar(u8, text, ':') orelse return Error.BadDirective;
-    const address = text[0..colon];
-    const port = std.fmt.parseInt(u16, text[colon + 1 ..], 10) catch return Error.BadPort;
+    const address: []const u8 = if (text.len > 0 and text[0] == '[') blk: {
+        const close = std.mem.indexOfScalar(u8, text, ']') orelse return Error.BadAddress;
+        if (close + 1 >= text.len or text[close + 1] != ':') return Error.BadAddress;
+        break :blk text[1..close];
+    } else blk: {
+        const colon = std.mem.lastIndexOfScalar(u8, text, ':') orelse return Error.BadDirective;
+        if (std.mem.indexOfScalarPos(u8, text, 0, ':') != colon) return Error.BadAddress;
+        break :blk text[0..colon];
+    };
+    const port_start = if (text[0] == '[')
+        (std.mem.indexOfScalar(u8, text, ']') orelse return Error.BadAddress) + 2
+    else
+        (std.mem.lastIndexOfScalar(u8, text, ':') orelse return Error.BadDirective) + 1;
+    const port = std.fmt.parseInt(u16, text[port_start..], 10) catch return Error.BadPort;
+    if (port == 0) return Error.BadPort;
+    _ = std.Io.net.IpAddress.parse(address, port) catch return Error.BadAddress;
     return .{ .address = address, .port = port };
 }
 
@@ -217,13 +290,6 @@ test "config parser loads documented directives" {
     const text =
         \\listen dns udp 0.0.0.0:1053
         \\listen dns tcp 0.0.0.0:1053
-        \\admin socket /run/zimdns/admin.sock
-        \\recursion deny 0.0.0.0/0
-        \\recursion deny ::/0
-        \\forwarder default udp 9.9.9.9
-        \\cache max-entries 100000
-        \\cache serve-stale on
-        \\cache serve-stale-ttl 3600
         \\zone home.arpa primary /etc/zimdns/zones/home.arpa.zone
         \\blocklist file /etc/zimdns/blocklists/ads.txt
         \\
@@ -233,12 +299,6 @@ test "config parser loads documented directives" {
     try std.testing.expectEqual(@as(usize, 2), config.listeners.len);
     try std.testing.expectEqual(Transport.udp, config.listeners.items[0].transport);
     try std.testing.expectEqual(@as(u16, 1053), config.listeners.items[0].port);
-    try std.testing.expectEqualStrings("/run/zimdns/admin.sock", config.admin_socket.pathText());
-    try std.testing.expectEqual(@as(usize, 2), config.recursion_rules.len);
-    try std.testing.expectEqual(@as(usize, 1), config.forwarders.len);
-    try std.testing.expectEqual(@as(u32, 100000), config.cache.max_entries);
-    try std.testing.expect(config.cache.serve_stale);
-    try std.testing.expectEqual(@as(u32, 3600), config.cache.serve_stale_ttl);
     try std.testing.expectEqual(@as(usize, 1), config.zones.len);
     try std.testing.expectEqualStrings("home.arpa", config.zones.items[0].nameText());
     try std.testing.expectEqual(@as(usize, 1), config.blocklists.len);
@@ -247,6 +307,41 @@ test "config parser loads documented directives" {
 
 test "config parser rejects unknown and malformed directives" {
     try std.testing.expectError(error.UnknownDirective, Config.parse("bogus thing\n"));
+    try std.testing.expectError(error.UnknownDirective, Config.parse("admin socket /run/zimdns/admin.sock\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("recursion deny 0.0.0.0/0\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("forwarder default udp 9.9.9.9\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("cookies validate\n"));
     try std.testing.expectError(error.BadDirective, Config.parse("listen dns quic 0.0.0.0:1053\n"));
     try std.testing.expectError(error.BadPort, Config.parse("listen dns udp 0.0.0.0:notaport\n"));
+}
+
+test "config parser loads strict forwarding policy" {
+    const config = try Config.parse(
+        \\recursion allow 127.0.0.0/8
+        \\recursion allow ::1/128
+        \\forwarder 127.0.0.1:5353
+        \\cookies validate current-secret previous-secret
+        \\
+    );
+    try std.testing.expectEqual(@as(usize, 2), config.recursion_allow.len);
+    try std.testing.expectEqualStrings("127.0.0.0/8", config.recursion_allow.items[0].text());
+    try std.testing.expectEqualStrings("127.0.0.1", config.forwarder.?.addressText());
+    try std.testing.expectEqual(@as(u16, 5353), config.forwarder.?.port);
+    try std.testing.expect(config.cookies.enabled);
+    try std.testing.expectEqualStrings("current-secret", config.cookies.currentText());
+    try std.testing.expectEqualStrings("previous-secret", config.cookies.previousText().?);
+}
+
+test "config parser rejects unsupported zone kinds and trailing tokens" {
+    try std.testing.expectError(error.BadDirective, Config.parse("zone home.arpa secondary /etc/zimdns/zones/home.arpa.zone\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("listen dns udp 127.0.0.1:1053 extra\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("zone home.arpa primary /etc/zimdns/zones/home.arpa.zone extra\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("blocklist file /etc/zimdns/blocklists/ads.txt extra\n"));
+}
+
+test "config parser requires bracketed IPv6 endpoints and one cookie policy" {
+    try std.testing.expectError(error.BadAddress, Config.parse("forwarder 2001:db8::53\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("cookies validate current previous\ncookies validate next\n"));
+    const config = try Config.parse("forwarder [2001:db8::53]:53\n");
+    try std.testing.expectEqualStrings("2001:db8::53", config.forwarder.?.addressText());
 }

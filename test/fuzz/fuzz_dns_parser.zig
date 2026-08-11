@@ -52,7 +52,7 @@ fn fuzzMessage(input: []const u8) !void {
     var allocator = std.heap.FixedBufferAllocator.init(&storage);
     var parsed = message.Message.parse(allocator.allocator(), input) catch |err| switch (err) {
         error.EndOfInput,
-        error.UnsupportedOpcode,
+        error.ResponseNotQuery,
         error.UnsupportedQuestionCount,
         error.BadRecord,
         error.AllocationBudgetExceeded,
@@ -99,6 +99,9 @@ fn fuzzZone(input: []const u8) !void {
         error.MissingTtl,
         error.MissingSoa,
         error.MissingApexNs,
+        error.MultipleApexSoa,
+        error.SoaNotAtApex,
+        error.CnameConflict,
         error.AllocationBudgetExceeded,
         error.BadDirective,
         error.BadRecord,
@@ -115,6 +118,8 @@ fn fuzzConfig(input: []const u8) !void {
         error.UnknownDirective,
         error.BadDirective,
         error.BadPort,
+        error.BadAddress,
+        error.BadCidr,
         error.TextTooLong,
         error.TooManyItems,
         => return,

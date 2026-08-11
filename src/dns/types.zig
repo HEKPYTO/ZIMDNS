@@ -27,6 +27,7 @@ pub const RecordType = struct {
     pub const A = RecordType{ .value = 1 };
     pub const NS = RecordType{ .value = 2 };
     pub const CNAME = RecordType{ .value = 5 };
+    pub const DNAME = RecordType{ .value = 39 };
     pub const SOA = RecordType{ .value = 6 };
     pub const PTR = RecordType{ .value = 12 };
     pub const MX = RecordType{ .value = 15 };

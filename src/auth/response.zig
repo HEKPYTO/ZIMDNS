@@ -19,7 +19,6 @@ pub const Error = error{
     MissingQuestion,
     BadQName,
     BadZoneRecord,
-    BadAddress,
     TooManyRecords,
     BadResponse,
     ResponseTooLarge,
@@ -82,6 +81,8 @@ fn findEdnsOpt(response_bytes: []const u8) ?dns_record.ResourceRecord {
 
 pub fn buildResponse(request: dns_message.Message, zone: *const zone_index.Zone) !dns_message.Message {
     const q = request.question orelse return Error.MissingQuestion;
+    if (request.header.opcode != .query) return buildNotImplementedResponse(request);
+    if (!q.qclass.eql(dns_types.Class.IN)) return buildEmptyResponse(request, q, .notimp);
     if (request.edns) |edns| {
         if (edns.version != dns_message.EDNS_VERSION) {
             return buildBadVersionResponse(request, q);
@@ -97,11 +98,13 @@ pub fn buildResponse(request: dns_message.Message, zone: *const zone_index.Zone)
         .header = .{
             .id = request.header.id,
             .qr = true,
-            .authoritative = lookup.kind != .not_authoritative,
+            .authoritative = lookup.kind != .not_authoritative and lookup.kind != .referral and lookup.kind != .servfail,
             .recursion_desired = request.header.recursion_desired,
             .recursion_available = false,
             .rcode = switch (lookup.kind) {
                 .nxdomain => .nxdomain,
+                .yxdomain => .yxdomain,
+                .servfail => .servfail,
                 .not_authoritative => .refused,
                 else => .no_error,
             },
@@ -123,18 +126,76 @@ pub fn buildResponse(request: dns_message.Message, zone: *const zone_index.Zone)
     if (response.edns != null) try appendOpt(&response);
 
     switch (lookup.kind) {
-        .answer, .cname => {
+        .answer, .cname, .dname, .yxdomain => {
             var index: usize = 0;
             while (index < lookup.records.len) : (index += 1) {
-                try response.answers.append(try toResourceRecord(lookup.records.items[index]));
+                try response.answers.append(try toResourceRecord(lookup.records.items[index], lookup.answer_owner));
+            }
+            if (lookup.synthesized_cname) |synthetic| {
+                try response.answers.append(.{
+                    .owner = synthetic.owner,
+                    .rrtype = .CNAME,
+                    .class = dns_types.Class.IN,
+                    .ttl = synthetic.ttl,
+                    .rdata = .{ .CNAME = synthetic.target },
+                });
+            }
+        },
+        .referral => {
+            var index: usize = 0;
+            while (index < lookup.authorities.len) : (index += 1) {
+                try response.authorities.append(try toResourceRecord(lookup.authorities.items[index], null));
+            }
+            index = 0;
+            while (index < lookup.additionals.len) : (index += 1) {
+                try response.additionals.append(try toResourceRecord(lookup.additionals.items[index], null));
             }
         },
         .nodata, .nxdomain => {
-            if (lookup.soa) |soa| try response.authorities.append(try toResourceRecord(soa));
+            if (lookup.soa) |soa| try response.authorities.append(try toNegativeSoa(soa));
         },
-        .not_authoritative => {},
+        .servfail, .not_authoritative => {},
     }
 
+    try setHeaderCounts(&response);
+    return response;
+}
+
+pub fn buildRefusedResponse(request: dns_message.Message) !dns_message.Message {
+    const q = request.question orelse return Error.MissingQuestion;
+    return buildEmptyResponse(request, q, if (q.qclass.eql(dns_types.Class.IN)) .refused else .notimp);
+}
+
+pub fn buildNotImplementedResponse(request: dns_message.Message) !dns_message.Message {
+    const q = request.question orelse return Error.MissingQuestion;
+    return buildEmptyResponse(request, q, .notimp);
+}
+
+fn buildEmptyResponse(request: dns_message.Message, q: question.Question, rcode: header.Rcode) !dns_message.Message {
+    var response = dns_message.Message{
+        .allocator = request.allocator,
+        .header = .{
+            .id = request.header.id,
+            .qr = true,
+            .opcode = request.header.opcode,
+            .recursion_desired = request.header.recursion_desired,
+            .recursion_available = false,
+            .rcode = rcode,
+            .question_count = 1,
+        },
+        .question = q,
+        .answers = try dns_message.RecordSection.init(request.allocator, 0),
+        .authorities = try dns_message.RecordSection.init(request.allocator, 0),
+        .additionals = try dns_message.RecordSection.init(request.allocator, 0),
+        .edns = if (request.edns) |edns| .{
+            .udp_payload_size = negotiateEdnsPayload(edns.udp_payload_size),
+            .extended_rcode = 0,
+            .version = dns_message.EDNS_VERSION,
+            .dnssec_ok = edns.dnssec_ok,
+        } else null,
+    };
+    errdefer response.deinit();
+    if (response.edns != null) try appendOpt(&response);
     try setHeaderCounts(&response);
     return response;
 }
@@ -144,7 +205,7 @@ pub fn negotiateEdnsPayload(advertised: u16) u16 {
     return @min(advertised, DEFAULT_EDNS_UDP_PAYLOAD_SIZE);
 }
 
-fn buildBadVersionResponse(request: dns_message.Message, q: question.Question) !dns_message.Message {
+pub fn buildBadVersionResponse(request: dns_message.Message, q: question.Question) !dns_message.Message {
     const request_edns = request.edns orelse return Error.BadResponse;
     var response = dns_message.Message{
         .allocator = request.allocator,
@@ -196,9 +257,9 @@ fn setHeaderCounts(response: *dns_message.Message) Error!void {
     response.header.additional_count = @intCast(response.additionals.len);
 }
 
-fn toResourceRecord(record: zone_parser.ZoneRecord) !dns_record.ResourceRecord {
+fn toResourceRecord(record: zone_parser.ZoneRecord, owner_override: ?[]const u8) !dns_record.ResourceRecord {
     return .{
-        .owner = dns_name.Name.fromText(record.ownerText()) catch return Error.BadZoneRecord,
+        .owner = dns_name.Name.fromText(owner_override orelse record.ownerText()) catch return Error.BadZoneRecord,
         .rrtype = record.rrtype,
         .class = dns_types.Class.IN,
         .ttl = record.ttl,
@@ -206,121 +267,14 @@ fn toResourceRecord(record: zone_parser.ZoneRecord) !dns_record.ResourceRecord {
     };
 }
 
+fn toNegativeSoa(record: zone_parser.ZoneRecord) !dns_record.ResourceRecord {
+    var rr = try toResourceRecord(record, null);
+    if (rr.rdata == .SOA) rr.ttl = @min(rr.ttl, rr.rdata.SOA.minimum);
+    return rr;
+}
+
 fn parseZoneRData(record: zone_parser.ZoneRecord) !dns_rdata.RData {
-    if (record.rrtype.eql(.A)) {
-        return .{ .A = try parseIpv4(record.rdataText()) };
-    }
-    if (record.rrtype.eql(.AAAA)) {
-        return .{ .AAAA = try parseIpv6(record.rdataText()) };
-    }
-    if (record.rrtype.eql(.NS)) {
-        return .{ .NS = dns_name.Name.fromText(record.rdataText()) catch return Error.BadZoneRecord };
-    }
-    if (record.rrtype.eql(.CNAME)) {
-        return .{ .CNAME = dns_name.Name.fromText(record.rdataText()) catch return Error.BadZoneRecord };
-    }
-    if (record.rrtype.eql(.SOA)) {
-        return .{ .SOA = try parseSoa(record.rdataText()) };
-    }
-    if (record.rrtype.eql(.MX)) {
-        return .{ .MX = try parseMx(record.rdataText()) };
-    }
-    if (record.rrtype.eql(.TXT)) {
-        return .{ .TXT = try parseTxt(record.rdataText()) };
-    }
-    if (record.rrtype.eql(.SRV)) {
-        return .{ .SRV = try parseSrv(record.rdataText()) };
-    }
-    if (record.rrtype.eql(.CAA)) {
-        return .{ .CAA = try parseCaa(record.rdataText()) };
-    }
-    return Error.BadZoneRecord;
-}
-
-fn parseIpv4(text: []const u8) ![4]u8 {
-    var parts = std.mem.splitScalar(u8, text, '.');
-    var out: [4]u8 = undefined;
-    var index: usize = 0;
-    while (parts.next()) |part| {
-        if (index >= 4) return Error.BadAddress;
-        out[index] = std.fmt.parseInt(u8, part, 10) catch return Error.BadAddress;
-        index += 1;
-    }
-    if (index != 4) return Error.BadAddress;
-    return out;
-}
-
-fn parseIpv6(text: []const u8) ![16]u8 {
-    const addr = std.Io.net.Ip6Address.parse(text, 0) catch return Error.BadAddress;
-    return addr.bytes;
-}
-
-fn parseMx(text: []const u8) !dns_rdata.Mx {
-    var tokens = std.mem.tokenizeAny(u8, text, " \t\r\n");
-    const preference = std.fmt.parseInt(u16, tokens.next() orelse return Error.BadZoneRecord, 10) catch return Error.BadZoneRecord;
-    const exchange = tokens.next() orelse return Error.BadZoneRecord;
-    return .{
-        .preference = preference,
-        .exchange = dns_name.Name.fromText(exchange) catch return Error.BadZoneRecord,
-    };
-}
-
-fn parseTxt(text: []const u8) !dns_rdata.Txt {
-    const value = if (text.len >= 2 and text[0] == '"' and text[text.len - 1] == '"') text[1 .. text.len - 1] else text;
-    if (value.len > 255) return Error.BadZoneRecord;
-    var txt = dns_rdata.Txt{ .len = @intCast(value.len) };
-    @memcpy(txt.data[0..value.len], value);
-    return txt;
-}
-
-fn parseSrv(text: []const u8) !dns_rdata.Srv {
-    var tokens = std.mem.tokenizeAny(u8, text, " \t\r\n");
-    const priority = std.fmt.parseInt(u16, tokens.next() orelse return Error.BadZoneRecord, 10) catch return Error.BadZoneRecord;
-    const weight = std.fmt.parseInt(u16, tokens.next() orelse return Error.BadZoneRecord, 10) catch return Error.BadZoneRecord;
-    const port = std.fmt.parseInt(u16, tokens.next() orelse return Error.BadZoneRecord, 10) catch return Error.BadZoneRecord;
-    const target = tokens.next() orelse return Error.BadZoneRecord;
-    return .{
-        .priority = priority,
-        .weight = weight,
-        .port = port,
-        .target = dns_name.Name.fromText(target) catch return Error.BadZoneRecord,
-    };
-}
-
-fn parseCaa(text: []const u8) !dns_rdata.Caa {
-    var tokens = std.mem.tokenizeAny(u8, text, " \t\r\n");
-    const flags = std.fmt.parseInt(u8, tokens.next() orelse return Error.BadZoneRecord, 10) catch return Error.BadZoneRecord;
-    const tag = tokens.next() orelse return Error.BadZoneRecord;
-    const value = tokens.rest();
-    if (tag.len > 32 or value.len > 255) return Error.BadZoneRecord;
-    var caa = dns_rdata.Caa{
-        .flags = flags,
-        .tag_len = @intCast(tag.len),
-        .value_len = @intCast(value.len),
-    };
-    @memcpy(caa.tag[0..tag.len], tag);
-    @memcpy(caa.value[0..value.len], value);
-    return caa;
-}
-
-fn parseSoa(text: []const u8) !dns_rdata.Soa {
-    var tokens = std.mem.tokenizeAny(u8, text, " \t\r\n");
-    const mname = tokens.next() orelse return Error.BadZoneRecord;
-    const rname = tokens.next() orelse return Error.BadZoneRecord;
-    const serial = std.fmt.parseInt(u32, tokens.next() orelse return Error.BadZoneRecord, 10) catch return Error.BadZoneRecord;
-    const refresh = std.fmt.parseInt(u32, tokens.next() orelse return Error.BadZoneRecord, 10) catch return Error.BadZoneRecord;
-    const retry = std.fmt.parseInt(u32, tokens.next() orelse return Error.BadZoneRecord, 10) catch return Error.BadZoneRecord;
-    const expire = std.fmt.parseInt(u32, tokens.next() orelse return Error.BadZoneRecord, 10) catch return Error.BadZoneRecord;
-    const minimum = std.fmt.parseInt(u32, tokens.next() orelse return Error.BadZoneRecord, 10) catch return Error.BadZoneRecord;
-    return .{
-        .mname = dns_name.Name.fromText(mname) catch return Error.BadZoneRecord,
-        .rname = dns_name.Name.fromText(rname) catch return Error.BadZoneRecord,
-        .serial = serial,
-        .refresh = refresh,
-        .retry = retry,
-        .expire = expire,
-        .minimum = minimum,
-    };
+    return zone_parser.parseRData(record.rrtype, record.rdataText()) catch Error.BadZoneRecord;
 }
 
 test "authoritative response builder answers exact A query" {
@@ -369,7 +323,7 @@ test "authoritative response builder returns CNAME and SOA-backed negatives" {
         \\$TTL 3600
         \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
         \\@ IN NS ns1.home.arpa.
-        \\alias IN CNAME dns.home.arpa.
+        \\alias IN CNAME dns
         \\dns IN A 192.168.1.1
         \\
     );
@@ -382,7 +336,7 @@ test "authoritative response builder returns CNAME and SOA-backed negatives" {
         'a',  'r',  'p',  'a',  0,    0x00, 0x01, 0x00, 0x01,
     });
     const cname_response = try buildResponse(cname_request, &zone);
-    try std.testing.expectEqual(@as(u16, 1), cname_response.header.answer_count);
+    try std.testing.expectEqual(@as(u16, 2), cname_response.header.answer_count);
     try std.testing.expect(cname_response.answers.items[0].rrtype.eql(.CNAME));
 
     const missing_request = try dns_message.Message.parseQuery(arena.allocator(), &.{
@@ -393,6 +347,38 @@ test "authoritative response builder returns CNAME and SOA-backed negatives" {
     const missing_response = try buildResponse(missing_request, &zone);
     try std.testing.expectEqual(header.Rcode.nxdomain, missing_response.header.rcode);
     try std.testing.expectEqual(@as(u16, 1), missing_response.header.authority_count);
+}
+
+test "non-IN queries return NOTIMP with the question and EDNS OPT preserved" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var request = try testQuery(arena.allocator(), "dns.home.arpa.", .A);
+    request.question.?.qclass = dns_types.Class.fromCode(3);
+    request.edns = .{
+        .udp_payload_size = 1232,
+        .extended_rcode = 0,
+        .version = 0,
+        .dnssec_ok = false,
+    };
+    var zone_file = try zone_parser.ZoneFile.parse(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
+        \\
+    );
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    const response = try buildResponse(request, &zone);
+    try std.testing.expectEqual(header.Rcode.notimp, response.header.rcode);
+    try std.testing.expectEqual(@as(u16, 0), response.header.answer_count);
+    try std.testing.expectEqual(@as(u16, 0), response.header.authority_count);
+    try std.testing.expectEqual(@as(u16, 1), response.header.additional_count);
+    try std.testing.expectEqual(dns_types.Class.fromCode(3), response.question.?.qclass);
+    try std.testing.expectEqual(@as(usize, 0), response.additionals.items[0].rdata.OPT.bytes().len);
 }
 
 test "authoritative response builder converts phase-one zone record types" {
@@ -422,14 +408,31 @@ test "authoritative response builder converts phase-one zone record types" {
     const txt_response = try buildResponse(txt_request, &zone);
     try std.testing.expectEqualStrings("hello world", txt_response.answers.items[0].rdata.TXT.text());
 
-    const aaaa_record = try toResourceRecord(zone.records.items[2]);
+    const aaaa_record = try toResourceRecord(zone.records.items[2], null);
     try std.testing.expectEqualSlices(u8, &.{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, &aaaa_record.rdata.AAAA);
-    const mx_record = try toResourceRecord(zone.records.items[3]);
+    const mx_record = try toResourceRecord(zone.records.items[3], null);
     try std.testing.expectEqual(@as(u16, 10), mx_record.rdata.MX.preference);
-    const srv_record = try toResourceRecord(zone.records.items[5]);
+    const srv_record = try toResourceRecord(zone.records.items[5], null);
     try std.testing.expectEqual(@as(u16, 8443), srv_record.rdata.SRV.port);
-    const caa_record = try toResourceRecord(zone.records.items[6]);
+    const caa_record = try toResourceRecord(zone.records.items[6], null);
     try std.testing.expectEqualStrings("issue", caa_record.rdata.CAA.tagText());
+}
+
+test "authoritative response builder converts PTR zone records" {
+    var zone_file = try zone_parser.ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 3600
+        \\@ IN NS ns.example.
+        \\reverse IN PTR target
+        \\
+    );
+    defer zone_file.deinit();
+
+    const ptr_record = try toResourceRecord(zone_file.records.items[2], null);
+    try std.testing.expect(ptr_record.rrtype.eql(.PTR));
+    var target: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("target.example.", try ptr_record.rdata.PTR.toText(&target));
 }
 
 test "rejects response section counts beyond the DNS wire limit" {
@@ -437,6 +440,81 @@ test "rejects response section counts beyond the DNS wire limit" {
     response.answers.len = @as(usize, std.math.maxInt(u16)) + 1;
 
     try std.testing.expectError(Error.TooManyRecords, setHeaderCounts(&response));
+}
+
+fn testQuery(allocator: std.mem.Allocator, name_text: []const u8, qtype: dns_types.RecordType) !dns_message.Message {
+    return .{
+        .allocator = allocator,
+        .header = .{ .id = 0x1234 },
+        .question = .{
+            .name = try dns_name.Name.fromText(name_text),
+            .qtype = qtype,
+            .qclass = dns_types.Class.IN,
+        },
+    };
+}
+
+test "authoritative response rewrites wildcard owners and preserves negative SOA TTL" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+        \\@ IN NS ns.example.
+        \\ns IN A 192.0.2.1
+        \\www IN A 192.0.2.2
+        \\*.example. IN A 192.0.2.3
+        \\
+    );
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    const wildcard = try buildResponse(try testQuery(arena.allocator(), "other.example.", .A), &zone);
+    try std.testing.expectEqual(@as(u16, 1), wildcard.header.answer_count);
+    try std.testing.expectEqualSlices(u8, &.{ 192, 0, 2, 3 }, &wildcard.answers.items[0].rdata.A);
+    var wildcard_owner: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("other.example.", try wildcard.answers.items[0].owner.toText(&wildcard_owner));
+
+    const nodata = try buildResponse(try testQuery(arena.allocator(), "www.example.", .AAAA), &zone);
+    try std.testing.expectEqual(header.Rcode.no_error, nodata.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), nodata.header.authority_count);
+    try std.testing.expectEqual(@as(u32, 300), nodata.authorities.items[0].ttl);
+}
+
+test "authoritative response emits referral glue and uncompressed DNAME CNAME" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+        \\@ IN NS ns.example.
+        \\ns IN A 192.0.2.1
+        \\child IN NS ns.child.example.
+        \\child IN NS ns.external.example.
+        \\ns.child.example. IN A 192.0.2.10
+        \\ns.external.example. IN A 192.0.2.11
+        \\legacy IN DNAME target.example.
+        \\
+    );
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    const referral = try buildResponse(try testQuery(arena.allocator(), "www.child.example.", .A), &zone);
+    try std.testing.expect(!referral.header.authoritative);
+    try std.testing.expectEqual(@as(u16, 2), referral.header.authority_count);
+    try std.testing.expectEqual(@as(u16, 1), referral.header.additional_count);
+    try std.testing.expectEqualSlices(u8, &.{ 192, 0, 2, 10 }, &referral.additionals.items[0].rdata.A);
+
+    const dname = try buildResponse(try testQuery(arena.allocator(), "www.legacy.example.", .A), &zone);
+    try std.testing.expectEqual(@as(u16, 2), dname.header.answer_count);
+    try std.testing.expectEqual(dns_types.RecordType.DNAME, dname.answers.items[0].rrtype);
+    try std.testing.expectEqual(dns_types.RecordType.CNAME, dname.answers.items[1].rrtype);
+    var target: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("www.target.example.", try dname.answers.items[1].rdata.CNAME.toText(&target));
 }
 
 test "unsupported EDNS version returns BADVERS" {

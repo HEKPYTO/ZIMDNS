@@ -97,6 +97,7 @@ pub const RData = union(enum) {
     NS: Name,
     SOA: Soa,
     CNAME: Name,
+    DNAME: Name,
     PTR: Name,
     MX: Mx,
     TXT: Txt,
@@ -123,6 +124,7 @@ pub const RData = union(enum) {
             },
             RecordType.NS.value => .{ .NS = try parseNameOnly(message, offset, end) },
             RecordType.CNAME.value => .{ .CNAME = try parseNameOnly(message, offset, end) },
+            RecordType.DNAME.value => .{ .DNAME = try parseUncompressedNameOnly(message, offset, end) },
             RecordType.PTR.value => .{ .PTR = try parseNameOnly(message, offset, end) },
             RecordType.SOA.value => blk: {
                 const mname_result = Name.parse(message, offset) catch return Error.BadName;
@@ -213,7 +215,7 @@ pub const RData = union(enum) {
         switch (self) {
             .A => |bytes| try writer.writeBytes(&bytes),
             .AAAA => |bytes| try writer.writeBytes(&bytes),
-            .NS, .CNAME, .PTR => |name| try name.encode(writer),
+            .NS, .CNAME, .DNAME, .PTR => |name| try name.encode(writer),
             .SOA => |soa| {
                 try soa.mname.encode(writer);
                 try soa.rname.encode(writer);
@@ -253,6 +255,7 @@ pub const RData = union(enum) {
             .A => |bytes| try writer.writeBytes(&bytes),
             .AAAA => |bytes| try writer.writeBytes(&bytes),
             .NS, .CNAME, .PTR => |name| try table.writeName(writer, name.asWire()),
+            .DNAME => |name| try name.encode(writer),
             .SOA => |soa| {
                 try table.writeName(writer, soa.mname.asWire());
                 try table.writeName(writer, soa.rname.asWire());
@@ -289,6 +292,21 @@ pub const RData = union(enum) {
 };
 
 fn parseNameOnly(message: []const u8, offset: usize, end: usize) Error!Name {
+    const result = Name.parse(message, offset) catch return Error.BadName;
+    if (result.next_offset != end) return Error.TrailingData;
+    return result.name;
+}
+
+fn parseUncompressedNameOnly(message: []const u8, offset: usize, end: usize) Error!Name {
+    if (offset >= message.len or end > message.len or offset > end) return Error.EndOfInput;
+    var cursor = offset;
+    while (cursor < end) {
+        const len = message[cursor];
+        if ((len & 0xc0) == 0xc0) return Error.BadName;
+        if (len == 0) break;
+        if ((len & 0xc0) != 0 or len > 63 or cursor + 1 + len > end) return Error.BadName;
+        cursor += 1 + len;
+    }
     const result = Name.parse(message, offset) catch return Error.BadName;
     if (result.next_offset != end) return Error.TrailingData;
     return result.name;
@@ -377,6 +395,25 @@ test "rdata parses SOA, SRV, and CAA records" {
 test "rdata preserves unknown record bytes" {
     const unknown = try RData.parse(RecordType.fromCode(65280), &.{ 1, 2, 3, 4 }, 0, 4);
     try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, unknown.Unknown.bytes());
+}
+
+test "rdata keeps unknown wire data within the declared bounded profile" {
+    var max: [max_unknown_len]u8 = undefined;
+    @memset(&max, 0xa5);
+    const unknown = try RData.parse(RecordType.fromCode(65280), &max, 0, max.len);
+    try std.testing.expectEqual(@as(usize, max_unknown_len), unknown.Unknown.bytes().len);
+
+    var overlong: [max_unknown_len + 1]u8 = undefined;
+    try std.testing.expectError(Error.UnknownTooLong, RData.parse(RecordType.fromCode(65280), &overlong, 0, overlong.len));
+}
+
+test "rdata parses and encodes DNAME targets without compression" {
+    const bytes = [_]u8{ 3, 'n', 'e', 'w', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0 };
+    const dname = try RData.parse(.DNAME, &bytes, 0, bytes.len);
+    var output: [32]u8 = undefined;
+    var writer = Writer.init(&output);
+    try dname.encode(&writer);
+    try std.testing.expectEqualSlices(u8, &bytes, writer.written());
 }
 
 test "rdata validates and round trips bounded EDNS options" {

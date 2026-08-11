@@ -32,6 +32,24 @@ test "EDNS response fixture asserts exact encoded OPT response" {
     try std.testing.expect(std.mem.indexOf(u8, actual, &.{ 0xc0, 0x0c }) != null);
 }
 
+test "authoritative semantics fixture asserts exact encoded wildcard response" {
+    const fixture = try Fixture.parse(@embedFile("authoritative-semantics.gdns-fixture"));
+    var runtime = try zimdns.auth_runtime.Runtime.fromZoneText(authoritative_fixture_zone);
+    defer runtime.deinit();
+
+    var output: [512]u8 = undefined;
+    const actual = try runtime.answer(fixture.inputBytes(), &output);
+    try std.testing.expectEqualSlices(u8, fixture.responseBytes(), actual);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try zimdns.dns_message.Message.parse(arena.allocator(), actual);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.answer_count);
+    try std.testing.expect(parsed.answers.items[0].rrtype.eql(.A));
+    var owner: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("other.example.", try parsed.answers.items[0].owner.toText(&owner));
+}
+
 test "EDNS unknown option response is exact and empty" {
     var runtime = try zimdns.auth_runtime.Runtime.fromZoneText(test_zone);
     defer runtime.deinit();
@@ -132,5 +150,15 @@ const test_zone =
     \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
     \\@ IN NS ns1.home.arpa.
     \\dns IN A 192.168.1.1
+    \\
+;
+
+const authoritative_fixture_zone =
+    \\$ORIGIN example.
+    \\$TTL 3600
+    \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+    \\@ IN NS ns.example.
+    \\ns IN A 192.0.2.1
+    \\*.example. IN A 192.0.2.3
     \\
 ;

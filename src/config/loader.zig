@@ -7,10 +7,13 @@ const blocklist_mod = @import("../blocklist.zig");
 const parser = @import("parser.zig");
 const zone_index = @import("../zone/index.zig");
 const zone_parser = @import("../zone/parser.zig");
+const resolver_mod = @import("../resolver.zig");
 
 pub const Error = error{
     MissingReferencedFile,
     NoPrimaryZone,
+    BadConfiguration,
+    ZoneNameMismatch,
 };
 
 pub const ServerContext = struct {
@@ -40,6 +43,9 @@ pub const ServerContext = struct {
 
             var zone_file = try zone_parser.ZoneFile.parse(zone_text);
             errdefer zone_file.deinit();
+            if (!zoneNamesEqual(context.config.zones.items[zone_index_value].nameText(), zone_file.originText())) {
+                return Error.ZoneNameMismatch;
+            }
             var zone = try zone_index.Zone.fromZoneFile(&zone_file);
             errdefer zone.deinit();
             try context.zones.append(allocator, zone);
@@ -60,12 +66,16 @@ pub const ServerContext = struct {
         return context;
     }
 
-    pub fn takePrimaryRuntime(self: *ServerContext) Error!auth_runtime.Runtime {
+    pub fn takeRuntime(self: *ServerContext, io: std.Io) Error!auth_runtime.Runtime {
         if (self.zones.items.len == 0) return Error.NoPrimaryZone;
-        return .{
-            .zone = self.zones.orderedRemove(0),
-            .blocklist = self.blocklist,
-        };
+        const policy = resolver_mod.Policy.fromConfig(&self.config) catch return error.BadConfiguration;
+        const runtime = if (self.config.forwarder != null or self.config.recursion_allow.len != 0 or self.config.cookies.enabled)
+            try auth_runtime.Runtime.fromZonesWithPolicy(self.allocator, &self.zones, self.blocklist, io, policy)
+        else
+            auth_runtime.Runtime.fromZones(self.allocator, &self.zones, self.blocklist);
+        self.blocklist = .{};
+        self.config = .{};
+        return runtime;
     }
 
     pub fn deinit(self: *ServerContext) void {
@@ -76,3 +86,10 @@ pub const ServerContext = struct {
         self.config = .{};
     }
 };
+
+fn zoneNamesEqual(configured: []const u8, parsed: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(configured, parsed)) return true;
+    if (std.mem.endsWith(u8, parsed, ".") and std.ascii.eqlIgnoreCase(configured, parsed[0 .. parsed.len - 1])) return true;
+    if (std.mem.endsWith(u8, configured, ".") and std.ascii.eqlIgnoreCase(configured[0 .. configured.len - 1], parsed)) return true;
+    return false;
+}
