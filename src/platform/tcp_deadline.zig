@@ -22,9 +22,12 @@ pub fn deadlineFromTimeout(io: std.Io, timeout: std.Io.Timeout) ?std.Io.Clock.Ti
 pub fn readExact(fd: std.posix.fd_t, io: std.Io, buffer: []u8, frame_deadline: std.Io.Clock.Timestamp) !void {
     var offset: usize = 0;
     while (offset < buffer.len) {
-        try waitForSocket(fd, io, frame_deadline, std.posix.POLL.IN);
+        waitForSocket(fd, io, frame_deadline, std.posix.POLL.IN) catch |err| {
+            if (err == error.EndOfStream and offset > 0) return error.Truncated;
+            return err;
+        };
         const count = try std.posix.read(fd, buffer[offset..]);
-        if (count == 0) return error.EndOfStream;
+        if (count == 0) return if (offset == 0) error.EndOfStream else error.Truncated;
         offset += count;
     }
 }

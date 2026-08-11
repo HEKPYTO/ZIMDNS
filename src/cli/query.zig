@@ -387,6 +387,7 @@ test "TCP query client talks to authoritative stream handler" {
     var query_buffer: [512]u8 = undefined;
     const query = try buildQueryPacket(&query_buffer, 0x999a, "dns.home.arpa.", .A);
     try sendTcpQuery(client_stream, io, query);
+    try client_stream.shutdown(io, .send);
     try listener.serveTcpStreamOnce(server_stream, io, &runtime);
     var response_buffer: [512]u8 = undefined;
     const response = try receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query);

@@ -13,6 +13,7 @@ pub const UDP_CLASSIC_MESSAGE_SIZE: usize = response_mod.CLASSIC_UDP_MESSAGE_SIZ
 pub const UDP_REQUEST_BUFFER_SIZE: usize = response_mod.DEFAULT_EDNS_UDP_PAYLOAD_SIZE;
 pub const UDP_RESPONSE_BUFFER_SIZE: usize = std.math.maxInt(u16);
 pub const TCP_MAX_FRAME_SIZE: usize = std.math.maxInt(u16);
+pub const TCP_MAX_FRAMES_PER_CONNECTION: usize = 16;
 pub const UDP_IDLE_TIMEOUT: std.Io.Timeout = .{ .duration = .{
     .raw = .fromSeconds(5),
     .clock = .awake,
@@ -401,7 +402,7 @@ test "classic UDP response over 512 bytes sets TC instead of clipping" {
     try std.testing.expect(parsed.edns == null);
 }
 
-test "TCP handler serves one length-prefixed DNS query on a stream" {
+test "TCP handler serves FIFO length-prefixed DNS queries on one stream" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -416,27 +417,245 @@ test "TCP handler serves one length-prefixed DNS query on a stream" {
     var client_stream = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
     defer client_stream.close(io);
 
-    const server_stream = try server.accept(io);
-    defer server_stream.close(io);
+    var first_query = simple_a_query.*;
+    var second_query = simple_a_query.*;
+    std.mem.writeInt(u16, first_query[0..2], 0x1234, .big);
+    std.mem.writeInt(u16, second_query[0..2], 0x5678, .big);
 
     var client_write_buffer: [512]u8 = undefined;
     var client_writer = client_stream.writer(io, &client_write_buffer);
     var prefix: [2]u8 = undefined;
-    std.mem.writeInt(u16, &prefix, simple_a_query.len, .big);
+    std.mem.writeInt(u16, &prefix, @intCast(first_query.len), .big);
     try client_writer.interface.writeAll(&prefix);
-    try client_writer.interface.writeAll(simple_a_query);
+    try client_writer.interface.writeAll(&first_query);
+    std.mem.writeInt(u16, &prefix, @intCast(second_query.len), .big);
+    try client_writer.interface.writeAll(&prefix);
+    try client_writer.interface.writeAll(&second_query);
     try client_writer.interface.flush();
+    try client_stream.shutdown(io, .send);
+
+    var server_stream = try server.accept(io);
+    var server_stream_closed = false;
+    defer {
+        if (!server_stream_closed) server_stream.close(io);
+    }
 
     try serveTcpStreamOnce(server_stream, io, &runtime);
 
     var client_read_buffer: [512]u8 = undefined;
     var client_reader = client_stream.reader(io, &client_read_buffer);
-    const response_len_bytes = try client_reader.interface.takeArray(2);
-    const response_len = std.mem.readInt(u16, response_len_bytes, .big);
-    const response_bytes = try client_reader.interface.take(response_len);
-    const response = try @import("../dns/message.zig").Message.parse(arena.allocator(), response_bytes);
-    try std.testing.expect(response.header.qr);
+    const first_response_len_bytes = try client_reader.interface.takeArray(2);
+    const first_response_len = std.mem.readInt(u16, first_response_len_bytes, .big);
+    const first_response_bytes = try client_reader.interface.take(first_response_len);
+    const first_response = try @import("../dns/message.zig").Message.parse(arena.allocator(), first_response_bytes);
+    try std.testing.expect(first_response.header.qr);
+    try std.testing.expectEqual(@as(u16, 0x1234), first_response.header.id);
+    try std.testing.expectEqual(@as(u16, 1), first_response.header.answer_count);
+
+    const second_response_len_bytes = try client_reader.interface.takeArray(2);
+    const second_response_len = std.mem.readInt(u16, second_response_len_bytes, .big);
+    const second_response_bytes = try client_reader.interface.take(second_response_len);
+    const second_response = try @import("../dns/message.zig").Message.parse(arena.allocator(), second_response_bytes);
+    try std.testing.expect(second_response.header.qr);
+    try std.testing.expectEqual(@as(u16, 0x5678), second_response.header.id);
+    try std.testing.expectEqual(@as(u16, 1), second_response.header.answer_count);
+
+    server_stream.close(io);
+    server_stream_closed = true;
+}
+
+test "TCP loop rejects truncated frames before serving the next connection" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+
+    var listen_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try std.Io.net.IpAddress.listen(&listen_addr, io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    var truncated_header_client = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer truncated_header_client.close(io);
+    var truncated_header_buffer: [8]u8 = undefined;
+    var truncated_header_writer = truncated_header_client.writer(io, &truncated_header_buffer);
+    try truncated_header_writer.interface.writeAll(&.{0});
+    try truncated_header_writer.interface.flush();
+    try truncated_header_client.shutdown(io, .send);
+
+    var truncated_payload_client = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer truncated_payload_client.close(io);
+    var truncated_payload_buffer: [8]u8 = undefined;
+    var truncated_payload_writer = truncated_payload_client.writer(io, &truncated_payload_buffer);
+    var length_prefix: [2]u8 = undefined;
+    std.mem.writeInt(u16, &length_prefix, @intCast(simple_a_query.len), .big);
+    try truncated_payload_writer.interface.writeAll(&length_prefix);
+    try truncated_payload_writer.interface.writeAll(simple_a_query[0..1]);
+    try truncated_payload_writer.interface.flush();
+    try truncated_payload_client.shutdown(io, .send);
+
+    var valid_client = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer valid_client.close(io);
+    var query_buffer: [512]u8 = undefined;
+    const query = try @import("../cli/query.zig").buildQueryPacket(&query_buffer, 0x6789, "dns.home.arpa.", .A);
+    try @import("../cli/query.zig").sendTcpQuery(valid_client, io, query);
+    try valid_client.shutdown(io, .send);
+
+    try serveTcpLoopWithTimeout(&server, io, &runtime, 1, .{ .seconds = 0, .microseconds = 100_000 });
+
+    var response_poll_fds = [_]std.posix.pollfd{.{
+        .fd = valid_client.socket.handle,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    try std.testing.expectEqual(@as(usize, 1), try std.posix.poll(&response_poll_fds, 100));
+    var response_buffer: [512]u8 = undefined;
+    const response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), valid_client, io, &response_buffer, query);
+    try std.testing.expectEqual(@as(u16, 0x6789), response.header.id);
     try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+}
+
+test "TCP loop does not count an empty EOF connection" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+
+    var listen_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try std.Io.net.IpAddress.listen(&listen_addr, io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    var empty_client = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer empty_client.close(io);
+    try empty_client.shutdown(io, .send);
+
+    var valid_client = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer valid_client.close(io);
+    var query_buffer: [512]u8 = undefined;
+    const query = try @import("../cli/query.zig").buildQueryPacket(&query_buffer, 0x6790, "dns.home.arpa.", .A);
+    try @import("../cli/query.zig").sendTcpQuery(valid_client, io, query);
+    try valid_client.shutdown(io, .send);
+
+    try serveTcpLoopWithTimeout(&server, io, &runtime, 1, .{ .seconds = 0, .microseconds = 100_000 });
+
+    var response_poll_fds = [_]std.posix.pollfd{.{
+        .fd = valid_client.socket.handle,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    try std.testing.expectEqual(@as(usize, 1), try std.posix.poll(&response_poll_fds, 100));
+    var response_buffer: [512]u8 = undefined;
+    const response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), valid_client, io, &response_buffer, query);
+    try std.testing.expectEqual(@as(u16, 0x6790), response.header.id);
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+}
+
+test "TCP loop rejects a length prefix without payload" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+
+    var listen_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try std.Io.net.IpAddress.listen(&listen_addr, io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    var prefix_client = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer prefix_client.close(io);
+    var prefix_buffer: [8]u8 = undefined;
+    var prefix_writer = prefix_client.writer(io, &prefix_buffer);
+    var prefix: [2]u8 = undefined;
+    std.mem.writeInt(u16, &prefix, @intCast(simple_a_query.len), .big);
+    try prefix_writer.interface.writeAll(&prefix);
+    try prefix_writer.interface.flush();
+    try prefix_client.shutdown(io, .send);
+
+    var valid_client = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer valid_client.close(io);
+    var query_buffer: [512]u8 = undefined;
+    const query = try @import("../cli/query.zig").buildQueryPacket(&query_buffer, 0x6791, "dns.home.arpa.", .A);
+    try @import("../cli/query.zig").sendTcpQuery(valid_client, io, query);
+    try valid_client.shutdown(io, .send);
+
+    const prefix_server_stream = try server.accept(io);
+    defer prefix_server_stream.close(io);
+    try std.testing.expectError(Error.BadTcpFrame, serveTcpStreamOnce(prefix_server_stream, io, &runtime));
+
+    try serveTcpLoopWithTimeout(&server, io, &runtime, 1, .{ .seconds = 0, .microseconds = 100_000 });
+
+    var response_poll_fds = [_]std.posix.pollfd{.{
+        .fd = valid_client.socket.handle,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    try std.testing.expectEqual(@as(usize, 1), try std.posix.poll(&response_poll_fds, 100));
+    var response_buffer: [512]u8 = undefined;
+    const response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), valid_client, io, &response_buffer, query);
+    try std.testing.expectEqual(@as(u16, 0x6791), response.header.id);
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+}
+
+test "TCP connection cap serves sixteen frames and closes before the seventeenth" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+
+    var listen_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try std.Io.net.IpAddress.listen(&listen_addr, io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    var client_stream = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer client_stream.close(io);
+
+    const total_frames = TCP_MAX_FRAMES_PER_CONNECTION + 1;
+    var queries: [total_frames][simple_a_query.len]u8 = undefined;
+    var client_write_buffer: [1024]u8 = undefined;
+    var client_writer = client_stream.writer(io, &client_write_buffer);
+    var prefix: [2]u8 = undefined;
+    for (&queries, 0..) |*query, index| {
+        query.* = simple_a_query.*;
+        const id: u16 = @intCast(0x6000 + index);
+        std.mem.writeInt(u16, query[0..2], id, .big);
+    }
+    for (queries) |query| {
+        std.mem.writeInt(u16, &prefix, @intCast(query.len), .big);
+        try client_writer.interface.writeAll(&prefix);
+        try client_writer.interface.writeAll(&query);
+    }
+    try client_writer.interface.flush();
+
+    var server_stream = try server.accept(io);
+    var server_stream_closed = false;
+    defer {
+        if (!server_stream_closed) server_stream.close(io);
+    }
+    try serveTcpStreamOnce(server_stream, io, &runtime);
+
+    var response_read_buffer: [1024]u8 = undefined;
+    var response_reader = client_stream.reader(io, &response_read_buffer);
+    for (0..TCP_MAX_FRAMES_PER_CONNECTION) |index| {
+        const response_len_bytes = try response_reader.interface.takeArray(2);
+        const response_len = std.mem.readInt(u16, response_len_bytes, .big);
+        const response_bytes = try response_reader.interface.take(response_len);
+        const response = try @import("../dns/message.zig").Message.parse(arena.allocator(), response_bytes);
+        try std.testing.expectEqual(@as(u16, @intCast(0x6000 + index)), response.header.id);
+        try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+    }
+
+    server_stream.close(io);
+    server_stream_closed = true;
+
+    if (response_reader.interface.takeArray(2)) |_| {
+        return error.UnexpectedSeventeenthResponse;
+    } else |_| {}
 }
 
 test "TCP framing accepts the largest u16 length-prefixed frame" {
@@ -470,6 +689,13 @@ test "TCP framing accepts the largest u16 length-prefixed frame" {
 test "TCP framing rejects zero and over-limit lengths" {
     try std.testing.expectError(Error.BadTcpFrame, validateTcpFrameLength(0));
     try std.testing.expectError(Error.BadTcpFrame, validateTcpFrameLength(TCP_MAX_FRAME_SIZE + 1));
+
+    var zero_reader = std.Io.Reader.fixed(&.{ 0, 0 });
+    var frame_buffer: [1]u8 = undefined;
+    try std.testing.expectError(Error.BadTcpFrame, readTcpFrame(&zero_reader, &frame_buffer));
+
+    var oversized_reader = std.Io.Reader.fixed(&.{ 0, 2 });
+    try std.testing.expectError(Error.BadTcpFrame, readTcpFrame(&oversized_reader, &frame_buffer));
 }
 
 test "TCP loop ignores malformed and idle connections before a valid query" {
@@ -497,6 +723,7 @@ test "TCP loop ignores malformed and idle connections before a valid query" {
     var query_buffer: [512]u8 = undefined;
     const query = try @import("../cli/query.zig").buildQueryPacket(&query_buffer, 0x3434, "dns.home.arpa.", .A);
     try @import("../cli/query.zig").sendTcpQuery(valid_client, io, query);
+    try valid_client.shutdown(io, .send);
 
     try serveTcpLoopWithTimeout(&server, io, &runtime, 1, .{ .seconds = 0, .microseconds = 1_000 });
 
@@ -550,19 +777,29 @@ const unix_tcp_deadlines = if (TCP_DEADLINES_SUPPORTED) struct {
 
         var request_buffer: [TCP_MAX_FRAME_SIZE]u8 = undefined;
         var response_buffer: [TCP_MAX_FRAME_SIZE]u8 = undefined;
-        const read_deadline = tcp_deadline.deadline(io, timeout);
-        const request = try readFrame(stream.socket.handle, io, &request_buffer, read_deadline);
-        const response_bytes = if (counters) |value|
-            try runtime.answerWithMetrics(request, &response_buffer, value)
-        else
-            try runtime.answer(request, &response_buffer);
-        if (response_bytes.len > TCP_MAX_FRAME_SIZE) return Error.ResponseTooLarge;
+        var frame_count: usize = 0;
+        while (frame_count < TCP_MAX_FRAMES_PER_CONNECTION) : (frame_count += 1) {
+            const read_deadline = tcp_deadline.deadline(io, timeout);
+            const request = readFrame(stream.socket.handle, io, &request_buffer, read_deadline) catch |err| {
+                if (err == error.EndOfStream) {
+                    if (frame_count == 0) return error.EndOfStream;
+                    return;
+                }
+                if (err == error.Truncated) return Error.BadTcpFrame;
+                return err;
+            };
+            const response_bytes = if (counters) |value|
+                try runtime.answerWithMetrics(request, &response_buffer, value)
+            else
+                try runtime.answer(request, &response_buffer);
+            if (response_bytes.len > TCP_MAX_FRAME_SIZE) return Error.ResponseTooLarge;
 
-        var prefix: [2]u8 = undefined;
-        std.mem.writeInt(u16, &prefix, @intCast(response_bytes.len), .big);
-        const write_deadline = tcp_deadline.deadline(io, timeout);
-        try tcp_deadline.writeExact(stream.socket.handle, io, &prefix, write_deadline);
-        try tcp_deadline.writeExact(stream.socket.handle, io, response_bytes, write_deadline);
+            var prefix: [2]u8 = undefined;
+            std.mem.writeInt(u16, &prefix, @intCast(response_bytes.len), .big);
+            const write_deadline = tcp_deadline.deadline(io, timeout);
+            try tcp_deadline.writeExact(stream.socket.handle, io, &prefix, write_deadline);
+            try tcp_deadline.writeExact(stream.socket.handle, io, response_bytes, write_deadline);
+        }
     }
 
     fn setSocketTimeout(stream: std.Io.net.Stream, timeout: std.posix.timeval) !void {
@@ -577,7 +814,10 @@ const unix_tcp_deadlines = if (TCP_DEADLINES_SUPPORTED) struct {
         const request_len = std.mem.readInt(u16, &len_bytes, .big);
         try validateTcpFrameLength(request_len);
         if (request_len > frame_buffer.len) return Error.BadTcpFrame;
-        try tcp_deadline.readExact(fd, io, frame_buffer[0..request_len], frame_deadline);
+        tcp_deadline.readExact(fd, io, frame_buffer[0..request_len], frame_deadline) catch |err| {
+            if (err == error.EndOfStream) return Error.BadTcpFrame;
+            return err;
+        };
         return frame_buffer[0..request_len];
     }
 } else struct {};

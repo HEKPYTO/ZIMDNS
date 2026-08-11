@@ -85,6 +85,7 @@ test "TCP request pipeline answers A query and records metrics" {
     var query_buffer: [512]u8 = undefined;
     const query = try cli_query.buildQueryPacket(&query_buffer, 0x4243, "dns.home.arpa.", .A);
     try cli_query.sendTcpQuery(client_stream, io, query);
+    try client_stream.shutdown(io, .send);
 
     var counters = metrics.Counters{};
     try listener.serveTcpStreamOnceWithMetrics(server_stream, io, &runtime, &counters);
@@ -93,6 +94,51 @@ test "TCP request pipeline answers A query and records metrics" {
     const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query);
     try expectAResponse(response);
     try expectMetrics(counters);
+}
+
+test "TCP request pipeline preserves FIFO responses for pipelined queries" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(fixture_zone);
+    defer runtime.deinit();
+
+    var listen_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try std.Io.net.IpAddress.listen(&listen_addr, io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    var client_stream = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer client_stream.close(io);
+
+    var first_query_buffer: [512]u8 = undefined;
+    var second_query_buffer: [512]u8 = undefined;
+    const first_query = try cli_query.buildQueryPacket(&first_query_buffer, 0x4245, "dns.home.arpa.", .A);
+    const second_query = try cli_query.buildQueryPacket(&second_query_buffer, 0x4246, "dns.home.arpa.", .A);
+    try cli_query.sendTcpQuery(client_stream, io, first_query);
+    try cli_query.sendTcpQuery(client_stream, io, second_query);
+    try client_stream.shutdown(io, .send);
+
+    var args = CliTcpArgs{ .io = io, .server = &server, .runtime = &runtime };
+    const thread = try std.Thread.spawn(.{}, serveCliTcp, .{&args});
+
+    var response_read_buffer: [1024]u8 = undefined;
+    var response_reader = client_stream.reader(io, &response_read_buffer);
+    const first_response_len_bytes = try response_reader.interface.takeArray(2);
+    const first_response_len = std.mem.readInt(u16, first_response_len_bytes, .big);
+    const first_response_bytes = try response_reader.interface.take(first_response_len);
+    const first_response = try dns_message.Message.parse(arena.allocator(), first_response_bytes);
+    const second_response_len_bytes = try response_reader.interface.takeArray(2);
+    const second_response_len = std.mem.readInt(u16, second_response_len_bytes, .big);
+    const second_response_bytes = try response_reader.interface.take(second_response_len);
+    const second_response = try dns_message.Message.parse(arena.allocator(), second_response_bytes);
+    thread.join();
+
+    try std.testing.expect(args.ok);
+    try expectAResponse(first_response);
+    try expectAResponse(second_response);
+    try std.testing.expectEqual(@as(u16, 0x4245), first_response.header.id);
+    try std.testing.expectEqual(@as(u16, 0x4246), second_response.header.id);
 }
 
 test "CLI TCP exchange uses the bounded connection path" {
@@ -172,6 +218,8 @@ test "configured two-zone TCP loop accepts bounded independent connections" {
     const child_query = try cli_query.buildQueryPacket(&child_query_buffer, 0x5202, "www.sub.example.", .A);
     try cli_query.sendTcpQuery(parent_client, io, parent_query);
     try cli_query.sendTcpQuery(child_client, io, child_query);
+    try parent_client.shutdown(io, .send);
+    try child_client.shutdown(io, .send);
 
     try listener.serveTcpLoop(&server, io, &runtime, 2);
 
