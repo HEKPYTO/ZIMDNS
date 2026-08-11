@@ -1,0 +1,9 @@
+.git
+.github
+.worktrees
+.zig-cache
+zig-out
+data
+*.log
+*.tmp
+.DS_Store

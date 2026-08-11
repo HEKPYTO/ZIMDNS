@@ -1,3 +1,6 @@
+/// Contract: Provides bounded cursor reads over a DNS wire buffer.
+/// Ownership: Reader borrows its input bytes and owns no allocation.
+/// Errors: Exhaustion is a typed EndOfInput error; there is no I/O operation.
 const std = @import("std");
 
 pub const Error = error{

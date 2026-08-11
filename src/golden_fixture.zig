@@ -22,6 +22,8 @@ pub const Error = error{
 pub const Fixture = struct {
     input: [max_packet_len]u8 = undefined,
     input_len: usize = 0,
+    response: [max_packet_len]u8 = undefined,
+    response_len: usize = 0,
     expect_parse_ok: ?bool = null,
     expect_id: ?u16 = null,
     expect_qname: ?[]const u8 = null,
@@ -31,6 +33,7 @@ pub const Fixture = struct {
     pub fn parse(text: []const u8) !Fixture {
         var fixture = Fixture{};
         var in_hex = false;
+        var in_response_hex = false;
         var in_expect = false;
 
         var lines = std.mem.splitScalar(u8, text, '\n');
@@ -40,17 +43,30 @@ pub const Fixture = struct {
 
             if (std.mem.eql(u8, line, "input_hex:")) {
                 in_hex = true;
+                in_response_hex = false;
+                in_expect = false;
+                continue;
+            }
+            if (std.mem.eql(u8, line, "response_hex:")) {
+                in_hex = false;
+                in_response_hex = true;
                 in_expect = false;
                 continue;
             }
             if (std.mem.eql(u8, line, "expect:")) {
                 in_hex = false;
+                in_response_hex = false;
                 in_expect = true;
                 continue;
             }
 
             if (in_hex) {
-                try fixture.appendHexLine(line);
+                try appendHexLine(&fixture.input, &fixture.input_len, line);
+                continue;
+            }
+
+            if (in_response_hex) {
+                try appendHexLine(&fixture.response, &fixture.response_len, line);
                 continue;
             }
 
@@ -63,6 +79,14 @@ pub const Fixture = struct {
         if (fixture.input_len == 0) return Error.MissingInput;
         if (fixture.expect_parse_ok == null) return Error.MissingExpectation;
         return fixture;
+    }
+
+    pub fn inputBytes(self: *const Fixture) []const u8 {
+        return self.input[0..self.input_len];
+    }
+
+    pub fn responseBytes(self: *const Fixture) []const u8 {
+        return self.response[0..self.response_len];
     }
 
     pub fn run(self: *const Fixture) !void {
@@ -94,13 +118,13 @@ pub const Fixture = struct {
         }
     }
 
-    fn appendHexLine(self: *Fixture, line: []const u8) !void {
+    fn appendHexLine(buffer: *[max_packet_len]u8, len: *usize, line: []const u8) !void {
         var parts = std.mem.tokenizeAny(u8, line, " \t");
         while (parts.next()) |part| {
             if (part.len != 2) return Error.BadHex;
-            if (self.input_len >= max_packet_len) return Error.PacketTooLong;
-            self.input[self.input_len] = try parseHexByte(part);
-            self.input_len += 1;
+            if (len.* >= max_packet_len) return Error.PacketTooLong;
+            buffer[len.*] = try parseHexByte(part);
+            len.* += 1;
         }
     }
 

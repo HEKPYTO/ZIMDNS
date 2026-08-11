@@ -210,7 +210,8 @@ test "UDP query client talks to authoritative listener socket" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const runtime = try Runtime.fromZoneText(test_zone);
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
     var server_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     var server_socket = try std.Io.net.IpAddress.bind(&server_addr, io, .{ .mode = .dgram, .protocol = .udp });
     defer server_socket.close(io);
@@ -233,7 +234,8 @@ test "TCP query client talks to authoritative stream handler" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const runtime = try Runtime.fromZoneText(test_zone);
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
     var listen_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     var server = try std.Io.net.IpAddress.listen(&listen_addr, io, .{ .reuse_address = true });
     defer server.deinit(io);

@@ -1,62 +1,97 @@
+/// Contract: Parses authoritative zone text into validated zone records.
+/// Ownership: ZoneFile owns its fixed backing reservation and records; call ZoneFile.deinit; input text is borrowed.
+/// Errors: Zone syntax and allocation limits are typed parser errors; file I/O belongs to callers.
 const std = @import("std");
 const RecordType = @import("../dns/types.zig").RecordType;
+const dns_name = @import("../dns/name.zig");
 
-const max_records = 256;
-const max_text = 256;
+/// Maximum parser-owned backing payload retained by one loaded zone.
+///
+/// Every loaded zone owns a backing slice with this exact capacity for its lifetime.
+/// This does not bound input storage, allocator metadata or page rounding, or
+/// physical process RSS.
+pub const max_zone_allocation_bytes: usize = 16 * 1024 * 1024;
 
 pub const Error = error{
     MissingOrigin,
     MissingTtl,
     MissingSoa,
     MissingApexNs,
-    TooManyRecords,
+    AllocationBudgetExceeded,
     BadDirective,
     BadRecord,
     BadTtl,
-    TextTooLong,
+    BadName,
 };
 
 pub const ZoneRecord = struct {
-    owner: [max_text]u8 = undefined,
-    owner_len: usize = 0,
+    owner: []const u8 = &.{},
     ttl: u32,
     rrtype: RecordType,
-    rdata: [max_text]u8 = undefined,
-    rdata_len: usize = 0,
+    rdata: []const u8 = &.{},
 
     pub fn ownerText(self: *const ZoneRecord) []const u8 {
-        return self.owner[0..self.owner_len];
+        return self.owner;
     }
 
     pub fn rdataText(self: *const ZoneRecord) []const u8 {
-        return self.rdata[0..self.rdata_len];
+        return self.rdata;
     }
 };
 
 pub const RecordList = struct {
-    items: [max_records]ZoneRecord = undefined,
+    items: []ZoneRecord = &.{},
     len: usize = 0,
 
-    pub fn append(self: *RecordList, record: ZoneRecord) Error!void {
-        if (self.len >= max_records) return Error.TooManyRecords;
+    pub fn append(self: *RecordList, allocator: std.mem.Allocator, record: ZoneRecord) !void {
+        if (self.len == self.items.len) {
+            const new_capacity = if (self.items.len == 0) 1 else std.math.mul(usize, self.items.len, 2) catch {
+                return error.OutOfMemory;
+            };
+            self.items = if (self.items.len == 0)
+                try allocator.alloc(ZoneRecord, new_capacity)
+            else
+                try allocator.realloc(self.items, new_capacity);
+        }
         self.items[self.len] = record;
         self.len += 1;
     }
 };
 
 pub const ZoneFile = struct {
-    origin: [max_text]u8 = undefined,
-    origin_len: usize = 0,
+    backing: []u8,
+    storage: std.heap.FixedBufferAllocator,
+    origin: []const u8 = &.{},
     default_ttl: u32 = 0,
     records: RecordList = .{},
 
+    /// The ZoneFile owns every returned origin, record, and RDATA slice through
+    /// its page-allocator backing reservation. Call deinit when it is no longer used.
     pub fn parse(text: []const u8) !ZoneFile {
-        var zone = ZoneFile{};
+        return parseWithBudget(text, max_zone_allocation_bytes);
+    }
+
+    fn parseWithBudget(text: []const u8, allocation_budget: usize) !ZoneFile {
+        if (text.len > allocation_budget) return Error.AllocationBudgetExceeded;
+        const backing = try std.heap.page_allocator.alloc(u8, allocation_budget);
+        var zone = ZoneFile{
+            .backing = backing,
+            .storage = std.heap.FixedBufferAllocator.init(backing),
+        };
+        errdefer zone.deinit();
+        parseWithAllocator(&zone, zone.storage.allocator(), text, allocation_budget) catch |err| switch (err) {
+            error.OutOfMemory => return Error.AllocationBudgetExceeded,
+            else => return err,
+        };
+        return zone;
+    }
+
+    fn parseWithAllocator(zone: *ZoneFile, storage_allocator: std.mem.Allocator, text: []const u8, allocation_budget: usize) !void {
         var saw_soa = false;
         var saw_apex_ns = false;
 
-        var logical_buffer: [1024]u8 = undefined;
-        var logical_len: usize = 0;
+        var logical_buffer: std.ArrayList(u8) = .empty;
+        defer logical_buffer.deinit(storage_allocator);
         var paren_depth: usize = 0;
 
         var lines = std.mem.splitScalar(u8, text, '\n');
@@ -65,40 +100,57 @@ pub const ZoneFile = struct {
             const trimmed = std.mem.trim(u8, stripped, " \t\r");
             if (trimmed.len == 0) continue;
 
-            if (logical_len != 0) {
-                if (logical_len >= logical_buffer.len) return Error.BadRecord;
-                logical_buffer[logical_len] = ' ';
-                logical_len += 1;
+            const separator_len: usize = if (logical_buffer.items.len == 0) 0 else 1;
+            const base_len = std.math.add(usize, logical_buffer.items.len, separator_len) catch {
+                return Error.AllocationBudgetExceeded;
+            };
+            const required_len = std.math.add(usize, base_len, trimmed.len) catch {
+                return Error.AllocationBudgetExceeded;
+            };
+            if (required_len > allocation_budget) return Error.AllocationBudgetExceeded;
+            if (logical_buffer.capacity < required_len) {
+                try logical_buffer.ensureTotalCapacityPrecise(storage_allocator, required_len);
             }
-            if (logical_len + trimmed.len > logical_buffer.len) return Error.BadRecord;
-            @memcpy(logical_buffer[logical_len .. logical_len + trimmed.len], trimmed);
-            logical_len += trimmed.len;
+            if (separator_len != 0) try logical_buffer.append(storage_allocator, ' ');
+            try logical_buffer.appendSlice(storage_allocator, trimmed);
             paren_depth = updateParenDepth(paren_depth, trimmed);
             if (paren_depth != 0) continue;
 
-            const logical = logical_buffer[0..logical_len];
-            try zone.parseLogicalLine(logical, &saw_soa, &saw_apex_ns);
-            logical_len = 0;
+            const logical = logical_buffer.items;
+            try zone.parseLogicalLine(storage_allocator, logical, &saw_soa, &saw_apex_ns);
+            logical_buffer.clearRetainingCapacity();
         }
 
-        if (zone.origin_len == 0) return Error.MissingOrigin;
+        if (logical_buffer.items.len != 0) return Error.BadRecord;
+        if (zone.origin.len == 0) return Error.MissingOrigin;
         if (zone.default_ttl == 0) return Error.MissingTtl;
         if (!saw_soa) return Error.MissingSoa;
         if (!saw_apex_ns) return Error.MissingApexNs;
-        return zone;
+    }
+
+    pub fn deinit(self: *ZoneFile) void {
+        std.heap.page_allocator.free(self.backing);
+        self.backing = &.{};
+        self.storage = std.heap.FixedBufferAllocator.init(self.backing);
+        self.records = .{};
+        self.origin = &.{};
+        self.default_ttl = 0;
     }
 
     pub fn originText(self: *const ZoneFile) []const u8 {
-        return self.origin[0..self.origin_len];
+        return self.origin;
     }
 
-    fn parseLogicalLine(self: *ZoneFile, line: []const u8, saw_soa: *bool, saw_apex_ns: *bool) !void {
+    fn parseLogicalLine(self: *ZoneFile, allocator: std.mem.Allocator, line: []const u8, saw_soa: *bool, saw_apex_ns: *bool) !void {
         var tokens = Tokenizer.init(line);
         const first = tokens.next() orelse return;
 
         if (std.mem.eql(u8, first, "$ORIGIN")) {
             const origin = tokens.next() orelse return Error.BadDirective;
-            try copyText(&self.origin, &self.origin_len, ensureTrailingDot(origin));
+            const origin_text = ensureTrailingDot(origin);
+            try validateName(origin_text);
+            const copied_origin = try copyText(allocator, origin_text);
+            self.origin = copied_origin;
             return;
         }
 
@@ -108,7 +160,7 @@ pub const ZoneFile = struct {
             return;
         }
 
-        if (self.origin_len == 0) return Error.MissingOrigin;
+        if (self.origin.len == 0) return Error.MissingOrigin;
         if (self.default_ttl == 0) return Error.MissingTtl;
 
         var ttl = self.default_ttl;
@@ -130,27 +182,38 @@ pub const ZoneFile = struct {
             .ttl = ttl,
             .rrtype = rrtype.?,
         };
-        try self.expandOwner(owner_token, &record);
-        try copyText(&record.rdata, &record.rdata_len, tokens.rest());
-        try self.records.append(record);
+        try self.expandOwner(allocator, owner_token, &record);
+        errdefer allocator.free(record.owner);
+        record.rdata = try copyText(allocator, tokens.rest());
+        errdefer allocator.free(record.rdata);
+        try self.records.append(allocator, record);
 
         if (record.rrtype.eql(.SOA)) saw_soa.* = true;
         if (record.rrtype.eql(.NS) and std.mem.eql(u8, record.ownerText(), self.originText())) saw_apex_ns.* = true;
     }
 
-    fn expandOwner(self: *const ZoneFile, owner: []const u8, record: *ZoneRecord) !void {
+    fn expandOwner(self: *ZoneFile, allocator: std.mem.Allocator, owner: []const u8, record: *ZoneRecord) !void {
         if (std.mem.eql(u8, owner, "@")) {
-            try copyText(&record.owner, &record.owner_len, self.originText());
+            record.owner = try copyText(allocator, self.originText());
         } else if (std.mem.endsWith(u8, owner, ".")) {
-            try copyText(&record.owner, &record.owner_len, owner);
+            record.owner = try copyText(allocator, owner);
         } else {
-            var buffer: [max_text]u8 = undefined;
-            if (owner.len + 1 + self.origin_len > buffer.len) return Error.TextTooLong;
-            @memcpy(buffer[0..owner.len], owner);
-            buffer[owner.len] = '.';
-            @memcpy(buffer[owner.len + 1 .. owner.len + 1 + self.origin_len], self.originText());
-            try copyText(&record.owner, &record.owner_len, buffer[0 .. owner.len + 1 + self.origin_len]);
+            const owner_len = std.math.add(usize, owner.len, 1) catch return error.OutOfMemory;
+            const expanded_len = std.math.add(usize, owner_len, self.origin.len) catch return error.OutOfMemory;
+            const expanded = try allocator.alloc(u8, expanded_len);
+            @memcpy(expanded[0..owner.len], owner);
+            expanded[owner.len] = '.';
+            @memcpy(expanded[owner.len + 1 ..], self.originText());
+            record.owner = expanded;
         }
+        errdefer allocator.free(record.owner);
+        try validateName(record.ownerText());
+    }
+
+    fn copyText(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
+        const copy = try allocator.alloc(u8, text.len);
+        @memcpy(copy, text);
+        return copy;
     }
 };
 
@@ -223,10 +286,8 @@ fn parseRecordType(text: []const u8) ?RecordType {
     return null;
 }
 
-fn copyText(dest: *[max_text]u8, len: *usize, text: []const u8) Error!void {
-    if (text.len > dest.len) return Error.TextTooLong;
-    @memcpy(dest[0..text.len], text);
-    len.* = text.len;
+fn validateName(text: []const u8) Error!void {
+    _ = dns_name.Name.fromText(text) catch return Error.BadName;
 }
 
 fn ensureTrailingDot(text: []const u8) []const u8 {
@@ -244,7 +305,8 @@ test "zone parser loads origin ttl and basic records" {
         \\
     ;
 
-    const zone = try ZoneFile.parse(text);
+    var zone = try ZoneFile.parse(text);
+    defer zone.deinit();
     try std.testing.expectEqualStrings("home.arpa.", zone.originText());
     try std.testing.expectEqual(@as(u32, 3600), zone.default_ttl);
     try std.testing.expectEqual(@as(usize, 4), zone.records.len);
@@ -287,7 +349,90 @@ test "zone parser loads bundled home.arpa example" {
         \\dns IN A  192.168.1.1
         \\
     ;
-    const zone = try ZoneFile.parse(text);
+    var zone = try ZoneFile.parse(text);
+    defer zone.deinit();
     try std.testing.expectEqualStrings("home.arpa.", zone.originText());
     try std.testing.expect(zone.records.len >= 4);
+}
+
+test "parses a large zone without arbitrary limits" {
+    var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer input.deinit();
+
+    try input.writer.writeAll(
+        "$ORIGIN home.arpa.\n" ++
+            "$TTL 3600\n" ++
+            "@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600\n" ++
+            "@ IN NS ns1.home.arpa.\n",
+    );
+    try input.writer.writeAll("long IN TXT \"");
+    const long_text = [_]u8{'x'} ** 300;
+    try input.writer.writeAll(&long_text);
+    try input.writer.writeAll("\"\n");
+    var index: usize = 0;
+    while (index < 1001) : (index += 1) {
+        try input.writer.print("host{d} IN A 192.0.2.1\n", .{index});
+    }
+
+    var zone = try ZoneFile.parse(input.written());
+    defer zone.deinit();
+    try std.testing.expectEqual(@as(usize, 1004), zone.records.len);
+    try std.testing.expectEqualStrings("home.arpa.", zone.originText());
+    try std.testing.expect(zone.records.items[2].rdataText().len > 256);
+    try std.testing.expectEqualStrings("192.0.2.1", zone.records.items[zone.records.len - 1].rdataText());
+}
+
+test "zone parser owns its fixed backing reservation" {
+    var zone = try ZoneFile.parse(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.0.2.1
+        \\
+    );
+    defer zone.deinit();
+    try std.testing.expectEqual(max_zone_allocation_bytes, zone.storage.buffer.len);
+}
+
+test "zone parser rejects malformed record parse" {
+    try std.testing.expectError(Error.BadName, ZoneFile.parse(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\invalid... IN A 192.0.2.1
+        \\
+    ));
+}
+
+test "zone parser charges retained arena reallocations against its allocation budget" {
+    var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer input.deinit();
+    try input.writer.writeAll(
+        "$ORIGIN home.arpa.\n" ++
+            "$TTL 3600\n" ++
+            "@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600\n" ++
+            "@ IN NS ns1.home.arpa.\n",
+    );
+    var index: usize = 0;
+    while (index < 32) : (index += 1) {
+        try input.writer.print("host{d} IN A 192.0.2.1\n", .{index});
+    }
+
+    try std.testing.expectError(Error.AllocationBudgetExceeded, ZoneFile.parseWithBudget(input.written(), 4096));
+}
+
+test "zone parser retains no more than its fixed allocation budget" {
+    const allocation_budget = 4096;
+    var zone = try ZoneFile.parseWithBudget(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.0.2.1
+        \\
+    , allocation_budget);
+    defer zone.deinit();
+
+    try std.testing.expectEqual(allocation_budget, zone.storage.buffer.len);
+    try std.testing.expect(zone.storage.end_index <= zone.storage.buffer.len);
 }

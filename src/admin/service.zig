@@ -1,3 +1,6 @@
+/// Contract: Applies admin commands to a metrics snapshot and formats responses.
+/// Ownership: Service is inline; request and response buffers are borrowed by the caller.
+/// Errors: Protocol and formatting failures are typed; socket/file I/O is handled by admin socket.
 const std = @import("std");
 const metrics = @import("../metrics.zig");
 const protocol = @import("protocol.zig");

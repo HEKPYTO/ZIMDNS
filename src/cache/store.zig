@@ -1,3 +1,6 @@
+/// Contract: Stores bounded DNS responses with TTL and stale-serving lookup semantics.
+/// Ownership: Store owns all fixed-size entry bytes; Lookup borrows response bytes from Store.
+/// Errors: Capacity and size violations are typed; persistence or I/O is not handled here.
 const std = @import("std");
 
 const max_name = 255;

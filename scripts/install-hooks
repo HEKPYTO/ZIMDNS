@@ -1,0 +1,44 @@
+#!/bin/sh
+set -eu
+
+repo_root=$(git rev-parse --show-toplevel)
+hook_path=$(git rev-parse --git-path hooks/pre-commit)
+hook_source="$repo_root/scripts/pre-commit"
+
+mkdir -p "$(dirname "$hook_path")"
+
+managed_hook=$(mktemp "$hook_path.tmp.XXXXXX")
+trap 'rm -f "$managed_hook"' EXIT HUP INT TERM
+printf '%s\n' \
+    '#!/bin/sh' \
+    '# ZIMDNS managed pre-commit hook' \
+    'set -eu' \
+    'exec "$(git rev-parse --show-toplevel)/scripts/pre-commit" "$@"' \
+    > "$managed_hook"
+chmod +x "$managed_hook"
+
+if [ -L "$hook_path" ]; then
+    hook_target=$(readlink "$hook_path")
+    case "$hook_target" in
+        "$hook_source")
+            ;;
+        */scripts/pre-commit|scripts/pre-commit)
+            if [ ! -f "$hook_path" ] || ! cmp -s "$hook_path" "$hook_source"; then
+                echo "refusing to replace existing pre-commit symlink: $hook_path" >&2
+                exit 1
+            fi
+            ;;
+        *)
+            echo "refusing to replace existing pre-commit symlink: $hook_path" >&2
+            exit 1
+            ;;
+    esac
+elif [ -e "$hook_path" ]; then
+    if ! cmp -s "$hook_path" "$managed_hook"; then
+        echo "refusing to replace existing pre-commit hook: $hook_path" >&2
+        exit 1
+    fi
+    exit 0
+fi
+
+mv "$managed_hook" "$hook_path"

@@ -9,14 +9,14 @@ const std = @import("std");
 
 pub fn formatPrometheus(counters: Counters, buffer: []u8) ![]const u8 {
     return std.fmt.bufPrint(buffer,
-        \\# TYPE gcli_dns_queries_total counter
-        \\gcli_dns_queries_total {d}
-        \\# TYPE gcli_dns_responses_total counter
-        \\gcli_dns_responses_total {d}
-        \\# TYPE gcli_dns_bad_queries_total counter
-        \\gcli_dns_bad_queries_total {d}
-        \\# TYPE gcli_dns_encode_failures_total counter
-        \\gcli_dns_encode_failures_total {d}
+        \\# TYPE zimdns_queries_total counter
+        \\zimdns_queries_total {d}
+        \\# TYPE zimdns_responses_total counter
+        \\zimdns_responses_total {d}
+        \\# TYPE zimdns_bad_queries_total counter
+        \\zimdns_bad_queries_total {d}
+        \\# TYPE zimdns_encode_failures_total counter
+        \\zimdns_encode_failures_total {d}
         \\
     , .{
         counters.queries_total,
@@ -36,8 +36,8 @@ test "metrics format emits prometheus counters" {
     var buffer: [512]u8 = undefined;
     const text = try formatPrometheus(counters, &buffer);
 
-    try std.testing.expect(std.mem.indexOf(u8, text, "gcli_dns_queries_total 2\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "gcli_dns_responses_total 1\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "gcli_dns_bad_queries_total 1\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "gcli_dns_encode_failures_total 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zimdns_queries_total 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zimdns_responses_total 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zimdns_bad_queries_total 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zimdns_encode_failures_total 0\n") != null);
 }

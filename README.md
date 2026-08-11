@@ -1,6 +1,6 @@
-# gcli-dns
+# ZIMDNS
 
-gcli-dns is a minimal, local-first DNS server and CLI written in Zig. The declared first-release profile is one scriptable binary with a small authoritative path, safe forwarding over DNS/UDP and DNS/TCP, and standards evidence for every advertised behavior. There is no web UI or remote administration surface in this profile.
+ZIMDNS is a minimal, local-first DNS server and CLI written in Zig. The declared first-release profile is one scriptable binary with a small authoritative path, safe forwarding over DNS/UDP and DNS/TCP, and standards evidence for every advertised behavior. There is no web UI or remote administration surface in this profile.
 
 The [RFC standards matrix](docs/standards-matrix.md) is the source of truth for what is implemented, partial, planned, or out of scope. A roadmap item is not a supported feature, and a `partial` row names only its tested subset.
 
@@ -12,10 +12,10 @@ The repository is a Phase 1 foundation and wire-core slice. It currently contain
 
 Key documents:
 
-- [Master specification](docs/specs/gcli-dns-master-spec.md)
-- [RFC-first long-range design](docs/plans/2026-05-30-gcli-dns-long-range-design.md)
-- [RFC-first implementation plan](docs/plans/2026-05-30-gcli-dns-implementation.md)
-- [Historical revision findings](docs/notes/specs/2026-08-10-gcli-dns-revision-findings.md)
+- [Master specification](docs/specs/zimdns-master-spec.md)
+- [RFC-first long-range design](docs/plans/2026-05-30-zimdns-long-range-design.md)
+- [RFC-first implementation plan](docs/plans/2026-05-30-zimdns-implementation.md)
+- [Historical revision findings](docs/notes/specs/2026-08-10-zimdns-revision-findings.md)
 
 ## Development
 

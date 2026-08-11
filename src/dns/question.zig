@@ -1,3 +1,6 @@
+/// Contract: Parses and encodes one DNS question.
+/// Ownership: Question names are inline values; message and Writer buffers are borrowed.
+/// Errors: Wire/type failures are typed protocol errors; this module has no I/O boundary.
 const std = @import("std");
 const Reader = @import("reader.zig").Reader;
 const Writer = @import("writer.zig").Writer;

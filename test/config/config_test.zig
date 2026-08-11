@@ -1,7 +1,26 @@
 const std = @import("std");
-const gcli_dns = @import("gcli_dns");
-const Config = gcli_dns.config_parser.Config;
-const doctor = gcli_dns.doctor;
+const zimdns = @import("zimdns");
+const Config = zimdns.config_parser.Config;
+const ServerContext = zimdns.config_loader.ServerContext;
+const doctor = zimdns.doctor;
+
+const zone_one =
+    \\$ORIGIN one.example.
+    \\$TTL 3600
+    \\@ IN SOA ns.one.example. hostmaster.one.example. 1 3600 900 1209600 3600
+    \\@ IN NS ns.one.example.
+    \\www IN A 192.0.2.1
+    \\
+;
+
+const zone_two =
+    \\$ORIGIN two.example.
+    \\$TTL 3600
+    \\@ IN SOA ns.two.example. hostmaster.two.example. 1 3600 900 1209600 3600
+    \\@ IN NS ns.two.example.
+    \\www IN A 192.0.2.2
+    \\
+;
 
 test "config parser loads bundled example config" {
     const text = @embedFile("config_fixture.gdns");
@@ -52,4 +71,67 @@ test "doctor reports invalid blocklist text" {
 
     try std.testing.expect(!report.ok());
     try std.testing.expect(report.has(.invalid_blocklist));
+}
+
+test "server context loads zones and blocklists in declaration order" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{ .sub_path = "one.zone", .data = zone_one });
+    try dir.dir.writeFile(io, .{ .sub_path = "two.zone", .data = zone_two });
+    try dir.dir.writeFile(io, .{ .sub_path = "one.list", .data = "ads.one.example.\n" });
+    try dir.dir.writeFile(io, .{ .sub_path = "two.list", .data = "ads.two.example.\n" });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data =
+        \\zone two.example primary two.zone
+        \\blocklist file two.list
+        \\zone one.example primary one.zone
+        \\blocklist file one.list
+        \\
+    });
+
+    var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), context.zones.items.len);
+    try std.testing.expectEqualStrings("two.example.", context.zones.items[0].originText());
+    try std.testing.expectEqualStrings("one.example.", context.zones.items[1].originText());
+    try std.testing.expectEqualStrings(
+        "ads.two.example.",
+        context.blocklist.entries[0].bytes[0..context.blocklist.entries[0].len],
+    );
+    try std.testing.expectEqualStrings(
+        "ads.one.example.",
+        context.blocklist.entries[1].bytes[0..context.blocklist.entries[1].len],
+    );
+
+    var runtime = try context.takePrimaryRuntime();
+    defer runtime.deinit();
+    try std.testing.expectEqualStrings("two.example.", runtime.zone.originText());
+    try std.testing.expect(runtime.blocklist.blocks("ads.one.example."));
+    try std.testing.expect(runtime.blocklist.blocks("ads.two.example."));
+}
+
+test "server context maps missing referenced zone" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone missing.example primary missing.zone\n" });
+
+    try std.testing.expectError(
+        error.MissingReferencedFile,
+        ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator),
+    );
+}
+
+test "server context maps missing referenced blocklist" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "blocklist file missing.list\n" });
+
+    try std.testing.expectError(
+        error.MissingReferencedFile,
+        ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator),
+    );
 }

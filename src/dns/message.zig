@@ -1,9 +1,14 @@
+/// Contract: Parses and encodes complete DNS messages, including bounded EDNS sections.
+/// Ownership: Message sections own allocator-backed arrays and require Message.deinit; inputs and Writer storage are borrowed.
+/// Errors: Wire violations are typed parser/encoder errors; transport I/O is outside this module.
 const std = @import("std");
 const Reader = @import("reader.zig").Reader;
 const Writer = @import("writer.zig").Writer;
+const CompressionTable = @import("writer.zig").CompressionTable;
 const header_mod = @import("header.zig");
 const question_mod = @import("question.zig");
 const record_mod = @import("record.zig");
+const name_mod = @import("name.zig");
 
 pub const Error = error{
     EndOfInput,
@@ -12,6 +17,10 @@ pub const Error = error{
     BadRecord,
     AllocationBudgetExceeded,
     TrailingData,
+    MalformedEdnsOption,
+    EdnsOptionsTooLong,
+    MultipleOptRecords,
+    InvalidOptOwner,
 };
 
 /// Maximum storage allocated for all resource-record sections in one message.
@@ -60,6 +69,10 @@ pub const EdnsState = struct {
     dnssec_ok: bool,
 };
 
+pub const EDNS_VERSION: u8 = 0;
+pub const DEFAULT_EDNS_UDP_PAYLOAD_SIZE: u16 = 1232;
+pub const CLASSIC_UDP_PAYLOAD_SIZE: u16 = 512;
+
 pub const Message = struct {
     allocator: std.mem.Allocator = std.heap.page_allocator,
     header: header_mod.Header,
@@ -104,7 +117,10 @@ pub const Message = struct {
             message.deinit();
             return Error.UnsupportedQuestionCount;
         }
-        if (message.header.answer_count != 0 or message.header.authority_count != 0 or message.header.additional_count != 0) {
+        if (message.header.answer_count != 0 or message.header.authority_count != 0 or
+            message.header.additional_count > 1 or
+            (message.header.additional_count == 1 and message.edns == null))
+        {
             message.deinit();
             return Error.UnsupportedQuestionCount;
         }
@@ -118,13 +134,16 @@ pub const Message = struct {
     }
 
     pub fn encode(self: Message, writer: *Writer) !void {
+        var compression = CompressionTable{};
         try self.header.encode(writer);
         if (self.question) |question| {
-            try question.encode(writer);
+            try compression.writeName(writer, question.name.asWire());
+            try writer.writeU16(question.qtype.code());
+            try writer.writeU16(question.qclass.code());
         }
-        for (self.answers.slice()) |record| try record.encode(writer);
-        for (self.authorities.slice()) |record| try record.encode(writer);
-        for (self.additionals.slice()) |record| try record.encode(writer);
+        for (self.answers.slice()) |record| try record.encodeCompressed(writer, &compression);
+        for (self.authorities.slice()) |record| try record.encodeCompressed(writer, &compression);
+        for (self.additionals.slice()) |record| try record.encodeCompressed(writer, &compression);
     }
 };
 
@@ -153,9 +172,19 @@ fn parseAdditionalSection(allocator: std.mem.Allocator, bytes: []const u8, reade
     message.additionals = try RecordSection.init(allocator, count);
     var index: u16 = 0;
     while (index < count) : (index += 1) {
-        const parsed_record = record_mod.ResourceRecord.parse(bytes, reader.position()) catch return Error.BadRecord;
+        const record_offset = reader.position();
+        const parsed_record = record_mod.ResourceRecord.parse(bytes, reader.position()) catch |err| switch (err) {
+            record_mod.Error.MalformedOption => return Error.MalformedEdnsOption,
+            record_mod.Error.OptionsTooLong => return Error.EdnsOptionsTooLong,
+            else => return Error.BadRecord,
+        };
         message.additionals.items[index] = parsed_record.record;
         if (parsed_record.record.rrtype.eql(.OPT)) {
+            if (message.edns != null) return Error.MultipleOptRecords;
+            var root = name_mod.Name.root();
+            if (record_offset >= bytes.len or bytes[record_offset] != 0 or !parsed_record.record.owner.eql(&root)) {
+                return Error.InvalidOptOwner;
+            }
             message.edns = .{
                 .udp_payload_size = parsed_record.record.class.code(),
                 .extended_rcode = @intCast((parsed_record.record.ttl >> 24) & 0xff),
@@ -273,4 +302,84 @@ test "message extracts EDNS OPT state from additional section" {
     try std.testing.expectEqual(@as(u8, 0), parsed.edns.?.version);
     try std.testing.expect(parsed.edns.?.dnssec_ok);
     try std.testing.expectEqual(@as(usize, 1), parsed.additionals.len);
+}
+
+test "message preserves EDNS extended RCODE, DO bit, and option bytes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const bytes = [_]u8{
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        7,    'e',  'x',  'a',  'm',  'p',  'l',  'e',  3,    'c',  'o',  'm',
+        0,    0x00, 0x01, 0x00, 0x01, 0,    0x00, 0x29, 0x10, 0x00, 0x02, 0x00,
+        0x80, 0x00, 0x00, 0x0b, 0xea, 0x60, 0x00, 0x03, 0x01, 0x02, 0x03, 0x00,
+        0x0f, 0x00, 0x00,
+    };
+
+    const parsed = try Message.parse(arena.allocator(), &bytes);
+    try std.testing.expect(parsed.edns != null);
+    try std.testing.expectEqual(@as(u16, 4096), parsed.edns.?.udp_payload_size);
+    try std.testing.expectEqual(@as(u8, 2), parsed.edns.?.extended_rcode);
+    try std.testing.expectEqual(@as(u8, 0), parsed.edns.?.version);
+    try std.testing.expect(parsed.edns.?.dnssec_ok);
+    try std.testing.expectEqualSlices(u8, &.{ 0xea, 0x60, 0x00, 0x03, 0x01, 0x02, 0x03, 0x00, 0x0f, 0x00, 0x00 }, parsed.additionals.items[0].rdata.OPT.bytes());
+}
+
+test "message rejects malformed OPT records" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const multiple_opt = [_]u8{
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
+        0,    0x00, 0x01, 0x00, 0x01, 0,    0x00, 0x29, 0x02, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0,    0x00, 0x29, 0x02, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00,
+    };
+    try std.testing.expectError(Error.MultipleOptRecords, Message.parse(arena.allocator(), &multiple_opt));
+
+    const invalid_owner = [_]u8{
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        0,    0x00, 0x01, 0x00, 0x01, 1,    'x',  0x00, 0x00, 0x29, 0x02, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    };
+    try std.testing.expectError(Error.InvalidOptOwner, Message.parse(arena.allocator(), &invalid_owner));
+
+    const malformed_option = [_]u8{
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        0,    0x00, 0x01, 0x00, 0x01, 0,    0x00, 0x29, 0x02, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x04, 0x00, 0x01, 0x00, 0x03,
+    };
+    try std.testing.expectError(Error.MalformedEdnsOption, Message.parse(arena.allocator(), &malformed_option));
+}
+
+test "message response encoding uses backwards owner compression" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const bytes = [_]u8{
+        0x12, 0x34, 0x85, 0x80, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
+        7,    'e',  'x',  'a',  'm',  'p',  'l',  'e',  3,    'c',  'o',  'm',
+        0,    0x00, 0x01, 0x00, 0x01, 3,    'w',  'w',  'w',  7,    'e',  'x',
+        'a',  'm',  'p',  'l',  'e',  3,    'c',  'o',  'm',  0,    0x00, 0x01,
+        0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04, 192,  0,    2,    1,
+        4,    'm',  'a',  'i',  'l',  7,    'e',  'x',  'a',  'm',  'p',  'l',
+        'e',  3,    'c',  'o',  'm',  0,    0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
+        0x00, 0x3c, 0x00, 0x04, 192,  0,    2,    2,
+    };
+
+    const parsed = try Message.parse(arena.allocator(), &bytes);
+    var output: [256]u8 = undefined;
+    var writer = Writer.init(&output);
+    try parsed.encode(&writer);
+
+    const encoded = writer.written();
+    try std.testing.expect(std.mem.indexOf(u8, encoded, &.{ 3, 'w', 'w', 'w', 0xc0 }) != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, &.{ 4, 'm', 'a', 'i', 'l', 0xc0 }) != null);
+    var pointer_index: usize = 0;
+    while (pointer_index + 1 < encoded.len) : (pointer_index += 1) {
+        if ((encoded[pointer_index] & 0xc0) == 0xc0) {
+            const pointer = std.mem.readInt(u16, encoded[pointer_index..][0..2], .big) & 0x3fff;
+            try std.testing.expect(pointer < pointer_index);
+        }
+    }
 }

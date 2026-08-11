@@ -1,6 +1,6 @@
 listen dns udp 0.0.0.0:1053
 listen dns tcp 0.0.0.0:1053
-admin socket /run/gcli-dns/admin.sock
+admin socket /run/zimdns/admin.sock
 recursion deny 0.0.0.0/0
 recursion deny ::/0
 forwarder default udp 9.9.9.9

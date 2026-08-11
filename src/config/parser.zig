@@ -1,3 +1,6 @@
+/// Contract: Parses the compact server configuration language into typed fixed-size values.
+/// Ownership: Config owns inline directive storage; input text is borrowed and no deinit is required.
+/// Errors: Directive and value failures are typed parser errors; config file I/O belongs to callers.
 const std = @import("std");
 
 const max_items = 32;
@@ -214,15 +217,15 @@ test "config parser loads documented directives" {
     const text =
         \\listen dns udp 0.0.0.0:1053
         \\listen dns tcp 0.0.0.0:1053
-        \\admin socket /run/gcli-dns/admin.sock
+        \\admin socket /run/zimdns/admin.sock
         \\recursion deny 0.0.0.0/0
         \\recursion deny ::/0
         \\forwarder default udp 9.9.9.9
         \\cache max-entries 100000
         \\cache serve-stale on
         \\cache serve-stale-ttl 3600
-        \\zone home.arpa primary /etc/gcli-dns/zones/home.arpa.zone
-        \\blocklist file /etc/gcli-dns/blocklists/ads.txt
+        \\zone home.arpa primary /etc/zimdns/zones/home.arpa.zone
+        \\blocklist file /etc/zimdns/blocklists/ads.txt
         \\
     ;
 
@@ -230,7 +233,7 @@ test "config parser loads documented directives" {
     try std.testing.expectEqual(@as(usize, 2), config.listeners.len);
     try std.testing.expectEqual(Transport.udp, config.listeners.items[0].transport);
     try std.testing.expectEqual(@as(u16, 1053), config.listeners.items[0].port);
-    try std.testing.expectEqualStrings("/run/gcli-dns/admin.sock", config.admin_socket.pathText());
+    try std.testing.expectEqualStrings("/run/zimdns/admin.sock", config.admin_socket.pathText());
     try std.testing.expectEqual(@as(usize, 2), config.recursion_rules.len);
     try std.testing.expectEqual(@as(usize, 1), config.forwarders.len);
     try std.testing.expectEqual(@as(u32, 100000), config.cache.max_entries);
@@ -239,7 +242,7 @@ test "config parser loads documented directives" {
     try std.testing.expectEqual(@as(usize, 1), config.zones.len);
     try std.testing.expectEqualStrings("home.arpa", config.zones.items[0].nameText());
     try std.testing.expectEqual(@as(usize, 1), config.blocklists.len);
-    try std.testing.expectEqualStrings("/etc/gcli-dns/blocklists/ads.txt", config.blocklists.items[0].pathText());
+    try std.testing.expectEqualStrings("/etc/zimdns/blocklists/ads.txt", config.blocklists.items[0].pathText());
 }
 
 test "config parser rejects unknown and malformed directives" {

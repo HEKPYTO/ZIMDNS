@@ -1,10 +1,15 @@
+/// Contract: Parses and encodes supported DNS RDATA and EDNS option payloads.
+/// Ownership: RDATA values own inline bounded bytes; input message and Writer storage are borrowed.
+/// Errors: RDATA and option violations are typed; transport/file I/O is not handled here.
 const std = @import("std");
 const Writer = @import("writer.zig").Writer;
+const CompressionTable = @import("writer.zig").CompressionTable;
 const Name = @import("name.zig").Name;
 const RecordType = @import("types.zig").RecordType;
 
 const max_txt_len = 255;
 const max_unknown_len = 512;
+const max_opt_data_len = 512;
 const max_caa_tag_len = 32;
 const max_caa_value_len = 255;
 
@@ -17,6 +22,8 @@ pub const Error = error{
     CaaTagTooLong,
     CaaValueTooLong,
     BadName,
+    MalformedOption,
+    OptionsTooLong,
 };
 
 pub const Soa = struct {
@@ -75,6 +82,15 @@ pub const Unknown = struct {
     }
 };
 
+pub const Opt = struct {
+    data: [max_opt_data_len]u8 = undefined,
+    len: u16 = 0,
+
+    pub fn bytes(self: *const Opt) []const u8 {
+        return self.data[0..self.len];
+    }
+};
+
 pub const RData = union(enum) {
     A: [4]u8,
     AAAA: [16]u8,
@@ -86,6 +102,7 @@ pub const RData = union(enum) {
     TXT: Txt,
     SRV: Srv,
     CAA: Caa,
+    OPT: Opt,
     Unknown: Unknown,
 
     pub fn parse(rrtype: RecordType, message: []const u8, offset: usize, len: usize) Error!RData {
@@ -169,6 +186,20 @@ pub const RData = union(enum) {
                 @memcpy(caa.value[0..value_len], message[offset + 2 + tag_len .. end]);
                 break :blk .{ .CAA = caa };
             },
+            RecordType.OPT.value => blk: {
+                if (len > max_opt_data_len) return Error.OptionsTooLong;
+                var opt = Opt{ .len = @intCast(len) };
+                @memcpy(opt.data[0..len], message[offset..end]);
+                var option_offset: usize = 0;
+                while (option_offset < len) {
+                    if (len - option_offset < 4) return Error.MalformedOption;
+                    const option_len = std.mem.readInt(u16, opt.data[option_offset + 2 ..][0..2], .big);
+                    option_offset += 4;
+                    if (option_len > len - option_offset) return Error.MalformedOption;
+                    option_offset += option_len;
+                }
+                break :blk .{ .OPT = opt };
+            },
             else => blk: {
                 if (len > max_unknown_len) return Error.UnknownTooLong;
                 var unknown = Unknown{ .len = @intCast(len) };
@@ -212,6 +243,46 @@ pub const RData = union(enum) {
                 try writer.writeBytes(caa.tagText());
                 try writer.writeBytes(caa.valueText());
             },
+            .OPT => |opt| try writer.writeBytes(opt.bytes()),
+            .Unknown => |unknown| try writer.writeBytes(unknown.bytes()),
+        }
+    }
+
+    pub fn encodeCompressed(self: RData, writer: *Writer, table: *CompressionTable) !void {
+        switch (self) {
+            .A => |bytes| try writer.writeBytes(&bytes),
+            .AAAA => |bytes| try writer.writeBytes(&bytes),
+            .NS, .CNAME, .PTR => |name| try table.writeName(writer, name.asWire()),
+            .SOA => |soa| {
+                try table.writeName(writer, soa.mname.asWire());
+                try table.writeName(writer, soa.rname.asWire());
+                try writer.writeU32(soa.serial);
+                try writer.writeU32(soa.refresh);
+                try writer.writeU32(soa.retry);
+                try writer.writeU32(soa.expire);
+                try writer.writeU32(soa.minimum);
+            },
+            .MX => |mx| {
+                try writer.writeU16(mx.preference);
+                try table.writeName(writer, mx.exchange.asWire());
+            },
+            .SRV => |srv| {
+                try writer.writeU16(srv.priority);
+                try writer.writeU16(srv.weight);
+                try writer.writeU16(srv.port);
+                try table.writeName(writer, srv.target.asWire());
+            },
+            .TXT => |txt| {
+                try writer.writeU8(txt.len);
+                try writer.writeBytes(txt.text());
+            },
+            .CAA => |caa| {
+                try writer.writeU8(caa.flags);
+                try writer.writeU8(caa.tag_len);
+                try writer.writeBytes(caa.tagText());
+                try writer.writeBytes(caa.valueText());
+            },
+            .OPT => |opt| try writer.writeBytes(opt.bytes()),
             .Unknown => |unknown| try writer.writeBytes(unknown.bytes()),
         }
     }
@@ -306,4 +377,14 @@ test "rdata parses SOA, SRV, and CAA records" {
 test "rdata preserves unknown record bytes" {
     const unknown = try RData.parse(RecordType.fromCode(65280), &.{ 1, 2, 3, 4 }, 0, 4);
     try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, unknown.Unknown.bytes());
+}
+
+test "rdata validates and round trips bounded EDNS options" {
+    const bytes = [_]u8{ 0xea, 0x60, 0x00, 0x03, 0x01, 0x02, 0x03 };
+    const opt = try RData.parse(.OPT, &bytes, 0, bytes.len);
+    var output: [16]u8 = undefined;
+    var writer = Writer.init(&output);
+    try opt.encode(&writer);
+    try std.testing.expectEqualSlices(u8, &bytes, writer.written());
+    try std.testing.expectError(Error.MalformedOption, RData.parse(.OPT, &.{ 0xea, 0x60, 0x00, 0x04, 0x01, 0x02, 0x03 }, 0, 7));
 }

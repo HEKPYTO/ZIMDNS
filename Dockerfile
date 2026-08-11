@@ -25,21 +25,20 @@ RUN /opt/zig/zig build -Doptimize=ReleaseSafe
 
 FROM alpine:3.22 AS runtime
 
-RUN addgroup -S -g 10001 gcli-dns \
-    && adduser -S -D -H -u 10001 -G gcli-dns gcli-dns \
-    && mkdir -p /etc/gcli-dns /var/lib/gcli-dns /run/gcli-dns \
-    && chown -R gcli-dns:gcli-dns /etc/gcli-dns /var/lib/gcli-dns /run/gcli-dns
+RUN addgroup -S -g 10001 zimdns \
+    && adduser -S -D -H -u 10001 -G zimdns zimdns \
+    && mkdir -p /etc/zimdns /var/lib/zimdns /run/zimdns \
+    && chown -R zimdns:zimdns /etc/zimdns /var/lib/zimdns /run/zimdns
 
-COPY --from=build /workspace/zig-out/bin/gcli-dns /usr/local/bin/gcli-dns
-COPY examples/config.gdns /etc/gcli-dns/config.gdns
+COPY --from=build /workspace/zig-out/bin/zimdns /usr/local/bin/zimdns
+COPY examples/config.gdns /etc/zimdns/config.gdns
 
 USER 10001:10001
 EXPOSE 1053/udp 1053/tcp 853/tcp 8443/tcp 8853/udp
-VOLUME ["/etc/gcli-dns", "/var/lib/gcli-dns"]
+VOLUME ["/etc/zimdns", "/var/lib/zimdns"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-    CMD ["/usr/local/bin/gcli-dns", "--help"]
+    CMD ["/usr/local/bin/zimdns", "--help"]
 
-ENTRYPOINT ["/usr/local/bin/gcli-dns"]
+ENTRYPOINT ["/usr/local/bin/zimdns"]
 CMD ["--help"]
-

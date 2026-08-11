@@ -1,3 +1,6 @@
+/// Contract: Parses DNS names and writes canonical wire names with pointer safety.
+/// Ownership: Name values are inline and parse borrows message bytes; Writer storage is borrowed.
+/// Errors: Name-format and capacity failures are typed; no file or socket I/O occurs.
 const std = @import("std");
 const Writer = @import("writer.zig").Writer;
 

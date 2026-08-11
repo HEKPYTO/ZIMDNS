@@ -1,3 +1,6 @@
+/// Contract: Builds authoritative lookup indexes from parsed zones.
+/// Ownership: Zone owns moved ZoneFile backing and records; call Zone.deinit; lookup results own allocator storage and need deinit.
+/// Errors: In-memory lookup has typed results; loading and file I/O are outside this module.
 const std = @import("std");
 const RecordType = @import("../dns/types.zig").RecordType;
 const parser = @import("parser.zig");
@@ -14,27 +17,47 @@ pub const LookupResult = struct {
     kind: LookupKind,
     records: parser.RecordList = .{},
     soa: ?parser.ZoneRecord = null,
+
+    pub fn deinit(self: *LookupResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.records.items);
+        self.records = .{};
+    }
 };
 
 pub const Zone = struct {
-    origin: [256]u8 = undefined,
-    origin_len: usize = 0,
+    backing: []u8,
+    origin: []const u8 = &.{},
     records: parser.RecordList = .{},
     soa: ?parser.ZoneRecord = null,
 
-    pub fn fromZoneFile(zone_file: parser.ZoneFile) !Zone {
-        var zone = Zone{};
-        try copyText(&zone.origin, &zone.origin_len, zone_file.originText());
-        var index: usize = 0;
-        while (index < zone_file.records.len) : (index += 1) {
-            const record = zone_file.records.items[index];
-            try zone.records.append(record);
+    /// Moves parsed-zone ownership into an index. The moved-from ZoneFile is safe
+    /// to deinit and no longer owns backing storage or records.
+    pub fn fromZoneFile(zone_file: *parser.ZoneFile) !Zone {
+        var zone = Zone{
+            .backing = zone_file.backing,
+            .origin = zone_file.origin,
+            .records = zone_file.records,
+        };
+        zone_file.backing = &.{};
+        zone_file.storage = std.heap.FixedBufferAllocator.init(zone_file.backing);
+        zone_file.origin = &.{};
+        zone_file.default_ttl = 0;
+        zone_file.records = .{};
+        for (zone.records.items[0..zone.records.len]) |record| {
             if (record.rrtype.eql(.SOA)) zone.soa = record;
         }
         return zone;
     }
 
-    pub fn lookup(self: *const Zone, qname: []const u8, qtype: RecordType) LookupResult {
+    pub fn deinit(self: *Zone) void {
+        std.heap.page_allocator.free(self.backing);
+        self.backing = &.{};
+        self.records = .{};
+        self.origin = &.{};
+        self.soa = null;
+    }
+
+    pub fn lookup(self: *const Zone, allocator: std.mem.Allocator, qname: []const u8, qtype: RecordType) LookupResult {
         if (!std.mem.endsWith(u8, qname, self.originText())) {
             return .{ .kind = .not_authoritative };
         }
@@ -51,31 +74,44 @@ pub const Zone = struct {
             if (record.rrtype.eql(qtype)) {
                 result.kind = .answer;
                 result.soa = null;
-                result.records.append(record) catch return .{ .kind = .nodata, .soa = self.soa };
+                result.records.append(allocator, record) catch {
+                    result.deinit(allocator);
+                    cname_result.deinit(allocator);
+                    return .{ .kind = .nodata, .soa = self.soa };
+                };
             } else if (record.rrtype.eql(.CNAME) and !qtype.eql(.CNAME)) {
-                cname_result.records.append(record) catch return .{ .kind = .nodata, .soa = self.soa };
+                cname_result.records.append(allocator, record) catch {
+                    result.deinit(allocator);
+                    cname_result.deinit(allocator);
+                    return .{ .kind = .nodata, .soa = self.soa };
+                };
             }
         }
 
-        if (result.kind == .answer) return result;
-        if (cname_result.records.len > 0) return cname_result;
+        if (result.kind == .answer) {
+            cname_result.deinit(allocator);
+            return result;
+        }
+        if (cname_result.records.len > 0) {
+            result.deinit(allocator);
+            return cname_result;
+        }
+        result.deinit(allocator);
+        cname_result.deinit(allocator);
         if (owner_exists) return .{ .kind = .nodata, .soa = self.soa };
         return result;
     }
 
     pub fn originText(self: *const Zone) []const u8 {
-        return self.origin[0..self.origin_len];
+        return self.origin;
     }
 };
 
-fn copyText(dest: *[256]u8, len: *usize, text: []const u8) !void {
-    if (text.len > dest.len) return error.TextTooLong;
-    @memcpy(dest[0..text.len], text);
-    len.* = text.len;
-}
-
 test "zone index answers exact A lookup" {
-    const zone_file = try parser.ZoneFile.parse(
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try parser.ZoneFile.parse(
         \\$ORIGIN home.arpa.
         \\$TTL 3600
         \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
@@ -83,15 +119,20 @@ test "zone index answers exact A lookup" {
         \\dns IN A 192.168.1.1
         \\
     );
-    const zone = try Zone.fromZoneFile(zone_file);
-    const result = zone.lookup("dns.home.arpa.", .A);
+    var zone = try Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+    var result = zone.lookup(arena.allocator(), "dns.home.arpa.", .A);
+    defer result.deinit(arena.allocator());
     try std.testing.expectEqual(LookupKind.answer, result.kind);
     try std.testing.expectEqual(@as(usize, 1), result.records.len);
     try std.testing.expectEqualStrings("192.168.1.1", result.records.items[0].rdataText());
 }
 
 test "zone index returns CNAME, NODATA, and NXDOMAIN results" {
-    const zone_file = try parser.ZoneFile.parse(
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try parser.ZoneFile.parse(
         \\$ORIGIN home.arpa.
         \\$TTL 3600
         \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
@@ -100,17 +141,38 @@ test "zone index returns CNAME, NODATA, and NXDOMAIN results" {
         \\dns IN A 192.168.1.1
         \\
     );
-    const zone = try Zone.fromZoneFile(zone_file);
+    var zone = try Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
 
-    const cname = zone.lookup("alias.home.arpa.", .A);
+    var cname = zone.lookup(arena.allocator(), "alias.home.arpa.", .A);
+    defer cname.deinit(arena.allocator());
     try std.testing.expectEqual(LookupKind.cname, cname.kind);
     try std.testing.expectEqual(@as(usize, 1), cname.records.len);
 
-    const nodata = zone.lookup("dns.home.arpa.", .AAAA);
+    var nodata = zone.lookup(arena.allocator(), "dns.home.arpa.", .AAAA);
+    defer nodata.deinit(arena.allocator());
     try std.testing.expectEqual(LookupKind.nodata, nodata.kind);
     try std.testing.expect(nodata.soa != null);
 
-    const nxdomain = zone.lookup("missing.home.arpa.", .A);
+    var nxdomain = zone.lookup(arena.allocator(), "missing.home.arpa.", .A);
+    defer nxdomain.deinit(arena.allocator());
     try std.testing.expectEqual(LookupKind.nxdomain, nxdomain.kind);
     try std.testing.expect(nxdomain.soa != null);
+}
+
+test "zone index moves zone file ownership before either value deinitializes" {
+    var zone_file = try parser.ZoneFile.parse(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
+        \\
+    );
+    var zone = try Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    zone_file.deinit();
+    try std.testing.expectEqual(@as(usize, 0), zone_file.backing.len);
+    try std.testing.expectEqual(@as(usize, 3), zone.records.len);
 }

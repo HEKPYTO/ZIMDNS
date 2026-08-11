@@ -1,6 +1,8 @@
 const std = @import("std");
 
 pub const golden_fixture = @import("golden_fixture.zig");
+pub const dns_message = @import("dns/message.zig");
+pub const dns_name = @import("dns/name.zig");
 pub const zone_parser = @import("zone/parser.zig");
 pub const zone_index = @import("zone/index.zig");
 pub const auth_response = @import("auth/response.zig");
@@ -8,6 +10,7 @@ pub const auth_runtime = @import("auth/runtime.zig");
 pub const listener = @import("platform/listener.zig");
 pub const cli_query = @import("cli/query.zig");
 pub const config_parser = @import("config/parser.zig");
+pub const config_loader = @import("config/loader.zig");
 pub const doctor = @import("doctor.zig");
 pub const cache_store = @import("cache/store.zig");
 pub const metrics = @import("metrics.zig");
@@ -38,6 +41,7 @@ test {
     _ = listener;
     _ = cli_query;
     _ = config_parser;
+    _ = config_loader;
     _ = doctor;
     _ = cache_store;
     _ = metrics;
@@ -69,7 +73,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, command, "--version")) {
-        try stdout.print("gcli-dns {s}\n", .{version_text});
+        try stdout.print("zimdns {s}\n", .{version_text});
         return;
     }
 
@@ -100,24 +104,24 @@ pub fn main(init: std.process.Init) !void {
 
 fn printHelp(writer: *std.Io.Writer) !void {
     try writer.writeAll(
-        \\gcli-dns - Zig DNS server platform
+        \\zimdns - Zig DNS server platform
         \\
         \\Usage:
-        \\  gcli-dns --help
-        \\  gcli-dns --version
-        \\  gcli-dns server run
-        \\  gcli-dns server run --config examples/config.gdns --once-udp
-        \\  gcli-dns server run --zone-file examples/zones/home.arpa.zone --once-udp 1053
-        \\  gcli-dns server run --zone-file examples/zones/home.arpa.zone --once-udp 1053 --max-queries 2 --print-metrics
-        \\  gcli-dns server run --zone-file examples/zones/home.arpa.zone --once-tcp 1053
-        \\  gcli-dns server admin --config examples/config.gdns --once
-        \\  gcli-dns query @127.0.0.1 -p 1053 example.com A
-        \\  gcli-dns zone list
-        \\  gcli-dns record list <zone>
-        \\  gcli-dns cache stats
-        \\  gcli-dns doctor --config examples/config.gdns
-        \\  gcli-dns backup manifest --config examples/config.gdns
-        \\  gcli-dns metrics
+        \\  zimdns --help
+        \\  zimdns --version
+        \\  zimdns server run
+        \\  zimdns server run --config examples/config.gdns --once-udp
+        \\  zimdns server run --zone-file examples/zones/home.arpa.zone --once-udp 1053
+        \\  zimdns server run --zone-file examples/zones/home.arpa.zone --once-udp 1053 --max-queries 2 --print-metrics
+        \\  zimdns server run --zone-file examples/zones/home.arpa.zone --once-tcp 1053
+        \\  zimdns server admin --config examples/config.gdns --once
+        \\  zimdns query @127.0.0.1 -p 1053 example.com A
+        \\  zimdns zone list
+        \\  zimdns record list <zone>
+        \\  zimdns cache stats
+        \\  zimdns doctor --config examples/config.gdns
+        \\  zimdns backup manifest --config examples/config.gdns
+        \\  zimdns metrics
         \\
         \\Implemented now:
         \\  --help, --version, server run --once-udp/--once-tcp, query, doctor
@@ -293,37 +297,42 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
         index += 1;
     }
 
-    var parsed_config: ?config_parser.Config = null;
-    var runtime_blocklist = blocklist.Blocklist{};
+    const explicit_zone_file = zone_file != null;
+    var server_context: ?config_loader.ServerContext = null;
+    defer if (server_context) |*context| context.deinit();
+
     if (config_file) |path| {
-        const config_text = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
-        parsed_config = try config_parser.Config.parse(config_text);
-        if (zone_file == null and parsed_config.?.zones.len > 0) {
-            zone_file = parsed_config.?.zones.items[0].fileText();
-        }
+        server_context = try config_loader.ServerContext.load(std.Io.Dir.cwd(), io, path, allocator);
         if (!port_set) {
-            if (findListenerPort(&parsed_config.?, mode)) |config_port| port = config_port;
-        }
-        var blocklist_index: usize = 0;
-        while (blocklist_index < parsed_config.?.blocklists.len) : (blocklist_index += 1) {
-            const blocklist_path = parsed_config.?.blocklists.items[blocklist_index].pathText();
-            const blocklist_text = try std.Io.Dir.cwd().readFileAlloc(io, blocklist_path, allocator, .limited(1024 * 1024));
-            const parsed_blocklist = try blocklist.Blocklist.parse(blocklist_text);
-            try runtime_blocklist.appendAll(parsed_blocklist);
+            if (findListenerPort(&server_context.?.config, mode)) |config_port| port = config_port;
         }
     }
 
-    const path = zone_file orelse {
-        try writer.writeAll("error: server run requires --zone-file or --config with a zone\n");
-        try exitUsage(writer);
-    };
     if (mode == .none) {
         try writer.writeAll("error: server run currently requires --once-udp or --once-tcp\n");
         try exitUsage(writer);
     }
 
-    const zone_text = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
-    const runtime = try auth_runtime.Runtime.fromZoneTextWithBlocklist(zone_text, runtime_blocklist);
+    var runtime: auth_runtime.Runtime = undefined;
+    if (!explicit_zone_file and server_context != null) {
+        if (server_context.?.zones.items.len == 0) {
+            try writer.writeAll("error: server run requires --zone-file or --config with a zone\n");
+            try exitUsage(writer);
+        }
+        runtime = try server_context.?.takePrimaryRuntime();
+    } else {
+        const path = zone_file orelse {
+            try writer.writeAll("error: server run requires --zone-file or --config with a zone\n");
+            try exitUsage(writer);
+        };
+        const zone_text = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
+        if (server_context) |*context| {
+            runtime = try auth_runtime.Runtime.fromZoneTextWithBlocklist(zone_text, context.blocklist);
+        } else {
+            runtime = try auth_runtime.Runtime.fromZoneText(zone_text);
+        }
+    }
+    defer runtime.deinit();
     var counters = metrics.Counters{};
 
     switch (mode) {
@@ -345,7 +354,11 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
                 try writer.writeAll("error: --print-metrics is currently supported for UDP runs\n");
                 try exitUsage(writer);
             }
-            try listener.serveTcpOnceOnPort(io, &runtime, port);
+            if (max_queries == 0 or max_queries > listener.TCP_MAX_MESSAGES_PER_CONNECTION) {
+                try writer.print("error: TCP --max-queries must be between 1 and {d}\n", .{listener.TCP_MAX_MESSAGES_PER_CONNECTION});
+                try exitUsage(writer);
+            }
+            try listener.serveTcpCountOnPort(io, &runtime, port, max_queries);
         },
         .none => unreachable,
     }

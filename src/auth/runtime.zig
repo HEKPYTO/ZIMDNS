@@ -1,3 +1,6 @@
+/// Contract: Answers DNS queries against one authoritative zone and blocklist.
+/// Ownership: Runtime owns its Zone and inline Blocklist; call Runtime.deinit; query and output buffers are borrowed.
+/// Errors: Query and response failures are typed; transport I/O is handled by platform listeners.
 const std = @import("std");
 const dns_message = @import("../dns/message.zig");
 const dns_writer = @import("../dns/writer.zig");
@@ -16,17 +19,25 @@ pub const Runtime = struct {
     zone: zone_index.Zone,
     blocklist: blocklist_mod.Blocklist = .{},
 
+    /// The returned runtime owns its authoritative zone; call deinit when done.
     pub fn fromZoneText(text: []const u8) !Runtime {
-        const zone_file = try zone_parser.ZoneFile.parse(text);
-        return .{ .zone = try zone_index.Zone.fromZoneFile(zone_file) };
+        var zone_file = try zone_parser.ZoneFile.parse(text);
+        errdefer zone_file.deinit();
+        return .{ .zone = try zone_index.Zone.fromZoneFile(&zone_file) };
     }
 
+    /// The returned runtime owns its authoritative zone; call deinit when done.
     pub fn fromZoneTextWithBlocklist(text: []const u8, blocklist: blocklist_mod.Blocklist) !Runtime {
-        const zone_file = try zone_parser.ZoneFile.parse(text);
+        var zone_file = try zone_parser.ZoneFile.parse(text);
+        errdefer zone_file.deinit();
         return .{
-            .zone = try zone_index.Zone.fromZoneFile(zone_file),
+            .zone = try zone_index.Zone.fromZoneFile(&zone_file),
             .blocklist = blocklist,
         };
+    }
+
+    pub fn deinit(self: *Runtime) void {
+        self.zone.deinit();
     }
 
     pub fn answer(self: *const Runtime, query_bytes: []const u8, output: []u8) ![]const u8 {
@@ -84,7 +95,7 @@ test "authoritative runtime answers raw query bytes" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const runtime = try Runtime.fromZoneText(
+    var runtime = try Runtime.fromZoneText(
         \\$ORIGIN home.arpa.
         \\$TTL 3600
         \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
@@ -92,6 +103,7 @@ test "authoritative runtime answers raw query bytes" {
         \\dns IN A 192.168.1.1
         \\
     );
+    defer runtime.deinit();
 
     var output: [512]u8 = undefined;
     const response_bytes = try runtime.answer(&.{
@@ -107,7 +119,10 @@ test "authoritative runtime answers raw query bytes" {
 }
 
 test "authoritative runtime records metrics for successful and bad queries" {
-    const runtime = try Runtime.fromZoneText(
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(
         \\$ORIGIN home.arpa.
         \\$TTL 3600
         \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
@@ -115,6 +130,7 @@ test "authoritative runtime records metrics for successful and bad queries" {
         \\dns IN A 192.168.1.1
         \\
     );
+    defer runtime.deinit();
 
     var counters = @import("../metrics.zig").Counters{};
     var output: [512]u8 = undefined;
@@ -136,7 +152,7 @@ test "authoritative runtime refuses exact blocklisted names" {
     defer arena.deinit();
 
     const blocklist = try @import("../blocklist.zig").Blocklist.parse("ads.home.arpa.\n");
-    const runtime = try Runtime.fromZoneTextWithBlocklist(
+    var runtime = try Runtime.fromZoneTextWithBlocklist(
         \\$ORIGIN home.arpa.
         \\$TTL 3600
         \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
@@ -144,6 +160,7 @@ test "authoritative runtime refuses exact blocklisted names" {
         \\ads IN A 192.168.1.99
         \\
     , blocklist);
+    defer runtime.deinit();
 
     var output: [512]u8 = undefined;
     const response_bytes = try runtime.answer(&.{

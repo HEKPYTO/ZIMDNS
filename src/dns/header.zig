@@ -1,3 +1,6 @@
+/// Contract: Encodes and decodes DNS header flags, opcodes, and response codes.
+/// Ownership: Header values are inline; parse borrows Reader bytes and encode borrows Writer storage.
+/// Errors: Malformed wire data is reported as typed protocol errors; this module performs no I/O.
 const std = @import("std");
 const Reader = @import("reader.zig").Reader;
 const Writer = @import("writer.zig").Writer;

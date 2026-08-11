@@ -1,3 +1,6 @@
+/// Contract: Parses admin command envelopes and renders bounded status responses.
+/// Ownership: Inputs and output buffer are borrowed; returned slices borrow caller buffer.
+/// Errors: Command and formatting failures are typed; socket I/O is outside this module.
 const std = @import("std");
 const metrics = @import("../metrics.zig");
 

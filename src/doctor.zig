@@ -53,10 +53,11 @@ pub fn inspectParsedConfig(config: *const config_parser.Config, report: *Report)
 
 pub fn inspectZoneText(name: []const u8, text: []const u8, report: *Report) !void {
     _ = name;
-    _ = zone_parser.ZoneFile.parse(text) catch {
+    var zone = zone_parser.ZoneFile.parse(text) catch {
         try report.add(.invalid_zone);
         return;
     };
+    defer zone.deinit();
 }
 
 pub fn inspectBlocklistText(text: []const u8, report: *Report) !void {

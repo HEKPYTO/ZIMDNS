@@ -1,3 +1,6 @@
+/// Contract: Parses and matches normalized exact domain blocklist entries.
+/// Ownership: Blocklist owns inline entry bytes; parsed inputs are borrowed and no deinit is required.
+/// Errors: Entry and size violations are typed; reading blocklist files is the caller's I/O boundary.
 const std = @import("std");
 
 const max_entries = 256;

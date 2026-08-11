@@ -1,3 +1,6 @@
+/// Contract: Serves one admin request over a connected or Unix stream.
+/// Ownership: Stream is consumed by the call; Service and path inputs are borrowed; buffers are local.
+/// Errors: Stream and address failures are propagated I/O errors; protocol errors remain typed below.
 const std = @import("std");
 const Service = @import("service.zig").Service;
 
@@ -31,7 +34,7 @@ test "admin unix socket serves one status request" {
     if (!std.Io.net.has_unix_sockets) return error.SkipZigTest;
 
     const io = std.Io.Threaded.global_single_threaded.io();
-    const path = ".zig-cache/gcli-dns-admin-test.sock";
+    const path = ".zig-cache/zimdns-admin-test.sock";
     std.Io.Dir.cwd().deleteFile(io, path) catch {};
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 

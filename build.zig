@@ -11,7 +11,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const exe = b.addExecutable(.{
-        .name = "gcli-dns",
+        .name = "zimdns",
         .root_module = app_module,
     });
     b.installArtifact(exe);
@@ -20,7 +20,7 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
-    const run_step = b.step("run", "Run gcli-dns");
+    const run_step = b.step("run", "Run zimdns");
     run_step.dependOn(&run_cmd.step);
 
     const unit_test_module = b.createModule(.{
@@ -41,7 +41,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    golden_test_module.addImport("gcli_dns", b.createModule(.{
+    golden_test_module.addImport("zimdns", b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
@@ -59,7 +59,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    config_test_module.addImport("gcli_dns", b.createModule(.{
+    config_test_module.addImport("zimdns", b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
@@ -71,4 +71,47 @@ pub fn build(b: *std.Build) void {
 
     const config_step = b.step("test-config", "Run config file integration tests");
     config_step.dependOn(&run_config_tests.step);
+
+    const fuzz_seed = b.option(u64, "fuzz-seed", "Seed for deterministic parser fuzzing") orelse 0x5eed_7a57;
+    const fuzz_iterations = b.option(usize, "fuzz-iterations", "Parser fuzz iteration budget") orelse 4096;
+    const fuzz_options = b.addOptions();
+    fuzz_options.addOption(u64, "seed", fuzz_seed);
+    fuzz_options.addOption(usize, "iterations", fuzz_iterations);
+
+    const fuzz_test_module = b.createModule(.{
+        .root_source_file = b.path("test/fuzz/fuzz_dns_parser.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    fuzz_test_module.addOptions("fuzz_options", fuzz_options);
+    fuzz_test_module.addImport("zimdns", b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
+    const fuzz_tests = b.addTest(.{
+        .root_module = fuzz_test_module,
+    });
+    const run_fuzz_tests = b.addRunArtifact(fuzz_tests);
+
+    const fuzz_step = b.step("test-fuzz", "Run deterministic DNS parser fuzz tests");
+    fuzz_step.dependOn(&run_fuzz_tests.step);
+
+    const integration_test_module = b.createModule(.{
+        .root_source_file = b.path("test/integration/pipeline_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    integration_test_module.addImport("zimdns", b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
+    const integration_tests = b.addTest(.{
+        .root_module = integration_test_module,
+    });
+    const run_integration_tests = b.addRunArtifact(integration_tests);
+
+    const integration_step = b.step("test-integration", "Run loopback DNS pipeline integration tests");
+    integration_step.dependOn(&run_integration_tests.step);
 }

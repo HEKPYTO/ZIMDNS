@@ -1,7 +1,12 @@
+/// Contract: Parses and encodes DNS resource records and their RDATA.
+/// Ownership: Records contain inline/borrowed name data; message and Writer storage remain borrowed.
+/// Errors: Wire and RDATA failures are typed; transport/file I/O is outside this module.
 const std = @import("std");
 const Reader = @import("reader.zig").Reader;
 const Writer = @import("writer.zig").Writer;
+const CompressionTable = @import("writer.zig").CompressionTable;
 const Name = @import("name.zig").Name;
+const rdata_mod = @import("rdata.zig");
 const RData = @import("rdata.zig").RData;
 const RecordType = @import("types.zig").RecordType;
 const Class = @import("types.zig").Class;
@@ -10,6 +15,8 @@ pub const Error = error{
     EndOfInput,
     BadName,
     BadRData,
+    MalformedOption,
+    OptionsTooLong,
 };
 
 pub const ParseResult = struct {
@@ -33,7 +40,11 @@ pub const ResourceRecord = struct {
         const rdlength = reader.readU16() catch return Error.EndOfInput;
 
         const rdata_offset = owner_result.next_offset + reader.position();
-        const rdata = RData.parse(RecordType.fromCode(rrtype_code), message, rdata_offset, rdlength) catch return Error.BadRData;
+        const rdata = RData.parse(RecordType.fromCode(rrtype_code), message, rdata_offset, rdlength) catch |err| switch (err) {
+            rdata_mod.Error.MalformedOption => return Error.MalformedOption,
+            rdata_mod.Error.OptionsTooLong => return Error.OptionsTooLong,
+            else => return Error.BadRData,
+        };
 
         return .{
             .record = .{
@@ -58,6 +69,18 @@ pub const ResourceRecord = struct {
         try self.rdata.encode(&rdata_writer);
         try writer.writeU16(@intCast(rdata_writer.len()));
         try writer.writeBytes(rdata_writer.written());
+    }
+
+    pub fn encodeCompressed(self: ResourceRecord, writer: *Writer, table: *CompressionTable) !void {
+        try table.writeName(writer, self.owner.asWire());
+        try writer.writeU16(self.rrtype.code());
+        try writer.writeU16(self.class.code());
+        try writer.writeU32(self.ttl);
+        const length_offset = writer.len();
+        try writer.writeU16(0);
+        const rdata_start = writer.len();
+        try self.rdata.encodeCompressed(writer, table);
+        try writer.patchU16(length_offset, @intCast(writer.len() - rdata_start));
     }
 };
 

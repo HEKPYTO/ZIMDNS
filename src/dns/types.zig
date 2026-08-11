@@ -1,3 +1,6 @@
+/// Contract: Defines DNS class and record-type value objects and mappings.
+/// Ownership: Values are inline and hold no allocated or borrowed storage.
+/// Errors: Unknown codes use typed mapping behavior; no I/O occurs.
 const std = @import("std");
 
 pub const Class = struct {

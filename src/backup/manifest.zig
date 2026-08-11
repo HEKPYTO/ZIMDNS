@@ -171,7 +171,7 @@ const TextWriter = struct {
 test "backup manifest includes config zones and blocklists" {
     const config = try config_parser.Config.parse(
         \\listen dns udp 0.0.0.0:1053
-        \\admin socket /tmp/gcli-dns.sock
+        \\admin socket /tmp/zimdns.sock
         \\recursion deny 0.0.0.0/0
         \\recursion deny ::/0
         \\blocklist file examples/blocklists/ads.txt
@@ -214,7 +214,7 @@ test "backup manifest reads assets referenced by config" {
     defer dir.cleanup();
     try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data =
         \\listen dns udp 0.0.0.0:1053
-        \\admin socket /tmp/gcli-dns.sock
+        \\admin socket /tmp/zimdns.sock
         \\recursion deny 0.0.0.0/0
         \\recursion deny ::/0
         \\blocklist file block.txt
