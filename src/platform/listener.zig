@@ -14,6 +14,7 @@ pub const UDP_REQUEST_BUFFER_SIZE: usize = response_mod.DEFAULT_EDNS_UDP_PAYLOAD
 pub const UDP_RESPONSE_BUFFER_SIZE: usize = std.math.maxInt(u16);
 pub const TCP_MAX_FRAME_SIZE: usize = std.math.maxInt(u16);
 pub const TCP_MAX_FRAMES_PER_CONNECTION: usize = 16;
+pub const TCP_MAX_CONNECTION_WORKERS: usize = 8;
 pub const UDP_IDLE_TIMEOUT: std.Io.Timeout = .{ .duration = .{
     .raw = .fromSeconds(5),
     .clock = .awake,
@@ -168,18 +169,22 @@ pub fn serveTcpLoop(server: anytype, io: std.Io, runtime: *const Runtime, max_re
     return serveTcpLoopWithTimeout(server, io, runtime, max_requests, TCP_IO_TIMEOUT);
 }
 
+fn serveTcpStreamWorker(stream: std.Io.net.Stream, io: std.Io, runtime: *const Runtime, timeout: TcpIoTimeout) void {
+    defer stream.close(io);
+    serveTcpStreamOnceWithTimeout(stream, io, runtime, timeout, null) catch {};
+}
+
 fn serveTcpLoopWithTimeout(server: anytype, io: std.Io, runtime: *const Runtime, max_requests: ?usize, timeout: TcpIoTimeout) !void {
-    var served: usize = 0;
-    while (max_requests == null or served < max_requests.?) {
+    var group: std.Io.Group = .init;
+    defer group.await(io) catch unreachable;
+
+    var accepted: usize = 0;
+    while (max_requests == null or accepted < max_requests.?) {
         const stream = try server.accept(io);
-        {
-            defer stream.close(io);
-            serveTcpStreamOnceWithTimeout(stream, io, runtime, timeout, null) catch |err| {
-                if (isRecoverableRequestError(err)) continue;
-                return err;
-            };
-        }
-        served += 1;
+        accepted += 1;
+        group.concurrent(io, serveTcpStreamWorker, .{ stream, io, runtime, timeout }) catch |err| switch (err) {
+            error.ConcurrencyUnavailable => stream.close(io),
+        };
     }
 }
 
@@ -465,7 +470,11 @@ test "TCP handler serves FIFO length-prefixed DNS queries on one stream" {
 }
 
 test "TCP loop rejects truncated frames before serving the next connection" {
-    const io = std.Io.Threaded.global_single_threaded.io();
+    var io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{
+        .concurrent_limit = .limited(TCP_MAX_CONNECTION_WORKERS),
+    });
+    defer io_backend.deinit();
+    const io = io_backend.io();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -502,7 +511,7 @@ test "TCP loop rejects truncated frames before serving the next connection" {
     try @import("../cli/query.zig").sendTcpQuery(valid_client, io, query);
     try valid_client.shutdown(io, .send);
 
-    try serveTcpLoopWithTimeout(&server, io, &runtime, 1, .{ .seconds = 0, .microseconds = 100_000 });
+    try serveTcpLoopWithTimeout(&server, io, &runtime, 3, .{ .seconds = 0, .microseconds = 100_000 });
 
     var response_poll_fds = [_]std.posix.pollfd{.{
         .fd = valid_client.socket.handle,
@@ -517,7 +526,11 @@ test "TCP loop rejects truncated frames before serving the next connection" {
 }
 
 test "TCP loop does not count an empty EOF connection" {
-    const io = std.Io.Threaded.global_single_threaded.io();
+    var io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{
+        .concurrent_limit = .limited(TCP_MAX_CONNECTION_WORKERS),
+    });
+    defer io_backend.deinit();
+    const io = io_backend.io();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -539,7 +552,7 @@ test "TCP loop does not count an empty EOF connection" {
     try @import("../cli/query.zig").sendTcpQuery(valid_client, io, query);
     try valid_client.shutdown(io, .send);
 
-    try serveTcpLoopWithTimeout(&server, io, &runtime, 1, .{ .seconds = 0, .microseconds = 100_000 });
+    try serveTcpLoopWithTimeout(&server, io, &runtime, 2, .{ .seconds = 0, .microseconds = 100_000 });
 
     var response_poll_fds = [_]std.posix.pollfd{.{
         .fd = valid_client.socket.handle,
@@ -554,7 +567,11 @@ test "TCP loop does not count an empty EOF connection" {
 }
 
 test "TCP loop rejects a length prefix without payload" {
-    const io = std.Io.Threaded.global_single_threaded.io();
+    var io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{
+        .concurrent_limit = .limited(TCP_MAX_CONNECTION_WORKERS),
+    });
+    defer io_backend.deinit();
+    const io = io_backend.io();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -699,7 +716,11 @@ test "TCP framing rejects zero and over-limit lengths" {
 }
 
 test "TCP loop ignores malformed and idle connections before a valid query" {
-    const io = std.Io.Threaded.global_single_threaded.io();
+    var io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{
+        .concurrent_limit = .limited(TCP_MAX_CONNECTION_WORKERS),
+    });
+    defer io_backend.deinit();
+    const io = io_backend.io();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -725,7 +746,7 @@ test "TCP loop ignores malformed and idle connections before a valid query" {
     try @import("../cli/query.zig").sendTcpQuery(valid_client, io, query);
     try valid_client.shutdown(io, .send);
 
-    try serveTcpLoopWithTimeout(&server, io, &runtime, 1, .{ .seconds = 0, .microseconds = 1_000 });
+    try serveTcpLoopWithTimeout(&server, io, &runtime, 3, .{ .seconds = 0, .microseconds = 1_000 });
 
     var response_buffer: [512]u8 = undefined;
     const response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), valid_client, io, &response_buffer, query);

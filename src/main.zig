@@ -392,11 +392,16 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
                 try writer.writeAll("error: --print-metrics is currently supported for UDP runs\n");
                 try exitUsage(writer);
             }
+            var io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{
+                .concurrent_limit = .limited(listener.TCP_MAX_CONNECTION_WORKERS),
+            });
+            defer io_backend.deinit();
+            const tcp_io = io_backend.io();
             if (configured_address) |*address| {
-                try listener.serveTcpLoopOnAddress(io, &runtime, address, max_requests);
+                try listener.serveTcpLoopOnAddress(tcp_io, &runtime, address, max_requests);
             } else {
                 var address = defaultListenerAddress(port);
-                try listener.serveTcpLoopOnAddress(io, &runtime, &address, max_requests);
+                try listener.serveTcpLoopOnAddress(tcp_io, &runtime, &address, max_requests);
             }
         },
         .none => unreachable,

@@ -27,6 +27,14 @@ const CliTcpArgs = struct {
     ok: bool = false,
 };
 
+const BoundedTcpArgs = struct {
+    io: std.Io,
+    server: *std.Io.net.Server,
+    runtime: *Runtime,
+    max_requests: ?usize,
+    ok: bool = false,
+};
+
 const UpstreamArgs = struct {
     io: std.Io,
     udp: *const std.Io.net.Socket,
@@ -196,7 +204,11 @@ test "configured two-zone UDP loop dispatches by longest origin" {
 }
 
 test "configured two-zone TCP loop accepts bounded independent connections" {
-    const io = std.Io.Threaded.global_single_threaded.io();
+    var io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{
+        .concurrent_limit = .limited(listener.TCP_MAX_CONNECTION_WORKERS),
+    });
+    defer io_backend.deinit();
+    const io = io_backend.io();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var tmp = std.testing.tmpDir(.{});
@@ -229,6 +241,87 @@ test "configured two-zone TCP loop accepts bounded independent connections" {
     try expectAddress(parent_response, .{ 192, 0, 2, 1 });
     const child_response = try cli_query.receiveTcpResponse(arena.allocator(), child_client, io, &child_response_buffer, child_query);
     try expectAddress(child_response, .{ 192, 0, 2, 2 });
+}
+
+test "authoritative TCP loop caps active connections at eight" {
+    var io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{
+        .concurrent_limit = .limited(listener.TCP_MAX_CONNECTION_WORKERS),
+    });
+    defer io_backend.deinit();
+    const io = io_backend.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(fixture_zone);
+    defer runtime.deinit();
+
+    var listen_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try std.Io.net.IpAddress.listen(&listen_addr, io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    var clients: [listener.TCP_MAX_CONNECTION_WORKERS]?std.Io.net.Stream = [_]?std.Io.net.Stream{null} ** listener.TCP_MAX_CONNECTION_WORKERS;
+    var client_queries: [listener.TCP_MAX_CONNECTION_WORKERS][512]u8 = undefined;
+    var client_query_slices: [listener.TCP_MAX_CONNECTION_WORKERS][]const u8 = undefined;
+    for (&clients, 0..) |*client, index| {
+        client.* = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+        client_query_slices[index] = try cli_query.buildQueryPacket(&client_queries[index], @intCast(0x5300 + index), "dns.home.arpa.", .A);
+        try cli_query.sendTcpQuery(client.*.?, io, client_query_slices[index]);
+    }
+
+    var excess_client: ?std.Io.net.Stream = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    var excess_query_buffer: [512]u8 = undefined;
+    const excess_query = try cli_query.buildQueryPacket(&excess_query_buffer, 0x53ff, "dns.home.arpa.", .A);
+    try cli_query.sendTcpQuery(excess_client.?, io, excess_query);
+    try excess_client.?.shutdown(io, .send);
+
+    var args = BoundedTcpArgs{ .io = io, .server = &server, .runtime = &runtime, .max_requests = 9 };
+    const server_thread = try std.Thread.spawn(.{}, serveBoundedTcp, .{&args});
+    var joined = false;
+    defer {
+        for (&clients) |*client| {
+            if (client.*) |stream| {
+                stream.close(io);
+                client.* = null;
+            }
+        }
+        if (excess_client) |client| {
+            client.close(io);
+            excess_client = null;
+        }
+        if (!joined) server_thread.join();
+    }
+
+    var response_buffers: [listener.TCP_MAX_CONNECTION_WORKERS][512]u8 = undefined;
+    for (&clients, 0..) |*client, index| {
+        const response = try cli_query.receiveTcpResponse(arena.allocator(), client.*.?, io, &response_buffers[index], client_query_slices[index]);
+        try expectAResponse(response);
+        try std.testing.expectEqual(@as(u16, @intCast(0x5300 + index)), response.header.id);
+    }
+
+    var excess_poll_fd = [_]std.posix.pollfd{.{
+        .fd = excess_client.?.socket.handle,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    try std.testing.expectEqual(@as(usize, 1), try std.posix.poll(&excess_poll_fd, 5_000));
+    var excess_bytes: [512]u8 = undefined;
+    const excess_read = std.posix.read(excess_client.?.socket.handle, &excess_bytes) catch |err| switch (err) {
+        error.ConnectionResetByPeer => 0,
+        else => return err,
+    };
+    try std.testing.expectEqual(@as(usize, 0), excess_read);
+
+    for (&clients) |*client| {
+        if (client.*) |stream| {
+            stream.close(io);
+            client.* = null;
+        }
+    }
+    excess_client.?.close(io);
+    excess_client = null;
+    server_thread.join();
+    joined = true;
+    try std.testing.expect(args.ok);
 }
 
 test "resolver accepts only an exact UDP upstream response" {
@@ -494,6 +587,11 @@ fn serveCliTcp(args: *CliTcpArgs) void {
     const stream = args.server.accept(args.io) catch return;
     defer stream.close(args.io);
     listener.serveTcpStreamOnce(stream, args.io, args.runtime) catch return;
+    args.ok = true;
+}
+
+fn serveBoundedTcp(args: *BoundedTcpArgs) void {
+    listener.serveTcpLoop(args.server, args.io, args.runtime, args.max_requests) catch return;
     args.ok = true;
 }
 
