@@ -1,0 +1,18 @@
+name: afsdb-response
+rfc: RFC 1183 section 1
+phase: 3
+description: Exact authoritative AFSDB response with no synthesized A additional record.
+input_hex:
+  44 62 01 00 00 01 00 00 00 00 00 00
+  05 61 66 73 64 62 04 68 6f 6d 65 04 61 72 70 61 00 00 12 00 01
+response_hex:
+  44 62 85 00 00 01 00 01 00 00 00 00
+  05 61 66 73 64 62 04 68 6f 6d 65 04 61 72 70 61 00 00 12 00 01
+  c0 0c 00 12 00 01 00 00 0e 10 00 0b
+  00 2a 06 73 65 72 76 65 72 c0 12
+expect:
+  parse_ok: true
+  id: 0x4462
+  qname: afsdb.home.arpa.
+  qtype: AFSDB
+  qclass: IN

@@ -1,0 +1,18 @@
+name: caa-response
+rfc: RFC 8659 sections 4.1-4.1.1
+phase: 3
+description: Exact authoritative CAA response preserving critical flags and raw value bytes.
+input_hex:
+  44 58 01 00 00 01 00 00 00 00 00 00
+  03 63 61 61 04 68 6f 6d 65 04 61 72 70 61 00 01 01 00 01
+response_hex:
+  44 58 85 00 00 01 00 01 00 00 00 00
+  03 63 61 61 04 68 6f 6d 65 04 61 72 70 61 00 01 01 00 01
+  c0 0c 01 01 00 01 00 00 0e 10 00 0b
+  80 05 69 73 73 75 65 61 00 80 ff
+expect:
+  parse_ok: true
+  id: 0x4458
+  qname: caa.home.arpa.
+  qtype: CAA
+  qclass: IN

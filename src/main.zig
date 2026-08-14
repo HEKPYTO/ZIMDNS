@@ -156,13 +156,12 @@ fn handleQuery(args: []const []const u8, io: std.Io, allocator: std.mem.Allocato
     };
 
     var response_buffer: [listener.UDP_RESPONSE_BUFFER_SIZE]u8 = undefined;
-    const response = if (use_tcp)
+    var response = if (use_tcp)
         try queryTcp(allocator, io, &server, query, &response_buffer)
     else
         try queryUdp(allocator, io, &server, query, &response_buffer);
-    var text_buffer: [2048]u8 = undefined;
-    const text = try cli_query.formatResponse(response, &text_buffer);
-    try writer.writeAll(text);
+    defer response.deinit();
+    try cli_query.writeResponse(response, writer);
 }
 
 fn parseQueryType(text: []const u8) !@import("dns/types.zig").RecordType {
@@ -173,6 +172,13 @@ fn parseQueryType(text: []const u8) !@import("dns/types.zig").RecordType {
     if (std.mem.eql(u8, text, "MX")) return .MX;
     if (std.mem.eql(u8, text, "TXT")) return .TXT;
     if (std.mem.eql(u8, text, "SOA")) return .SOA;
+    if (std.mem.eql(u8, text, "AFSDB")) return .AFSDB;
+    if (std.mem.eql(u8, text, "SSHFP")) return .SSHFP;
+    if (std.mem.eql(u8, text, "TLSA")) return .TLSA;
+    if (std.mem.eql(u8, text, "NAPTR")) return .NAPTR;
+    if (std.mem.eql(u8, text, "APL")) return .APL;
+    if (std.mem.eql(u8, text, "URI")) return .URI;
+    if (std.mem.eql(u8, text, "CAA")) return .CAA;
     return error.UnsupportedType;
 }
 
@@ -463,4 +469,93 @@ fn exitUsage(writer: *std.Io.Writer) !noreturn {
 fn exitFailure(writer: *std.Io.Writer) !noreturn {
     try writer.flush();
     std.process.exit(1);
+}
+test "query parser accepts SSHFP" {
+    try std.testing.expectEqual(@import("dns/types.zig").RecordType.SSHFP, try parseQueryType("SSHFP"));
+}
+
+test "query parser accepts TLSA" {
+    try std.testing.expectEqual(@import("dns/types.zig").RecordType.TLSA, try parseQueryType("TLSA"));
+}
+
+test "query parser accepts URI" {
+    try std.testing.expectEqual(@import("dns/types.zig").RecordType.URI, try parseQueryType("URI"));
+}
+
+test "query parser accepts NAPTR" {
+    try std.testing.expectEqual(@import("dns/types.zig").RecordType.NAPTR, try parseQueryType("NAPTR"));
+}
+
+test "query parser accepts APL" {
+    try std.testing.expectEqual(@import("dns/types.zig").RecordType.APL, try parseQueryType("APL"));
+}
+
+test "query parser accepts AFSDB" {
+    try std.testing.expectEqual(@import("dns/types.zig").RecordType.AFSDB, try parseQueryType("AFSDB"));
+}
+
+test "query parser accepts CAA" {
+    try std.testing.expectEqual(@import("dns/types.zig").RecordType.CAA, try parseQueryType("CAA"));
+}
+
+test "query command renders a maximum escaped URI target" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var zone_text: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer zone_text.deinit();
+    try zone_text.writer.writeAll(
+        "$ORIGIN home.arpa.\n" ++
+            "$TTL 3600\n" ++
+            "@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600\n" ++
+            "@ IN NS ns1.home.arpa.\n" ++
+            "_uri IN URI 0 0 \"",
+    );
+    var index: usize = 0;
+    while (index < 508) : (index += 1) try zone_text.writer.writeAll("\\000");
+    try zone_text.writer.writeAll("\"\n");
+
+    var runtime = try auth_runtime.Runtime.fromZoneText(zone_text.written());
+    defer runtime.deinit();
+
+    var server_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try std.Io.net.IpAddress.listen(&server_addr, io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    const ServerArgs = struct {
+        io: std.Io,
+        server: *std.Io.net.Server,
+        runtime: *const auth_runtime.Runtime,
+        ok: bool = false,
+
+        fn run(self: *@This()) void {
+            const stream = self.server.accept(self.io) catch return;
+            defer stream.close(self.io);
+            listener.serveTcpStreamOnce(stream, self.io, self.runtime) catch return;
+            self.ok = true;
+        }
+    };
+    var server_args = ServerArgs{ .io = io, .server = &server, .runtime = &runtime };
+    const server_thread = try std.Thread.spawn(.{}, ServerArgs.run, .{&server_args});
+
+    var port_buffer: [5]u8 = undefined;
+    const port_text = try std.fmt.bufPrint(&port_buffer, "{}", .{server.socket.address.getPort()});
+    const args = [_][]const u8{ "zimdns", "query", "@127.0.0.1", "-p", port_text, "--tcp", "_uri.home.arpa.", "URI" };
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    handleQuery(&args, io, std.testing.allocator, &output.writer) catch |err| {
+        server_thread.join();
+        return err;
+    };
+    server_thread.join();
+    try std.testing.expect(server_args.ok);
+
+    var expected: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer expected.deinit();
+    try expected.writer.writeAll("_uri.home.arpa. 3600 IN URI 0 0 \"");
+    index = 0;
+    while (index < 508) : (index += 1) try expected.writer.writeAll("\\000");
+    try expected.writer.writeAll("\"\n");
+    try std.testing.expect(expected.written().len > 2048);
+    try std.testing.expectEqualSlices(u8, expected.written(), output.written());
 }

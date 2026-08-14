@@ -31,9 +31,15 @@ pub const RecordType = struct {
     pub const SOA = RecordType{ .value = 6 };
     pub const PTR = RecordType{ .value = 12 };
     pub const MX = RecordType{ .value = 15 };
+    pub const AFSDB = RecordType{ .value = 18 };
     pub const TXT = RecordType{ .value = 16 };
     pub const AAAA = RecordType{ .value = 28 };
     pub const SRV = RecordType{ .value = 33 };
+    pub const NAPTR = RecordType{ .value = 35 };
+    pub const APL = RecordType{ .value = 42 };
+    pub const SSHFP = RecordType{ .value = 44 };
+    pub const TLSA = RecordType{ .value = 52 };
+    pub const URI = RecordType{ .value = 256 };
     pub const OPT = RecordType{ .value = 41 };
     pub const CAA = RecordType{ .value = 257 };
 
@@ -60,4 +66,34 @@ test "record type and class codes round trip for phase-one values" {
 test "unknown record type and class preserve raw wire codes" {
     try std.testing.expectEqual(@as(u16, 65280), RecordType.fromCode(65280).code());
     try std.testing.expectEqual(@as(u16, 1232), Class.fromCode(1232).code());
+}
+
+test "SSHFP record type uses wire code 44" {
+    try std.testing.expectEqual(@as(u16, 44), RecordType.SSHFP.code());
+    try std.testing.expectEqual(RecordType.SSHFP, RecordType.fromCode(44));
+}
+
+test "TLSA record type uses wire code 52" {
+    try std.testing.expectEqual(@as(u16, 52), RecordType.TLSA.code());
+    try std.testing.expectEqual(RecordType.TLSA, RecordType.fromCode(52));
+}
+
+test "URI record type uses wire code 256" {
+    try std.testing.expectEqual(@as(u16, 256), RecordType.URI.code());
+    try std.testing.expectEqual(RecordType.URI, RecordType.fromCode(256));
+}
+
+test "NAPTR record type uses wire code 35" {
+    try std.testing.expectEqual(@as(u16, 35), RecordType.NAPTR.code());
+    try std.testing.expectEqual(RecordType.NAPTR, RecordType.fromCode(35));
+}
+
+test "APL record type uses wire code 42" {
+    try std.testing.expectEqual(@as(u16, 42), RecordType.APL.code());
+    try std.testing.expectEqual(RecordType.APL, RecordType.fromCode(42));
+}
+
+test "AFSDB record type uses wire code 18" {
+    try std.testing.expectEqual(@as(u16, 18), RecordType.AFSDB.code());
+    try std.testing.expectEqual(RecordType.AFSDB, RecordType.fromCode(18));
 }

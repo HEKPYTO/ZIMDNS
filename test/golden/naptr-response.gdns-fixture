@@ -1,0 +1,19 @@
+name: naptr-response
+rfc: RFC 3403 section 4
+phase: 3
+description: Exact authoritative NAPTR response with an uncompressed replacement name.
+input_hex:
+  44 60 01 00 00 01 00 00 00 00 00 00
+  05 6e 61 70 74 72 04 68 6f 6d 65 04 61 72 70 61 00 00 23 00 01
+response_hex:
+  44 60 85 00 00 01 00 01 00 00 00 00
+  05 6e 61 70 74 72 04 68 6f 6d 65 04 61 72 70 61 00 00 23 00 01
+  c0 0c 00 23 00 01 00 00 0e 10 00 24
+  00 64 00 0a 01 55 07 45 32 55 2b 73 69 70 00
+  0b 72 65 70 6c 61 63 65 6d 65 6e 74 07 65 78 61 6d 70 6c 65 00
+expect:
+  parse_ok: true
+  id: 0x4460
+  qname: naptr.home.arpa.
+  qtype: NAPTR
+  qclass: IN

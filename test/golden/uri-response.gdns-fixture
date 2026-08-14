@@ -1,0 +1,17 @@
+name: uri-response
+rfc: RFC 7553 sections 4.1-4.5; wire format section 4.5
+phase: 2
+description: Exact authoritative URI response for _https._tcp.home.arpa.
+input_hex:
+  44 57 01 00 00 01 00 00 00 00 00 00
+  06 5f 68 74 74 70 73 04 5f 74 63 70 04 68 6f 6d 65 04 61 72 70 61 00 01 00 00 01
+response_hex:
+  44 57 85 00 00 01 00 01 00 00 00 00
+  06 5f 68 74 74 70 73 04 5f 74 63 70 04 68 6f 6d 65 04 61 72 70 61 00 01 00 00 01
+  c0 0c 01 00 00 01 00 00 0e 10 00 1d
+  00 0a 00 14 68 74 74 70 73 3a 2f 2f 65 78 61 6d 70 6c 65 2e 74 65 73 74 2f 70 61 74 68
+expect:
+  parse_ok: true
+  id: 0x4457
+  qname: _https._tcp.home.arpa.
+  qtype: URI

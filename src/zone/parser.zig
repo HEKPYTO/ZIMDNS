@@ -276,7 +276,13 @@ const Tokenizer = struct {
 
 fn stripComment(line: []const u8) []const u8 {
     var in_quote = false;
-    for (line, 0..) |byte, index| {
+    var index: usize = 0;
+    while (index < line.len) : (index += 1) {
+        const byte = line[index];
+        if (in_quote and byte == '\\' and index + 1 < line.len) {
+            index += 1;
+            continue;
+        }
         if (byte == '"') in_quote = !in_quote;
         if (byte == ';' and !in_quote) return line[0..index];
     }
@@ -286,7 +292,13 @@ fn stripComment(line: []const u8) []const u8 {
 fn updateParenDepth(start_depth: usize, line: []const u8) usize {
     var depth = start_depth;
     var in_quote = false;
-    for (line) |byte| {
+    var index: usize = 0;
+    while (index < line.len) : (index += 1) {
+        const byte = line[index];
+        if (in_quote and byte == '\\' and index + 1 < line.len) {
+            index += 1;
+            continue;
+        }
         if (byte == '"') in_quote = !in_quote;
         if (in_quote) continue;
         if (byte == '(') depth += 1;
@@ -308,9 +320,15 @@ fn parseRecordType(text: []const u8) ?RecordType {
     if (std.mem.eql(u8, text, "DNAME")) return .DNAME;
     if (std.mem.eql(u8, text, "PTR")) return .PTR;
     if (std.mem.eql(u8, text, "MX")) return .MX;
+    if (std.mem.eql(u8, text, "AFSDB")) return .AFSDB;
     if (std.mem.eql(u8, text, "TXT")) return .TXT;
     if (std.mem.eql(u8, text, "SRV")) return .SRV;
+    if (std.mem.eql(u8, text, "NAPTR")) return .NAPTR;
     if (std.mem.eql(u8, text, "CAA")) return .CAA;
+    if (std.mem.eql(u8, text, "SSHFP")) return .SSHFP;
+    if (std.mem.eql(u8, text, "TLSA")) return .TLSA;
+    if (std.mem.eql(u8, text, "URI")) return .URI;
+    if (std.mem.eql(u8, text, "APL")) return .APL;
     return null;
 }
 
@@ -329,9 +347,15 @@ pub fn parseRData(rrtype: RecordType, text: []const u8) Error!dns_rdata.RData {
     if (rrtype.eql(.PTR)) return .{ .PTR = try parseRdataName(text) };
     if (rrtype.eql(.SOA)) return .{ .SOA = try parseSoa(text) };
     if (rrtype.eql(.MX)) return .{ .MX = try parseMx(text) };
+    if (rrtype.eql(.AFSDB)) return .{ .AFSDB = try parseAfsdb(text) };
     if (rrtype.eql(.TXT)) return .{ .TXT = try parseTxt(text) };
     if (rrtype.eql(.SRV)) return .{ .SRV = try parseSrv(text) };
+    if (rrtype.eql(.NAPTR)) return .{ .NAPTR = try parseNaptr(text) };
     if (rrtype.eql(.CAA)) return .{ .CAA = try parseCaa(text) };
+    if (rrtype.eql(.SSHFP)) return .{ .SSHFP = try parseSshfp(text) };
+    if (rrtype.eql(.TLSA)) return .{ .TLSA = try parseTlsa(text) };
+    if (rrtype.eql(.URI)) return .{ .URI = try parseUri(text) };
+    if (rrtype.eql(.APL)) return .{ .APL = try parseApl(text) };
     return Error.BadRecord;
 }
 
@@ -353,6 +377,69 @@ fn parseIpv6(text: []const u8) Error![16]u8 {
     return address.bytes;
 }
 
+fn parseApl(text: []const u8) Error!dns_rdata.Unknown {
+    var apl = dns_rdata.Unknown{};
+    var output_len: usize = 0;
+    var items = std.mem.tokenizeAny(u8, text, " \t\r\n");
+    while (items.next()) |item| {
+        var negated = false;
+        var value = item;
+        if (value[0] == '!') {
+            negated = true;
+            value = value[1..];
+        }
+        if (value.len == 0) return Error.BadRecord;
+
+        const colon = std.mem.indexOfScalar(u8, value, ':') orelse return Error.BadRecord;
+        const afi = parseStrictDecimal(u16, value[0..colon]) orelse return Error.BadRecord;
+        if (afi != 1 and afi != 2) return Error.BadRecord;
+
+        const address_and_prefix = value[colon + 1 ..];
+        const slash = std.mem.indexOfScalar(u8, address_and_prefix, '/') orelse return Error.BadRecord;
+        const address_text = address_and_prefix[0..slash];
+        const prefix = parseStrictDecimal(u8, address_and_prefix[slash + 1 ..]) orelse return Error.BadRecord;
+
+        var address: [16]u8 = undefined;
+        const address_len: usize = switch (afi) {
+            1 => blk: {
+                if (prefix > 32) return Error.BadRecord;
+                const parsed = try parseIpv4(address_text);
+                @memcpy(address[0..4], &parsed);
+                break :blk 4;
+            },
+            2 => blk: {
+                if (prefix > 128) return Error.BadRecord;
+                const parsed = try parseIpv6(address_text);
+                @memcpy(&address, &parsed);
+                break :blk 16;
+            },
+            else => unreachable,
+        };
+        maskAplAddress(address[0..address_len], prefix);
+
+        var afd_len = address_len;
+        while (afd_len != 0 and address[afd_len - 1] == 0) afd_len -= 1;
+        if (output_len + 4 + afd_len > apl.data.len) return Error.BadRecord;
+
+        std.mem.writeInt(u16, apl.data[output_len..][0..2], afi, .big);
+        apl.data[output_len + 2] = prefix;
+        const negation_bit: u8 = if (negated) 0x80 else 0;
+        apl.data[output_len + 3] = @as(u8, @intCast(afd_len)) | negation_bit;
+        @memcpy(apl.data[output_len + 4 ..][0..afd_len], address[0..afd_len]);
+        output_len += 4 + afd_len;
+    }
+    apl.len = @intCast(output_len);
+    return apl;
+}
+
+fn maskAplAddress(address: []u8, prefix: u8) void {
+    const full_bytes = @as(usize, prefix) / 8;
+    const remaining_bits = prefix % 8;
+    if (remaining_bits != 0) address[full_bytes] &= @as(u8, 0xff) << @intCast(8 - remaining_bits);
+    const first_zero = full_bytes + @intFromBool(remaining_bits != 0);
+    if (first_zero < address.len) @memset(address[first_zero..], 0);
+}
+
 fn parseRdataName(text: []const u8) Error!dns_name.Name {
     return dns_name.Name.fromText(text) catch Error.BadRecord;
 }
@@ -365,6 +452,17 @@ fn parseMx(text: []const u8) Error!dns_rdata.Mx {
     return .{
         .preference = preference,
         .exchange = try parseRdataName(exchange),
+    };
+}
+
+fn parseAfsdb(text: []const u8) Error!dns_rdata.Mx {
+    var tokens = std.mem.tokenizeAny(u8, text, " \t\r\n");
+    const subtype = parseStrictDecimal(u16, tokens.next() orelse return Error.BadRecord) orelse return Error.BadRecord;
+    const hostname = tokens.next() orelse return Error.BadRecord;
+    if (tokens.next() != null) return Error.BadRecord;
+    return .{
+        .preference = subtype,
+        .exchange = try parseRdataName(hostname),
     };
 }
 
@@ -392,19 +490,306 @@ fn parseSrv(text: []const u8) Error!dns_rdata.Srv {
 }
 
 fn parseCaa(text: []const u8) Error!dns_rdata.Caa {
-    var tokens = std.mem.tokenizeAny(u8, text, " \t\r\n");
-    const flags = std.fmt.parseInt(u8, tokens.next() orelse return Error.BadRecord, 10) catch return Error.BadRecord;
-    const tag = tokens.next() orelse return Error.BadRecord;
-    const value = tokens.rest();
-    if (tag.len > 32 or value.len > 255) return Error.BadRecord;
-    var caa = dns_rdata.Caa{
-        .flags = flags,
-        .tag_len = @intCast(tag.len),
-        .value_len = @intCast(value.len),
+    const input = std.mem.trim(u8, text, " \t\r\n");
+    var index: usize = 0;
+
+    const flags_start = index;
+    while (index < input.len and !std.ascii.isWhitespace(input[index])) index += 1;
+    if (index == flags_start) return Error.BadRecord;
+    const flags_text = input[flags_start..index];
+    const flags = parseStrictDecimal(u8, flags_text) orelse return Error.BadRecord;
+    if ((flags != 0 and flags != 128) or
+        (!std.mem.eql(u8, flags_text, "0") and !std.mem.eql(u8, flags_text, "128")))
+    {
+        return Error.BadRecord;
+    }
+
+    while (index < input.len and std.ascii.isWhitespace(input[index])) index += 1;
+    const tag_start = index;
+    while (index < input.len and !std.ascii.isWhitespace(input[index])) index += 1;
+    if (index == tag_start) return Error.BadRecord;
+    const tag = input[tag_start..index];
+    if (tag.len > std.math.maxInt(u8)) return Error.BadRecord;
+    for (tag) |byte| {
+        if (!((byte >= 'a' and byte <= 'z') or (byte >= '0' and byte <= '9'))) return Error.BadRecord;
+    }
+
+    while (index < input.len and std.ascii.isWhitespace(input[index])) index += 1;
+    if (index == input.len) return Error.BadRecord;
+
+    var value: [509]u8 = undefined;
+    const value_len: usize = if (input[index] == '"') blk: {
+        const decoded_len = try parseCaaQuoted(input, &index, value[0..]);
+        while (index < input.len and std.ascii.isWhitespace(input[index])) index += 1;
+        if (index != input.len) return Error.BadRecord;
+        break :blk decoded_len;
+    } else blk: {
+        const value_start = index;
+        while (index < input.len and !std.ascii.isWhitespace(input[index])) index += 1;
+        const unquoted = input[value_start..index];
+        if (unquoted.len > value.len) return Error.BadRecord;
+        for (unquoted) |byte| {
+            if (byte == '"' or byte == '\\') return Error.BadRecord;
+        }
+        @memcpy(value[0..unquoted.len], unquoted);
+        while (index < input.len and std.ascii.isWhitespace(input[index])) index += 1;
+        if (index != input.len) return Error.BadRecord;
+        break :blk unquoted.len;
     };
-    @memcpy(caa.tag[0..tag.len], tag);
-    @memcpy(caa.value[0..value.len], value);
-    return caa;
+
+    return dns_rdata.Caa.init(flags, tag, value[0..value_len]) catch Error.BadRecord;
+}
+
+fn parseCaaQuoted(input: []const u8, index: *usize, output: []u8) Error!usize {
+    if (index.* >= input.len or input[index.*] != '"') return Error.BadRecord;
+    index.* += 1;
+    var length: usize = 0;
+    while (index.* < input.len) {
+        const byte = input[index.*];
+        index.* += 1;
+        if (byte == '"') return length;
+        if (length >= output.len) return Error.BadRecord;
+        if (byte != '\\') {
+            output[length] = byte;
+            length += 1;
+            continue;
+        }
+
+        if (index.* >= input.len) return Error.BadRecord;
+        const escaped = input[index.*];
+        if (escaped >= '0' and escaped <= '9') {
+            if (index.* + 3 > input.len) return Error.BadRecord;
+            const digits = input[index.* .. index.* + 3];
+            if (digits[1] < '0' or digits[1] > '9' or digits[2] < '0' or digits[2] > '9') {
+                return Error.BadRecord;
+            }
+            output[length] = parseStrictDecimal(u8, digits) orelse return Error.BadRecord;
+            length += 1;
+            index.* += 3;
+        } else {
+            output[length] = escaped;
+            length += 1;
+            index.* += 1;
+        }
+    }
+    return Error.BadRecord;
+}
+
+fn parseHexDigit(byte: u8) ?u8 {
+    return switch (byte) {
+        '0'...'9' => byte - '0',
+        'A'...'F' => byte - 'A' + 10,
+        'a'...'f' => byte - 'a' + 10,
+        else => null,
+    };
+}
+
+fn parseStrictDecimal(comptime T: type, text: []const u8) ?T {
+    if (text.len == 0) return null;
+    for (text) |byte| {
+        if (byte < '0' or byte > '9') return null;
+    }
+    return std.fmt.parseInt(T, text, 10) catch null;
+}
+
+fn parseSshfp(text: []const u8) Error!dns_rdata.Sshfp {
+    var tokens = std.mem.tokenizeAny(u8, text, " \t\r\n");
+    const algorithm = parseStrictDecimal(u8, tokens.next() orelse return Error.BadRecord) orelse return Error.BadRecord;
+    const fingerprint_type = parseStrictDecimal(u8, tokens.next() orelse return Error.BadRecord) orelse return Error.BadRecord;
+    const fingerprint_text = tokens.next() orelse return Error.BadRecord;
+    if (tokens.next() != null) return Error.BadRecord;
+
+    if (fingerprint_text.len % 2 != 0) return Error.BadRecord;
+    const fingerprint_len = fingerprint_text.len / 2;
+    if (!dns_rdata.validSshfp(algorithm, fingerprint_type, fingerprint_len)) return Error.BadRecord;
+
+    var sshfp = dns_rdata.Sshfp{
+        .algorithm = algorithm,
+        .fingerprint_type = fingerprint_type,
+        .fingerprint_len = @intCast(fingerprint_len),
+    };
+    for (sshfp.fingerprint[0..fingerprint_len], 0..) |*byte, index| {
+        const high = parseHexDigit(fingerprint_text[index * 2]) orelse return Error.BadRecord;
+        const low = parseHexDigit(fingerprint_text[index * 2 + 1]) orelse return Error.BadRecord;
+        byte.* = (high << 4) | low;
+    }
+    return sshfp;
+}
+
+fn parseTlsa(text: []const u8) Error!dns_rdata.Tlsa {
+    var tokens = std.mem.tokenizeAny(u8, text, " \t\r\n");
+    const usage = parseStrictDecimal(u8, tokens.next() orelse return Error.BadRecord) orelse return Error.BadRecord;
+    const selector = parseStrictDecimal(u8, tokens.next() orelse return Error.BadRecord) orelse return Error.BadRecord;
+    const matching_type = parseStrictDecimal(u8, tokens.next() orelse return Error.BadRecord) orelse return Error.BadRecord;
+
+    var tlsa = dns_rdata.Tlsa{
+        .usage = usage,
+        .selector = selector,
+        .matching_type = matching_type,
+    };
+    var output_index: usize = 0;
+    var pending_nibble: ?u8 = null;
+    while (tokens.next()) |chunk| {
+        for (chunk) |byte| {
+            const nibble = parseHexDigit(byte) orelse return Error.BadRecord;
+            if (pending_nibble) |high| {
+                if (output_index >= tlsa.association.len) return Error.BadRecord;
+                tlsa.association[output_index] = (high << 4) | nibble;
+                output_index += 1;
+                pending_nibble = null;
+            } else {
+                pending_nibble = nibble;
+            }
+        }
+    }
+    if (pending_nibble != null) return Error.BadRecord;
+    if (!dns_rdata.validTlsa(usage, selector, matching_type, output_index)) return Error.BadRecord;
+    tlsa.association_len = @intCast(output_index);
+    return tlsa;
+}
+
+fn parseUri(text: []const u8) Error!dns_rdata.Uri {
+    var tokens = std.mem.tokenizeAny(u8, text, &std.ascii.whitespace);
+    const priority = parseStrictDecimal(u16, tokens.next() orelse return Error.BadRecord) orelse return Error.BadRecord;
+    const weight = parseStrictDecimal(u16, tokens.next() orelse return Error.BadRecord) orelse return Error.BadRecord;
+    const input = tokens.rest();
+
+    var index: usize = 0;
+    if (index >= input.len or input[index] != '"') return Error.BadRecord;
+    index += 1;
+
+    var uri = dns_rdata.Uri{
+        .priority = priority,
+        .weight = weight,
+    };
+    var closed_quote = false;
+    while (index < input.len) {
+        if (input[index] == '"') {
+            index += 1;
+            closed_quote = true;
+            break;
+        }
+        if (uri.target_len >= uri.target.len) return Error.BadRecord;
+        if (input[index] != '\\') {
+            uri.target[uri.target_len] = input[index];
+            uri.target_len += 1;
+            index += 1;
+            continue;
+        }
+
+        index += 1;
+        if (index >= input.len) return Error.BadRecord;
+        if (input[index] >= '0' and input[index] <= '9') {
+            if (index + 3 > input.len or
+                input[index + 1] < '0' or input[index + 1] > '9' or
+                input[index + 2] < '0' or input[index + 2] > '9')
+            {
+                return Error.BadRecord;
+            }
+            uri.target[uri.target_len] = parseStrictDecimal(u8, input[index .. index + 3]) orelse return Error.BadRecord;
+            uri.target_len += 1;
+            index += 3;
+        } else {
+            uri.target[uri.target_len] = input[index];
+            uri.target_len += 1;
+            index += 1;
+        }
+    }
+    if (!closed_quote or uri.target_len == 0) return Error.BadRecord;
+    while (index < input.len and std.ascii.isWhitespace(input[index])) index += 1;
+    if (index != input.len) return Error.BadRecord;
+    return uri;
+}
+
+fn parseNaptr(text: []const u8) Error!dns_rdata.Naptr {
+    const input = std.mem.trim(u8, text, " \t\r\n");
+    var index: usize = 0;
+    const order = try parseNaptrDecimal(input, &index);
+    try parseNaptrWhitespace(input, &index);
+    const preference = try parseNaptrDecimal(input, &index);
+    try parseNaptrWhitespace(input, &index);
+
+    var naptr = dns_rdata.Naptr{
+        .order = order,
+        .preference = preference,
+        .replacement = dns_name.Name.root(),
+    };
+    const flags_len = try parseNaptrQuoted(input, &index, naptr.flags[0..]);
+    try parseNaptrWhitespace(input, &index);
+    const services_len = try parseNaptrQuoted(input, &index, naptr.services[0..]);
+    try parseNaptrWhitespace(input, &index);
+    const regexp_len = try parseNaptrQuoted(input, &index, naptr.regexp[0..]);
+    try parseNaptrWhitespace(input, &index);
+    const replacement_start = index;
+    while (index < input.len and !std.ascii.isWhitespace(input[index])) index += 1;
+    if (index == replacement_start) return Error.BadRecord;
+    const replacement_text = input[replacement_start..index];
+    if (!std.mem.endsWith(u8, replacement_text, ".")) return Error.BadRecord;
+    if (std.mem.indexOfScalar(u8, replacement_text, '"') != null) return Error.BadRecord;
+    naptr.replacement = dns_name.Name.fromText(replacement_text) catch return Error.BadRecord;
+    while (index < input.len and std.ascii.isWhitespace(input[index])) index += 1;
+    if (index != input.len) return Error.BadRecord;
+
+    if (regexp_len != 0 and naptr.replacement.asWire().len != 1) return Error.BadRecord;
+    const wire_len = 4 + (1 + flags_len) + (1 + services_len) + (1 + regexp_len) + naptr.replacement.asWire().len;
+    if (wire_len > 512) return Error.BadRecord;
+    naptr.flags_len = @intCast(flags_len);
+    naptr.services_len = @intCast(services_len);
+    naptr.regexp_len = @intCast(regexp_len);
+    for (naptr.flagsText()) |byte| {
+        if (!std.ascii.isAlphanumeric(byte)) return Error.BadRecord;
+    }
+    return naptr;
+}
+
+fn parseNaptrDecimal(text: []const u8, index: *usize) Error!u16 {
+    const start = index.*;
+    while (index.* < text.len and !std.ascii.isWhitespace(text[index.*])) index.* += 1;
+    if (index.* == start) return Error.BadRecord;
+    return parseStrictDecimal(u16, text[start..index.*]) orelse Error.BadRecord;
+}
+
+fn parseNaptrWhitespace(text: []const u8, index: *usize) Error!void {
+    const start = index.*;
+    while (index.* < text.len and std.ascii.isWhitespace(text[index.*])) index.* += 1;
+    if (index.* == start) return Error.BadRecord;
+}
+
+fn parseNaptrQuoted(text: []const u8, index: *usize, output: []u8) Error!usize {
+    if (index.* >= text.len or text[index.*] != '"') return Error.BadRecord;
+    index.* += 1;
+    var length: usize = 0;
+    var closed = false;
+    while (index.* < text.len) {
+        const byte = text[index.*];
+        index.* += 1;
+        if (byte == '"') {
+            closed = true;
+            break;
+        }
+        if (length >= output.len) return Error.BadRecord;
+        if (byte != '\\') {
+            output[length] = byte;
+            length += 1;
+            continue;
+        }
+        if (index.* >= text.len) return Error.BadRecord;
+        const escaped = text[index.*];
+        if (escaped >= '0' and escaped <= '9') {
+            if (index.* + 3 > text.len) return Error.BadRecord;
+            const digits = text[index.* .. index.* + 3];
+            if (digits[1] < '0' or digits[1] > '9' or digits[2] < '0' or digits[2] > '9') return Error.BadRecord;
+            output[length] = parseStrictDecimal(u8, digits) orelse return Error.BadRecord;
+            length += 1;
+            index.* += 3;
+        } else {
+            output[length] = escaped;
+            length += 1;
+            index.* += 1;
+        }
+    }
+    if (!closed or !std.unicode.utf8ValidateSlice(output[0..length])) return Error.BadRecord;
+    return length;
 }
 
 fn parseSoa(text: []const u8) Error!dns_rdata.Soa {
@@ -681,6 +1066,547 @@ test "zone RDATA parser rejects malformed text for every supported type" {
 
     const overlong_txt = [_]u8{'x'} ** 256;
     try std.testing.expectError(Error.BadRecord, parseRData(.TXT, &overlong_txt));
+}
+
+test "CAA zone text parses canonical tags and raw quoted values" {
+    const empty = try parseRData(.CAA, "0 issue \"\"");
+    try std.testing.expectEqual(@as(u8, 0), empty.CAA.flags);
+    try std.testing.expectEqualStrings("issue", empty.CAA.tagText());
+    try std.testing.expectEqual(@as(usize, 0), empty.CAA.valueText().len);
+
+    const quoted = try parseRData(.CAA, "128 issue \"a\\ b\\000\\128\\255\"");
+    try std.testing.expectEqual(@as(u8, 128), quoted.CAA.flags);
+    try std.testing.expectEqualSlices(u8, &.{ 'a', ' ', 'b', 0, 128, 255 }, quoted.CAA.valueText());
+
+    const raw = try parseRData(.CAA, "0 iodef \"space \\\"quote\\\" \\\\slash\"");
+    try std.testing.expectEqualSlices(u8, "space \"quote\" \\slash", raw.CAA.valueText());
+
+    const unquoted = try parseRData(.CAA, "0 issue letsencrypt.org");
+    try std.testing.expectEqualStrings("letsencrypt.org", unquoted.CAA.valueText());
+}
+
+test "CAA zone text accepts the 512-octet RDATA boundary" {
+    var input: [4 + 509]u8 = undefined;
+    @memcpy(input[0..4], "0 a ");
+    @memset(input[4..], 'x');
+
+    const caa = try parseRData(.CAA, &input);
+    try std.testing.expectEqual(@as(usize, 509), caa.CAA.valueText().len);
+}
+
+test "CAA zone text loads through ZoneFile" {
+    var zone = try ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns hostmaster 1 3600 900 1209600 3600
+        \\@ IN NS ns
+        \\@ IN CAA 0 issue "letsencrypt.org"
+        \\
+    );
+    defer zone.deinit();
+
+    try std.testing.expectEqual(RecordType.CAA, zone.records.items[2].rrtype);
+    const caa = try parseRData(.CAA, zone.records.items[2].rdataText());
+    try std.testing.expectEqualStrings("issue", caa.CAA.tagText());
+    try std.testing.expectEqualStrings("letsencrypt.org", caa.CAA.valueText());
+}
+
+test "CAA zone text rejects noncanonical fields and malformed values" {
+    const invalid = [_][]const u8{
+        "1 issue value",
+        "127 issue value",
+        "129 issue value",
+        "256 issue value",
+        "00 issue value",
+        "0128 issue value",
+        "+0 issue value",
+        "0 Issue value",
+        "0 is-sue value",
+        "0 \"\" value",
+        "0 issue",
+        "0issue value",
+        "0 issuevalue",
+        "0 issue value extra",
+        "0 issue \"unterminated",
+        "0 issue \"unterminated\\",
+        "0 issue \"value\" extra",
+        "0 issue \"bad\\12\"",
+        "0 issue \"bad\\1x2\"",
+        "0 issue \"bad\\256\"",
+        "0 issue \"bad\\2a3\"",
+    };
+    for (invalid) |text| try std.testing.expectError(Error.BadRecord, parseRData(.CAA, text));
+
+    var overlong: [4 + 510]u8 = undefined;
+    @memcpy(overlong[0..4], "0 a ");
+    @memset(overlong[4..], 'x');
+    try std.testing.expectError(Error.BadRecord, parseRData(.CAA, &overlong));
+}
+
+test "AFSDB zone text accepts subtype boundaries and absolute hostname" {
+    const minimum = try parseRData(.AFSDB, "0 db.example.");
+    try std.testing.expectEqual(@as(u16, 0), minimum.AFSDB.preference);
+    try std.testing.expectEqualSlices(u8, &.{ 2, 'd', 'b', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0 }, minimum.AFSDB.exchange.asWire());
+
+    const maximum = try parseRData(.AFSDB, "65535 DB.EXAMPLE.");
+    try std.testing.expectEqual(@as(u16, 65535), maximum.AFSDB.preference);
+    try std.testing.expectEqualSlices(u8, &.{ 2, 'd', 'b', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0 }, maximum.AFSDB.exchange.asWire());
+}
+
+test "AFSDB zone text rejects malformed presentation" {
+    const invalid = [_][]const u8{
+        "",
+        "0",
+        "db.example.",
+        "0 db.example. extra",
+        "+1 db.example.",
+        "-1 db.example.",
+        "65536 db.example.",
+        "1x db.example.",
+        "1 db.example",
+        "1 bad..example.",
+    };
+    for (invalid) |text| try std.testing.expectError(Error.BadRecord, parseRData(.AFSDB, text));
+}
+
+test "zone parser recognizes and validates AFSDB records" {
+    var zone = try ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns hostmaster 1 3600 900 1209600 3600
+        \\@ IN NS ns
+        \\database IN AFSDB 65535 db.example.
+        \\
+    );
+    defer zone.deinit();
+
+    try std.testing.expectEqual(RecordType.AFSDB, zone.records.items[2].rrtype);
+    const afsdb = try parseRData(.AFSDB, zone.records.items[2].rdataText());
+    try std.testing.expectEqual(@as(u16, 65535), afsdb.AFSDB.preference);
+    try std.testing.expectEqualSlices(u8, &.{ 2, 'd', 'b', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0 }, afsdb.AFSDB.exchange.asWire());
+}
+
+test "SSHFP zone text accepts mixed-case hex and exact supported lengths" {
+    const sha1 = try parseRData(.SSHFP, "1 1 00112233445566778899AaBbCcDdEeFf00112233");
+    try std.testing.expectEqual(@as(u8, 1), sha1.SSHFP.algorithm);
+    try std.testing.expectEqual(@as(u8, 1), sha1.SSHFP.fingerprint_type);
+    try std.testing.expectEqual(@as(usize, 20), sha1.SSHFP.fingerprintBytes().len);
+    try std.testing.expectEqual(@as(u8, 0xaa), sha1.SSHFP.fingerprintBytes()[10]);
+
+    const sha256 = try parseRData(.SSHFP, "6 2 00112233445566778899aabbccddeeff00112233445566778899AABBCCDDEEFF");
+    try std.testing.expectEqual(@as(u8, 6), sha256.SSHFP.algorithm);
+    try std.testing.expectEqual(@as(u8, 2), sha256.SSHFP.fingerprint_type);
+    try std.testing.expectEqual(@as(usize, 32), sha256.SSHFP.fingerprintBytes().len);
+}
+
+test "SSHFP zone text rejects unsupported selectors, malformed hex, and field count errors" {
+    const invalid = [_][]const u8{
+        "0 1 00112233445566778899aabbccddeeff00112233",
+        "5 1 00112233445566778899aabbccddeeff00112233",
+        "7 1 00112233445566778899aabbccddeeff00112233",
+        "1 0 00112233445566778899aabbccddeeff00112233",
+        "1 3 00112233445566778899aabbccddeeff00112233",
+        "1 1 00112233445566778899aabbccddeeff0011223",
+        "1 1 00112233445566778899aabbccddeeff0011223g",
+        "1 1 +a112233445566778899aabbccddeeff00112233",
+        "1 1 -0112233445566778899aabbccddeeff00112233",
+        "1 2 00112233445566778899aabbccddeeff00112233",
+        "1 1 00112233445566778899aabbccddeeff00112233 extra",
+        "256 1 00112233445566778899aabbccddeeff00112233",
+        "1 1",
+        "1",
+    };
+    for (invalid) |text| try std.testing.expectError(Error.BadRecord, parseRData(.SSHFP, text));
+}
+
+test "SSHFP zone text rejects non-decimal selector syntax" {
+    const fingerprint = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+    try std.testing.expectError(Error.BadRecord, parseRData(.SSHFP, "+4 2 " ++ fingerprint));
+    try std.testing.expectError(Error.BadRecord, parseRData(.SSHFP, "4 +2 " ++ fingerprint));
+    try std.testing.expectError(Error.BadRecord, parseRData(.SSHFP, "4_0 2 " ++ fingerprint));
+}
+
+test "zone parser recognizes and validates SSHFP records" {
+    var zone = try ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns hostmaster 1 3600 900 1209600 3600
+        \\@ IN NS ns
+        \\host IN SSHFP 4 2 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
+        \\
+    );
+    defer zone.deinit();
+    try std.testing.expectEqual(RecordType.SSHFP, zone.records.items[2].rrtype);
+}
+
+test "TLSA zone text accepts split hex associations and exact digest lengths" {
+    const sha256 = try parseRData(.TLSA, "0 0 1 000102030405060708090a0b0c0d0e0f 101112131415161718191a1b1c1d1e1f");
+    try std.testing.expectEqual(@as(u8, 0), sha256.TLSA.usage);
+    try std.testing.expectEqual(@as(u8, 0), sha256.TLSA.selector);
+    try std.testing.expectEqual(@as(u8, 1), sha256.TLSA.matching_type);
+    try std.testing.expectEqual(@as(usize, 32), @as(usize, sha256.TLSA.association_len));
+    for (sha256.TLSA.association[0..sha256.TLSA.association_len], 0..) |byte, index| {
+        try std.testing.expectEqual(@as(u8, @intCast(index)), byte);
+    }
+
+    const sha512 = try parseRData(.TLSA, "1 1 2 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f");
+    try std.testing.expectEqual(@as(usize, 64), @as(usize, sha512.TLSA.association_len));
+    try std.testing.expectEqual(@as(u8, 0x3f), sha512.TLSA.association[63]);
+
+    var one_char_chunks: [133]u8 = undefined;
+    @memcpy(one_char_chunks[0..6], "0 0 1 ");
+    const hex = "0123456789abcdef";
+    for (0..64) |index| {
+        one_char_chunks[6 + index * 2] = hex[index % hex.len];
+        if (index != 63) one_char_chunks[7 + index * 2] = ' ';
+    }
+    const chunked = try parseRData(.TLSA, &one_char_chunks);
+    try std.testing.expectEqual(@as(usize, 32), @as(usize, chunked.TLSA.association_len));
+    try std.testing.expectEqual(@as(u8, 0x01), chunked.TLSA.association[0]);
+    try std.testing.expectEqual(@as(u8, 0xef), chunked.TLSA.association[31]);
+}
+
+test "TLSA zone text accepts type zero data and normalizes service owner" {
+    const certificate = try parseRData(.TLSA, "3 1 0 aAbBcC");
+    try std.testing.expectEqual(@as(u8, 3), certificate.TLSA.usage);
+    try std.testing.expectEqual(@as(u8, 1), certificate.TLSA.selector);
+    try std.testing.expectEqual(@as(u8, 0), certificate.TLSA.matching_type);
+    try std.testing.expectEqual(@as(usize, 3), @as(usize, certificate.TLSA.association_len));
+    try std.testing.expectEqualSlices(u8, &.{ 0xaa, 0xbb, 0xcc }, certificate.TLSA.association[0..3]);
+
+    var zone = try ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns hostmaster 1 3600 900 1209600 3600
+        \\@ IN NS ns
+        \\_443._tcp IN TLSA 3 1 0 aabbcc
+        \\
+    );
+    defer zone.deinit();
+    try std.testing.expectEqual(RecordType.TLSA, zone.records.items[2].rrtype);
+    try std.testing.expectEqualStrings("_443._tcp.example.", zone.records.items[2].ownerText());
+}
+
+test "TLSA zone text rejects malformed selectors, chunks, and lengths" {
+    const invalid = [_][]const u8{
+        "0 0 0",
+        "0 0 0 0g",
+        "0 0 0 abc",
+        "0 0 0 00 1g",
+        "0 0 0 00 extra",
+        "+0 0 0 00",
+        "-0 0 0 00",
+        "0_0 0 0 00",
+        "256 0 0 00",
+        "0 256 0 00",
+        "0 0 256 00",
+        "4 0 0 00",
+        "0 2 0 00",
+        "0 0 3 00",
+        "0",
+        "0 0",
+        "0 0 0 \x80",
+    };
+    for (invalid) |text| try std.testing.expectError(Error.BadRecord, parseRData(.TLSA, text));
+
+    const short_sha256 = "0 0 1 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e";
+    const long_sha256 = "0 0 1 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
+    const short_sha512 = "0 0 2 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a";
+    const long_sha512 = "0 0 2 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c";
+    try std.testing.expectError(Error.BadRecord, parseRData(.TLSA, short_sha256));
+    try std.testing.expectError(Error.BadRecord, parseRData(.TLSA, long_sha256));
+    try std.testing.expectError(Error.BadRecord, parseRData(.TLSA, short_sha512));
+    try std.testing.expectError(Error.BadRecord, parseRData(.TLSA, long_sha512));
+
+    var too_long: [1026]u8 = undefined;
+    @memcpy(too_long[0..6], "0 0 0 ");
+    @memset(too_long[6..], '0');
+    try std.testing.expectError(Error.BadRecord, parseRData(.TLSA, &too_long));
+}
+
+test "URI zone text parses strict numeric fields and escaped target bytes" {
+    const basic = try parseRData(.URI, "10 20 \"https://example.test/path\"");
+    try std.testing.expectEqual(@as(u16, 10), basic.URI.priority);
+    try std.testing.expectEqual(@as(u16, 20), basic.URI.weight);
+    try std.testing.expectEqualStrings("https://example.test/path", basic.URI.targetBytes());
+
+    const spaced = try parseRData(.URI, " \t1 2 \"spaced\" \r\n");
+    try std.testing.expectEqualStrings("spaced", spaced.URI.targetBytes());
+
+    const raw_target = try parseRData(.URI, " \t1\t2 \t\"target with spaces\" \r\n");
+    try std.testing.expectEqualStrings("target with spaces", raw_target.URI.targetBytes());
+
+    const maximum_fields = try parseRData(.URI, "65535 65535 \"max\"");
+    try std.testing.expectEqual(@as(u16, 65535), maximum_fields.URI.priority);
+    try std.testing.expectEqual(@as(u16, 65535), maximum_fields.URI.weight);
+
+    const escaped = try parseRData(.URI, "1 2 \"quote\\\"slash\\\\tail\"");
+    try std.testing.expectEqualStrings("quote\"slash\\tail", escaped.URI.targetBytes());
+
+    const decimal_bytes = try parseRData(.URI, "1 2 \"A\\000B\\065C\\255\"");
+    try std.testing.expectEqualSlices(u8, &.{ 'A', 0, 'B', 'A', 'C', 255 }, decimal_bytes.URI.targetBytes());
+
+    const prefix = "65535 65535 \"";
+    var maximum_input: [prefix.len + 508 + 1]u8 = undefined;
+    @memcpy(maximum_input[0..prefix.len], prefix);
+    @memset(maximum_input[prefix.len .. prefix.len + 508], 'x');
+    maximum_input[maximum_input.len - 1] = '"';
+    const maximum_target = try parseRData(.URI, &maximum_input);
+    try std.testing.expectEqual(@as(u16, 508), maximum_target.URI.target_len);
+}
+
+test "URI zone text rejects malformed fields and targets" {
+    const invalid = [_][]const u8{
+        "1 2 target",
+        "1 2 \"\"",
+        "1 2 \"unterminated",
+        "1 2 \"unterminated\\",
+        "1 2 \"short\\1\"",
+        "1 2 \"short\\12\"",
+        "1 2 \"short\\12x\"",
+        "1 2 \"bad\\256\"",
+        "1 2 \"target\" extra",
+        "1 2 \"target\"\"second\"",
+        "+1 2 \"target\"",
+        "1 +2 \"target\"",
+        "1_0 2 \"target\"",
+        "1 2_0 \"target\"",
+        "65536 2 \"target\"",
+        "1 65536 \"target\"",
+        "1 2\"target\"",
+        "1 2",
+        "1",
+    };
+    for (invalid) |text| try std.testing.expectError(Error.BadRecord, parseRData(.URI, text));
+
+    const prefix = "1 2 \"";
+    var overlong_target: [prefix.len + 509 + 1]u8 = undefined;
+    @memcpy(overlong_target[0..prefix.len], prefix);
+    @memset(overlong_target[prefix.len .. prefix.len + 509], 'x');
+    overlong_target[overlong_target.len - 1] = '"';
+    try std.testing.expectError(Error.BadRecord, parseRData(.URI, &overlong_target));
+}
+
+test "zone parser decodes escaped URI target bytes after stripping comments" {
+    var zone = try ZoneFile.parse(
+        "$ORIGIN example.\n" ++
+            "$TTL 3600\n" ++
+            "@ IN SOA ns hostmaster 1 3600 900 1209600 3600\n" ++
+            "@ IN NS ns\n" ++
+            "service IN URI 1 2 \"a\\\"b\\\\c\\000\\255\" ; comment\n",
+    );
+    defer zone.deinit();
+
+    try std.testing.expectEqualStrings("1 2 \"a\\\"b\\\\c\\000\\255\"", zone.records.items[2].rdataText());
+    const uri = try parseRData(.URI, zone.records.items[2].rdataText());
+    try std.testing.expectEqualSlices(u8, &.{ 'a', '"', 'b', 0x5c, 'c', 0, 255 }, uri.URI.targetBytes());
+}
+
+test "zone parser ignores parentheses inside escaped URI targets" {
+    var zone = try ZoneFile.parse(
+        "$ORIGIN example.\n" ++
+            "$TTL 3600\n" ++
+            "@ IN SOA ns hostmaster 1 3600 900 1209600 3600\n" ++
+            "@ IN NS ns\n" ++
+            "service IN URI 3 4 \"a\\\"(b\\\\c\" ; comment\n",
+    );
+    defer zone.deinit();
+
+    const uri = try parseRData(.URI, zone.records.items[2].rdataText());
+    try std.testing.expectEqualSlices(u8, &.{ 'a', '"', '(', 'b', 0x5c, 'c' }, uri.URI.targetBytes());
+}
+
+test "zone parser recognizes and validates URI records" {
+    var zone = try ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns hostmaster 1 3600 900 1209600 3600
+        \\@ IN NS ns
+        \\service IN URI 10 20 "https://example.test/path"
+        \\
+    );
+    defer zone.deinit();
+    try std.testing.expectEqual(RecordType.URI, zone.records.items[2].rrtype);
+    try std.testing.expectEqualStrings("service.example.", zone.records.items[2].ownerText());
+    try std.testing.expectEqualStrings("10 20 \"https://example.test/path\"", zone.records.items[2].rdataText());
+}
+
+test "APL zone text parses empty ordered duplicate and negated items" {
+    const empty = try parseRData(.APL, " \t\r\n");
+    try std.testing.expectEqual(@as(usize, 0), empty.APL.bytes().len);
+
+    const apl = try parseRData(.APL, "!1:192.0.2.7/24 2:2001:db8:1::/48 1:192.0.2.7/24");
+    try std.testing.expectEqualSlices(u8, &.{
+        0,    1, 24, 0x83, 192,  0,    2,
+        0,    2, 48, 6,    0x20, 0x01, 0x0d,
+        0xb8, 0, 1,  0,    1,    24,   3,
+        192,  0, 2,
+    }, apl.APL.bytes());
+}
+
+test "APL zone text masks host bits and strips trailing zero octets" {
+    const apl = try parseRData(.APL, "1:192.0.2.7/16 2:2001:db8:1::1234/64 1:192.255.2.7/9");
+    try std.testing.expectEqualSlices(u8, &.{
+        0,    1,    16,   1, 192,
+        0,    2,    64,   6, 0x20,
+        0x01, 0x0d, 0xb8, 0, 1,
+        0,    1,    9,    2, 0xc0,
+        0x80,
+    }, apl.APL.bytes());
+}
+
+test "zone parser recognizes bare APL records" {
+    var zone = try ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns hostmaster 1 3600 900 1209600 3600
+        \\@ IN NS ns
+        \\empty IN APL
+        \\
+    );
+    defer zone.deinit();
+    try std.testing.expectEqual(RecordType.APL, zone.records.items[2].rrtype);
+    try std.testing.expectEqual(@as(usize, 0), zone.records.items[2].rdataText().len);
+    const apl = try parseRData(.APL, zone.records.items[2].rdataText());
+    try std.testing.expectEqual(@as(usize, 0), apl.APL.bytes().len);
+}
+
+test "APL zone text rejects malformed fields addresses families prefixes and bounds" {
+    const invalid = [_][]const u8{
+        "!",
+        "!!1:192.0.2.0/24",
+        "1::192.0.2.0/24",
+        "1:192.0.2.0",
+        "1:192.0.2.0/",
+        "1:192.0.2.0//24",
+        "1:192.0.2.0/24/1",
+        "1:192.0.2.0/24:extra",
+        "3:192.0.2.0/24",
+        "+1:192.0.2.0/24",
+        "-1:192.0.2.0/24",
+        "65536:192.0.2.0/24",
+        "1:999.0.2.1/24",
+        "2:2001:db8::g/32",
+        "1:2001:db8::/32",
+        "2:192.0.2.0/24",
+        "1:192.0.2.0/+24",
+        "1:192.0.2.0/-1",
+        "1:192.0.2.0/33",
+        "2:2001:db8::/129",
+        "1:192.0.2.0/18446744073709551616",
+    };
+    for (invalid) |text| try std.testing.expectError(Error.BadRecord, parseRData(.APL, text));
+
+    var overlong: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer overlong.deinit();
+    for (0..129) |_| try overlong.writer.writeAll("1:192.0.2.0/0 ");
+    try std.testing.expectError(Error.BadRecord, parseRData(.APL, overlong.written()));
+}
+
+test "NAPTR zone text parses strict fields and absolute replacement" {
+    const naptr = try parseRData(.NAPTR, "100 200 \"U\" \"SIP+D2U\" \"\" replacement.example.");
+    try std.testing.expectEqual(@as(u16, 100), naptr.NAPTR.order);
+    try std.testing.expectEqual(@as(u16, 200), naptr.NAPTR.preference);
+    try std.testing.expectEqualStrings("U", naptr.NAPTR.flagsText());
+    try std.testing.expectEqualStrings("SIP+D2U", naptr.NAPTR.servicesText());
+    try std.testing.expectEqualStrings("", naptr.NAPTR.regexpText());
+
+    var replacement_text: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("replacement.example.", try naptr.NAPTR.replacement.toText(&replacement_text));
+
+    const root = try parseRData(.NAPTR, "65535 65535 \"\" \"\" \"\" .");
+    try std.testing.expectEqual(@as(u16, 65535), root.NAPTR.order);
+    try std.testing.expectEqual(@as(u16, 65535), root.NAPTR.preference);
+    try std.testing.expectEqual(@as(usize, 0), root.NAPTR.flagsText().len);
+    try std.testing.expectEqual(@as(usize, 0), root.NAPTR.servicesText().len);
+    try std.testing.expectEqual(@as(usize, 0), root.NAPTR.regexpText().len);
+    try std.testing.expectEqualSlices(u8, &.{0}, root.NAPTR.replacement.asWire());
+}
+
+test "NAPTR zone text decodes quoted escapes and UTF-8" {
+    const naptr = try parseRData(.NAPTR, "1 2 \"U\" \"a\\\"b\\\\c SIP\\195\\169\" \"\\195\\169\" .");
+    try std.testing.expectEqualStrings("U", naptr.NAPTR.flagsText());
+    try std.testing.expectEqualSlices(u8, &.{ 'a', '"', 'b', '\\', 'c', ' ', 'S', 'I', 'P', 0xc3, 0xa9 }, naptr.NAPTR.servicesText());
+    try std.testing.expectEqualSlices(u8, &.{ 0xc3, 0xa9 }, naptr.NAPTR.regexpText());
+}
+
+test "NAPTR zone text rejects malformed presentation" {
+    const invalid = [_][]const u8{
+        "+1 2 \"U\" \"S\" \"\" .",
+        "1 +2 \"U\" \"S\" \"\" .",
+        "65536 2 \"U\" \"S\" \"\" .",
+        "1 65536 \"U\" \"S\" \"\" .",
+        "1 2 \"U\" \"S\" \"\"",
+        "1 2 U \"S\" \"\" .",
+        "1 2 \"U \"S\" \"\" .",
+        "1 2 \"U\" \"S\" \"unterminated .",
+        "1 2 \"U\" \"S\" \"short\\1\" .",
+        "1 2 \"U\" \"S\" \"short\\12\" .",
+        "1 2 \"U\" \"S\" \"bad\\256\" .",
+        "1 2 \"U\" \"S\" \"bad\\12x\" .",
+        "1 2 \"U!\" \"S\" \"\" .",
+        "1 2 \"U\" \"S\" \"\" relative",
+        "1 2 \"U\" \"S\" \"\" bad..example.",
+        "1 2 \"U\" \"S\" \"regexp\" replacement.example.",
+        "1 2 \"U\" \"S\" \"\" \"fourth\".",
+        "1 2 \"U\" \"S\" \"\" replacement.example. trailing",
+    };
+    for (invalid) |text| try std.testing.expectError(Error.BadRecord, parseRData(.NAPTR, text));
+
+    var overlong: [255 + 1]u8 = undefined;
+    @memset(&overlong, 'x');
+    const prefix = "1 2 \"";
+    const suffix = "\" \"S\" \"\" .";
+    var input: [prefix.len + overlong.len + suffix.len]u8 = undefined;
+    @memcpy(input[0..prefix.len], prefix);
+    @memcpy(input[prefix.len .. prefix.len + overlong.len], &overlong);
+    @memcpy(input[prefix.len + overlong.len ..], suffix);
+    try std.testing.expectError(Error.BadRecord, parseRData(.NAPTR, &input));
+}
+
+test "NAPTR zone text rejects non-UTF8 and oversized wire data" {
+    try std.testing.expectError(Error.BadRecord, parseRData(.NAPTR, "1 2 \"U\" \"bad\\255\" \"\" ."));
+
+    var field: [255]u8 = undefined;
+    @memset(&field, 'x');
+    var text: [4 + (1 + 1) + (1 + field.len) + (1 + field.len) + (1 + field.len) + 256]u8 = undefined;
+    var index: usize = 0;
+    @memcpy(text[index .. index + 4], "1 2 ");
+    index += 4;
+    for (0..3) |field_index| {
+        text[index] = '"';
+        index += 1;
+        const bytes = if (field_index == 0) "U" else &field;
+        @memcpy(text[index .. index + bytes.len], bytes);
+        index += bytes.len;
+        text[index] = '"';
+        index += 1;
+        text[index] = ' ';
+        index += 1;
+    }
+    @memcpy(text[index .. index + 256], "a" ** 256);
+    index += 256;
+    text[index] = '.';
+    index += 1;
+    try std.testing.expectError(Error.BadRecord, parseRData(.NAPTR, text[0..index]));
+}
+
+test "zone parser decodes escaped NAPTR text across parentheses and comments" {
+    var zone = try ZoneFile.parse(
+        "$ORIGIN example.\n" ++
+            "$TTL 3600\n" ++
+            "@ IN SOA ns hostmaster 1 3600 900 1209600 3600\n" ++
+            "@ IN NS ns\n" ++
+            "service IN NAPTR (\n" ++
+            " 100 10 \"U\" \"SIP\\\"(D2U\\\\x\" \"\" .\n" ++
+            ") ; comment\n",
+    );
+    defer zone.deinit();
+
+    try std.testing.expectEqual(RecordType.NAPTR, zone.records.items[2].rrtype);
+    const naptr = try parseRData(.NAPTR, zone.records.items[2].rdataText());
+    try std.testing.expectEqualSlices(u8, &.{ 'S', 'I', 'P', '"', '(', 'D', '2', 'U', '\\', 'x' }, naptr.NAPTR.servicesText());
+    try std.testing.expectEqualSlices(u8, &.{0}, naptr.NAPTR.replacement.asWire());
 }
 
 test "zone parser loads bundled home.arpa example" {

@@ -1,0 +1,20 @@
+name: apl-response
+rfc: RFC 3123 sections 3-6
+phase: 3
+description: Exact authoritative APL response preserving mixed ordered items.
+input_hex:
+  44 61 01 00 00 01 00 00 00 00 00 00
+  03 61 70 6c 04 68 6f 6d 65 04 61 72 70 61 00 00 2a 00 01
+response_hex:
+  44 61 85 00 00 01 00 01 00 00 00 00
+  03 61 70 6c 04 68 6f 6d 65 04 61 72 70 61 00 00 2a 00 01
+  c0 0c 00 2a 00 01 00 00 0e 10 00 18
+  00 01 18 83 c0 00 02
+  00 02 30 06 20 01 0d b8 00 01
+  00 01 18 03 c0 00 02
+expect:
+  parse_ok: true
+  id: 0x4461
+  qname: apl.home.arpa.
+  qtype: APL
+  qclass: IN
