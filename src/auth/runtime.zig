@@ -72,7 +72,13 @@ pub const Runtime = struct {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
 
-        const query = dns_message.Message.parseQuery(arena.allocator(), query_bytes) catch return Error.BadQuery;
+        const query = dns_message.Message.parseQuery(arena.allocator(), query_bytes) catch |err| switch (err) {
+            error.MalformedEcsOption => {
+                const partial = dns_message.Message.parseHeaderQuestion(arena.allocator(), query_bytes) catch return Error.BadQuery;
+                return self.encodeMessage(try response.buildFormerrResponse(partial), output);
+            },
+            else => return Error.BadQuery,
+        };
         const message = try self.buildMessage(query);
         var writer = dns_writer.Writer.init(output);
         message.encode(&writer) catch return Error.EncodeFailed;
@@ -82,7 +88,13 @@ pub const Runtime = struct {
     pub fn answerFrom(self: *Runtime, query_bytes: []const u8, output: []u8, client: *const std.Io.net.IpAddress) ![]const u8 {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
-        const query = dns_message.Message.parseQuery(arena.allocator(), query_bytes) catch return Error.BadQuery;
+        const query = dns_message.Message.parseQuery(arena.allocator(), query_bytes) catch |err| switch (err) {
+            error.MalformedEcsOption => {
+                const partial = dns_message.Message.parseHeaderQuestion(arena.allocator(), query_bytes) catch return Error.BadQuery;
+                return self.encodeMessage(try response.buildFormerrResponse(partial), output);
+            },
+            else => return Error.BadQuery,
+        };
         const q = query.question orelse return Error.BadQuery;
         if (query.header.opcode != .query) {
             return self.encodeMessage(try response.buildNotImplementedResponse(query), output);
@@ -117,6 +129,7 @@ pub const Runtime = struct {
                 resolver_mod.Error.BadUpstreamResponse,
                 => self.encodeMessage(try resolver_mod.buildNetworkErrorResponse(query), output),
                 resolver_mod.Error.NoForwarder => self.encodeMessage(try response.buildRefusedResponse(query), output),
+                resolver_mod.Error.EcsRefused => self.encodeMessage(try response.buildRefusedResponse(query), output),
                 resolver_mod.Error.ResponseTooLarge => return Error.EncodeFailed,
                 else => return err,
             };
@@ -140,9 +153,23 @@ pub const Runtime = struct {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
 
-        const query = dns_message.Message.parseQuery(arena.allocator(), query_bytes) catch {
-            counters.bad_queries_total += 1;
-            return Error.BadQuery;
+        const query = dns_message.Message.parseQuery(arena.allocator(), query_bytes) catch |err| switch (err) {
+            error.MalformedEcsOption => {
+                counters.bad_queries_total += 1;
+                const partial = dns_message.Message.parseHeaderQuestion(arena.allocator(), query_bytes) catch {
+                    return Error.BadQuery;
+                };
+                const result = self.encodeMessage(try response.buildFormerrResponse(partial), output) catch {
+                    counters.encode_failures_total += 1;
+                    return Error.EncodeFailed;
+                };
+                counters.responses_total += 1;
+                return result;
+            },
+            else => {
+                counters.bad_queries_total += 1;
+                return Error.BadQuery;
+            },
         };
         const message = try self.buildMessage(query);
         var writer = dns_writer.Writer.init(output);
@@ -216,6 +243,38 @@ test "authoritative runtime answers raw query bytes" {
     try std.testing.expect(parsed.header.qr);
     try std.testing.expectEqual(@as(u16, 1), parsed.header.answer_count);
     try std.testing.expectEqualSlices(u8, &.{ 192, 168, 1, 1 }, &parsed.answers.items[0].rdata.A);
+}
+
+test "runtime returns bare FORMERR for malformed ECS with a valid question" {
+    var runtime = try Runtime.fromZoneText(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
+        \\
+    );
+    defer runtime.deinit();
+
+    const malformed_ecs_query = [_]u8{
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        7,    'e',  'x',  'a',  'm',  'p',  'l',  'e',  3,    'c',  'o',  'm',
+        0,    0x00, 0x01, 0x00, 0x01, 0,    0x00, 0x29, 0x04, 0xd0, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x0b, 0x00, 0x08, 0x00, 0x07, 0x00, 0x01, 0x18, 0x01,
+        192,  0,    2,
+    };
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 53003);
+    var output: [512]u8 = undefined;
+    const response_bytes = try runtime.answerFrom(&malformed_ecs_query, &output, &client);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expect(parsed.header.qr);
+    try std.testing.expectEqual(@as(@TypeOf(parsed.header.rcode), .formerr), parsed.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.question_count);
+    try std.testing.expectEqual(@as(u16, 0), parsed.header.additional_count);
+    try std.testing.expect(parsed.edns == null);
 }
 
 test "authoritative runtime records metrics for successful and bad queries" {

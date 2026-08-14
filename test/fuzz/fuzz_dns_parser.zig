@@ -58,6 +58,7 @@ fn fuzzMessage(input: []const u8) !void {
         error.AllocationBudgetExceeded,
         error.TrailingData,
         error.MalformedEdnsOption,
+        error.MalformedEcsOption,
         error.EdnsOptionsTooLong,
         error.MultipleOptRecords,
         error.InvalidOptOwner,

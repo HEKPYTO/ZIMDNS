@@ -8,6 +8,7 @@ const CompressionTable = @import("writer.zig").CompressionTable;
 const header_mod = @import("header.zig");
 const question_mod = @import("question.zig");
 const record_mod = @import("record.zig");
+const rdata_mod = @import("rdata.zig");
 const name_mod = @import("name.zig");
 
 pub const Error = error{
@@ -18,6 +19,7 @@ pub const Error = error{
     AllocationBudgetExceeded,
     TrailingData,
     MalformedEdnsOption,
+    MalformedEcsOption,
     EdnsOptionsTooLong,
     MultipleOptRecords,
     InvalidOptOwner,
@@ -125,6 +127,40 @@ pub const Message = struct {
             message.deinit();
             return Error.UnsupportedQuestionCount;
         }
+        for (message.additionals.slice()) |record| {
+            if (!record.rrtype.eql(.OPT)) continue;
+            const options = switch (record.rdata) {
+                .OPT => |opt| opt.bytes(),
+                else => unreachable,
+            };
+            rdata_mod.validateEdnsOptions(options, true) catch |err| {
+                message.deinit();
+                return switch (err) {
+                    error.MalformedEcsOption => Error.MalformedEcsOption,
+                    else => Error.MalformedEdnsOption,
+                };
+            };
+        }
+        return message;
+    }
+
+    /// Parse only the header and one question for a protocol error response.
+    /// The remaining sections are intentionally ignored after the question.
+    pub fn parseHeaderQuestion(allocator: std.mem.Allocator, bytes: []const u8) !Message {
+        var reader = Reader.init(bytes);
+        const header = try header_mod.Header.parse(&reader);
+        if (header.qr) return Error.ResponseNotQuery;
+        if (header.question_count != 1) return Error.UnsupportedQuestionCount;
+        const parsed_question = try question_mod.Question.parse(bytes, reader.position());
+        var message = Message{
+            .allocator = allocator,
+            .header = header,
+            .question = parsed_question.question,
+        };
+        errdefer message.deinit();
+        message.answers = try RecordSection.init(allocator, 0);
+        message.authorities = try RecordSection.init(allocator, 0);
+        message.additionals = try RecordSection.init(allocator, 0);
         return message;
     }
 
@@ -176,6 +212,7 @@ fn parseAdditionalSection(allocator: std.mem.Allocator, bytes: []const u8, reade
         const record_offset = reader.position();
         const parsed_record = record_mod.ResourceRecord.parse(bytes, reader.position()) catch |err| switch (err) {
             record_mod.Error.MalformedOption => return Error.MalformedEdnsOption,
+            record_mod.Error.MalformedEcsOption => return Error.MalformedEcsOption,
             record_mod.Error.OptionsTooLong => return Error.EdnsOptionsTooLong,
             else => return Error.BadRecord,
         };
@@ -365,6 +402,23 @@ test "message rejects malformed OPT records" {
         0x00, 0x00, 0x00, 0x04, 0x00, 0x01, 0x00, 0x03,
     };
     try std.testing.expectError(Error.MalformedEdnsOption, Message.parse(arena.allocator(), &malformed_option));
+}
+
+test "message rejects nonzero ECS scope in queries" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const query = [_]u8{
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        7,    'e',  'x',  'a',  'm',  'p',  'l',  'e',  3,    'c',  'o',  'm',
+        0,    0x00, 0x01, 0x00, 0x01, 0,    0x00, 0x29, 0x04, 0xd0, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x0b, 0x00, 0x08, 0x00, 0x07, 0x00, 0x01, 0x18, 0x01,
+        192,  0,    2,
+    };
+
+    const response_view = try Message.parse(arena.allocator(), &query);
+    try std.testing.expect(response_view.edns != null);
+    try std.testing.expectError(Error.MalformedEcsOption, Message.parseQuery(arena.allocator(), &query));
 }
 
 test "message response encoding uses backwards owner compression" {

@@ -1,0 +1,17 @@
+name: isdn-response
+rfc: RFC 1183 section 3.2
+phase: 3
+description: Exact authoritative ISDN response with address and subaddress and no synthesized additional record.
+input_hex:
+  44 64 01 00 00 01 00 00 00 00 00 00
+  04 69 73 64 6e 04 68 6f 6d 65 04 61 72 70 61 00 00 14 00 01
+response_hex:
+  44 64 85 00 00 01 00 01 00 00 00 00
+  04 69 73 64 6e 04 68 6f 6d 65 04 61 72 70 61 00 00 14 00 01
+  c0 0c 00 14 00 01 00 00 0e 10 00 09 04 31 32 33 34 03 61 42 66
+expect:
+  parse_ok: true
+  id: 0x4464
+  qname: isdn.home.arpa.
+  qtype: ISDN
+  qclass: IN

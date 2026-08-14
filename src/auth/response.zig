@@ -166,6 +166,15 @@ pub fn buildRefusedResponse(request: dns_message.Message) !dns_message.Message {
     return buildEmptyResponse(request, q, if (q.qclass.eql(dns_types.Class.IN)) .refused else .notimp);
 }
 
+pub fn buildFormerrResponse(request: dns_message.Message) !dns_message.Message {
+    const q = request.question orelse return Error.MissingQuestion;
+    var response = try buildEmptyResponse(request, q, .formerr);
+    response.edns = null;
+    response.additionals.len = 0;
+    response.header.additional_count = 0;
+    return response;
+}
+
 pub fn buildNotImplementedResponse(request: dns_message.Message) !dns_message.Message {
     const q = request.question orelse return Error.MissingQuestion;
     return buildEmptyResponse(request, q, .notimp);
@@ -625,4 +634,43 @@ test "authoritative response ignores unknown EDNS options" {
     try std.testing.expectEqual(@as(u16, 1232), response.edns.?.udp_payload_size);
     try std.testing.expectEqual(@as(usize, 1), response.additionals.len);
     try std.testing.expectEqual(@as(usize, 0), response.additionals.items[0].rdata.OPT.bytes().len);
+}
+
+test "authoritative response emits bare OPT for Padding and ECS /0" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const padding_query = [_]u8{
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        3,    'd',  'n',  's',  4,    'h',  'o',  'm',  'e',  4,    'a',  'r',
+        'p',  'a',  0,    0x00, 0x01, 0x00, 0x01, 0,    0x00, 0x29, 0x10, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x00, 0x0c, 0x00, 0x03, 0xaa, 0xbb,
+        0xcc,
+    };
+    const ecs_zero_query = [_]u8{
+        0x12, 0x35, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        3,    'd',  'n',  's',  4,    'h',  'o',  'm',  'e',  4,    'a',  'r',
+        'p',  'a',  0,    0x00, 0x01, 0x00, 0x01, 0,    0x00, 0x29, 0x10, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x08, 0x00, 0x04, 0x00, 0x01,
+        0x00, 0x00,
+    };
+
+    var zone_file = try zone_parser.ZoneFile.parse(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
+        \\
+    );
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    for ([_][]const u8{ &padding_query, &ecs_zero_query }) |wire| {
+        const request = try dns_message.Message.parseQuery(arena.allocator(), wire);
+        const response = try buildResponse(request, &zone);
+        try std.testing.expect(response.edns != null);
+        try std.testing.expectEqual(@as(usize, 1), response.additionals.len);
+        try std.testing.expectEqual(@as(usize, 0), response.additionals.items[0].rdata.OPT.bytes().len);
+    }
 }

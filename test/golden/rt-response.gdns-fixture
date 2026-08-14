@@ -1,0 +1,18 @@
+name: rt-response
+rfc: RFC 1183 section 3.3
+phase: 3
+description: Exact authoritative RT response with target A, X25, and ISDN records omitted from additionals.
+input_hex:
+  44 65 01 00 00 01 00 00 00 00 00 00
+  02 72 74 04 68 6f 6d 65 04 61 72 70 61 00 00 15 00 01
+response_hex:
+  44 65 85 00 00 01 00 01 00 00 00 00
+  02 72 74 04 68 6f 6d 65 04 61 72 70 61 00 00 15 00 01
+  c0 0c 00 15 00 01 00 00 0e 10 00 0b
+  00 64 06 74 61 72 67 65 74 c0 0f
+expect:
+  parse_ok: true
+  id: 0x4465
+  qname: rt.home.arpa.
+  qtype: RT
+  qclass: IN

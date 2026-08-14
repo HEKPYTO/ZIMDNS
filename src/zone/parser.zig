@@ -320,7 +320,11 @@ fn parseRecordType(text: []const u8) ?RecordType {
     if (std.mem.eql(u8, text, "DNAME")) return .DNAME;
     if (std.mem.eql(u8, text, "PTR")) return .PTR;
     if (std.mem.eql(u8, text, "MX")) return .MX;
+    if (std.mem.eql(u8, text, "RT")) return .RT;
+    if (std.mem.eql(u8, text, "RP")) return .RP;
     if (std.mem.eql(u8, text, "AFSDB")) return .AFSDB;
+    if (std.mem.eql(u8, text, "X25")) return .X25;
+    if (std.mem.eql(u8, text, "ISDN")) return .ISDN;
     if (std.mem.eql(u8, text, "TXT")) return .TXT;
     if (std.mem.eql(u8, text, "SRV")) return .SRV;
     if (std.mem.eql(u8, text, "NAPTR")) return .NAPTR;
@@ -347,7 +351,11 @@ pub fn parseRData(rrtype: RecordType, text: []const u8) Error!dns_rdata.RData {
     if (rrtype.eql(.PTR)) return .{ .PTR = try parseRdataName(text) };
     if (rrtype.eql(.SOA)) return .{ .SOA = try parseSoa(text) };
     if (rrtype.eql(.MX)) return .{ .MX = try parseMx(text) };
+    if (rrtype.eql(.RT)) return .{ .RT = try parseMx(text) };
+    if (rrtype.eql(.RP)) return .{ .RP = try parseRp(text) };
     if (rrtype.eql(.AFSDB)) return .{ .AFSDB = try parseAfsdb(text) };
+    if (rrtype.eql(.X25)) return .{ .X25 = try parseX25(text) };
+    if (rrtype.eql(.ISDN)) return .{ .ISDN = try parseIsdn(text) };
     if (rrtype.eql(.TXT)) return .{ .TXT = try parseTxt(text) };
     if (rrtype.eql(.SRV)) return .{ .SRV = try parseSrv(text) };
     if (rrtype.eql(.NAPTR)) return .{ .NAPTR = try parseNaptr(text) };
@@ -446,7 +454,7 @@ fn parseRdataName(text: []const u8) Error!dns_name.Name {
 
 fn parseMx(text: []const u8) Error!dns_rdata.Mx {
     var tokens = std.mem.tokenizeAny(u8, text, " \t\r\n");
-    const preference = std.fmt.parseInt(u16, tokens.next() orelse return Error.BadRecord, 10) catch return Error.BadRecord;
+    const preference = parseStrictDecimal(u16, tokens.next() orelse return Error.BadRecord) orelse return Error.BadRecord;
     const exchange = tokens.next() orelse return Error.BadRecord;
     if (tokens.next() != null) return Error.BadRecord;
     return .{
@@ -466,6 +474,17 @@ fn parseAfsdb(text: []const u8) Error!dns_rdata.Mx {
     };
 }
 
+fn parseRp(text: []const u8) Error!dns_rdata.Rp {
+    var tokens = std.mem.tokenizeAny(u8, text, " \t\r\n");
+    const mbox = tokens.next() orelse return Error.BadRecord;
+    const txt = tokens.next() orelse return Error.BadRecord;
+    if (tokens.next() != null) return Error.BadRecord;
+    return .{
+        .mbox = try parseRdataName(mbox),
+        .txt = try parseRdataName(txt),
+    };
+}
+
 fn parseTxt(text: []const u8) Error!dns_rdata.Txt {
     const value = if (text.len >= 2 and text[0] == '"' and text[text.len - 1] == '"') text[1 .. text.len - 1] else text;
     if (value.len > 255) return Error.BadRecord;
@@ -474,11 +493,74 @@ fn parseTxt(text: []const u8) Error!dns_rdata.Txt {
     return txt;
 }
 
+fn parseX25(text: []const u8) Error!dns_rdata.Txt {
+    const input = std.mem.trim(u8, text, " \t\r\n");
+    if (input.len == 0) return Error.BadRecord;
+
+    const value = if (input[0] == '"') blk: {
+        if (input.len < 2 or input[input.len - 1] != '"') return Error.BadRecord;
+        break :blk input[1 .. input.len - 1];
+    } else blk: {
+        for (input) |byte| {
+            if (std.ascii.isWhitespace(byte)) return Error.BadRecord;
+        }
+        break :blk input;
+    };
+    if (!dns_rdata.validX25(value)) return Error.BadRecord;
+
+    var x25 = dns_rdata.Txt{ .len = @intCast(value.len) };
+    @memcpy(x25.data[0..value.len], value);
+    return x25;
+}
+
+fn parseIsdn(text: []const u8) Error!dns_rdata.Isdn {
+    const input = std.mem.trim(u8, text, " \t\r\n");
+    if (input.len == 0) return Error.BadRecord;
+
+    var index: usize = 0;
+    const address = try parseIsdnField(input, &index);
+    if (!dns_rdata.validIsdnAddress(address)) return Error.BadRecord;
+
+    if (index == input.len) return dns_rdata.Isdn.init(address, null) catch Error.BadRecord;
+    if (!std.ascii.isWhitespace(input[index])) return Error.BadRecord;
+    while (index < input.len and std.ascii.isWhitespace(input[index])) index += 1;
+    if (index == input.len) return Error.BadRecord;
+
+    const subaddress = try parseIsdnField(input, &index);
+    if (!dns_rdata.validIsdnSubaddress(subaddress)) return Error.BadRecord;
+    while (index < input.len and std.ascii.isWhitespace(input[index])) index += 1;
+    if (index != input.len) return Error.BadRecord;
+    return dns_rdata.Isdn.init(address, subaddress) catch Error.BadRecord;
+}
+
+fn parseIsdnField(input: []const u8, index: *usize) Error![]const u8 {
+    if (index.* >= input.len) return Error.BadRecord;
+    if (input[index.*] == '"') {
+        index.* += 1;
+        const start = index.*;
+        while (index.* < input.len and input[index.*] != '"') {
+            if (input[index.*] == '\\' or std.ascii.isWhitespace(input[index.*])) return Error.BadRecord;
+            index.* += 1;
+        }
+        if (index.* == input.len) return Error.BadRecord;
+        const value = input[start..index.*];
+        index.* += 1;
+        return value;
+    }
+
+    const start = index.*;
+    while (index.* < input.len and !std.ascii.isWhitespace(input[index.*])) {
+        if (input[index.*] == '"' or input[index.*] == '\\') return Error.BadRecord;
+        index.* += 1;
+    }
+    return input[start..index.*];
+}
+
 fn parseSrv(text: []const u8) Error!dns_rdata.Srv {
     var tokens = std.mem.tokenizeAny(u8, text, " \t\r\n");
-    const priority = std.fmt.parseInt(u16, tokens.next() orelse return Error.BadRecord, 10) catch return Error.BadRecord;
-    const weight = std.fmt.parseInt(u16, tokens.next() orelse return Error.BadRecord, 10) catch return Error.BadRecord;
-    const port = std.fmt.parseInt(u16, tokens.next() orelse return Error.BadRecord, 10) catch return Error.BadRecord;
+    const priority = parseStrictDecimal(u16, tokens.next() orelse return Error.BadRecord) orelse return Error.BadRecord;
+    const weight = parseStrictDecimal(u16, tokens.next() orelse return Error.BadRecord) orelse return Error.BadRecord;
+    const port = parseStrictDecimal(u16, tokens.next() orelse return Error.BadRecord) orelse return Error.BadRecord;
     const target = tokens.next() orelse return Error.BadRecord;
     if (tokens.next() != null) return Error.BadRecord;
     return .{
@@ -1008,6 +1090,40 @@ test "zone parser expands relative domain-bearing RDATA against origin" {
     try std.testing.expectEqualStrings("target.Example.", zone.records.items[7].rdataText());
 }
 
+test "zone parser preserves SRV numeric fields and root target" {
+    var zone = try ZoneFile.parse(
+        \\$ORIGIN Example.
+        \\$TTL 3600
+        \\@ IN SOA ns hostmaster 1 3600 900 1209600 3600
+        \\@ IN NS ns
+        \\service IN SRV 0 65535 65535 target
+        \\root-service IN SRV 65535 0 0 .
+        \\
+    );
+    defer zone.deinit();
+
+    const srv = try parseRData(.SRV, zone.records.items[2].rdataText());
+    try std.testing.expectEqual(@as(u16, 0), srv.SRV.priority);
+    try std.testing.expectEqual(@as(u16, 65535), srv.SRV.weight);
+    try std.testing.expectEqual(@as(u16, 65535), srv.SRV.port);
+    try std.testing.expectEqualSlices(u8, &.{
+        0x06, 't',  'a', 'r', 'g', 'e', 't',
+        0x07, 'e',  'x', 'a', 'm', 'p', 'l',
+        'e',  0x00,
+    }, srv.SRV.target.asWire());
+
+    const root = try parseRData(.SRV, zone.records.items[3].rdataText());
+    try std.testing.expectEqual(@as(u16, 65535), root.SRV.priority);
+    try std.testing.expectEqualSlices(u8, &.{0}, root.SRV.target.asWire());
+    try std.testing.expectError(Error.BadRecord, parseRData(.SRV, "65536 0 1 target.Example."));
+    try std.testing.expectError(Error.BadRecord, parseRData(.SRV, "+1 0 1 target.Example."));
+    try std.testing.expectError(Error.BadRecord, parseRData(.SRV, "0 +1 1 target.Example."));
+    try std.testing.expectError(Error.BadRecord, parseRData(.SRV, "0 1 +1 target.Example."));
+    try std.testing.expectError(Error.BadRecord, parseRData(.SRV, "1_0 0 1 target.Example."));
+    try std.testing.expectError(Error.BadRecord, parseRData(.SRV, "0 1_0 1 target.Example."));
+    try std.testing.expectError(Error.BadRecord, parseRData(.SRV, "0 1 1_0 target.Example."));
+}
+
 test "zone parser rejects incomplete SOA RDATA at load time" {
     try std.testing.expectError(Error.BadRecord, ZoneFile.parse(
         \\$ORIGIN example.
@@ -1143,6 +1259,210 @@ test "CAA zone text rejects noncanonical fields and malformed values" {
     try std.testing.expectError(Error.BadRecord, parseRData(.CAA, &overlong));
 }
 
+test "X25 zone text accepts one bare or quoted decimal address" {
+    const bare = try parseRData(.X25, "1234");
+    try std.testing.expectEqualStrings("1234", bare.X25.text());
+
+    const quoted = try parseRData(.X25, "\"1234\"");
+    try std.testing.expectEqualStrings("1234", quoted.X25.text());
+
+    var maximum: [255]u8 = undefined;
+    @memset(&maximum, '9');
+    const maximum_value = try parseRData(.X25, &maximum);
+    try std.testing.expectEqual(@as(usize, 255), maximum_value.X25.text().len);
+}
+
+test "X25 zone text rejects malformed quoting fields escapes and addresses" {
+    const invalid = [_][]const u8{
+        "",
+        "123",
+        "1234 5678",
+        "1234\t5678",
+        "\"1234",
+        "1234\"",
+        "\"1234\" extra",
+        "extra \"1234\"",
+        "\"12 34\"",
+        "\"1234 5678\"",
+        "\"1234\\\"",
+        "\"12\\34\"",
+        "\"\\049234\"",
+        "12a4",
+        "\"12a4\"",
+        "+1234",
+        "-1234",
+        "1234.",
+        "\"\"",
+    };
+    for (invalid) |text| try std.testing.expectError(Error.BadRecord, parseRData(.X25, text));
+
+    var overlong: [256]u8 = undefined;
+    @memset(&overlong, '9');
+    try std.testing.expectError(Error.BadRecord, parseRData(.X25, &overlong));
+}
+
+test "zone parser recognizes and validates X25 records" {
+    var zone = try ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns hostmaster 1 3600 900 1209600 3600
+        \\@ IN NS ns
+        \\bare IN X25 1234
+        \\quoted IN X25 "5678"
+        \\
+    );
+    defer zone.deinit();
+
+    try std.testing.expectEqual(RecordType.X25, zone.records.items[2].rrtype);
+    try std.testing.expectEqualStrings("1234", zone.records.items[2].rdataText());
+    const bare = try parseRData(.X25, zone.records.items[2].rdataText());
+    try std.testing.expectEqualStrings("1234", bare.X25.text());
+
+    try std.testing.expectEqual(RecordType.X25, zone.records.items[3].rrtype);
+    try std.testing.expectEqualStrings("\"5678\"", zone.records.items[3].rdataText());
+    const quoted = try parseRData(.X25, zone.records.items[3].rdataText());
+    try std.testing.expectEqualStrings("5678", quoted.X25.text());
+}
+
+test "ISDN zone text parses bare and quoted address fields" {
+    const bare_address = try parseRData(.ISDN, "1234");
+    try std.testing.expectEqualStrings("1234", bare_address.ISDN.addressText());
+    try std.testing.expect(!bare_address.ISDN.has_subaddress);
+
+    const quoted_address = try parseRData(.ISDN, "\"5678\"");
+    try std.testing.expectEqualStrings("5678", quoted_address.ISDN.addressText());
+    try std.testing.expect(!quoted_address.ISDN.has_subaddress);
+
+    const bare_address_quoted_subaddress = try parseRData(.ISDN, "1234 \"aBf\"");
+    try std.testing.expectEqualStrings("1234", bare_address_quoted_subaddress.ISDN.addressText());
+    try std.testing.expectEqualStrings("aBf", bare_address_quoted_subaddress.ISDN.subaddressText());
+
+    const bare_address_bare_subaddress = try parseRData(.ISDN, "1234 09af");
+    try std.testing.expectEqualStrings("1234", bare_address_bare_subaddress.ISDN.addressText());
+    try std.testing.expectEqualStrings("09af", bare_address_bare_subaddress.ISDN.subaddressText());
+
+    const quoted_address_bare_subaddress = try parseRData(.ISDN, "\"5678\" 09af");
+    try std.testing.expectEqualStrings("5678", quoted_address_bare_subaddress.ISDN.addressText());
+    try std.testing.expectEqualStrings("09af", quoted_address_bare_subaddress.ISDN.subaddressText());
+
+    const quoted_address_quoted_subaddress = try parseRData(.ISDN, "\"5678\" \"aBf\"");
+    try std.testing.expectEqualStrings("5678", quoted_address_quoted_subaddress.ISDN.addressText());
+    try std.testing.expectEqualStrings("aBf", quoted_address_quoted_subaddress.ISDN.subaddressText());
+}
+
+test "ISDN zone text accepts minimum and maximum strings" {
+    const minimum = try parseRData(.ISDN, "1 a");
+    try std.testing.expectEqualStrings("1", minimum.ISDN.addressText());
+    try std.testing.expectEqualStrings("a", minimum.ISDN.subaddressText());
+
+    var address: [255]u8 = undefined;
+    @memset(&address, '9');
+    var subaddress: [255]u8 = undefined;
+    @memset(&subaddress, 'f');
+    var input: [255 + 1 + 255]u8 = undefined;
+    @memcpy(input[0..address.len], &address);
+    input[address.len] = ' ';
+    @memcpy(input[address.len + 1 ..], &subaddress);
+
+    const maximum = try parseRData(.ISDN, &input);
+    try std.testing.expectEqualSlices(u8, &address, maximum.ISDN.addressText());
+    try std.testing.expectEqualSlices(u8, &subaddress, maximum.ISDN.subaddressText());
+}
+
+test "ISDN zone text rejects malformed presentation" {
+    const invalid = [_][]const u8{
+        "",
+        "1234 5678 extra",
+        "\"1234",
+        "1234\"",
+        "\"1234\" extra",
+        "\"12 34\"",
+        "1234 \"ab cd\"",
+        "\"12\\34\"",
+        "123a",
+        "1234 g",
+        "1234 \"ag\"",
+        "\"\"",
+        "1234 \"\"",
+        "1234 \\",
+    };
+    for (invalid) |text| try std.testing.expectError(Error.BadRecord, parseRData(.ISDN, text));
+
+    var overlong_address: [256]u8 = undefined;
+    @memset(&overlong_address, '1');
+    try std.testing.expectError(Error.BadRecord, parseRData(.ISDN, &overlong_address));
+
+    var overlong_subaddress: [256]u8 = undefined;
+    @memset(&overlong_subaddress, 'f');
+    var overlong_input: [1 + 1 + 256]u8 = undefined;
+    overlong_input[0] = '1';
+    overlong_input[1] = ' ';
+    @memcpy(overlong_input[2..], &overlong_subaddress);
+    try std.testing.expectError(Error.BadRecord, parseRData(.ISDN, &overlong_input));
+}
+
+test "zone parser recognizes and validates ISDN records" {
+    var zone = try ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns hostmaster 1 3600 900 1209600 3600
+        \\@ IN NS ns
+        \\phone IN ISDN 1234 "aBf"
+        \\
+    );
+    defer zone.deinit();
+
+    try std.testing.expectEqual(RecordType.ISDN, zone.records.items[2].rrtype);
+    try std.testing.expectEqualStrings("1234 \"aBf\"", zone.records.items[2].rdataText());
+    const isdn = try parseRData(.ISDN, zone.records.items[2].rdataText());
+    try std.testing.expectEqualStrings("1234", isdn.ISDN.addressText());
+    try std.testing.expectEqualStrings("aBf", isdn.ISDN.subaddressText());
+}
+
+test "RP zone text parses two absolute names and either root field" {
+    const named = try parseRData(.RP, "mbox.example. txt.example.");
+    try std.testing.expectEqualSlices(u8, &.{ 4, 'm', 'b', 'o', 'x', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0 }, named.RP.mbox.asWire());
+    try std.testing.expectEqualSlices(u8, &.{ 3, 't', 'x', 't', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0 }, named.RP.txt.asWire());
+
+    const root_mbox = try parseRData(.RP, ". txt.example.");
+    try std.testing.expectEqualSlices(u8, &.{0}, root_mbox.RP.mbox.asWire());
+    try std.testing.expectEqualSlices(u8, named.RP.txt.asWire(), root_mbox.RP.txt.asWire());
+
+    const root_txt = try parseRData(.RP, "mbox.example. .");
+    try std.testing.expectEqualSlices(u8, named.RP.mbox.asWire(), root_txt.RP.mbox.asWire());
+    try std.testing.expectEqualSlices(u8, &.{0}, root_txt.RP.txt.asWire());
+}
+
+test "RP zone text rejects missing extra relative and malformed names" {
+    const invalid = [_][]const u8{
+        "",
+        "mbox.example.",
+        "mbox.example. txt.example. extra",
+        "mbox txt.example.",
+        "mbox.example. txt",
+        "bad..example. txt.example.",
+    };
+    for (invalid) |text| try std.testing.expectError(Error.BadRecord, parseRData(.RP, text));
+}
+
+test "zone parser recognizes and validates RP records" {
+    var zone = try ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns hostmaster 1 3600 900 1209600 3600
+        \\@ IN NS ns
+        \\contact IN RP mbox.example. txt.example.
+        \\
+    );
+    defer zone.deinit();
+
+    try std.testing.expectEqual(RecordType.RP, zone.records.items[2].rrtype);
+    try std.testing.expectEqualStrings("mbox.example. txt.example.", zone.records.items[2].rdataText());
+    const rp = try parseRData(.RP, zone.records.items[2].rdataText());
+    try std.testing.expectEqualSlices(u8, &.{ 4, 'm', 'b', 'o', 'x', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0 }, rp.RP.mbox.asWire());
+    try std.testing.expectEqualSlices(u8, &.{ 3, 't', 'x', 't', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0 }, rp.RP.txt.asWire());
+}
+
 test "AFSDB zone text accepts subtype boundaries and absolute hostname" {
     const minimum = try parseRData(.AFSDB, "0 db.example.");
     try std.testing.expectEqual(@as(u16, 0), minimum.AFSDB.preference);
@@ -1151,6 +1471,49 @@ test "AFSDB zone text accepts subtype boundaries and absolute hostname" {
     const maximum = try parseRData(.AFSDB, "65535 DB.EXAMPLE.");
     try std.testing.expectEqual(@as(u16, 65535), maximum.AFSDB.preference);
     try std.testing.expectEqualSlices(u8, &.{ 2, 'd', 'b', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0 }, maximum.AFSDB.exchange.asWire());
+}
+
+test "RT zone text accepts preference boundaries and absolute intermediate host" {
+    const minimum = try parseRData(.RT, "0 rt.example.");
+    try std.testing.expectEqual(@as(u16, 0), minimum.RT.preference);
+    try std.testing.expectEqualSlices(u8, &.{ 2, 'r', 't', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0 }, minimum.RT.exchange.asWire());
+
+    const maximum = try parseRData(.RT, "65535 RT.EXAMPLE.");
+    try std.testing.expectEqual(@as(u16, 65535), maximum.RT.preference);
+    try std.testing.expectEqualSlices(u8, &.{ 2, 'r', 't', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0 }, maximum.RT.exchange.asWire());
+}
+
+test "RT zone text rejects missing extra nondecimal range relative and malformed input" {
+    const invalid = [_][]const u8{
+        "",
+        "0",
+        "rt.example.",
+        "0 rt.example. extra",
+        "+1 rt.example.",
+        "-1 rt.example.",
+        "65536 rt.example.",
+        "1x rt.example.",
+        "1 rt.example",
+        "1 bad..example.",
+    };
+    for (invalid) |text| try std.testing.expectError(Error.BadRecord, parseRData(.RT, text));
+}
+
+test "zone parser recognizes and validates RT records" {
+    var zone = try ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns hostmaster 1 3600 900 1209600 3600
+        \\@ IN NS ns
+        \\route IN RT 65535 rt.example.
+        \\
+    );
+    defer zone.deinit();
+
+    try std.testing.expectEqual(RecordType.RT, zone.records.items[2].rrtype);
+    const rt = try parseRData(.RT, zone.records.items[2].rdataText());
+    try std.testing.expectEqual(@as(u16, 65535), rt.RT.preference);
+    try std.testing.expectEqualSlices(u8, &.{ 2, 'r', 't', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0 }, rt.RT.exchange.asWire());
 }
 
 test "AFSDB zone text rejects malformed presentation" {

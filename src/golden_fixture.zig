@@ -176,7 +176,12 @@ fn parseRecordType(text: []const u8) RecordType {
     if (std.mem.eql(u8, text, "CNAME")) return .CNAME;
     if (std.mem.eql(u8, text, "SOA")) return .SOA;
     if (std.mem.eql(u8, text, "MX")) return .MX;
+    if (std.mem.eql(u8, text, "RT")) return .RT;
+    if (std.mem.eql(u8, text, "SRV")) return .SRV;
+    if (std.mem.eql(u8, text, "RP")) return .RP;
     if (std.mem.eql(u8, text, "AFSDB")) return .AFSDB;
+    if (std.mem.eql(u8, text, "X25")) return .X25;
+    if (std.mem.eql(u8, text, "ISDN")) return .ISDN;
     if (std.mem.eql(u8, text, "TXT")) return .TXT;
     if (std.mem.eql(u8, text, "SSHFP")) return .SSHFP;
     if (std.mem.eql(u8, text, "TLSA")) return .TLSA;

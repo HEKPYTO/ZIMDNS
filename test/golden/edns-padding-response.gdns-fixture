@@ -1,0 +1,19 @@
+name: edns-padding-response
+rfc: RFC 7830
+phase: A
+description: Valid Padding query with arbitrary bytes and an exact bare-OPT authoritative response.
+input_hex:
+  12 01 01 00 00 01 00 00 00 00 00 01
+  03 64 6e 73 04 68 6f 6d 65 04 61 72 70 61 00 00 01 00 01
+  00 00 29 10 00 00 00 00 00 00 07 00 0c 00 03 aa bb cc
+response_hex:
+  12 01 85 00 00 01 00 01 00 00 00 01
+  03 64 6e 73 04 68 6f 6d 65 04 61 72 70 61 00 00 01 00 01
+  c0 0c 00 01 00 01 00 00 0e 10 00 04 c0 a8 01 01
+  00 00 29 04 d0 00 00 00 00 00 00
+expect:
+  parse_ok: true
+  id: 0x1201
+  qname: dns.home.arpa.
+  qtype: A
+  qclass: IN

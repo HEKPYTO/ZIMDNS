@@ -15,6 +15,9 @@ const max_sshfp_fingerprint_len = 32;
 const max_tlsa_association_len = 509;
 const max_uri_target_len = 508;
 
+pub const EDNS_ECS_OPTION_CODE: u16 = 8;
+pub const EDNS_PADDING_OPTION_CODE: u16 = 12;
+
 pub fn validSshfp(algorithm: u8, fingerprint_type: u8, fingerprint_len: usize) bool {
     const valid_algorithm = switch (algorithm) {
         1, 2, 3, 4, 6 => true,
@@ -38,6 +41,86 @@ pub fn validTlsa(usage: u8, selector: u8, matching_type: u8, association_len: us
     };
 }
 
+pub fn validX25(address: []const u8) bool {
+    if (address.len < 4 or address.len > max_txt_len) return false;
+    for (address) |byte| {
+        if (byte < '0' or byte > '9') return false;
+    }
+    return true;
+}
+
+pub fn validIsdnAddress(address: []const u8) bool {
+    if (address.len == 0 or address.len > max_txt_len) return false;
+    for (address) |byte| {
+        if (byte < '0' or byte > '9') return false;
+    }
+    return true;
+}
+
+pub fn validIsdnSubaddress(subaddress: []const u8) bool {
+    if (subaddress.len == 0 or subaddress.len > max_txt_len) return false;
+    for (subaddress) |byte| {
+        if (!((byte >= '0' and byte <= '9') or
+            (byte >= 'a' and byte <= 'f') or
+            (byte >= 'A' and byte <= 'F'))) return false;
+    }
+    return true;
+}
+
+/// Validate bounded EDNS option framing and the known RFC 7871/RFC 7830 options.
+/// `query_scope_zero` applies the RFC 7871 query-side scope rule; responses may
+/// carry a non-zero scope prefix.
+pub fn validateEdnsOptions(data: []const u8, query_scope_zero: bool) Error!void {
+    var offset: usize = 0;
+    var saw_ecs = false;
+    var saw_padding = false;
+
+    while (offset < data.len) {
+        if (data.len - offset < 4) return Error.MalformedOption;
+        const code = std.mem.readInt(u16, data[offset..][0..2], .big);
+        const option_len = std.mem.readInt(u16, data[offset + 2 ..][0..2], .big);
+        offset += 4;
+        if (option_len > data.len - offset) return Error.MalformedOption;
+        const payload = data[offset .. offset + option_len];
+
+        switch (code) {
+            EDNS_PADDING_OPTION_CODE => {
+                if (saw_padding) return Error.MalformedOption;
+                saw_padding = true;
+            },
+            EDNS_ECS_OPTION_CODE => {
+                if (saw_ecs or !validEcs(payload, query_scope_zero)) return Error.MalformedEcsOption;
+                saw_ecs = true;
+            },
+            else => {},
+        }
+        offset += option_len;
+    }
+}
+
+fn validEcs(payload: []const u8, query_scope_zero: bool) bool {
+    if (payload.len < 4) return false;
+
+    const family = std.mem.readInt(u16, payload[0..2], .big);
+    const source_prefix = payload[2];
+    const scope_prefix = payload[3];
+    const max_prefix: u8 = switch (family) {
+        1 => 32,
+        2 => 128,
+        else => return false,
+    };
+    if (source_prefix > max_prefix or scope_prefix > max_prefix) return false;
+    if (query_scope_zero and scope_prefix != 0) return false;
+
+    const address_len = (@as(usize, source_prefix) + 7) / 8;
+    if (payload.len != 4 + address_len) return false;
+    if (source_prefix % 8 == 0 or address_len == 0) return true;
+
+    const unused_bits = 8 - (source_prefix % 8);
+    const unused_mask: u8 = @intCast((@as(u16, 1) << @intCast(unused_bits)) - 1);
+    return payload[3 + address_len] & unused_mask == 0;
+}
+
 pub const Error = error{
     EndOfInput,
     InvalidLength,
@@ -46,6 +129,7 @@ pub const Error = error{
     UnknownTooLong,
     BadName,
     MalformedOption,
+    MalformedEcsOption,
     OptionsTooLong,
 };
 
@@ -62,6 +146,11 @@ pub const Soa = struct {
 pub const Mx = struct {
     preference: u16,
     exchange: Name,
+};
+
+pub const Rp = struct {
+    mbox: Name,
+    txt: Name,
 };
 
 pub const Srv = struct {
@@ -102,6 +191,46 @@ pub const Caa = struct {
 
     pub fn valueText(self: *const Caa) []const u8 {
         return self.payload[self.tag_len..self.payload_len];
+    }
+};
+
+pub const Isdn = struct {
+    address: [max_txt_len]u8 = undefined,
+    address_len: u8 = 0,
+    subaddress: [max_txt_len]u8 = undefined,
+    subaddress_len: u8 = 0,
+    has_subaddress: bool = false,
+
+    pub fn init(address: []const u8, subaddress: ?[]const u8) Error!Isdn {
+        if (!validIsdnAddress(address)) return Error.InvalidLength;
+        if (subaddress) |value| {
+            if (!validIsdnSubaddress(value)) return Error.InvalidLength;
+        }
+
+        var isdn = Isdn{
+            .address_len = @intCast(address.len),
+            .has_subaddress = subaddress != null,
+        };
+        @memcpy(isdn.address[0..address.len], address);
+        if (subaddress) |value| {
+            isdn.subaddress_len = @intCast(value.len);
+            @memcpy(isdn.subaddress[0..value.len], value);
+        }
+        return isdn;
+    }
+
+    pub fn addressText(self: *const Isdn) []const u8 {
+        return self.address[0..self.address_len];
+    }
+
+    pub fn subaddressText(self: *const Isdn) []const u8 {
+        return self.subaddress[0..self.subaddress_len];
+    }
+
+    pub fn isValid(self: *const Isdn) bool {
+        if (!validIsdnAddress(self.addressText())) return false;
+        if (!self.has_subaddress) return self.subaddress_len == 0;
+        return validIsdnSubaddress(self.subaddressText());
     }
 };
 
@@ -195,7 +324,11 @@ pub const RData = union(enum) {
     DNAME: Name,
     PTR: Name,
     MX: Mx,
+    RT: Mx,
+    RP: Rp,
     AFSDB: Mx,
+    X25: Txt,
+    ISDN: Isdn,
     TXT: Txt,
     SRV: Srv,
     NAPTR: Naptr,
@@ -242,12 +375,20 @@ pub const RData = union(enum) {
                     .minimum = reader.readU32() catch return Error.EndOfInput,
                 } };
             },
-            RecordType.MX.value => blk: {
+            RecordType.MX.value, RecordType.RT.value => blk: {
                 if (len < 3) return Error.InvalidLength;
                 const preference = std.mem.readInt(u16, message[offset..][0..2], .big);
                 const exchange_result = Name.parse(message, offset + 2) catch return Error.BadName;
                 if (exchange_result.next_offset != end) return Error.TrailingData;
-                break :blk .{ .MX = .{ .preference = preference, .exchange = exchange_result.name } };
+                const mx = Mx{ .preference = preference, .exchange = exchange_result.name };
+                break :blk if (rrtype.code() == RecordType.MX.value) .{ .MX = mx } else .{ .RT = mx };
+            },
+            RecordType.RP.value => blk: {
+                if (len < 2) return Error.InvalidLength;
+                const mbox_result = Name.parse(message, offset) catch return Error.BadName;
+                const txt_result = Name.parse(message, mbox_result.next_offset) catch return Error.BadName;
+                if (txt_result.next_offset != end) return Error.TrailingData;
+                break :blk .{ .RP = .{ .mbox = mbox_result.name, .txt = txt_result.name } };
             },
             RecordType.AFSDB.value => blk: {
                 if (len < 3) return Error.InvalidLength;
@@ -256,18 +397,27 @@ pub const RData = union(enum) {
                 if (hostname_result.next_offset != end) return Error.TrailingData;
                 break :blk .{ .AFSDB = .{ .preference = subtype, .exchange = hostname_result.name } };
             },
+            RecordType.X25.value => blk: {
+                if (len == 0) return Error.InvalidLength;
+                const text_len = message[offset];
+                if (@as(usize, text_len) + 1 != len) return Error.InvalidLength;
+                var x25 = Txt{ .len = text_len };
+                @memcpy(x25.data[0..text_len], message[offset + 1 .. end]);
+                if (!validX25(x25.text())) return Error.InvalidLength;
+                break :blk .{ .X25 = x25 };
+            },
+            RecordType.ISDN.value => .{ .ISDN = try parseIsdn(message, offset, end) },
             RecordType.SRV.value => blk: {
                 if (len < 7) return Error.InvalidLength;
                 const priority = std.mem.readInt(u16, message[offset..][0..2], .big);
                 const weight = std.mem.readInt(u16, message[offset + 2 ..][0..2], .big);
                 const port = std.mem.readInt(u16, message[offset + 4 ..][0..2], .big);
-                const target_result = Name.parse(message, offset + 6) catch return Error.BadName;
-                if (target_result.next_offset != end) return Error.TrailingData;
+                const target = try parseUncompressedNameOnly(message, offset + 6, end);
                 break :blk .{ .SRV = .{
                     .priority = priority,
                     .weight = weight,
                     .port = port,
-                    .target = target_result.name,
+                    .target = target,
                 } };
             },
             RecordType.NAPTR.value => .{ .NAPTR = try parseNaptr(message, offset, end) },
@@ -345,14 +495,7 @@ pub const RData = union(enum) {
                 if (len > max_opt_data_len) return Error.OptionsTooLong;
                 var opt = Opt{ .len = @intCast(len) };
                 @memcpy(opt.data[0..len], message[offset..end]);
-                var option_offset: usize = 0;
-                while (option_offset < len) {
-                    if (len - option_offset < 4) return Error.MalformedOption;
-                    const option_len = std.mem.readInt(u16, opt.data[option_offset + 2 ..][0..2], .big);
-                    option_offset += 4;
-                    if (option_len > len - option_offset) return Error.MalformedOption;
-                    option_offset += option_len;
-                }
+                try validateEdnsOptions(opt.bytes(), false);
                 break :blk .{ .OPT = opt };
             },
             else => blk: {
@@ -378,9 +521,13 @@ pub const RData = union(enum) {
                 try writer.writeU32(soa.expire);
                 try writer.writeU32(soa.minimum);
             },
-            .MX => |mx| {
+            .MX, .RT => |mx| {
                 try writer.writeU16(mx.preference);
                 try mx.exchange.encode(writer);
+            },
+            .RP => |rp| {
+                try rp.mbox.encode(writer);
+                try rp.txt.encode(writer);
             },
             .AFSDB => |afsdb| {
                 try writer.writeU16(afsdb.preference);
@@ -407,6 +554,20 @@ pub const RData = union(enum) {
             .TXT => |txt| {
                 try writer.writeU8(txt.len);
                 try writer.writeBytes(txt.text());
+            },
+            .X25 => |x25| {
+                if (!validX25(x25.text())) return Error.InvalidLength;
+                try writer.writeU8(x25.len);
+                try writer.writeBytes(x25.text());
+            },
+            .ISDN => |isdn| {
+                if (!isdn.isValid()) return Error.InvalidLength;
+                try writer.writeU8(isdn.address_len);
+                try writer.writeBytes(isdn.addressText());
+                if (isdn.has_subaddress) {
+                    try writer.writeU8(isdn.subaddress_len);
+                    try writer.writeBytes(isdn.subaddressText());
+                }
             },
             .CAA => |caa| {
                 try writer.writeU8(caa.flags);
@@ -450,9 +611,13 @@ pub const RData = union(enum) {
                 try writer.writeU32(soa.expire);
                 try writer.writeU32(soa.minimum);
             },
-            .MX => |mx| {
+            .MX, .RT => |mx| {
                 try writer.writeU16(mx.preference);
                 try table.writeName(writer, mx.exchange.asWire());
+            },
+            .RP => |rp| {
+                try table.writeName(writer, rp.mbox.asWire());
+                try table.writeName(writer, rp.txt.asWire());
             },
             .AFSDB => |afsdb| {
                 try writer.writeU16(afsdb.preference);
@@ -462,7 +627,7 @@ pub const RData = union(enum) {
                 try writer.writeU16(srv.priority);
                 try writer.writeU16(srv.weight);
                 try writer.writeU16(srv.port);
-                try table.writeName(writer, srv.target.asWire());
+                try srv.target.encode(writer);
             },
             .NAPTR => |naptr| {
                 try writer.writeU16(naptr.order);
@@ -480,6 +645,8 @@ pub const RData = union(enum) {
                 try writer.writeU8(txt.len);
                 try writer.writeBytes(txt.text());
             },
+            .X25 => try self.encode(writer),
+            .ISDN => try self.encode(writer),
             .CAA => |caa| {
                 try writer.writeU8(caa.flags);
                 try writer.writeU8(caa.tag_len);
@@ -512,6 +679,30 @@ fn parseNameOnly(message: []const u8, offset: usize, end: usize) Error!Name {
     const result = Name.parse(message, offset) catch return Error.BadName;
     if (result.next_offset != end) return Error.TrailingData;
     return result.name;
+}
+
+fn parseIsdn(message: []const u8, offset: usize, end: usize) Error!Isdn {
+    if (end - offset == 0 or end - offset > 2 * (max_txt_len + 1)) return Error.InvalidLength;
+
+    var cursor = offset;
+    const address_len = message[cursor];
+    cursor += 1;
+    if (address_len == 0) return Error.InvalidLength;
+    if (@as(usize, address_len) > end - cursor) return Error.EndOfInput;
+    const address = message[cursor .. cursor + address_len];
+    cursor += address_len;
+
+    var subaddress: ?[]const u8 = null;
+    if (cursor < end) {
+        const subaddress_len = message[cursor];
+        cursor += 1;
+        if (subaddress_len == 0) return Error.InvalidLength;
+        if (@as(usize, subaddress_len) > end - cursor) return Error.EndOfInput;
+        subaddress = message[cursor .. cursor + subaddress_len];
+        cursor += subaddress_len;
+    }
+    if (cursor != end) return Error.TrailingData;
+    return Isdn.init(address, subaddress) catch return Error.InvalidLength;
 }
 
 fn parseApl(message: []const u8, offset: usize, end: usize) Error!void {
@@ -682,6 +873,232 @@ test "AFSDB wire rejects truncated subtype, missing or malformed names, and trai
     try std.testing.expectError(Error.TrailingData, RData.parse(.AFSDB, &.{ 0, 1, 0, 0, 0xaa }, 0, 5));
 }
 
+test "RT wire round trips preference boundaries with ordinary and compressed names" {
+    const hostname = [_]u8{ 3, 'r', 't', 'x', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0 };
+
+    inline for ([_]u16{ 0, 0xffff }) |preference| {
+        var input: [2 + hostname.len]u8 = undefined;
+        std.mem.writeInt(u16, input[0..2], preference, .big);
+        @memcpy(input[2..], &hostname);
+
+        const parsed = try RData.parse(.RT, &input, 0, input.len);
+        try std.testing.expectEqual(preference, parsed.RT.preference);
+        try std.testing.expectEqualSlices(u8, &hostname, parsed.RT.exchange.asWire());
+
+        var ordinary: [input.len]u8 = undefined;
+        var ordinary_writer = Writer.init(&ordinary);
+        try parsed.encode(&ordinary_writer);
+        try std.testing.expectEqualSlices(u8, &input, ordinary_writer.written());
+
+        var compressed: [hostname.len + 4]u8 = undefined;
+        var compressed_writer = Writer.init(&compressed);
+        var table = CompressionTable{};
+        try table.writeName(&compressed_writer, &hostname);
+        const rdata_offset = compressed_writer.len();
+        try parsed.encodeCompressed(&compressed_writer, &table);
+        try std.testing.expectEqualSlices(u8, &hostname, compressed[0..rdata_offset]);
+        try std.testing.expectEqual(preference, std.mem.readInt(u16, compressed[rdata_offset..][0..2], .big));
+        try std.testing.expectEqual(@as(u16, 0xc000), std.mem.readInt(u16, compressed[rdata_offset + 2 ..][0..2], .big));
+
+        const reparsed = try RData.parse(.RT, compressed[0..compressed_writer.len()], rdata_offset, compressed_writer.len() - rdata_offset);
+        try std.testing.expectEqual(preference, reparsed.RT.preference);
+        try std.testing.expectEqualSlices(u8, &hostname, reparsed.RT.exchange.asWire());
+    }
+}
+
+test "RT wire rejects truncated preference, malformed names, and trailing data" {
+    try std.testing.expectError(Error.InvalidLength, RData.parse(.RT, &.{0}, 0, 1));
+    try std.testing.expectError(Error.InvalidLength, RData.parse(.RT, &.{ 0, 1 }, 0, 2));
+    try std.testing.expectError(Error.BadName, RData.parse(.RT, &.{ 0, 1, 3, 'x' }, 0, 4));
+    try std.testing.expectError(Error.BadName, RData.parse(.RT, &.{ 0, 1, 0x40, 0 }, 0, 4));
+    try std.testing.expectError(Error.TrailingData, RData.parse(.RT, &.{ 0, 1, 0, 0, 0xaa }, 0, 5));
+}
+
+test "RP wire round trips two names and compressed names" {
+    const mbox = [_]u8{ 4, 'l', 'o', 'u', 'i', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0 };
+    const txt = [_]u8{ 3, 't', 'x', 't', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0 };
+    const bytes = [_]u8{
+        4, 'l', 'o', 'u', 'i', 7,   'e', 'x', 'a', 'm', 'p', 'l', 'e', 0,
+        3, 't', 'x', 't', 7,   'e', 'x', 'a', 'm', 'p', 'l', 'e', 0,
+    };
+
+    const rp = try RData.parse(.RP, &bytes, 0, bytes.len);
+    try std.testing.expectEqualSlices(u8, &mbox, rp.RP.mbox.asWire());
+    try std.testing.expectEqualSlices(u8, &txt, rp.RP.txt.asWire());
+
+    var ordinary_bytes: [bytes.len]u8 = undefined;
+    var ordinary_writer = Writer.init(&ordinary_bytes);
+    try rp.encode(&ordinary_writer);
+    try std.testing.expectEqualSlices(u8, &bytes, ordinary_writer.written());
+
+    var compressed_bytes: [128]u8 = undefined;
+    var compressed_writer = Writer.init(&compressed_bytes);
+    var table = CompressionTable{};
+    try table.writeName(&compressed_writer, &mbox);
+    const rdata_offset = compressed_writer.len();
+    try rp.encodeCompressed(&compressed_writer, &table);
+    try std.testing.expectEqual(@as(u8, 0xc0), compressed_writer.written()[rdata_offset]);
+    const reparsed = try RData.parse(
+        .RP,
+        compressed_writer.written(),
+        rdata_offset,
+        compressed_writer.len() - rdata_offset,
+    );
+    try std.testing.expectEqualSlices(u8, &mbox, reparsed.RP.mbox.asWire());
+    try std.testing.expectEqualSlices(u8, &txt, reparsed.RP.txt.asWire());
+}
+
+test "RP wire accepts either field as the root name" {
+    const mbox_root = [_]u8{ 0, 3, 't', 'x', 't', 0 };
+    const txt_root = [_]u8{ 4, 'm', 'b', 'o', 'x', 0, 0 };
+
+    const first = try RData.parse(.RP, &mbox_root, 0, mbox_root.len);
+    try std.testing.expectEqualSlices(u8, &.{0}, first.RP.mbox.asWire());
+    try std.testing.expectEqualSlices(u8, &.{ 3, 't', 'x', 't', 0 }, first.RP.txt.asWire());
+
+    const second = try RData.parse(.RP, &txt_root, 0, txt_root.len);
+    try std.testing.expectEqualSlices(u8, &.{ 4, 'm', 'b', 'o', 'x', 0 }, second.RP.mbox.asWire());
+    try std.testing.expectEqualSlices(u8, &.{0}, second.RP.txt.asWire());
+}
+
+test "RP wire rejects truncation, malformed names, and trailing data" {
+    try std.testing.expectError(Error.InvalidLength, RData.parse(.RP, &.{0}, 0, 1));
+    try std.testing.expectError(Error.BadName, RData.parse(.RP, &.{ 3, 'm', 'b', 'o', 0 }, 0, 5));
+    try std.testing.expectError(Error.BadName, RData.parse(.RP, &.{ 0, 0xc0 }, 0, 2));
+    try std.testing.expectError(Error.TrailingData, RData.parse(.RP, &.{ 0, 0, 0xaa }, 0, 3));
+}
+
+test "X25 wire round trips the minimum and maximum decimal addresses" {
+    const minimum = [_]u8{ 4, '1', '2', '3', '4' };
+    const parsed_minimum = try RData.parse(.X25, &minimum, 0, minimum.len);
+    try std.testing.expectEqualStrings("1234", parsed_minimum.X25.text());
+
+    var minimum_out: [minimum.len]u8 = undefined;
+    var minimum_writer = Writer.init(&minimum_out);
+    try parsed_minimum.encode(&minimum_writer);
+    try std.testing.expectEqualSlices(u8, &minimum, minimum_writer.written());
+
+    var minimum_compressed_out: [minimum.len]u8 = undefined;
+    var minimum_compressed_writer = Writer.init(&minimum_compressed_out);
+    var minimum_compression_table = CompressionTable{};
+    try parsed_minimum.encodeCompressed(&minimum_compressed_writer, &minimum_compression_table);
+    try std.testing.expectEqualSlices(u8, &minimum, minimum_compressed_writer.written());
+
+    var maximum = [_]u8{0} ** 256;
+    maximum[0] = 255;
+    @memset(maximum[1..], '9');
+    const parsed_maximum = try RData.parse(.X25, &maximum, 0, maximum.len);
+    try std.testing.expectEqual(@as(usize, 255), parsed_maximum.X25.text().len);
+    try std.testing.expectEqual(@as(u8, 255), maximum[0]);
+
+    var maximum_out: [maximum.len]u8 = undefined;
+    var maximum_writer = Writer.init(&maximum_out);
+    try parsed_maximum.encode(&maximum_writer);
+    try std.testing.expectEqualSlices(u8, &maximum, maximum_writer.written());
+}
+
+test "X25 wire rejects malformed count, truncation, trailing data, and values" {
+    try std.testing.expectError(Error.InvalidLength, RData.parse(.X25, &.{}, 0, 0));
+    try std.testing.expectError(Error.InvalidLength, RData.parse(.X25, &.{ 3, '1', '2', '3' }, 0, 4));
+    try std.testing.expectError(Error.InvalidLength, RData.parse(.X25, &.{ 4, '1', '2', '3' }, 0, 4));
+    try std.testing.expectError(Error.InvalidLength, RData.parse(.X25, &.{ 4, '1', '2', '3', '4', 0xaa }, 0, 6));
+    try std.testing.expectError(Error.InvalidLength, RData.parse(.X25, &.{ 4, '1', '2', '3', 'x' }, 0, 5));
+    try std.testing.expectError(Error.InvalidLength, RData.parse(.X25, &.{ 4, '1', '2', '3', ' ' }, 0, 5));
+
+    var short = Txt{ .len = 3 };
+    @memcpy(short.data[0..3], "123");
+    var short_output: [4]u8 = undefined;
+    var short_writer = Writer.init(&short_output);
+    try std.testing.expectError(Error.InvalidLength, (RData{ .X25 = short }).encode(&short_writer));
+
+    var non_decimal = Txt{ .len = 4 };
+    @memcpy(non_decimal.data[0..4], "12x4");
+    var non_decimal_output: [5]u8 = undefined;
+    var non_decimal_writer = Writer.init(&non_decimal_output);
+    try std.testing.expectError(Error.InvalidLength, (RData{ .X25 = non_decimal }).encode(&non_decimal_writer));
+}
+
+test "ISDN wire round trips one and two character strings" {
+    const one = [_]u8{ 4, '1', '2', '3', '4' };
+    const parsed_one = try RData.parse(.ISDN, &one, 0, one.len);
+    try std.testing.expectEqualStrings("1234", parsed_one.ISDN.addressText());
+    try std.testing.expect(!parsed_one.ISDN.has_subaddress);
+    try std.testing.expectEqual(@as(usize, 0), parsed_one.ISDN.subaddressText().len);
+
+    var one_output: [one.len]u8 = undefined;
+    var one_writer = Writer.init(&one_output);
+    try parsed_one.encode(&one_writer);
+    try std.testing.expectEqualSlices(u8, &one, one_writer.written());
+
+    var one_compressed_output: [one.len]u8 = undefined;
+    var one_compressed_writer = Writer.init(&one_compressed_output);
+    var one_table = CompressionTable{};
+    try parsed_one.encodeCompressed(&one_compressed_writer, &one_table);
+    try std.testing.expectEqualSlices(u8, &one, one_compressed_writer.written());
+
+    const two = [_]u8{ 4, '1', '2', '3', '4', 3, 'a', 'B', 'f' };
+    const parsed_two = try RData.parse(.ISDN, &two, 0, two.len);
+    try std.testing.expectEqualStrings("1234", parsed_two.ISDN.addressText());
+    try std.testing.expect(parsed_two.ISDN.has_subaddress);
+    try std.testing.expectEqualStrings("aBf", parsed_two.ISDN.subaddressText());
+
+    var two_output: [two.len]u8 = undefined;
+    var two_writer = Writer.init(&two_output);
+    try parsed_two.encode(&two_writer);
+    try std.testing.expectEqualSlices(u8, &two, two_writer.written());
+
+    var two_compressed_output: [two.len]u8 = undefined;
+    var two_compressed_writer = Writer.init(&two_compressed_output);
+    var two_table = CompressionTable{};
+    try parsed_two.encodeCompressed(&two_compressed_writer, &two_table);
+    try std.testing.expectEqualSlices(u8, &two, two_compressed_writer.written());
+}
+
+test "ISDN wire accepts maximum address and subaddress fields" {
+    var bytes: [512]u8 = undefined;
+    bytes[0] = 255;
+    @memset(bytes[1..256], '9');
+    bytes[256] = 255;
+    @memset(bytes[257..], 'f');
+
+    const parsed = try RData.parse(.ISDN, &bytes, 0, bytes.len);
+    try std.testing.expectEqual(@as(usize, 255), parsed.ISDN.addressText().len);
+    try std.testing.expectEqual(@as(usize, 255), parsed.ISDN.subaddressText().len);
+    try std.testing.expect(parsed.ISDN.has_subaddress);
+
+    var output: [bytes.len]u8 = undefined;
+    var writer = Writer.init(&output);
+    try parsed.encode(&writer);
+    try std.testing.expectEqualSlices(u8, &bytes, writer.written());
+}
+
+test "ISDN wire rejects count, truncation, trailing, invalid, and overlong fields" {
+    try std.testing.expectError(Error.InvalidLength, RData.parse(.ISDN, &.{}, 0, 0));
+    try std.testing.expectError(Error.InvalidLength, RData.parse(.ISDN, &.{0}, 0, 1));
+    try std.testing.expectError(Error.EndOfInput, RData.parse(.ISDN, &.{ 4, '1', '2' }, 0, 3));
+    try std.testing.expectError(Error.InvalidLength, RData.parse(.ISDN, &.{ 1, '1', 0 }, 0, 3));
+    try std.testing.expectError(Error.EndOfInput, RData.parse(.ISDN, &.{ 1, '1', 2, 'a' }, 0, 4));
+    try std.testing.expectError(Error.TrailingData, RData.parse(.ISDN, &.{ 1, '1', 1, 'a', 0xaa }, 0, 5));
+    try std.testing.expectError(Error.InvalidLength, RData.parse(.ISDN, &.{ 1, 'x' }, 0, 2));
+    try std.testing.expectError(Error.InvalidLength, RData.parse(.ISDN, &.{ 1, '1', 1, 'g' }, 0, 4));
+
+    var overlong_address: [256]u8 = undefined;
+    @memset(&overlong_address, '1');
+    try std.testing.expectError(Error.InvalidLength, Isdn.init(&overlong_address, null));
+
+    var overlong_subaddress: [256]u8 = undefined;
+    @memset(&overlong_subaddress, 'f');
+    try std.testing.expectError(Error.InvalidLength, Isdn.init("1", overlong_subaddress[0..]));
+
+    var invalid: Isdn = undefined;
+    invalid.address_len = 1;
+    invalid.has_subaddress = false;
+    invalid.address[0] = 'x';
+    var invalid_output: [512]u8 = undefined;
+    var invalid_writer = Writer.init(&invalid_output);
+    try std.testing.expectError(Error.InvalidLength, (RData{ .ISDN = invalid }).encode(&invalid_writer));
+}
+
 test "rdata parses SOA, SRV, and CAA records" {
     const soa_message = [_]u8{
         3,    'n',  's',  '1',  7,    'e',  'x',  'a',  'm',  'p',  'l',  'e',  0,
@@ -713,6 +1130,69 @@ test "rdata parses SOA, SRV, and CAA records" {
     try std.testing.expectEqual(@as(u8, 0), caa.CAA.flags);
     try std.testing.expectEqualStrings("issue", caa.CAA.tagText());
     try std.testing.expectEqualStrings("letsencrypt", caa.CAA.valueText());
+}
+
+test "SRV wire round trips numeric boundaries with root and normal targets" {
+    const targets = [_][]const u8{
+        &.{0},
+        &.{ 3, 's', 'i', 'p', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0 },
+    };
+
+    for (targets) |target| {
+        var input: [19]u8 = undefined;
+        std.mem.writeInt(u16, input[0..2], 0xffff, .big);
+        std.mem.writeInt(u16, input[2..4], 0, .big);
+        std.mem.writeInt(u16, input[4..6], 0xffff, .big);
+        @memcpy(input[6..][0..target.len], target);
+        const input_len = 6 + target.len;
+
+        const parsed = try RData.parse(.SRV, &input, 0, input_len);
+        try std.testing.expectEqual(@as(u16, 0xffff), parsed.SRV.priority);
+        try std.testing.expectEqual(@as(u16, 0), parsed.SRV.weight);
+        try std.testing.expectEqual(@as(u16, 0xffff), parsed.SRV.port);
+        try std.testing.expectEqualSlices(u8, target, parsed.SRV.target.asWire());
+
+        var ordinary: [19]u8 = undefined;
+        var ordinary_writer = Writer.init(&ordinary);
+        try parsed.encode(&ordinary_writer);
+        try std.testing.expectEqualSlices(u8, input[0..input_len], ordinary_writer.written());
+
+        var compressed: [19]u8 = undefined;
+        var compressed_writer = Writer.init(&compressed);
+        var table = CompressionTable{};
+        try parsed.encodeCompressed(&compressed_writer, &table);
+        try std.testing.expectEqualSlices(u8, input[0..input_len], compressed_writer.written());
+    }
+}
+
+test "SRV wire rejects a compressed target pointer" {
+    const compressed_target = [_]u8{
+        0,    10,
+        0,    20,
+        0x20, 0xfb,
+        0xc0, 0x00,
+    };
+    try std.testing.expectError(Error.BadName, RData.parse(.SRV, &compressed_target, 0, compressed_target.len));
+}
+
+test "SRV compressed encoding never compresses the target" {
+    const suffix = [_]u8{ 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0 };
+    const target = [_]u8{ 3, 's', 'i', 'p', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0 };
+    var input: [6 + target.len]u8 = undefined;
+    std.mem.writeInt(u16, input[0..2], 10, .big);
+    std.mem.writeInt(u16, input[2..4], 20, .big);
+    std.mem.writeInt(u16, input[4..6], 8443, .big);
+    @memcpy(input[6..], &target);
+
+    const parsed = try RData.parse(.SRV, &input, 0, input.len);
+    var output: [suffix.len + input.len]u8 = undefined;
+    var writer = Writer.init(&output);
+    var table = CompressionTable{};
+    try table.writeName(&writer, &suffix);
+    const rdata_offset = writer.len();
+
+    try parsed.encodeCompressed(&writer, &table);
+    try std.testing.expectEqualSlices(u8, &input, writer.written()[rdata_offset..]);
 }
 
 test "CAA init validates and copies raw fields" {
@@ -841,6 +1321,55 @@ test "rdata validates and round trips bounded EDNS options" {
     try opt.encode(&writer);
     try std.testing.expectEqualSlices(u8, &bytes, writer.written());
     try std.testing.expectError(Error.MalformedOption, RData.parse(.OPT, &.{ 0xea, 0x60, 0x00, 0x04, 0x01, 0x02, 0x03 }, 0, 7));
+}
+
+test "rdata validates RFC 7830 Padding and RFC 7871 ECS options" {
+    const padding = [_]u8{ 0, 12, 0, 3, 0xaa, 0xbb, 0xcc };
+    try std.testing.expect((try RData.parse(.OPT, &padding, 0, padding.len)) == .OPT);
+
+    const ipv4_ecs = [_]u8{ 0, 8, 0, 7, 0, 1, 24, 0, 192, 0, 2 };
+    try std.testing.expect((try RData.parse(.OPT, &ipv4_ecs, 0, ipv4_ecs.len)) == .OPT);
+
+    const ipv6_ecs = [_]u8{ 0, 8, 0, 11, 0, 2, 56, 0, 32, 1, 13, 184, 0, 0, 0 };
+    try std.testing.expect((try RData.parse(.OPT, &ipv6_ecs, 0, ipv6_ecs.len)) == .OPT);
+}
+
+test "rdata rejects duplicate and semantically invalid known EDNS options" {
+    const duplicate_padding = [_]u8{
+        0, 12, 0, 0,
+        0, 12, 0, 0,
+    };
+    try std.testing.expectError(Error.MalformedOption, RData.parse(.OPT, &duplicate_padding, 0, duplicate_padding.len));
+
+    const duplicate_ecs = [_]u8{
+        0, 8, 0, 8, 0, 1, 32, 0, 192, 0, 2, 1,
+        0, 8, 0, 8, 0, 1, 32, 0, 192, 0, 2, 1,
+    };
+    try std.testing.expectError(Error.MalformedEcsOption, RData.parse(.OPT, &duplicate_ecs, 0, duplicate_ecs.len));
+
+    const bad_family = [_]u8{ 0, 8, 0, 4, 0, 3, 0, 0 };
+    const bad_source_prefix = [_]u8{ 0, 8, 0, 8, 0, 1, 33, 0, 192, 0, 2, 1 };
+    const bad_address_length = [_]u8{ 0, 8, 0, 6, 0, 1, 24, 0, 192, 0 };
+    const bad_trailing_bits = [_]u8{ 0, 8, 0, 7, 0, 1, 17, 0, 192, 0, 1 };
+    for ([_][]const u8{ &bad_family, &bad_source_prefix, &bad_address_length, &bad_trailing_bits }) |bytes| {
+        try std.testing.expectError(Error.MalformedEcsOption, RData.parse(.OPT, bytes, 0, bytes.len));
+    }
+}
+
+test "rdata accepts ECS prefix boundaries response scope and unknown coexistence" {
+    const ipv4_zero = [_]u8{ 0, 8, 0, 4, 0, 1, 0, 0 };
+    const ipv4_full = [_]u8{ 0, 8, 0, 8, 0, 1, 32, 0, 192, 0, 2, 1 };
+    const ipv6_full = [_]u8{
+        0,    8,    0,    20,   0, 2, 128, 0,
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0,   0,
+        0,    0,    0,    0,    0, 0, 0,   1,
+    };
+    const response_scope = [_]u8{ 0, 8, 0, 7, 0, 1, 24, 16, 192, 0, 2 };
+    const with_unknown = response_scope ++ [_]u8{ 0xea, 0x60, 0, 2, 0xaa, 0xbb };
+
+    for ([_][]const u8{ &ipv4_zero, &ipv4_full, &ipv6_full, &response_scope, &with_unknown }) |bytes| {
+        try std.testing.expect((try RData.parse(.OPT, bytes, 0, bytes.len)) == .OPT);
+    }
 }
 
 test "SSHFP wire parses and encodes exact selector and fingerprint bytes" {

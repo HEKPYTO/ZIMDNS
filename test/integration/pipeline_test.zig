@@ -324,6 +324,61 @@ test "TCP request pipeline answers NAPTR query with root replacement" {
     try expectNaptrResponse(response, 0x4254, "!^.*$!sip:info@example.com!", ".");
 }
 
+test "UDP request pipeline answers RP query without synthesized TXT additional" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(fixture_zone);
+    defer runtime.deinit();
+
+    var server_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server_socket = try std.Io.net.IpAddress.bind(&server_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer server_socket.close(io);
+
+    var client_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var client_socket = try std.Io.net.IpAddress.bind(&client_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer client_socket.close(io);
+
+    var query_buffer: [512]u8 = undefined;
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x425b, "rp.home.arpa.", .RP);
+    try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, query);
+    try listener.serveUdpOnce(&server_socket, io, &runtime);
+
+    var response_buffer: [512]u8 = undefined;
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    try expectRpResponse(response, 0x425b);
+}
+
+test "TCP request pipeline answers RP query without synthesized TXT additional" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(fixture_zone);
+    defer runtime.deinit();
+
+    var listen_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try std.Io.net.IpAddress.listen(&listen_addr, io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    var client_stream = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer client_stream.close(io);
+    const server_stream = try server.accept(io);
+    defer server_stream.close(io);
+
+    var query_buffer: [512]u8 = undefined;
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x425c, "rp.home.arpa.", .RP);
+    try cli_query.sendTcpQuery(client_stream, io, query);
+    try client_stream.shutdown(io, .send);
+
+    try listener.serveTcpStreamOnce(server_stream, io, &runtime);
+
+    var response_buffer: [512]u8 = undefined;
+    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query);
+    try expectRpResponse(response, 0x425c);
+}
+
 test "UDP request pipeline answers ordered APL query" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -487,6 +542,226 @@ test "TCP request pipeline answers AFSDB query without synthesized additional A"
     var response_buffer: [512]u8 = undefined;
     const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query);
     try expectAfsdbResponse(response, 0x4258);
+}
+
+test "UDP request pipeline answers X25 query without synthesized additional" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(fixture_zone);
+    defer runtime.deinit();
+
+    var server_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server_socket = try std.Io.net.IpAddress.bind(&server_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer server_socket.close(io);
+
+    var client_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var client_socket = try std.Io.net.IpAddress.bind(&client_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer client_socket.close(io);
+
+    var query_buffer: [512]u8 = undefined;
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x425d, "x25.home.arpa.", .X25);
+    try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, query);
+    try listener.serveUdpOnce(&server_socket, io, &runtime);
+
+    var response_buffer: [512]u8 = undefined;
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    try expectX25Response(response, 0x425d);
+}
+
+test "TCP request pipeline answers X25 query without synthesized additional" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(fixture_zone);
+    defer runtime.deinit();
+
+    var listen_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try std.Io.net.IpAddress.listen(&listen_addr, io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    var client_stream = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer client_stream.close(io);
+    const server_stream = try server.accept(io);
+    defer server_stream.close(io);
+
+    var query_buffer: [512]u8 = undefined;
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x425e, "x25.home.arpa.", .X25);
+    try cli_query.sendTcpQuery(client_stream, io, query);
+    try client_stream.shutdown(io, .send);
+
+    try listener.serveTcpStreamOnce(server_stream, io, &runtime);
+
+    var response_buffer: [512]u8 = undefined;
+    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query);
+    try expectX25Response(response, 0x425e);
+}
+
+test "UDP request pipeline answers ISDN query without synthesized additional" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(fixture_zone);
+    defer runtime.deinit();
+
+    var server_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server_socket = try std.Io.net.IpAddress.bind(&server_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer server_socket.close(io);
+
+    var client_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var client_socket = try std.Io.net.IpAddress.bind(&client_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer client_socket.close(io);
+
+    var query_buffer: [512]u8 = undefined;
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x425f, "isdn.home.arpa.", .ISDN);
+    try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, query);
+    try listener.serveUdpOnce(&server_socket, io, &runtime);
+
+    var response_buffer: [512]u8 = undefined;
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    try expectIsdnResponse(response, 0x425f);
+}
+
+test "TCP request pipeline answers ISDN query without synthesized additional" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(fixture_zone);
+    defer runtime.deinit();
+
+    var listen_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try std.Io.net.IpAddress.listen(&listen_addr, io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    var client_stream = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer client_stream.close(io);
+    const server_stream = try server.accept(io);
+    defer server_stream.close(io);
+
+    var query_buffer: [512]u8 = undefined;
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4260, "isdn.home.arpa.", .ISDN);
+    try cli_query.sendTcpQuery(client_stream, io, query);
+    try client_stream.shutdown(io, .send);
+
+    try listener.serveTcpStreamOnce(server_stream, io, &runtime);
+
+    var response_buffer: [512]u8 = undefined;
+    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query);
+    try expectIsdnResponse(response, 0x4260);
+}
+
+test "UDP request pipeline answers RT query without synthesized additionals" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(fixture_zone);
+    defer runtime.deinit();
+
+    var server_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server_socket = try std.Io.net.IpAddress.bind(&server_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer server_socket.close(io);
+
+    var client_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var client_socket = try std.Io.net.IpAddress.bind(&client_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer client_socket.close(io);
+
+    var query_buffer: [512]u8 = undefined;
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4261, "rt.home.arpa.", .RT);
+    try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, query);
+    try listener.serveUdpOnce(&server_socket, io, &runtime);
+
+    var response_buffer: [512]u8 = undefined;
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    try expectRtResponse(response, 0x4261);
+}
+
+test "TCP request pipeline answers RT query without synthesized additionals" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(fixture_zone);
+    defer runtime.deinit();
+
+    var listen_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try std.Io.net.IpAddress.listen(&listen_addr, io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    var client_stream = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer client_stream.close(io);
+    const server_stream = try server.accept(io);
+    defer server_stream.close(io);
+
+    var query_buffer: [512]u8 = undefined;
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4262, "rt.home.arpa.", .RT);
+    try cli_query.sendTcpQuery(client_stream, io, query);
+    try client_stream.shutdown(io, .send);
+
+    try listener.serveTcpStreamOnce(server_stream, io, &runtime);
+
+    var response_buffer: [512]u8 = undefined;
+    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query);
+    try expectRtResponse(response, 0x4262);
+}
+
+test "UDP request pipeline answers SRV query without synthesized A or AAAA additionals" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(fixture_zone);
+    defer runtime.deinit();
+
+    var server_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server_socket = try std.Io.net.IpAddress.bind(&server_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer server_socket.close(io);
+
+    var client_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var client_socket = try std.Io.net.IpAddress.bind(&client_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer client_socket.close(io);
+
+    var query_buffer: [512]u8 = undefined;
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4263, "srv.home.arpa.", .SRV);
+    try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, query);
+    try listener.serveUdpOnce(&server_socket, io, &runtime);
+
+    var response_buffer: [512]u8 = undefined;
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    try expectSrvResponse(response, 0x4263);
+}
+
+test "TCP request pipeline answers SRV query without synthesized A or AAAA additionals" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(fixture_zone);
+    defer runtime.deinit();
+
+    var listen_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try std.Io.net.IpAddress.listen(&listen_addr, io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    var client_stream = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer client_stream.close(io);
+    const server_stream = try server.accept(io);
+    defer server_stream.close(io);
+
+    var query_buffer: [512]u8 = undefined;
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4264, "srv.home.arpa.", .SRV);
+    try cli_query.sendTcpQuery(client_stream, io, query);
+    try client_stream.shutdown(io, .send);
+
+    try listener.serveTcpStreamOnce(server_stream, io, &runtime);
+
+    var response_buffer: [512]u8 = undefined;
+    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query);
+    try expectSrvResponse(response, 0x4264);
 }
 
 test "TCP request pipeline preserves FIFO responses for pipelined queries" {
@@ -1183,6 +1458,20 @@ fn expectNaptrResponse(response: anytype, expected_id: u16, expected_regexp: []c
     try std.testing.expectEqualStrings(expected_replacement, try answer.rdata.NAPTR.replacement.toText(&replacement));
 }
 
+fn expectRpResponse(response: anytype, expected_id: u16) !void {
+    try std.testing.expect(response.header.qr);
+    try std.testing.expectEqual(@as(@TypeOf(response.header.rcode), .no_error), response.header.rcode);
+    try std.testing.expectEqual(expected_id, response.header.id);
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+    try std.testing.expectEqual(@as(u16, 0), response.header.additional_count);
+    const answer = response.answers.items[0];
+    try std.testing.expect(answer.rrtype.eql(.RP));
+    var mbox: [256]u8 = undefined;
+    var txt: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("mbox.home.arpa.", try answer.rdata.RP.mbox.toText(&mbox));
+    try std.testing.expectEqualStrings("txt-dname.home.arpa.", try answer.rdata.RP.txt.toText(&txt));
+}
+
 fn expectAplResponse(response: anytype, expected_id: u16) !void {
     try std.testing.expect(response.header.qr);
     try std.testing.expectEqual(@as(@TypeOf(response.header.rcode), .no_error), response.header.rcode);
@@ -1223,6 +1512,61 @@ fn expectAfsdbResponse(response: anytype, expected_id: u16) !void {
     try std.testing.expectEqualStrings("server.home.arpa.", try answer.rdata.AFSDB.exchange.toText(&hostname));
 }
 
+fn expectX25Response(response: anytype, expected_id: u16) !void {
+    try std.testing.expect(response.header.qr);
+    try std.testing.expectEqual(@as(@TypeOf(response.header.rcode), .no_error), response.header.rcode);
+    try std.testing.expectEqual(expected_id, response.header.id);
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+    try std.testing.expectEqual(@as(u16, 0), response.header.additional_count);
+    const answer = response.answers.items[0];
+    try std.testing.expect(answer.rrtype.eql(.X25));
+    try std.testing.expectEqualStrings("1234", answer.rdata.X25.text());
+}
+
+fn expectIsdnResponse(response: anytype, expected_id: u16) !void {
+    try std.testing.expect(response.header.qr);
+    try std.testing.expectEqual(@as(@TypeOf(response.header.rcode), .no_error), response.header.rcode);
+    try std.testing.expectEqual(expected_id, response.header.id);
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+    try std.testing.expectEqual(@as(u16, 0), response.header.additional_count);
+    const answer = response.answers.items[0];
+    try std.testing.expect(answer.rrtype.eql(.ISDN));
+    try std.testing.expectEqualStrings("1234", answer.rdata.ISDN.addressText());
+    try std.testing.expect(answer.rdata.ISDN.has_subaddress);
+    try std.testing.expectEqualStrings("aBf", answer.rdata.ISDN.subaddressText());
+}
+
+fn expectRtResponse(response: anytype, expected_id: u16) !void {
+    try std.testing.expect(response.header.qr);
+    try std.testing.expectEqual(@as(@TypeOf(response.header.rcode), .no_error), response.header.rcode);
+    try std.testing.expectEqual(expected_id, response.header.id);
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+    try std.testing.expectEqual(@as(u16, 0), response.header.additional_count);
+    const answer = response.answers.items[0];
+    try std.testing.expect(answer.rrtype.eql(.RT));
+    try std.testing.expectEqual(@as(u16, 100), answer.rdata.RT.preference);
+    var target: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("target.home.arpa.", try answer.rdata.RT.exchange.toText(&target));
+}
+
+fn expectSrvResponse(response: anytype, expected_id: u16) !void {
+    try std.testing.expect(response.header.qr);
+    try std.testing.expectEqual(@as(@TypeOf(response.header.rcode), .no_error), response.header.rcode);
+    try std.testing.expectEqual(expected_id, response.header.id);
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+    try std.testing.expectEqual(@as(u16, 0), response.header.additional_count);
+    const answer = response.answers.items[0];
+    try std.testing.expect(answer.rrtype.eql(.SRV));
+    try std.testing.expectEqual(@as(u16, 10), answer.rdata.SRV.priority);
+    try std.testing.expectEqual(@as(u16, 20), answer.rdata.SRV.weight);
+    try std.testing.expectEqual(@as(u16, 8443), answer.rdata.SRV.port);
+    try std.testing.expectEqualSlices(u8, &.{
+        0x06, 't', 'a', 'r',  'g', 'e',  't',
+        0x04, 'h', 'o', 'm',  'e', 0x04, 'a',
+        'r',  'p', 'a', 0x00,
+    }, answer.rdata.SRV.target.asWire());
+}
+
 fn expectMetrics(counters: metrics.Counters) !void {
     try std.testing.expectEqual(@as(u64, 1), counters.queries_total);
     try std.testing.expectEqual(@as(u64, 1), counters.responses_total);
@@ -1261,9 +1605,19 @@ const fixture_zone =
     \\naptr IN NAPTR 100 10 "U" "E2U+sip" "" replacement.example.
     \\naptr-root IN NAPTR 100 10 "U" "E2U+sip" "!^.*$!sip:info@example.com!" .
     \\apl IN APL !1:192.0.2.7/24 2:2001:db8:1::/48 1:192.0.2.7/24
+    \\rp IN RP mbox.home.arpa. txt-dname.home.arpa.
+    \\txt-dname IN TXT "target text"
     \\caa IN CAA 128 issue "a\000\128\255"
     \\afsdb IN AFSDB 42 server.home.arpa.
     \\server IN A 192.0.2.53
+    \\x25 IN X25 1234
+    \\isdn IN ISDN 1234 "aBf"
+    \\rt IN RT 100 target.home.arpa.
+    \\srv IN SRV 10 20 8443 target.home.arpa.
+    \\target IN A 192.0.2.21
+    \\target IN AAAA 2001:db8::21
+    \\target IN X25 1234
+    \\target IN ISDN 1234 "aBf"
     \\
 ;
 

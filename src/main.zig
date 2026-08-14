@@ -172,13 +172,18 @@ fn parseQueryType(text: []const u8) !@import("dns/types.zig").RecordType {
     if (std.mem.eql(u8, text, "MX")) return .MX;
     if (std.mem.eql(u8, text, "TXT")) return .TXT;
     if (std.mem.eql(u8, text, "SOA")) return .SOA;
+    if (std.mem.eql(u8, text, "RP")) return .RP;
+    if (std.mem.eql(u8, text, "RT")) return .RT;
     if (std.mem.eql(u8, text, "AFSDB")) return .AFSDB;
+    if (std.mem.eql(u8, text, "X25")) return .X25;
+    if (std.mem.eql(u8, text, "ISDN")) return .ISDN;
     if (std.mem.eql(u8, text, "SSHFP")) return .SSHFP;
     if (std.mem.eql(u8, text, "TLSA")) return .TLSA;
     if (std.mem.eql(u8, text, "NAPTR")) return .NAPTR;
     if (std.mem.eql(u8, text, "APL")) return .APL;
     if (std.mem.eql(u8, text, "URI")) return .URI;
     if (std.mem.eql(u8, text, "CAA")) return .CAA;
+    if (std.mem.eql(u8, text, "SRV")) return .SRV;
     return error.UnsupportedType;
 }
 
@@ -494,8 +499,28 @@ test "query parser accepts AFSDB" {
     try std.testing.expectEqual(@import("dns/types.zig").RecordType.AFSDB, try parseQueryType("AFSDB"));
 }
 
+test "query parser accepts RP" {
+    try std.testing.expectEqual(@import("dns/types.zig").RecordType.RP, try parseQueryType("RP"));
+}
+
 test "query parser accepts CAA" {
     try std.testing.expectEqual(@import("dns/types.zig").RecordType.CAA, try parseQueryType("CAA"));
+}
+
+test "query parser accepts X25" {
+    try std.testing.expectEqual(@import("dns/types.zig").RecordType.X25, try parseQueryType("X25"));
+}
+
+test "query parser accepts ISDN" {
+    try std.testing.expectEqual(@import("dns/types.zig").RecordType.ISDN, try parseQueryType("ISDN"));
+}
+
+test "query parser accepts RT" {
+    try std.testing.expectEqual(@import("dns/types.zig").RecordType.RT, try parseQueryType("RT"));
+}
+
+test "query parser accepts SRV" {
+    try std.testing.expectEqual(@import("dns/types.zig").RecordType.SRV, try parseQueryType("SRV"));
 }
 
 test "query command renders a maximum escaped URI target" {

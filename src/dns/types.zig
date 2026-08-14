@@ -31,7 +31,11 @@ pub const RecordType = struct {
     pub const SOA = RecordType{ .value = 6 };
     pub const PTR = RecordType{ .value = 12 };
     pub const MX = RecordType{ .value = 15 };
+    pub const RP = RecordType{ .value = 17 };
     pub const AFSDB = RecordType{ .value = 18 };
+    pub const X25 = RecordType{ .value = 19 };
+    pub const ISDN = RecordType{ .value = 20 };
+    pub const RT = RecordType{ .value = 21 };
     pub const TXT = RecordType{ .value = 16 };
     pub const AAAA = RecordType{ .value = 28 };
     pub const SRV = RecordType{ .value = 33 };
@@ -61,6 +65,11 @@ test "record type and class codes round trip for phase-one values" {
     try std.testing.expectEqual(@as(u16, 28), RecordType.AAAA.code());
     try std.testing.expectEqual(Class.IN, Class.fromCode(1));
     try std.testing.expectEqual(@as(u16, 1), Class.IN.code());
+}
+
+test "ISDN record type uses wire code 20" {
+    try std.testing.expectEqual(@as(u16, 20), RecordType.ISDN.code());
+    try std.testing.expectEqual(RecordType.ISDN, RecordType.fromCode(20));
 }
 
 test "unknown record type and class preserve raw wire codes" {
@@ -96,4 +105,19 @@ test "APL record type uses wire code 42" {
 test "AFSDB record type uses wire code 18" {
     try std.testing.expectEqual(@as(u16, 18), RecordType.AFSDB.code());
     try std.testing.expectEqual(RecordType.AFSDB, RecordType.fromCode(18));
+}
+
+test "RP record type uses wire code 17" {
+    try std.testing.expectEqual(@as(u16, 17), RecordType.RP.code());
+    try std.testing.expectEqual(RecordType.RP, RecordType.fromCode(17));
+}
+
+test "X25 record type uses wire code 19" {
+    try std.testing.expectEqual(@as(u16, 19), RecordType.X25.code());
+    try std.testing.expectEqual(RecordType.X25, RecordType.fromCode(19));
+}
+
+test "RT record type uses wire code 21" {
+    try std.testing.expectEqual(@as(u16, 21), RecordType.RT.code());
+    try std.testing.expectEqual(RecordType.RT, RecordType.fromCode(21));
 }

@@ -155,6 +155,125 @@ test "AFSDB response fixture asserts exact authoritative wire and RDATA without 
     try std.testing.expectEqualStrings("server.home.arpa.", try answer.rdata.AFSDB.exchange.toText(&hostname));
 }
 
+test "RP response fixture asserts exact authoritative wire and no synthesized TXT additional" {
+    const fixture = try Fixture.parse(@embedFile("rp-response.gdns-fixture"));
+    try fixture.run();
+
+    var runtime = try zimdns.auth_runtime.Runtime.fromZoneText(rp_fixture_zone);
+    defer runtime.deinit();
+
+    var output: [512]u8 = undefined;
+    const actual = try runtime.answer(fixture.inputBytes(), &output);
+    try std.testing.expectEqualSlices(u8, fixture.responseBytes(), actual);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try zimdns.dns_message.Message.parse(arena.allocator(), actual);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.answer_count);
+    try std.testing.expectEqual(@as(u16, 0), parsed.header.additional_count);
+    const answer = parsed.answers.items[0];
+    try std.testing.expect(answer.rrtype.eql(.RP));
+    var mbox: [256]u8 = undefined;
+    var txt: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("mbox.home.arpa.", try answer.rdata.RP.mbox.toText(&mbox));
+    try std.testing.expectEqualStrings("txt-dname.home.arpa.", try answer.rdata.RP.txt.toText(&txt));
+}
+
+test "X25 response fixture asserts exact authoritative wire and RDATA without additionals" {
+    const fixture = try Fixture.parse(@embedFile("x25-response.gdns-fixture"));
+    try fixture.run();
+
+    var runtime = try zimdns.auth_runtime.Runtime.fromZoneText(x25_fixture_zone);
+    defer runtime.deinit();
+
+    var output: [512]u8 = undefined;
+    const actual = try runtime.answer(fixture.inputBytes(), &output);
+    try std.testing.expectEqualSlices(u8, fixture.responseBytes(), actual);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try zimdns.dns_message.Message.parse(arena.allocator(), actual);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.answer_count);
+    try std.testing.expectEqual(@as(u16, 0), parsed.header.additional_count);
+    const answer = parsed.answers.items[0];
+    try std.testing.expect(answer.rrtype.eql(.X25));
+    try std.testing.expectEqualStrings("1234", answer.rdata.X25.text());
+}
+
+test "ISDN response fixture asserts exact authoritative wire and both fields without additionals" {
+    const fixture = try Fixture.parse(@embedFile("isdn-response.gdns-fixture"));
+    try fixture.run();
+
+    var runtime = try zimdns.auth_runtime.Runtime.fromZoneText(isdn_fixture_zone);
+    defer runtime.deinit();
+
+    var output: [512]u8 = undefined;
+    const actual = try runtime.answer(fixture.inputBytes(), &output);
+    try std.testing.expectEqualSlices(u8, fixture.responseBytes(), actual);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try zimdns.dns_message.Message.parse(arena.allocator(), actual);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.answer_count);
+    try std.testing.expectEqual(@as(u16, 0), parsed.header.additional_count);
+    const answer = parsed.answers.items[0];
+    try std.testing.expect(answer.rrtype.eql(.ISDN));
+    try std.testing.expectEqualStrings("1234", answer.rdata.ISDN.addressText());
+    try std.testing.expect(answer.rdata.ISDN.has_subaddress);
+    try std.testing.expectEqualStrings("aBf", answer.rdata.ISDN.subaddressText());
+}
+
+test "RT response fixture asserts exact authoritative wire and no synthesized additionals" {
+    const fixture = try Fixture.parse(@embedFile("rt-response.gdns-fixture"));
+    try fixture.run();
+
+    var runtime = try zimdns.auth_runtime.Runtime.fromZoneText(rt_fixture_zone);
+    defer runtime.deinit();
+
+    var output: [512]u8 = undefined;
+    const actual = try runtime.answer(fixture.inputBytes(), &output);
+    try std.testing.expectEqualSlices(u8, fixture.responseBytes(), actual);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try zimdns.dns_message.Message.parse(arena.allocator(), actual);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.answer_count);
+    try std.testing.expectEqual(@as(u16, 0), parsed.header.additional_count);
+    const answer = parsed.answers.items[0];
+    try std.testing.expect(answer.rrtype.eql(.RT));
+    try std.testing.expectEqual(@as(u16, 100), answer.rdata.RT.preference);
+    var target: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("target.home.arpa.", try answer.rdata.RT.exchange.toText(&target));
+}
+
+test "SRV response fixture asserts exact uncompressed target wire and no additionals" {
+    const fixture = try Fixture.parse(@embedFile("srv-response.gdns-fixture"));
+    try fixture.run();
+
+    var runtime = try zimdns.auth_runtime.Runtime.fromZoneText(srv_fixture_zone);
+    defer runtime.deinit();
+
+    var output: [512]u8 = undefined;
+    const actual = try runtime.answer(fixture.inputBytes(), &output);
+    try std.testing.expectEqualSlices(u8, fixture.responseBytes(), actual);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try zimdns.dns_message.Message.parse(arena.allocator(), actual);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.answer_count);
+    try std.testing.expectEqual(@as(u16, 0), parsed.header.additional_count);
+    const answer = parsed.answers.items[0];
+    try std.testing.expect(answer.rrtype.eql(.SRV));
+    try std.testing.expectEqual(@as(u16, 10), answer.rdata.SRV.priority);
+    try std.testing.expectEqual(@as(u16, 20), answer.rdata.SRV.weight);
+    try std.testing.expectEqual(@as(u16, 8443), answer.rdata.SRV.port);
+    try std.testing.expectEqualSlices(u8, &.{
+        0x06, 't', 'a', 'r',  'g', 'e',  't',
+        0x04, 'h', 'o', 'm',  'e', 0x04, 'a',
+        'r',  'p', 'a', 0x00,
+    }, answer.rdata.SRV.target.asWire());
+}
+
 test "CAA response fixture asserts exact authoritative wire and raw RDATA" {
     const fixture = try Fixture.parse(@embedFile("caa-response.gdns-fixture"));
     try fixture.run();
@@ -193,6 +312,44 @@ test "EDNS response fixture asserts exact encoded OPT response" {
     try std.testing.expect(parsed.edns.?.dnssec_ok);
     try std.testing.expectEqual(@as(u8, 0), parsed.edns.?.extended_rcode);
     try std.testing.expect(std.mem.indexOf(u8, actual, &.{ 0xc0, 0x0c }) != null);
+}
+
+test "RFC 7830 Padding request has an exact bare-OPT authoritative response" {
+    const fixture = try Fixture.parse(@embedFile("edns-padding-response.gdns-fixture"));
+    try fixture.run();
+
+    var runtime = try zimdns.auth_runtime.Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+
+    var output: [512]u8 = undefined;
+    const actual = try runtime.answer(fixture.inputBytes(), &output);
+    try std.testing.expectEqualSlices(u8, fixture.responseBytes(), actual);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try zimdns.dns_message.Message.parse(arena.allocator(), actual);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.answer_count);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.additional_count);
+    try std.testing.expectEqual(@as(usize, 0), parsed.additionals.items[0].rdata.OPT.bytes().len);
+}
+
+test "RFC 7871 ECS /0 request has an exact bare-OPT authoritative response" {
+    const fixture = try Fixture.parse(@embedFile("edns-ecs-zero-response.gdns-fixture"));
+    try fixture.run();
+
+    var runtime = try zimdns.auth_runtime.Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+
+    var output: [512]u8 = undefined;
+    const actual = try runtime.answer(fixture.inputBytes(), &output);
+    try std.testing.expectEqualSlices(u8, fixture.responseBytes(), actual);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try zimdns.dns_message.Message.parse(arena.allocator(), actual);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.answer_count);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.additional_count);
+    try std.testing.expectEqual(@as(usize, 0), parsed.additionals.items[0].rdata.OPT.bytes().len);
 }
 
 test "authoritative semantics fixture asserts exact encoded wildcard response" {
@@ -369,5 +526,56 @@ const caa_fixture_zone =
     \\@ IN SOA ns.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 300
     \\@ IN NS ns.home.arpa.
     \\caa IN CAA 128 issue "a\000\128\255"
+    \\
+;
+
+const x25_fixture_zone =
+    \\$ORIGIN home.arpa.
+    \\$TTL 3600
+    \\@ IN SOA ns.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 300
+    \\@ IN NS ns.home.arpa.
+    \\x25 IN X25 1234
+    \\
+;
+
+const isdn_fixture_zone =
+    \\$ORIGIN home.arpa.
+    \\$TTL 3600
+    \\@ IN SOA ns.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 300
+    \\@ IN NS ns.home.arpa.
+    \\isdn IN ISDN 1234 "aBf"
+    \\
+;
+
+const rt_fixture_zone =
+    \\$ORIGIN home.arpa.
+    \\$TTL 3600
+    \\@ IN SOA ns.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 300
+    \\@ IN NS ns.home.arpa.
+    \\rt IN RT 100 target.home.arpa.
+    \\target IN A 192.0.2.21
+    \\target IN X25 1234
+    \\target IN ISDN 1234 "aBf"
+    \\
+;
+
+const srv_fixture_zone =
+    \\$ORIGIN home.arpa.
+    \\$TTL 3600
+    \\@ IN SOA ns.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 300
+    \\@ IN NS ns.home.arpa.
+    \\srv IN SRV 10 20 8443 target.home.arpa.
+    \\target IN A 192.0.2.21
+    \\target IN AAAA 2001:db8::21
+    \\
+;
+
+const rp_fixture_zone =
+    \\$ORIGIN home.arpa.
+    \\$TTL 3600
+    \\@ IN SOA ns.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 300
+    \\@ IN NS ns.home.arpa.
+    \\rp IN RP mbox.home.arpa. txt-dname.home.arpa.
+    \\txt-dname IN TXT "target text"
     \\
 ;

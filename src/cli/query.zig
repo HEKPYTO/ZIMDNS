@@ -115,12 +115,37 @@ pub fn writeResponse(response: dns_message.Message, writer: *std.Io.Writer) !voi
             const afsdb = record.rdata.AFSDB;
             const hostname = afsdb.exchange.toText(&value_buffer) catch return Error.BadResponse;
             try writer.print("AFSDB {} {s}", .{ afsdb.preference, hostname });
+        } else if (record.rrtype.eql(.RP)) {
+            const rp = record.rdata.RP;
+            const mbox = rp.mbox.toText(&value_buffer) catch return Error.BadResponse;
+            var txt_buffer: [256]u8 = undefined;
+            const txt = rp.txt.toText(&txt_buffer) catch return Error.BadResponse;
+            try writer.print("RP {s} {s}", .{ mbox, txt });
+        } else if (record.rrtype.eql(.RT)) {
+            const rt = record.rdata.RT;
+            const exchange = rt.exchange.toText(&value_buffer) catch return Error.BadResponse;
+            try writer.print("RT {} {s}", .{ rt.preference, exchange });
+        } else if (record.rrtype.eql(.SRV)) {
+            const srv = record.rdata.SRV;
+            const target = srv.target.toText(&value_buffer) catch return Error.BadResponse;
+            try writer.print("SRV {} {} {} {s}", .{ srv.priority, srv.weight, srv.port, target });
         } else if (record.rrtype.eql(.CAA)) {
             const caa = record.rdata.CAA;
             try writer.print("CAA {} ", .{caa.flags});
             for (caa.tagText()) |byte| try writer.print("{c}", .{std.ascii.toLower(byte)});
             try writer.writeAll(" ");
             try writeQuoted(writer, caa.valueText(), true);
+        } else if (record.rrtype.eql(.X25)) {
+            try writer.writeAll("X25 ");
+            try writeQuoted(writer, record.rdata.X25.text(), false);
+        } else if (record.rrtype.eql(.ISDN)) {
+            const isdn = record.rdata.ISDN;
+            try writer.writeAll("ISDN ");
+            try writeQuoted(writer, isdn.addressText(), false);
+            if (isdn.has_subaddress) {
+                try writer.writeAll(" ");
+                try writeQuoted(writer, isdn.subaddressText(), false);
+            }
         } else if (record.rrtype.eql(.APL)) {
             try writer.writeAll("APL");
             try writeApl(writer, record.rdata.APL.bytes());
@@ -508,6 +533,69 @@ test "query formatter prints AFSDB subtype and hostname" {
     );
 }
 
+test "query formatter prints RP mailbox and TXT names" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const response = try dns_message.Message.parse(arena.allocator(), &.{
+        0x12, 0x34, 0x85, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x02, 'r',  'p',  0x04, 'h',  'o',  'm',  'e',  0x04, 'a',  'r',  'p',
+        'a',  0x00, 0x00, 0x11, 0x00, 0x01, 0xc0, 0x0c, 0x00, 0x11, 0x00, 0x01,
+        0x00, 0x00, 0x0e, 0x10, 0x00, 0x13, 0x04, 'm',  'b',  'o',  'x',  0xc0,
+        0x0f, 0x09, 't',  'x',  't',  '-',  'd',  'n',  'a',  'm',  'e',  0xc0,
+        0x0f,
+    });
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try writeResponse(response, &output.writer);
+    try std.testing.expectEqualStrings(
+        "rp.home.arpa. 3600 IN RP mbox.home.arpa. txt-dname.home.arpa.\n",
+        output.written(),
+    );
+}
+
+test "query formatter prints RT preference and intermediate hostname" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const response = try dns_message.Message.parse(arena.allocator(), &.{
+        0x12, 0x34, 0x85, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x02, 'r',  't',  0x04, 'h',  'o',  'm',  'e',  0x04, 'a',  'r',  'p',
+        'a',  0x00, 0x00, 0x15, 0x00, 0x01, 0xc0, 0x0c, 0x00, 0x15, 0x00, 0x01,
+        0x00, 0x00, 0x0e, 0x10, 0x00, 0x14, 0x00, 0x64, 0x06, 't',  'a',  'r',
+        'g',  'e',  't',  0x04, 'h',  'o',  'm',  'e',  0x04, 'a',  'r',  'p',
+        'a',  0x00,
+    });
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try writeResponse(response, &output.writer);
+    try std.testing.expectEqualStrings(
+        "rt.home.arpa. 3600 IN RT 100 target.home.arpa.\n",
+        output.written(),
+    );
+}
+
+test "query formatter prints SRV priority weight port and target" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const response = try dns_message.Message.parse(arena.allocator(), &.{
+        0x12, 0x34, 0x85, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x03, 's',  'r',  'v',  0x04, 'h',  'o',  'm',  'e',  0x04, 'a',  'r',
+        'p',  'a',  0x00, 0x00, 0x21, 0x00, 0x01, 0xc0, 0x0c, 0x00, 0x21, 0x00,
+        0x01, 0x00, 0x00, 0x0e, 0x10, 0x00, 0x18, 0x00, 0x0a, 0x00, 0x14, 0x20,
+        0xfb, 0x06, 't',  'a',  'r',  'g',  'e',  't',  0x04, 'h',  'o',  'm',
+        'e',  0x04, 'a',  'r',  'p',  'a',  0x00,
+    });
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try writeResponse(response, &output.writer);
+    try std.testing.expectEqualStrings(
+        "srv.home.arpa. 3600 IN SRV 10 20 8443 target.home.arpa.\n",
+        output.written(),
+    );
+}
+
 test "query formatter prints CAA with canonical tag and raw value escapes" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -524,6 +612,45 @@ test "query formatter prints CAA with canonical tag and raw value escapes" {
     try writeResponse(response, &output.writer);
     try std.testing.expectEqualStrings(
         "host.home.arpa. 3600 IN CAA 128 issue \"a\\000\\128\\255\"\n",
+        output.written(),
+    );
+}
+
+test "query formatter prints X25 as a quoted decimal address" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const response = try dns_message.Message.parse(arena.allocator(), &.{
+        0x44, 0x63, 0x85, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x03, 'x',  '2',  '5',  0x04, 'h',  'o',  'm',  'e',  0x04, 'a',  'r',
+        'p',  'a',  0x00, 0x00, 0x13, 0x00, 0x01, 0xc0, 0x0c, 0x00, 0x13, 0x00,
+        0x01, 0x00, 0x00, 0x0e, 0x10, 0x00, 0x05, 0x04, '1',  '2',  '3',  '4',
+    });
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try writeResponse(response, &output.writer);
+    try std.testing.expectEqualStrings(
+        "x25.home.arpa. 3600 IN X25 \"1234\"\n",
+        output.written(),
+    );
+}
+
+test "query formatter prints ISDN address and optional subaddress" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const response = try dns_message.Message.parse(arena.allocator(), &.{
+        0x44, 0x64, 0x85, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x04, 'i',  's',  'd',  'n',  0x04, 'h',  'o',  'm',  'e',  0x04, 'a',
+        'r',  'p',  'a',  0x00, 0x00, 0x14, 0x00, 0x01, 0xc0, 0x0c, 0x00, 0x14,
+        0x00, 0x01, 0x00, 0x00, 0x0e, 0x10, 0x00, 0x09, 0x04, '1',  '2',  '3',
+        '4',  0x03, 'a',  'B',  'f',
+    });
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try writeResponse(response, &output.writer);
+    try std.testing.expectEqualStrings(
+        "isdn.home.arpa. 3600 IN ISDN \"1234\" \"aBf\"\n",
         output.written(),
     );
 }

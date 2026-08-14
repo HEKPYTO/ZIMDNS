@@ -8,6 +8,7 @@ const dns_header = @import("dns/header.zig");
 const dns_message = @import("dns/message.zig");
 const dns_name = @import("dns/name.zig");
 const dns_record = @import("dns/record.zig");
+const dns_rdata = @import("dns/rdata.zig");
 const dns_types = @import("dns/types.zig");
 const dns_writer = @import("dns/writer.zig");
 const tcp_deadline = @import("platform/tcp_deadline.zig");
@@ -39,6 +40,7 @@ pub const Error = error{
     BadUpstreamResponse,
     ResponseTooLarge,
     UnsupportedOpcode,
+    EcsRefused,
     BadCookie,
 };
 
@@ -365,6 +367,9 @@ pub const Resolver = struct {
 
     pub fn answer(self: *Resolver, query_bytes: []const u8, query: dns_message.Message, client: *const std.Io.net.IpAddress, output: []u8) ![]const u8 {
         if (query.header.opcode != .query) return Error.UnsupportedOpcode;
+        if (findOption(query, dns_rdata.EDNS_ECS_OPTION_CODE)) |ecs| {
+            if (ecs.len >= 4 and ecs[2] != 0) return Error.EcsRefused;
+        }
         const cookie = self.clientCookie(query, client);
         if (cookie == .invalid) return self.cookieFailure(query, client, output);
         const key = try CacheKey.fromQuestion(query);
@@ -633,6 +638,7 @@ fn cloneMessage(allocator: std.mem.Allocator, source: dns_message.Message) !dns_
 
 fn validUpstreamResponse(response: dns_message.Message, query: dns_message.Message, expected_id: u16) bool {
     if (!response.header.qr or response.header.id != expected_id or response.header.opcode != query.header.opcode or response.header.question_count != 1) return false;
+    if (findOption(response, dns_rdata.EDNS_ECS_OPTION_CODE) != null) return false;
     const expected = query.question orelse return false;
     const actual = response.question orelse return false;
     return actual.name.eql(&expected.name) and actual.qtype.eql(expected.qtype) and actual.qclass.eql(expected.qclass);
@@ -944,6 +950,68 @@ test "resolver rejects non-query opcodes before cache or upstream" {
     var output: [2048]u8 = undefined;
     const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42600);
     try std.testing.expectError(Error.UnsupportedOpcode, resolver.answer(encoded, query, &client, &output));
+}
+
+test "resolver refuses nonzero ECS before cache or upstream" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var resolver = try Resolver.init(std.testing.allocator, io, .{});
+    defer resolver.deinit();
+
+    var query = try makeTestQuery(std.testing.allocator, 0x2601, "example.com.", true);
+    defer query.deinit();
+    const ecs = [_]u8{ 0, 1, 24, 0, 192, 0, 2 };
+    try appendOption(&query, dns_rdata.EDNS_ECS_OPTION_CODE, &ecs);
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42601);
+    try std.testing.expectError(Error.EcsRefused, resolver.answer(encoded, query, &client, &output));
+}
+
+test "resolver rejects ECS-bearing upstream responses before cache" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2602, "example.com.", true);
+    defer query.deinit();
+    var response = try makePositiveResponse(arena.allocator(), 60);
+    defer response.deinit();
+    response.header.id = query.header.id;
+    response.question = query.question;
+    try appendOpt(&response, query.edns.?);
+    const ecs = [_]u8{ 0, 1, 24, 0, 192, 0, 2 };
+    try appendOption(&response, dns_rdata.EDNS_ECS_OPTION_CODE, &ecs);
+    try std.testing.expect(!validUpstreamResponse(response, query, query.header.id));
+}
+
+test "buildUpstreamQuery strips client EDNS options but preserves payload size and DO" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var query = try makeTestQuery(arena.allocator(), 0x2603, "example.com.", true);
+    defer query.deinit();
+    query.edns.?.udp_payload_size = 1200;
+    query.edns.?.dnssec_ok = true;
+    query.additionals.items[0].class = dns_types.Class.fromCode(1200);
+    query.additionals.items[0].ttl = 0x8000;
+
+    try appendOption(&query, dns_rdata.EDNS_PADDING_OPTION_CODE, &.{ 0xaa, 0xbb });
+    try appendOption(&query, dns_rdata.EDNS_ECS_OPTION_CODE, &.{ 0, 1, 0, 0 });
+    try appendOption(&query, COOKIE_OPTION_CODE, &.{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    try appendOption(&query, 65000, &.{ 9, 8, 7 });
+
+    var output: [512]u8 = undefined;
+    const encoded = try buildUpstreamQuery(&.{ 0xde, 0xad }, query, &output);
+
+    var parsed_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer parsed_arena.deinit();
+    const upstream = try dns_message.Message.parse(parsed_arena.allocator(), encoded);
+    try std.testing.expectEqual(@as(u16, 1200), upstream.edns.?.udp_payload_size);
+    try std.testing.expect(upstream.edns.?.dnssec_ok);
+    try std.testing.expectEqual(@as(usize, 0), upstream.additionals.items[0].rdata.OPT.bytes().len);
+    try std.testing.expect(findOption(upstream, dns_rdata.EDNS_PADDING_OPTION_CODE) == null);
+    try std.testing.expect(findOption(upstream, dns_rdata.EDNS_ECS_OPTION_CODE) == null);
+    try std.testing.expect(findOption(upstream, COOKIE_OPTION_CODE) == null);
+    try std.testing.expect(findOption(upstream, 65000) == null);
 }
 
 test "cache separates CD and EDNS DO variants" {

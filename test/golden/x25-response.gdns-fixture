@@ -1,0 +1,17 @@
+name: x25-response
+rfc: RFC 1183 section 3.1
+phase: 3
+description: Exact authoritative X25 response with no synthesized additional record.
+input_hex:
+  44 63 01 00 00 01 00 00 00 00 00 00
+  03 78 32 35 04 68 6f 6d 65 04 61 72 70 61 00 00 13 00 01
+response_hex:
+  44 63 85 00 00 01 00 01 00 00 00 00
+  03 78 32 35 04 68 6f 6d 65 04 61 72 70 61 00 00 13 00 01
+  c0 0c 00 13 00 01 00 00 0e 10 00 05 04 31 32 33 34
+expect:
+  parse_ok: true
+  id: 0x4463
+  qname: x25.home.arpa.
+  qtype: X25
+  qclass: IN

@@ -1,0 +1,18 @@
+name: rp-response
+rfc: RFC 1183 section 2
+phase: 3
+description: Exact authoritative RP response with no synthesized additional record for the TXT target.
+input_hex:
+  44 59 01 00 00 01 00 00 00 00 00 00
+  02 72 70 04 68 6f 6d 65 04 61 72 70 61 00 00 11 00 01
+response_hex:
+  44 59 85 00 00 01 00 01 00 00 00 00
+  02 72 70 04 68 6f 6d 65 04 61 72 70 61 00 00 11 00 01
+  c0 0c 00 11 00 01 00 00 0e 10 00 13
+  04 6d 62 6f 78 c0 0f 09 74 78 74 2d 64 6e 61 6d 65 c0 0f
+expect:
+  parse_ok: true
+  id: 0x4459
+  qname: rp.home.arpa.
+  qtype: RP
+  qclass: IN

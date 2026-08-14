@@ -16,6 +16,7 @@ pub const Error = error{
     BadName,
     BadRData,
     MalformedOption,
+    MalformedEcsOption,
     OptionsTooLong,
 };
 
@@ -42,6 +43,7 @@ pub const ResourceRecord = struct {
         const rdata_offset = owner_result.next_offset + reader.position();
         const rdata = RData.parse(RecordType.fromCode(rrtype_code), message, rdata_offset, rdlength) catch |err| switch (err) {
             rdata_mod.Error.MalformedOption => return Error.MalformedOption,
+            rdata_mod.Error.MalformedEcsOption => return Error.MalformedEcsOption,
             rdata_mod.Error.OptionsTooLong => return Error.OptionsTooLong,
             else => return Error.BadRData,
         };
