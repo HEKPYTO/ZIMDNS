@@ -5,6 +5,8 @@ const cli_query = zimdns.cli_query;
 const listener = zimdns.listener;
 const metrics = zimdns.metrics;
 const Runtime = zimdns.auth_runtime.Runtime;
+const zone_index = zimdns.zone_index;
+const zone_store = zimdns.zone_store;
 const Resolver = zimdns.resolver.Resolver;
 const resolver = zimdns.resolver;
 const dns_message = zimdns.dns_message;
@@ -32,6 +34,14 @@ const BoundedTcpArgs = struct {
     server: *std.Io.net.Server,
     runtime: *Runtime,
     max_requests: ?usize,
+    ok: bool = false,
+};
+
+const BoundedUdpArgs = struct {
+    io: std.Io,
+    socket: *const std.Io.net.Socket,
+    runtime: *Runtime,
+    count: usize,
     ok: bool = false,
 };
 
@@ -71,6 +81,136 @@ test "UDP request pipeline answers A query and records metrics" {
     try expectAResponse(response);
     try std.testing.expectEqual(@as(u16, 0x4242), response.header.id);
     try expectMetrics(counters);
+}
+
+test "UDP loop publishes only durable primary-zone replacements" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "zone.snapshot", .data = reload_initial_zone });
+    var store = try zone_store.Store.init(tmp.dir, io, "zone.snapshot");
+    defer store.deinit();
+
+    var zones: std.ArrayList(zone_index.Zone) = .empty;
+    try zones.append(std.testing.allocator, store.takeZone() orelse return error.TestExpectedEqual);
+    var runtime = Runtime.fromZones(std.testing.allocator, &zones, .{});
+    defer runtime.deinit();
+
+    var server_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server_socket = try std.Io.net.IpAddress.bind(&server_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    var client_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var client_socket = try std.Io.net.IpAddress.bind(&client_addr, io, .{ .mode = .dgram, .protocol = .udp });
+
+    var server_args = BoundedUdpArgs{
+        .io = io,
+        .socket = &server_socket,
+        .runtime = &runtime,
+        .count = 3,
+    };
+    const server_thread = std.Thread.spawn(.{}, serveBoundedUdp, .{&server_args}) catch |err| {
+        client_socket.close(io);
+        server_socket.close(io);
+        return err;
+    };
+    var joined = false;
+    defer {
+        client_socket.close(io);
+        server_socket.close(io);
+        if (!joined) server_thread.join();
+    }
+
+    var query_buffer: [512]u8 = undefined;
+    const first_query = try cli_query.buildQueryPacket(&query_buffer, 0x5401, "www.example.", .A);
+    try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, first_query);
+    var response_buffer: [512]u8 = undefined;
+    const first_response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, first_query);
+    try expectAddress(first_response, .{ 192, 0, 2, 1 });
+
+    const replacement = try store.replaceText(reload_newer_zone);
+    try runtime.replaceZone(replacement);
+
+    var second_query_buffer: [512]u8 = undefined;
+    const second_query = try cli_query.buildQueryPacket(&second_query_buffer, 0x5402, "www.example.", .A);
+    try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, second_query);
+    const second_response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, second_query);
+    try expectAddress(second_response, .{ 192, 0, 2, 2 });
+
+    try std.testing.expectError(error.BadRecord, store.replaceText(reload_invalid_zone));
+    try std.testing.expectError(zone_store.Store.Error.SerialOlder, store.replaceText(reload_older_zone));
+    try std.testing.expectError(zone_store.Store.Error.SerialUndefined, store.replaceText(reload_undefined_zone));
+
+    var third_query_buffer: [512]u8 = undefined;
+    const third_query = try cli_query.buildQueryPacket(&third_query_buffer, 0x5403, "www.example.", .A);
+    try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, third_query);
+    const third_response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, third_query);
+    try expectAddress(third_response, .{ 192, 0, 2, 2 });
+
+    server_thread.join();
+    joined = true;
+    try std.testing.expect(server_args.ok);
+}
+
+test "concurrent UDP queries and zone replacements keep responses valid" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "zone.snapshot", .data = reload_initial_zone });
+    var store = try zone_store.Store.init(tmp.dir, io, "zone.snapshot");
+    defer store.deinit();
+
+    var zones: std.ArrayList(zone_index.Zone) = .empty;
+    try zones.append(std.testing.allocator, store.takeZone() orelse return error.TestExpectedEqual);
+    var runtime = Runtime.fromZones(std.testing.allocator, &zones, .{});
+    defer runtime.deinit();
+
+    var server_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server_socket = try std.Io.net.IpAddress.bind(&server_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    var client_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var client_socket = try std.Io.net.IpAddress.bind(&client_addr, io, .{ .mode = .dgram, .protocol = .udp });
+
+    var server_args = BoundedUdpArgs{
+        .io = io,
+        .socket = &server_socket,
+        .runtime = &runtime,
+        .count = concurrent_udp_requests,
+    };
+    const server_thread = std.Thread.spawn(.{}, serveBoundedUdp, .{&server_args}) catch |err| {
+        client_socket.close(io);
+        server_socket.close(io);
+        return err;
+    };
+    var joined = false;
+    defer {
+        client_socket.close(io);
+        server_socket.close(io);
+        if (!joined) server_thread.join();
+    }
+
+    var query_buffer: [512]u8 = undefined;
+    for (0..concurrent_udp_requests) |index| {
+        const query = try cli_query.buildQueryPacket(&query_buffer, @intCast(0x6000 + index), "www.example.", .A);
+        try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, query);
+        const replacement_text = if (index % 2 == 0) reload_newer_zone else reload_initial_zone;
+        try runtime.replaceZone(try parseZone(replacement_text));
+    }
+
+    server_thread.join();
+    joined = true;
+    try std.testing.expect(server_args.ok);
+
+    var response_buffer: [512]u8 = undefined;
+    for (0..concurrent_udp_requests) |_| {
+        const incoming = try client_socket.receiveTimeout(io, &response_buffer, TestTimeout);
+        const response = try dns_message.Message.parse(arena.allocator(), incoming.data);
+        try std.testing.expect(response.header.qr);
+        try expectAddressIsPublished(response);
+    }
 }
 
 test "TCP request pipeline answers A query and records metrics" {
@@ -1255,6 +1395,17 @@ fn serveBoundedTcp(args: *BoundedTcpArgs) void {
     args.ok = true;
 }
 
+fn serveBoundedUdp(args: *BoundedUdpArgs) void {
+    listener.serveUdpCount(args.socket, args.io, args.runtime, args.count) catch return;
+    args.ok = true;
+}
+
+fn parseZone(text: []const u8) !zone_index.Zone {
+    var zone_file = try zimdns.zone_parser.ZoneFile.parse(text);
+    errdefer zone_file.deinit();
+    return zone_index.Zone.fromZoneFile(&zone_file);
+}
+
 fn serveUpstream(args: *UpstreamArgs) void {
     var request_buffer: [resolver.MAX_UPSTREAM_MESSAGE]u8 = undefined;
     const incoming = args.udp.receiveTimeout(args.io, &request_buffer, TestTimeout) catch return;
@@ -1579,6 +1730,12 @@ fn expectAddress(response: anytype, expected: [4]u8) !void {
     try std.testing.expectEqualSlices(u8, &expected, &response.answers.items[0].rdata.A);
 }
 
+fn expectAddressIsPublished(response: anytype) !void {
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+    const address = &response.answers.items[0].rdata.A;
+    try std.testing.expect(std.mem.eql(u8, address, &.{ 192, 0, 2, 1 }) or std.mem.eql(u8, address, &.{ 192, 0, 2, 2 }));
+}
+
 fn loadConfiguredRuntime(io: std.Io, tmp: *std.testing.TmpDir) !Runtime {
     try tmp.dir.writeFile(io, .{ .sub_path = "parent.zone", .data = parent_zone });
     try tmp.dir.writeFile(io, .{ .sub_path = "child.zone", .data = child_zone });
@@ -1618,6 +1775,49 @@ const fixture_zone =
     \\target IN AAAA 2001:db8::21
     \\target IN X25 1234
     \\target IN ISDN 1234 "aBf"
+    \\
+;
+
+const concurrent_udp_requests = 64;
+
+const reload_initial_zone =
+    \\$ORIGIN example.
+    \\$TTL 3600
+    \\@ IN SOA ns.example. hostmaster.example. 10 3600 900 1209600 300
+    \\@ IN NS ns.example.
+    \\www IN A 192.0.2.1
+    \\
+;
+
+const reload_newer_zone =
+    \\$ORIGIN example.
+    \\$TTL 3600
+    \\@ IN SOA ns.example. hostmaster.example. 11 3600 900 1209600 300
+    \\@ IN NS ns.example.
+    \\www IN A 192.0.2.2
+    \\
+;
+
+const reload_invalid_zone =
+    \\$ORIGIN example.
+    \\$TTL 3600
+    \\this is not a zone record
+    \\
+;
+
+const reload_older_zone =
+    \\$ORIGIN example.
+    \\$TTL 3600
+    \\@ IN SOA ns.example. hostmaster.example. 9 3600 900 1209600 300
+    \\@ IN NS ns.example.
+    \\
+;
+
+const reload_undefined_zone =
+    \\$ORIGIN example.
+    \\$TTL 3600
+    \\@ IN SOA ns.example. hostmaster.example. 2147483659 3600 900 1209600 300
+    \\@ IN NS ns.example.
     \\
 ;
 

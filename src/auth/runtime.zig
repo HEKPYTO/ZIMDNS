@@ -14,6 +14,7 @@ const resolver_mod = @import("../resolver.zig");
 pub const Error = error{
     BadQuery,
     EncodeFailed,
+    UnknownZoneOrigin,
 };
 
 pub const Runtime = struct {
@@ -21,6 +22,8 @@ pub const Runtime = struct {
     zones: std.ArrayList(zone_index.Zone) = .empty,
     blocklist: blocklist_mod.Blocklist = .{},
     resolver: ?resolver_mod.Resolver = null,
+    // ceiling: global runtime lock serializes all zone reads/reloads; use per-zone or read/write locks if contention matters.
+    mutex: std.Io.Mutex = .init,
 
     /// The returned runtime owns its authoritative zone; call deinit when done.
     pub fn fromZoneText(text: []const u8) !Runtime {
@@ -60,12 +63,38 @@ pub const Runtime = struct {
     }
 
     pub fn deinit(self: *Runtime) void {
+        self.lock();
+        defer self.unlock();
         if (self.resolver) |*resolver| resolver.deinit();
         self.resolver = null;
         for (self.zones.items) |*zone| zone.deinit();
         self.zones.deinit(self.allocator);
         self.zones = .empty;
         self.blocklist = .{};
+    }
+
+    pub fn replaceZone(self: *Runtime, replacement: zone_index.Zone) !void {
+        self.lock();
+        defer self.unlock();
+        const origin = replacement.originText();
+        for (self.zones.items) |*zone| {
+            if (!std.ascii.eqlIgnoreCase(zone.originText(), origin)) continue;
+            var old_zone = zone.*;
+            zone.* = replacement;
+            old_zone.deinit();
+            return;
+        }
+        var unowned = replacement;
+        unowned.deinit();
+        return Error.UnknownZoneOrigin;
+    }
+
+    fn lock(self: *const Runtime) void {
+        std.Io.Threaded.mutexLock(@constCast(&self.mutex));
+    }
+
+    fn unlock(self: *const Runtime) void {
+        std.Io.Threaded.mutexUnlock(@constCast(&self.mutex));
     }
 
     pub fn answer(self: *const Runtime, query_bytes: []const u8, output: []u8) ![]const u8 {
@@ -79,6 +108,8 @@ pub const Runtime = struct {
             },
             else => return Error.BadQuery,
         };
+        self.lock();
+        defer self.unlock();
         const message = try self.buildMessage(query);
         var writer = dns_writer.Writer.init(output);
         message.encode(&writer) catch return Error.EncodeFailed;
@@ -95,6 +126,12 @@ pub const Runtime = struct {
             },
             else => return Error.BadQuery,
         };
+        self.lock();
+        defer self.unlock();
+        return self.answerFromUnlocked(query_bytes, output, client, query);
+    }
+
+    fn answerFromUnlocked(self: *Runtime, query_bytes: []const u8, output: []u8, client: *const std.Io.net.IpAddress, query: dns_message.Message) ![]const u8 {
         const q = query.question orelse return Error.BadQuery;
         if (query.header.opcode != .query) {
             return self.encodeMessage(try response.buildNotImplementedResponse(query), output);
@@ -139,7 +176,21 @@ pub const Runtime = struct {
 
     pub fn answerFromWithMetrics(self: *Runtime, query_bytes: []const u8, output: []u8, client: *const std.Io.net.IpAddress, counters: *metrics.Counters) ![]const u8 {
         counters.queries_total += 1;
-        const result = self.answerFrom(query_bytes, output, client) catch |err| {
+        self.lock();
+        defer self.unlock();
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const query = dns_message.Message.parseQuery(arena.allocator(), query_bytes) catch |err| switch (err) {
+            error.MalformedEcsOption => {
+                const partial = dns_message.Message.parseHeaderQuestion(arena.allocator(), query_bytes) catch return Error.BadQuery;
+                return self.encodeMessage(try response.buildFormerrResponse(partial), output) catch |encode_err| {
+                    if (encode_err == Error.EncodeFailed) counters.encode_failures_total += 1;
+                    return encode_err;
+                };
+            },
+            else => return Error.BadQuery,
+        };
+        const result = self.answerFromUnlocked(query_bytes, output, client, query) catch |err| {
             if (err == Error.BadQuery) counters.bad_queries_total += 1;
             if (err == Error.EncodeFailed) counters.encode_failures_total += 1;
             return err;
@@ -171,6 +222,8 @@ pub const Runtime = struct {
                 return Error.BadQuery;
             },
         };
+        self.lock();
+        defer self.unlock();
         const message = try self.buildMessage(query);
         var writer = dns_writer.Writer.init(output);
         message.encode(&writer) catch {
@@ -525,4 +578,63 @@ test "authoritative runtime selects longest mixed-case ancestor origin" {
     const selected = runtime.selectZone("WWW.SUB.EXAMPLE.") orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("Sub.Example.", selected.originText());
     try std.testing.expect(runtime.selectZone("www.notexample.") == null);
+}
+
+test "runtime swaps a matching zone by move" {
+    var runtime = try Runtime.fromZoneText(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+        \\@ IN NS ns.example.
+        \\www IN A 192.0.2.1
+        \\
+    );
+    defer runtime.deinit();
+
+    const replacement = try parseTestZone(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 2 3600 900 1209600 300
+        \\@ IN NS ns.example.
+        \\www IN A 192.0.2.2
+        \\
+    );
+    try runtime.replaceZone(replacement);
+
+    const selected = runtime.selectZone("www.example.") orelse return error.TestExpectedEqual;
+    var result = selected.lookup(std.testing.allocator, "www.example.", .A);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("192.0.2.2", result.records.items[0].rdataText());
+}
+
+test "runtime rejects a replacement whose origin cannot be caller-mislabeled" {
+    var runtime = try Runtime.fromZoneText(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+        \\@ IN NS ns.example.
+        \\www IN A 192.0.2.1
+        \\
+    );
+    defer runtime.deinit();
+
+    const replacement = try parseTestZone(
+        \\$ORIGIN other.
+        \\$TTL 3600
+        \\@ IN SOA ns.other. hostmaster.other. 2 3600 900 1209600 300
+        \\@ IN NS ns.other.
+        \\
+    );
+    try std.testing.expectError(Error.UnknownZoneOrigin, runtime.replaceZone(replacement));
+
+    const selected = runtime.selectZone("www.example.") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("example.", selected.originText());
+    var result = selected.lookup(std.testing.allocator, "www.example.", .A);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("192.0.2.1", result.records.items[0].rdataText());
+}
+
+fn parseTestZone(text: []const u8) !zone_index.Zone {
+    var zone_file = try zone_parser.ZoneFile.parse(text);
+    return zone_index.Zone.fromZoneFile(&zone_file);
 }
