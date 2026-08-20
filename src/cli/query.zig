@@ -216,6 +216,7 @@ fn rcodeName(rcode: dns_header.Rcode) []const u8 {
         .refused => "REFUSED",
         .yxdomain => "YXDOMAIN",
         .badcookie => "BADCOOKIE",
+        .notauth => "NOTAUTH",
     };
 }
 

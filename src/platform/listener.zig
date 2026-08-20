@@ -7,6 +7,11 @@ const builtin = @import("builtin");
 const Runtime = @import("../auth/runtime.zig").Runtime;
 const metrics = @import("../metrics.zig");
 const response_mod = @import("../auth/response.zig");
+const dns_tsig = @import("../dns/tsig.zig");
+const dns_rdata = @import("../dns/rdata.zig");
+const dns_record = @import("../dns/record.zig");
+const dns_name = @import("../dns/name.zig");
+const dns_writer = @import("../dns/writer.zig");
 const tcp_deadline = @import("tcp_deadline.zig");
 
 pub const UDP_CLASSIC_MESSAGE_SIZE: usize = response_mod.CLASSIC_UDP_MESSAGE_SIZE;
@@ -51,7 +56,7 @@ fn serveUdpOnceWithTimeout(socket: *const std.Io.net.Socket, io: std.Io, runtime
     var response_buffer: [UDP_RESPONSE_BUFFER_SIZE]u8 = undefined;
     var classic_response_buffer: [UDP_RESPONSE_BUFFER_SIZE]u8 = undefined;
     const response_bytes = try runtime.answerFrom(incoming.data, &response_buffer, &incoming.from);
-    const response_data = try response_mod.truncateClassicUdpResponse(response_bytes, &classic_response_buffer);
+    const response_data = try runtime.truncateUdpResponse(incoming.data, response_bytes, &classic_response_buffer);
     try socket.send(io, &incoming.from, response_data);
 }
 
@@ -65,7 +70,7 @@ fn serveUdpOnceWithMetricsTimeout(socket: *const std.Io.net.Socket, io: std.Io, 
     var response_buffer: [UDP_RESPONSE_BUFFER_SIZE]u8 = undefined;
     var classic_response_buffer: [UDP_RESPONSE_BUFFER_SIZE]u8 = undefined;
     const response_bytes = try runtime.answerFromWithMetrics(incoming.data, &response_buffer, &incoming.from, counters);
-    const response_data = try response_mod.truncateClassicUdpResponse(response_bytes, &classic_response_buffer);
+    const response_data = try runtime.truncateUdpResponse(incoming.data, response_bytes, &classic_response_buffer);
     try socket.send(io, &incoming.from, response_data);
 }
 
@@ -405,6 +410,64 @@ test "classic UDP response over 512 bytes sets TC instead of clipping" {
     try std.testing.expect(parsed.header.truncated);
     try std.testing.expectEqual(@as(u16, 0), parsed.header.answer_count);
     try std.testing.expect(parsed.edns == null);
+}
+
+test "classic UDP signed response retains TSIG and verifies after truncation" {
+    try expectSignedUdpTruncation(false);
+}
+
+test "EDNS UDP signed response drops OPT and retains TSIG after truncation" {
+    try expectSignedUdpTruncation(true);
+}
+
+fn expectSignedUdpTruncation(include_edns: bool) !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_text: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer zone_text.deinit();
+    try zone_text.writer.writeAll(
+        "$ORIGIN home.arpa.\n" ++
+            "$TTL 3600\n" ++
+            "@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600\n" ++
+            "@ IN NS ns1.home.arpa.\n",
+    );
+    var record_index: usize = 0;
+    while (record_index < 100) : (record_index += 1) {
+        try zone_text.writer.print("many IN A 192.0.2.{d}\n", .{record_index + 1});
+    }
+
+    var keyring = try @import("../auth/keyring.zig").Keyring.parse("key \"key.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };");
+    var runtime = try Runtime.fromZoneTextWithKeyring(zone_text.written(), &keyring);
+    defer runtime.deinit();
+    const now = 1_700_000_000;
+    runtime.setTsigNow(now);
+
+    var server_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server_socket = try std.Io.net.IpAddress.bind(&server_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer server_socket.close(io);
+    var client_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var client_socket = try std.Io.net.IpAddress.bind(&client_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer client_socket.close(io);
+
+    const query = try buildSignedListenerQueryWithEdns(now, include_edns);
+    try client_socket.send(io, &server_socket.address, query.bytes[0..query.len]);
+    try serveUdpOnce(&server_socket, io, &runtime);
+
+    var response_buffer: [UDP_CLASSIC_MESSAGE_SIZE]u8 = undefined;
+    const incoming = try client_socket.receiveTimeout(io, &response_buffer, UDP_IDLE_TIMEOUT);
+    const parsed = try @import("../dns/message.zig").Message.parse(arena.allocator(), incoming.data);
+    try std.testing.expect(parsed.header.truncated);
+    try std.testing.expectEqual(@as(@TypeOf(parsed.header.rcode), .no_error), parsed.header.rcode);
+    try std.testing.expectEqual(@as(u16, 0), parsed.header.answer_count);
+    try std.testing.expectEqual(@as(usize, 1), parsed.additionals.len);
+    try std.testing.expect(parsed.edns == null);
+    const request_final = (try dns_tsig.parseFinalAdditional(query.bytes[0..query.len])).?;
+    const response_final = (try dns_tsig.parseFinalAdditional(incoming.data)).?;
+    try std.testing.expectEqual(@as(u16, 0x1234), response_final.tsig.original_id);
+    try std.testing.expectEqual(@as(usize, 32), response_final.tsig.macBytes().len);
+    _ = try dns_tsig.verify(incoming.data, "01234567890123456789012345678901", request_final.tsig.macBytes(), 32);
 }
 
 test "TCP handler serves FIFO length-prefixed DNS queries on one stream" {
@@ -786,6 +849,51 @@ fn buildLargeEdnsQuery(buffer: []u8, id: u16) ![]const u8 {
     offset += 2;
     @memset(buffer[offset .. offset + option_data_len], 0);
     return buffer[0 .. offset + option_data_len];
+}
+
+const SignedListenerQuery = struct {
+    bytes: [512]u8,
+    len: usize,
+};
+
+fn buildSignedListenerQueryWithEdns(time_signed: u64, include_edns: bool) !SignedListenerQuery {
+    const algorithm = try dns_name.Name.fromText("hmac-sha256.");
+    const owner = try dns_name.Name.fromText("key.");
+    const root = dns_name.Name.root();
+    var packet: [512]u8 = undefined;
+    var writer = dns_writer.Writer.init(&packet);
+    try writer.writeBytes(&.{
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+    });
+    try writer.writeU16(if (include_edns) 2 else 1);
+    try writer.writeBytes(&.{
+        4,   'm', 'a', 'n',  'y',  4,    'h',  'o', 'm', 'e', 4, 'a', 'r',
+        'p', 'a', 0,   0x00, 0x01, 0x00, 0x01,
+    });
+    if (include_edns) {
+        try (dns_record.ResourceRecord{
+            .owner = root,
+            .rrtype = .OPT,
+            .class = @import("../dns/types.zig").Class.fromCode(response_mod.DEFAULT_EDNS_UDP_PAYLOAD_SIZE),
+            .ttl = 0,
+            .rdata = .{ .OPT = .{} },
+        }).encode(&writer);
+    }
+
+    var zeros: [32]u8 = @splat(0);
+    const value = try dns_rdata.Tsig.init(algorithm, time_signed, 300, &zeros, 0x1234, 0, &.{});
+    try (dns_record.ResourceRecord{
+        .owner = owner,
+        .rrtype = .TSIG,
+        .class = .ANY,
+        .ttl = 0,
+        .rdata = .{ .TSIG = value },
+    }).encode(&writer);
+
+    const final = (try dns_tsig.parseFinalAdditional(writer.written())).?;
+    const signed = try dns_tsig.sign(writer.written(), "01234567890123456789012345678901", final.owner, final.tsig, null);
+    try dns_tsig.patchMac(packet[0..writer.len()], final, signed.slice());
+    return .{ .bytes = packet, .len = writer.len() };
 }
 
 const unix_tcp_deadlines = if (TCP_DEADLINES_SUPPORTED) struct {

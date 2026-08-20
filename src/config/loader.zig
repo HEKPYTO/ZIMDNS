@@ -1,8 +1,9 @@
 /// Contract: Loads one parsed server configuration and its referenced assets.
-/// Ownership: ServerContext owns its Config, ordered zones, and aggregate blocklist; call deinit.
+/// Ownership: ServerContext owns its Config, ordered zones, blocklist, and optional TSIG keyring; call deinit.
 /// Errors: Parser and referenced-file I/O errors stay typed; missing referenced assets map to MissingReferencedFile.
 const std = @import("std");
 const auth_runtime = @import("../auth/runtime.zig");
+const keyring_mod = @import("../auth/keyring.zig");
 const blocklist_mod = @import("../blocklist.zig");
 const parser = @import("parser.zig");
 const zone_index = @import("../zone/index.zig");
@@ -21,6 +22,7 @@ pub const ServerContext = struct {
     config: parser.Config,
     zones: std.ArrayList(zone_index.Zone) = .empty,
     blocklist: blocklist_mod.Blocklist = .{},
+    keyring: keyring_mod.Keyring = .{},
 
     pub fn load(dir: std.Io.Dir, io: std.Io, config_path: []const u8, allocator: std.mem.Allocator) !ServerContext {
         const config_text = try dir.readFileAlloc(io, config_path, allocator, .limited(1024 * 1024));
@@ -31,6 +33,15 @@ pub const ServerContext = struct {
             .config = try parser.Config.parse(config_text),
         };
         errdefer context.deinit();
+
+        if (context.config.tsigKeyFileText()) |key_path| {
+            const key_text = dir.readFileAlloc(io, key_path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+                error.FileNotFound => return Error.MissingReferencedFile,
+                else => return err,
+            };
+            defer allocator.free(key_text);
+            context.keyring = parseKeyTextAndClear(key_text) catch |err| return err;
+        }
 
         var zone_index_value: usize = 0;
         while (zone_index_value < context.config.zones.len) : (zone_index_value += 1) {
@@ -70,9 +81,9 @@ pub const ServerContext = struct {
         if (self.zones.items.len == 0) return Error.NoPrimaryZone;
         const policy = resolver_mod.Policy.fromConfig(&self.config) catch return error.BadConfiguration;
         const runtime = if (self.config.forwarder != null or self.config.recursion_allow.len != 0 or self.config.cookies.enabled)
-            try auth_runtime.Runtime.fromZonesWithPolicy(self.allocator, &self.zones, self.blocklist, io, policy)
+            try auth_runtime.Runtime.fromZonesWithPolicyAndKeyring(self.allocator, &self.zones, self.blocklist, io, policy, &self.keyring)
         else
-            auth_runtime.Runtime.fromZones(self.allocator, &self.zones, self.blocklist);
+            auth_runtime.Runtime.fromZonesWithKeyring(self.allocator, &self.zones, self.blocklist, &self.keyring);
         self.blocklist = .{};
         self.config = .{};
         return runtime;
@@ -83,6 +94,7 @@ pub const ServerContext = struct {
         self.zones.deinit(self.allocator);
         self.zones = .empty;
         self.blocklist = .{};
+        self.keyring.deinit();
         self.config = .{};
     }
 };
@@ -92,4 +104,62 @@ fn zoneNamesEqual(configured: []const u8, parsed: []const u8) bool {
     if (std.mem.endsWith(u8, parsed, ".") and std.ascii.eqlIgnoreCase(configured, parsed[0 .. parsed.len - 1])) return true;
     if (std.mem.endsWith(u8, configured, ".") and std.ascii.eqlIgnoreCase(configured[0 .. configured.len - 1], parsed)) return true;
     return false;
+}
+
+fn parseKeyTextAndClear(key_text: []u8) keyring_mod.Error!keyring_mod.Keyring {
+    defer std.crypto.secureZero(u8, key_text);
+    return keyring_mod.Keyring.parse(key_text);
+}
+
+test "server context loads the configured TSIG key file during startup" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{
+        .sub_path = "tsig.keys",
+        .data = "key \"Example.COM.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };\n",
+    });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "tsig-key-file tsig.keys\n" });
+
+    var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+    defer context.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), context.keyring.len);
+    const name = try @import("../dns/name.zig").Name.fromText("example.com.");
+    try std.testing.expect(context.keyring.find(name) != null);
+}
+
+test "server context rejects an unreadable TSIG key file" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "tsig-key-file missing.keys\n" });
+    try std.testing.expectError(
+        error.MissingReferencedFile,
+        ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator),
+    );
+}
+
+test "server context preserves non-missing TSIG key file I/O errors" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.createDir(io, "tsig.keys", .default_dir);
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "tsig-key-file tsig.keys\n" });
+
+    try std.testing.expectError(
+        error.IsDir,
+        ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator),
+    );
+}
+
+test "server context clears the temporary TSIG key text after parsing" {
+    var key_text = "key \"one.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };".*;
+    var ring = try parseKeyTextAndClear(&key_text);
+    defer ring.deinit();
+
+    for (key_text) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
 }

@@ -33,6 +33,7 @@ pub const Rcode = enum(u4) {
     refused = 5,
     yxdomain = 6,
     badcookie = 7,
+    notauth = 9,
 };
 
 pub const Error = error{
@@ -76,6 +77,7 @@ pub const Header = struct {
             5 => Rcode.refused,
             6 => Rcode.yxdomain,
             7 => Rcode.badcookie,
+            9 => Rcode.notauth,
             else => Rcode.servfail,
         };
 
@@ -150,4 +152,13 @@ test "header rejects short input and preserves unassigned opcode" {
     var unsupported = Reader.init(&.{ 0x12, 0x34, 0x78, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 });
     const parsed = try Header.parse(&unsupported);
     try std.testing.expectEqual(Opcode.unassigned_15, parsed.opcode);
+}
+
+test "header round trips NOTAUTH" {
+    var output: [12]u8 = undefined;
+    var writer = Writer.init(&output);
+    try (Header{ .id = 0x1234, .rcode = .notauth }).encode(&writer);
+    try std.testing.expectEqual(@as(u8, 9), output[3] & 0x0f);
+    var reader = Reader.init(&output);
+    try std.testing.expectEqual(Rcode.notauth, (try Header.parse(&reader)).rcode);
 }

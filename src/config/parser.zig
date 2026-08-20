@@ -159,6 +159,13 @@ pub const Config = struct {
     cookies: CookieConfig = .{},
     zones: List(Zone) = .{},
     blocklists: List(BlocklistFile) = .{},
+    tsig_key_file: Text = .{},
+    has_tsig_key_file: bool = false,
+
+    pub fn tsigKeyFileText(self: *const Config) ?[]const u8 {
+        if (!self.has_tsig_key_file) return null;
+        return self.tsig_key_file.text();
+    }
 
     pub fn parse(text: []const u8) !Config {
         var config = Config{};
@@ -181,6 +188,7 @@ pub const Config = struct {
         if (std.mem.eql(u8, first, "cookies")) return self.parseCookies(&tokens);
         if (std.mem.eql(u8, first, "zone")) return self.parseZone(&tokens);
         if (std.mem.eql(u8, first, "blocklist")) return self.parseBlocklist(&tokens);
+        if (std.mem.eql(u8, first, "tsig-key-file")) return self.parseTsigKeyFile(&tokens);
         return Error.UnknownDirective;
     }
 
@@ -246,6 +254,15 @@ pub const Config = struct {
         try file.path.set(tokens.next() orelse return Error.BadDirective);
         try requireNoTrailingTokens(tokens);
         try self.blocklists.append(file);
+    }
+
+    fn parseTsigKeyFile(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        if (self.has_tsig_key_file) return Error.BadDirective;
+        const path = tokens.next() orelse return Error.BadDirective;
+        try requireNoTrailingTokens(tokens);
+        if (path.len == 0) return Error.BadDirective;
+        try self.tsig_key_file.set(path);
+        self.has_tsig_key_file = true;
     }
 };
 
@@ -344,4 +361,13 @@ test "config parser requires bracketed IPv6 endpoints and one cookie policy" {
     try std.testing.expectError(error.BadDirective, Config.parse("cookies validate current previous\ncookies validate next\n"));
     const config = try Config.parse("forwarder [2001:db8::53]:53\n");
     try std.testing.expectEqualStrings("2001:db8::53", config.forwarder.?.addressText());
+}
+
+test "config parser accepts one TSIG key-file path and no secret directive" {
+    const config = try Config.parse("tsig-key-file /etc/zimdns/tsig.keys\n");
+    try std.testing.expectEqualStrings("/etc/zimdns/tsig.keys", config.tsigKeyFileText().?);
+    try std.testing.expectError(error.BadDirective, Config.parse(
+        "tsig-key-file /etc/zimdns/a\ntsig-key-file /etc/zimdns/b\n",
+    ));
+    try std.testing.expectError(error.UnknownDirective, Config.parse("tsig-key secret-value\n"));
 }

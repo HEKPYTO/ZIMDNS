@@ -5,6 +5,7 @@ const std = @import("std");
 const Writer = @import("writer.zig").Writer;
 const CompressionTable = @import("writer.zig").CompressionTable;
 const Name = @import("name.zig").Name;
+const NameParseResult = @import("name.zig").ParseResult;
 const RecordType = @import("types.zig").RecordType;
 
 const max_txt_len = 255;
@@ -14,6 +15,10 @@ const max_caa_payload_len = max_unknown_len - 2;
 const max_sshfp_fingerprint_len = 32;
 const max_tlsa_association_len = 509;
 const max_uri_target_len = 508;
+const max_tsig_mac_len = 32;
+const max_tsig_other_len = 512;
+const max_tsig_rdata_len = 512;
+const max_tsig_time: u64 = 0x0000ffffffffffff;
 
 pub const EDNS_ECS_OPTION_CODE: u16 = 8;
 pub const EDNS_PADDING_OPTION_CODE: u16 = 12;
@@ -315,6 +320,81 @@ pub const Opt = struct {
     }
 };
 
+pub const Tsig = struct {
+    algorithm: Name,
+    time_signed: u64,
+    fudge: u16,
+    mac: [max_tsig_mac_len]u8 = undefined,
+    mac_len: u16 = 0,
+    original_id: u16,
+    error_code: u16,
+    other_data: [max_tsig_other_len]u8 = undefined,
+    other_len: u16 = 0,
+
+    pub fn init(
+        algorithm: Name,
+        time_signed: u64,
+        fudge: u16,
+        mac: []const u8,
+        original_id: u16,
+        error_code: u16,
+        other_data: []const u8,
+    ) Error!Tsig {
+        if (time_signed > max_tsig_time or mac.len > max_tsig_mac_len or other_data.len > max_tsig_other_len or
+            algorithm.asWire().len + 16 + mac.len + other_data.len > max_tsig_rdata_len)
+        {
+            return Error.InvalidLength;
+        }
+
+        var value = Tsig{
+            .algorithm = algorithm,
+            .time_signed = time_signed,
+            .fudge = fudge,
+            .mac_len = @intCast(mac.len),
+            .original_id = original_id,
+            .error_code = error_code,
+            .other_len = @intCast(other_data.len),
+        };
+        @memcpy(value.mac[0..mac.len], mac);
+        @memcpy(value.other_data[0..other_data.len], other_data);
+        return value;
+    }
+
+    pub fn macBytes(self: *const Tsig) []const u8 {
+        return self.mac[0..self.mac_len];
+    }
+
+    pub fn otherData(self: *const Tsig) []const u8 {
+        return self.other_data[0..self.other_len];
+    }
+
+    pub fn encode(self: Tsig, writer: *Writer) !void {
+        if (self.time_signed > max_tsig_time or self.mac_len > max_tsig_mac_len or self.other_len > max_tsig_other_len or
+            self.algorithm.asWire().len + 16 + @as(usize, self.mac_len) + @as(usize, self.other_len) > max_tsig_rdata_len)
+        {
+            return Error.InvalidLength;
+        }
+
+        try self.algorithm.encode(writer);
+        var time_bytes: [6]u8 = .{
+            @intCast((self.time_signed >> 40) & 0xff),
+            @intCast((self.time_signed >> 32) & 0xff),
+            @intCast((self.time_signed >> 24) & 0xff),
+            @intCast((self.time_signed >> 16) & 0xff),
+            @intCast((self.time_signed >> 8) & 0xff),
+            @intCast(self.time_signed & 0xff),
+        };
+        try writer.writeBytes(&time_bytes);
+        try writer.writeU16(self.fudge);
+        try writer.writeU16(self.mac_len);
+        try writer.writeBytes(self.macBytes());
+        try writer.writeU16(self.original_id);
+        try writer.writeU16(self.error_code);
+        try writer.writeU16(self.other_len);
+        try writer.writeBytes(self.otherData());
+    }
+};
+
 pub const RData = union(enum) {
     A: [4]u8,
     AAAA: [16]u8,
@@ -338,6 +418,7 @@ pub const RData = union(enum) {
     TLSA: Tlsa,
     URI: Uri,
     OPT: Opt,
+    TSIG: Tsig,
     Unknown: Unknown,
 
     pub fn parse(rrtype: RecordType, message: []const u8, offset: usize, len: usize) Error!RData {
@@ -498,6 +579,7 @@ pub const RData = union(enum) {
                 try validateEdnsOptions(opt.bytes(), false);
                 break :blk .{ .OPT = opt };
             },
+            RecordType.TSIG.value => .{ .TSIG = try parseTsig(message, offset, end) },
             else => blk: {
                 if (len > max_unknown_len) return Error.UnknownTooLong;
                 var unknown = Unknown{ .len = @intCast(len) };
@@ -592,6 +674,7 @@ pub const RData = union(enum) {
                 try writer.writeBytes(uri.targetBytes());
             },
             .OPT => |opt| try writer.writeBytes(opt.bytes()),
+            .TSIG => |tsig| try tsig.encode(writer),
             .Unknown => |unknown| try writer.writeBytes(unknown.bytes()),
         }
     }
@@ -670,6 +753,7 @@ pub const RData = union(enum) {
                 try writer.writeBytes(uri.targetBytes());
             },
             .OPT => |opt| try writer.writeBytes(opt.bytes()),
+            .TSIG => |tsig| try tsig.encode(writer),
             .Unknown => |unknown| try writer.writeBytes(unknown.bytes()),
         }
     }
@@ -783,6 +867,56 @@ fn parseUncompressedNameOnly(message: []const u8, offset: usize, end: usize) Err
     const result = Name.parse(message, offset) catch return Error.BadName;
     if (result.next_offset != end) return Error.TrailingData;
     return result.name;
+}
+
+fn parseTsig(message: []const u8, offset: usize, end: usize) Error!Tsig {
+    if (end - offset > max_tsig_rdata_len) return Error.InvalidLength;
+    const algorithm_result = parseUncompressedName(message, offset, end) catch |err| switch (err) {
+        Error.BadName => return Error.BadName,
+        else => return Error.InvalidLength,
+    };
+    var reader = @import("reader.zig").Reader.init(message[algorithm_result.next_offset..end]);
+    const time_bytes = reader.readBytes(6) catch return Error.InvalidLength;
+    const time_signed: u64 = (@as(u64, time_bytes[0]) << 40) |
+        (@as(u64, time_bytes[1]) << 32) |
+        (@as(u64, time_bytes[2]) << 24) |
+        (@as(u64, time_bytes[3]) << 16) |
+        (@as(u64, time_bytes[4]) << 8) |
+        @as(u64, time_bytes[5]);
+    const fudge = reader.readU16() catch return Error.InvalidLength;
+    const mac_len = reader.readU16() catch return Error.InvalidLength;
+    if (mac_len > max_tsig_mac_len) return Error.InvalidLength;
+    const mac = reader.readBytes(mac_len) catch return Error.InvalidLength;
+    const original_id = reader.readU16() catch return Error.InvalidLength;
+    const error_code = reader.readU16() catch return Error.InvalidLength;
+    const other_len = reader.readU16() catch return Error.InvalidLength;
+    if (other_len > max_tsig_other_len) return Error.InvalidLength;
+    const other_data = reader.readBytes(other_len) catch return Error.InvalidLength;
+    if (reader.remaining() != 0) return Error.TrailingData;
+
+    return Tsig.init(
+        algorithm_result.name,
+        time_signed,
+        fudge,
+        mac,
+        original_id,
+        error_code,
+        other_data,
+    ) catch return Error.InvalidLength;
+}
+
+fn parseUncompressedName(message: []const u8, offset: usize, end: usize) Error!NameParseResult {
+    if (offset >= message.len or end > message.len or offset >= end) return Error.EndOfInput;
+    var cursor = offset;
+    while (cursor < end) {
+        const len = message[cursor];
+        if ((len & 0xc0) == 0xc0) return Error.BadName;
+        if (len == 0) break;
+        if ((len & 0xc0) != 0 or len > 63 or cursor + 1 + len > end) return Error.BadName;
+        cursor += 1 + len;
+    }
+    if (cursor >= end) return Error.BadName;
+    return Name.parse(message, offset) catch return Error.BadName;
 }
 
 test "rdata parses and encodes A and AAAA records" {

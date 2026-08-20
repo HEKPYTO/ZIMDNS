@@ -10,6 +10,12 @@ const zone_store = zimdns.zone_store;
 const Resolver = zimdns.resolver.Resolver;
 const resolver = zimdns.resolver;
 const dns_message = zimdns.dns_message;
+const dns_tsig = zimdns.dns_tsig;
+const dns_writer = zimdns.dns_writer;
+const dns_rdata = zimdns.dns_rdata;
+const dns_record = zimdns.dns_record;
+const dns_name = zimdns.dns_name;
+const auth_keyring = zimdns.auth_keyring;
 
 const UpstreamMode = enum { valid, nxdomain, wrong_source, wrong_id, wrong_question, truncated_tcp, trickle_tcp };
 const TestTimeout = std.Io.Timeout{ .duration = .{
@@ -81,6 +87,49 @@ test "UDP request pipeline answers A query and records metrics" {
     try expectAResponse(response);
     try std.testing.expectEqual(@as(u16, 0x4242), response.header.id);
     try expectMetrics(counters);
+}
+
+test "UDP signed query pipeline authenticates and returns signed success and unsigned BADKEY" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var keyring = try auth_keyring.Keyring.parse("key \"key.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };");
+    var runtime = try Runtime.fromZoneTextWithKeyring(fixture_zone, &keyring);
+    defer runtime.deinit();
+    const now = 1_700_000_000;
+    runtime.setTsigNow(now);
+
+    var server_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server_socket = try std.Io.net.IpAddress.bind(&server_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer server_socket.close(io);
+    var client_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var client_socket = try std.Io.net.IpAddress.bind(&client_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer client_socket.close(io);
+
+    var query = try buildIntegrationSignedQuery(now);
+    try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, query.bytes[0..query.len]);
+    try listener.serveUdpOnce(&server_socket, io, &runtime);
+    var response_buffer: [1024]u8 = undefined;
+    const incoming = try client_socket.receiveTimeout(io, &response_buffer, TestTimeout);
+    const response = try dns_message.Message.parse(arena.allocator(), incoming.data);
+    try std.testing.expectEqual(@as(@TypeOf(response.header.rcode), .no_error), response.header.rcode);
+    const request_final = (try dns_tsig.parseFinalAdditional(query.bytes[0..query.len])).?;
+    const response_final = (try dns_tsig.parseFinalAdditional(incoming.data)).?;
+    try std.testing.expectEqual(@as(u16, 0), response_final.tsig.error_code);
+    _ = try dns_tsig.verify(incoming.data, "01234567890123456789012345678901", request_final.tsig.macBytes(), 32);
+
+    query.bytes[query.owner_start + 1] = 'b';
+    query.bytes[query.owner_start + 2] = 'a';
+    query.bytes[query.owner_start + 3] = 'd';
+    try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, query.bytes[0..query.len]);
+    try listener.serveUdpOnce(&server_socket, io, &runtime);
+    const bad_incoming = try client_socket.receiveTimeout(io, &response_buffer, TestTimeout);
+    const bad_response = try dns_message.Message.parse(arena.allocator(), bad_incoming.data);
+    try std.testing.expectEqual(@as(@TypeOf(bad_response.header.rcode), .notauth), bad_response.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), bad_response.header.additional_count);
+    try std.testing.expectEqual(@as(u16, 17), bad_response.additionals.items[0].rdata.TSIG.error_code);
+    try std.testing.expectEqual(@as(usize, 0), bad_response.additionals.items[0].rdata.TSIG.macBytes().len);
 }
 
 test "UDP loop publishes only durable primary-zone replacements" {
@@ -1393,6 +1442,39 @@ fn serveCliTcp(args: *CliTcpArgs) void {
 fn serveBoundedTcp(args: *BoundedTcpArgs) void {
     listener.serveTcpLoop(args.server, args.io, args.runtime, args.max_requests) catch return;
     args.ok = true;
+}
+
+const IntegrationSignedQuery = struct {
+    bytes: [512]u8,
+    len: usize,
+    owner_start: usize,
+};
+
+fn buildIntegrationSignedQuery(time_signed: u64) !IntegrationSignedQuery {
+    const algorithm = try dns_name.Name.fromText("hmac-sha256.");
+    const owner = try dns_name.Name.fromText("key.");
+    var packet: [512]u8 = undefined;
+    var writer = dns_writer.Writer.init(&packet);
+    try writer.writeBytes(&.{
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+    });
+    try writer.writeBytes(&.{ 3, 'd', 'n', 's', 4, 'h', 'o', 'm', 'e', 4, 'a', 'r', 'p', 'a', 0 });
+    try writer.writeU16(1);
+    try writer.writeU16(1);
+    const owner_start = writer.len();
+    var zeros: [32]u8 = @splat(0);
+    const value = try dns_rdata.Tsig.init(algorithm, time_signed, 300, &zeros, 0x1234, 0, &.{});
+    try (dns_record.ResourceRecord{
+        .owner = owner,
+        .rrtype = .TSIG,
+        .class = .ANY,
+        .ttl = 0,
+        .rdata = .{ .TSIG = value },
+    }).encode(&writer);
+    const final = (try dns_tsig.parseFinalAdditional(writer.written())).?;
+    const signed = try dns_tsig.sign(writer.written(), "01234567890123456789012345678901", final.owner, final.tsig, null);
+    try dns_tsig.patchMac(packet[0..writer.len()], final, signed.slice());
+    return .{ .bytes = packet, .len = writer.len(), .owner_start = owner_start };
 }
 
 fn serveBoundedUdp(args: *BoundedUdpArgs) void {

@@ -7,6 +7,7 @@ pub const Class = struct {
     value: u16,
 
     pub const IN = Class{ .value = 1 };
+    pub const ANY = Class{ .value = 255 };
 
     pub fn fromCode(value: u16) Class {
         return .{ .value = value };
@@ -46,6 +47,7 @@ pub const RecordType = struct {
     pub const URI = RecordType{ .value = 256 };
     pub const OPT = RecordType{ .value = 41 };
     pub const CAA = RecordType{ .value = 257 };
+    pub const TSIG = RecordType{ .value = 250 };
 
     pub fn fromCode(value: u16) RecordType {
         return .{ .value = value };
@@ -65,6 +67,13 @@ test "record type and class codes round trip for phase-one values" {
     try std.testing.expectEqual(@as(u16, 28), RecordType.AAAA.code());
     try std.testing.expectEqual(Class.IN, Class.fromCode(1));
     try std.testing.expectEqual(@as(u16, 1), Class.IN.code());
+}
+
+test "TSIG record type and ANY class use their RFC wire codes" {
+    try std.testing.expectEqual(@as(u16, 250), RecordType.TSIG.code());
+    try std.testing.expectEqual(RecordType.TSIG, RecordType.fromCode(250));
+    try std.testing.expectEqual(@as(u16, 255), Class.ANY.code());
+    try std.testing.expectEqual(Class.ANY, Class.fromCode(255));
 }
 
 test "ISDN record type uses wire code 20" {

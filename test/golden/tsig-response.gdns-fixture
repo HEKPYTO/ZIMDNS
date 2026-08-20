@@ -1,0 +1,27 @@
+name: tsig-response
+rfc: RFC 8945 sections 5.2-5.3
+phase: 4
+description: Signed ordinary A query and deterministic signed authoritative response.
+input_hex:
+  12 34 01 00 00 01 00 00 00 00 00 01 03 64 6e 73
+  04 68 6f 6d 65 04 61 72 70 61 00 00 01 00 01 03
+  6b 65 79 00 00 fa 00 ff 00 00 00 00 00 3d 0b 68
+  6d 61 63 2d 73 68 61 32 35 36 00 00 00 65 53 f1
+  00 01 2c 00 20 c6 c1 c1 cf 69 ef 79 3d fa 22 9d
+  cb 3e 36 52 ed af b9 34 f6 f0 70 e9 3c d3 bd d5
+  b3 70 31 d2 b0 12 34 00 00 00 00
+response_hex:
+  12 34 85 00 00 01 00 01 00 00 00 01 03 64 6e 73
+  04 68 6f 6d 65 04 61 72 70 61 00 00 01 00 01 c0
+  0c 00 01 00 01 00 00 0e 10 00 04 c0 a8 01 01 03
+  6b 65 79 00 00 fa 00 ff 00 00 00 00 00 3d 0b 68
+  6d 61 63 2d 73 68 61 32 35 36 00 00 00 65 53 f1
+  00 01 2c 00 20 63 5f a6 5a 83 ca 62 2a b9 ab d6
+  2a 6f 33 ac 75 78 89 a8 5f 5a e4 81 ea cc c7 a1
+  48 81 1a bd ef 12 34 00 00 00 00
+expect:
+  parse_ok: true
+  id: 0x1234
+  qname: dns.home.arpa.
+  qtype: A
+  qclass: IN

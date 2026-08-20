@@ -3,11 +3,16 @@ const std = @import("std");
 pub const golden_fixture = @import("golden_fixture.zig");
 pub const dns_message = @import("dns/message.zig");
 pub const dns_name = @import("dns/name.zig");
+pub const dns_tsig = @import("dns/tsig.zig");
+pub const dns_writer = @import("dns/writer.zig");
+pub const dns_rdata = @import("dns/rdata.zig");
+pub const dns_record = @import("dns/record.zig");
 pub const zone_parser = @import("zone/parser.zig");
 pub const zone_index = @import("zone/index.zig");
 pub const zone_store = @import("zone/store.zig");
 pub const auth_response = @import("auth/response.zig");
 pub const auth_runtime = @import("auth/runtime.zig");
+pub const auth_keyring = @import("auth/keyring.zig");
 pub const listener = @import("platform/listener.zig");
 pub const cli_query = @import("cli/query.zig");
 pub const config_parser = @import("config/parser.zig");
@@ -29,6 +34,7 @@ test {
     _ = @import("dns/record.zig");
     _ = @import("dns/question.zig");
     _ = @import("dns/message.zig");
+    _ = @import("dns/tsig.zig");
     _ = golden_fixture;
     _ = @import("zone/journal.zig");
     _ = zone_parser;
@@ -36,6 +42,7 @@ test {
     _ = zone_store;
     _ = auth_response;
     _ = auth_runtime;
+    _ = auth_keyring;
     _ = listener;
     _ = cli_query;
     _ = config_parser;
@@ -333,7 +340,7 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
         };
         const zone_text = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
         if (server_context) |*context| {
-            runtime = try auth_runtime.Runtime.fromZoneTextWithBlocklist(zone_text, context.blocklist);
+            runtime = try auth_runtime.Runtime.fromZoneTextWithBlocklistAndKeyring(zone_text, context.blocklist, &context.keyring);
         } else {
             runtime = try auth_runtime.Runtime.fromZoneText(zone_text);
         }

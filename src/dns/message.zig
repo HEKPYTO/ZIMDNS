@@ -144,6 +144,32 @@ pub const Message = struct {
         return message;
     }
 
+    /// Parse a query after removing its already-validated final TSIG record.
+    /// The copied header keeps every byte identical except ARCOUNT, preserving
+    /// the ordinary query parser's restrictions without authenticating a
+    /// re-encoded message.
+    pub fn parseQueryWithoutTsig(
+        allocator: std.mem.Allocator,
+        bytes: []const u8,
+        record_start: usize,
+        record_end: usize,
+    ) !Message {
+        if (bytes.len < 12 or record_start < 12 or record_start > record_end or record_end > bytes.len or
+            record_end - record_start > bytes.len - 12)
+        {
+            return Error.BadRecord;
+        }
+        const additional_count = std.mem.readInt(u16, bytes[10..12], .big);
+        if (additional_count == 0) return Error.BadRecord;
+
+        const unsigned = try allocator.alloc(u8, bytes.len - (record_end - record_start));
+        defer allocator.free(unsigned);
+        @memcpy(unsigned[0..record_start], bytes[0..record_start]);
+        std.mem.writeInt(u16, unsigned[10..12], additional_count - 1, .big);
+        @memcpy(unsigned[record_start..], bytes[record_end..]);
+        return parseQuery(allocator, unsigned);
+    }
+
     /// Parse only the header and one question for a protocol error response.
     /// The remaining sections are intentionally ignored after the question.
     pub fn parseHeaderQuestion(allocator: std.mem.Allocator, bytes: []const u8) !Message {

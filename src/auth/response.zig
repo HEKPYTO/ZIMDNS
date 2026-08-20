@@ -61,6 +61,44 @@ pub fn truncateClassicUdpResponse(response_bytes: []const u8, output: []u8) Erro
     return writer.written();
 }
 
+/// Truncate a signed response while retaining its final TSIG RR.
+/// The caller must recompute the response MAC after this wire-level rewrite.
+pub fn truncateSignedClassicUdpResponse(response_bytes: []const u8, output: []u8) Error![]const u8 {
+    const payload_limit = responsePayloadLimit(response_bytes);
+    if (response_bytes.len <= payload_limit) {
+        if (response_bytes.len > output.len) return Error.ResponseTooLarge;
+        @memcpy(output[0..response_bytes.len], response_bytes);
+        return output[0..response_bytes.len];
+    }
+    if (response_bytes.len < 12 or output.len < 12) return Error.BadResponse;
+
+    const final = (@import("../dns/tsig.zig").parseFinalAdditional(response_bytes) catch return Error.BadResponse) orelse return Error.BadResponse;
+    var reader = @import("../dns/reader.zig").Reader.init(response_bytes);
+    const parsed_header = header.Header.parse(&reader) catch return Error.BadResponse;
+    if (parsed_header.question_count > 1) return Error.BadResponse;
+
+    var question_end: usize = 12;
+    if (parsed_header.question_count == 1) {
+        const parsed_question = question.Question.parse(response_bytes, question_end) catch return Error.BadResponse;
+        question_end = parsed_question.next_offset;
+    }
+    if (question_end > output.len) return Error.ResponseTooLarge;
+
+    @memcpy(output[0..question_end], response_bytes[0..question_end]);
+    var flags = std.mem.readInt(u16, output[2..4], .big);
+    flags = (flags | 0x0200) & 0xfff0;
+    std.mem.writeInt(u16, output[2..4], flags, .big);
+    std.mem.writeInt(u16, output[6..8], 0, .big);
+    std.mem.writeInt(u16, output[8..10], 0, .big);
+
+    std.mem.writeInt(u16, output[10..12], 1, .big);
+    var writer = @import("../dns/writer.zig").Writer.init(output);
+    writer.rewind(question_end);
+    writer.writeBytes(response_bytes[final.record_start..final.record_end]) catch return Error.ResponseTooLarge;
+    if (writer.len() > payload_limit) return Error.ResponseTooLarge;
+    return writer.written();
+}
+
 fn responsePayloadLimit(response_bytes: []const u8) usize {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();

@@ -14,6 +14,23 @@ test "EDNS response golden fixture" {
     try fixture.run();
 }
 
+test "TSIG response golden fixture is byte-exact" {
+    const fixture = try Fixture.parse(@embedFile("tsig-response.gdns-fixture"));
+    try fixture.run();
+
+    var keyring = try zimdns.auth_keyring.Keyring.parse("key \"key.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };");
+    var runtime = try zimdns.auth_runtime.Runtime.fromZoneTextWithKeyring(
+        tsig_fixture_zone,
+        &keyring,
+    );
+    defer runtime.deinit();
+    runtime.setTsigNow(1_700_000_000);
+
+    var output: [512]u8 = undefined;
+    const actual = try runtime.answer(fixture.inputBytes(), &output);
+    try std.testing.expectEqualSlices(u8, fixture.responseBytes(), actual);
+}
+
 test "SSHFP response fixture asserts exact authoritative wire and RDATA" {
     const fixture = try Fixture.parse(@embedFile("sshfp-response.gdns-fixture"));
     try fixture.run();
@@ -474,6 +491,15 @@ const test_zone =
     \\_443._tcp IN TLSA 0 0 1 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
     \\_https._tcp IN URI 10 20 "https://example.test/path"
     \\naptr IN NAPTR 100 10 "U" "E2U+sip" "" replacement.example.
+    \\
+;
+
+const tsig_fixture_zone =
+    \\$ORIGIN home.arpa.
+    \\$TTL 3600
+    \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+    \\@ IN NS ns1.home.arpa.
+    \\dns IN A 192.168.1.1
     \\
 ;
 

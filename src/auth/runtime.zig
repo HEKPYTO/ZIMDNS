@@ -10,6 +10,8 @@ const zone_index = @import("../zone/index.zig");
 const metrics = @import("../metrics.zig");
 const blocklist_mod = @import("../blocklist.zig");
 const resolver_mod = @import("../resolver.zig");
+const keyring_mod = @import("keyring.zig");
+const tsig = @import("../dns/tsig.zig");
 
 pub const Error = error{
     BadQuery,
@@ -17,11 +19,45 @@ pub const Error = error{
     UnknownZoneOrigin,
 };
 
+const TsigAuth = struct {
+    final: tsig.FinalAdditional,
+    key: *const keyring_mod.Key,
+    request_mac: tsig.Mac,
+};
+
+const FailureCode = enum {
+    bad_query,
+    formerr,
+    badkey,
+    badsig,
+    badtime,
+    badtrunc,
+};
+
+const Failure = struct {
+    code: FailureCode,
+    final: ?tsig.FinalAdditional = null,
+    key: ?*const keyring_mod.Key = null,
+    request_mac: ?tsig.Mac = null,
+};
+
+const Incoming = struct {
+    query: dns_message.Message,
+    auth: ?TsigAuth = null,
+};
+
+const IncomingResult = union(enum) {
+    incoming: Incoming,
+    failure: Failure,
+};
+
 pub const Runtime = struct {
     allocator: std.mem.Allocator = std.heap.page_allocator,
     zones: std.ArrayList(zone_index.Zone) = .empty,
     blocklist: blocklist_mod.Blocklist = .{},
     resolver: ?resolver_mod.Resolver = null,
+    keyring: keyring_mod.Keyring = .{},
+    tsig_now: ?u64 = null,
     // ceiling: global runtime lock serializes all zone reads/reloads; use per-zone or read/write locks if contention matters.
     mutex: std.Io.Mutex = .init,
 
@@ -33,10 +69,28 @@ pub const Runtime = struct {
         return runtime;
     }
 
+    pub fn fromZoneTextWithKeyring(text: []const u8, keyring: *keyring_mod.Keyring) !Runtime {
+        var runtime = try fromZoneText(text);
+        runtime.keyring = keyring.*;
+        keyring.deinit();
+        return runtime;
+    }
+
     /// The returned runtime owns its authoritative zone; call deinit when done.
     pub fn fromZoneTextWithBlocklist(text: []const u8, blocklist: blocklist_mod.Blocklist) !Runtime {
         var runtime = try fromZoneText(text);
         runtime.blocklist = blocklist;
+        return runtime;
+    }
+
+    pub fn fromZoneTextWithBlocklistAndKeyring(
+        text: []const u8,
+        blocklist: blocklist_mod.Blocklist,
+        keyring: *keyring_mod.Keyring,
+    ) !Runtime {
+        var runtime = try fromZoneTextWithBlocklist(text, blocklist);
+        runtime.keyring = keyring.*;
+        keyring.deinit();
         return runtime;
     }
 
@@ -47,10 +101,36 @@ pub const Runtime = struct {
         return runtime;
     }
 
+    pub fn fromZonesWithKeyring(
+        allocator: std.mem.Allocator,
+        zones: *std.ArrayList(zone_index.Zone),
+        blocklist: blocklist_mod.Blocklist,
+        keyring: *keyring_mod.Keyring,
+    ) Runtime {
+        var runtime = fromZones(allocator, zones, blocklist);
+        runtime.keyring = keyring.*;
+        keyring.deinit();
+        return runtime;
+    }
+
     pub fn fromZonesWithPolicy(allocator: std.mem.Allocator, zones: *std.ArrayList(zone_index.Zone), blocklist: blocklist_mod.Blocklist, io: std.Io, policy: resolver_mod.Policy) !Runtime {
         var runtime = fromZones(allocator, zones, blocklist);
         errdefer runtime.deinit();
         runtime.resolver = try resolver_mod.Resolver.init(allocator, io, policy);
+        return runtime;
+    }
+
+    pub fn fromZonesWithPolicyAndKeyring(
+        allocator: std.mem.Allocator,
+        zones: *std.ArrayList(zone_index.Zone),
+        blocklist: blocklist_mod.Blocklist,
+        io: std.Io,
+        policy: resolver_mod.Policy,
+        keyring: *keyring_mod.Keyring,
+    ) !Runtime {
+        var runtime = try fromZonesWithPolicy(allocator, zones, blocklist, io, policy);
+        runtime.keyring = keyring.*;
+        keyring.deinit();
         return runtime;
     }
 
@@ -67,10 +147,15 @@ pub const Runtime = struct {
         defer self.unlock();
         if (self.resolver) |*resolver| resolver.deinit();
         self.resolver = null;
+        self.keyring.deinit();
         for (self.zones.items) |*zone| zone.deinit();
         self.zones.deinit(self.allocator);
         self.zones = .empty;
         self.blocklist = .{};
+    }
+
+    pub fn setTsigNow(self: *Runtime, now: u64) void {
+        self.tsig_now = now;
     }
 
     pub fn replaceZone(self: *Runtime, replacement: zone_index.Zone) !void {
@@ -97,38 +182,299 @@ pub const Runtime = struct {
         std.Io.Threaded.mutexUnlock(@constCast(&self.mutex));
     }
 
+    fn currentTsigTime(self: *const Runtime) u64 {
+        if (self.tsig_now) |now| return now;
+        const timestamp = std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds;
+        return @intCast(@divTrunc(timestamp, std.time.ns_per_s));
+    }
+
+    fn copyMac(bytes: []const u8) tsig.Mac {
+        var mac = tsig.Mac{ .len = @intCast(bytes.len) };
+        @memcpy(mac.bytes[0..bytes.len], bytes);
+        return mac;
+    }
+
+    fn parseIncoming(self: *const Runtime, allocator: std.mem.Allocator, packet: []const u8) !IncomingResult {
+        const final = tsig.parseFinalAdditional(packet) catch |err| switch (err) {
+            error.TsigNotFinal,
+            error.InvalidClass,
+            error.InvalidTtl,
+            error.MalformedTsig,
+            => return .{ .failure = .{ .code = .formerr } },
+            else => {
+                const query = dns_message.Message.parseQuery(allocator, packet) catch |parse_err| switch (parse_err) {
+                    error.MalformedEcsOption => return .{ .failure = .{ .code = .formerr } },
+                    error.OutOfMemory => return parse_err,
+                    else => return .{ .failure = .{ .code = .bad_query } },
+                };
+                return .{ .incoming = .{ .query = query } };
+            },
+        };
+        const final_record = final orelse {
+            const query = dns_message.Message.parseQuery(allocator, packet) catch |err| switch (err) {
+                error.MalformedEcsOption => return .{ .failure = .{ .code = .formerr } },
+                error.OutOfMemory => return err,
+                else => return .{ .failure = .{ .code = .bad_query } },
+            };
+            return .{ .incoming = .{ .query = query } };
+        };
+
+        const key = self.keyring.find(final_record.owner) orelse {
+            return .{ .failure = .{ .code = .badkey, .final = final_record } };
+        };
+        const algorithm = tsig.algorithmForName(&final_record.tsig.algorithm) catch {
+            return .{ .failure = .{ .code = .badkey, .final = final_record } };
+        };
+        if (algorithm != key.algorithm) {
+            return .{ .failure = .{ .code = .badkey, .final = final_record } };
+        }
+        if (final_record.tsig.error_code != 0) {
+            return .{ .failure = .{ .code = .formerr, .final = final_record } };
+        }
+        const request_mac = copyMac(final_record.tsig.macBytes());
+        _ = tsig.verify(packet, key.secretBytes(), null, tsig.digestLength(algorithm)) catch |err| switch (err) {
+            error.BadTrunc => return .{ .failure = .{
+                .code = .badtrunc,
+                .final = final_record,
+                .key = key,
+                .request_mac = request_mac,
+            } },
+            error.BadMac => return .{ .failure = .{ .code = .badsig, .final = final_record, .key = key } },
+            error.UnsupportedAlgorithm => return .{ .failure = .{ .code = .badkey, .final = final_record } },
+            error.Formerr => return .{ .failure = .{ .code = .formerr, .final = final_record } },
+            else => return .{ .failure = .{ .code = .formerr, .final = final_record } },
+        };
+
+        const now = self.currentTsigTime();
+        const signed_time = final_record.tsig.time_signed;
+        const delta = if (now >= signed_time) now - signed_time else signed_time - now;
+        if (delta > final_record.tsig.fudge) {
+            return .{ .failure = .{
+                .code = .badtime,
+                .final = final_record,
+                .key = key,
+                .request_mac = request_mac,
+            } };
+        }
+
+        const query = dns_message.Message.parseQueryWithoutTsig(
+            allocator,
+            packet,
+            final_record.record_start,
+            final_record.record_end,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return .{ .failure = .{ .code = .formerr, .final = final_record } },
+        };
+        return .{ .incoming = .{
+            .query = query,
+            .auth = .{ .final = final_record, .key = key, .request_mac = request_mac },
+        } };
+    }
+
+    fn writeTsigTime(now: u64, output: *[6]u8) void {
+        output[0] = @intCast((now >> 40) & 0xff);
+        output[1] = @intCast((now >> 32) & 0xff);
+        output[2] = @intCast((now >> 24) & 0xff);
+        output[3] = @intCast((now >> 16) & 0xff);
+        output[4] = @intCast((now >> 8) & 0xff);
+        output[5] = @intCast(now & 0xff);
+    }
+
+    fn encodeFailure(
+        self: *const Runtime,
+        allocator: std.mem.Allocator,
+        packet: []const u8,
+        output: []u8,
+        failure: Failure,
+    ) ![]const u8 {
+        if (failure.code == .bad_query) return Error.BadQuery;
+        var partial = dns_message.Message.parseHeaderQuestion(allocator, packet) catch return Error.BadQuery;
+        defer partial.deinit();
+
+        switch (failure.code) {
+            .formerr => return self.encodeMessage(try response.buildFormerrResponse(partial), output),
+            .badkey, .badsig => {
+                var message = try response.buildRefusedResponse(partial);
+                message.header.rcode = .notauth;
+                const final = failure.final orelse return self.encodeMessage(message, output);
+                return self.encodeUnsignedTsigErrorMessage(message, output, final, if (failure.code == .badkey) 17 else 16);
+            },
+            .badtime, .badtrunc => {
+                const final = failure.final orelse return Error.BadQuery;
+                const key = failure.key orelse return Error.BadQuery;
+                const request_mac = failure.request_mac orelse return Error.BadQuery;
+                var message = try response.buildRefusedResponse(partial);
+                message.header.rcode = .notauth;
+                var other: [6]u8 = undefined;
+                const error_code: u16 = if (failure.code == .badtime) 18 else 22;
+                if (failure.code == .badtime) {
+                    writeTsigTime(self.currentTsigTime(), &other);
+                    return self.encodeSignedMessage(
+                        message,
+                        output,
+                        .{ .final = final, .key = key, .request_mac = request_mac },
+                        error_code,
+                        &other,
+                        final.tsig.time_signed,
+                    );
+                }
+                return self.encodeSignedMessage(
+                    message,
+                    output,
+                    .{ .final = final, .key = key, .request_mac = request_mac },
+                    error_code,
+                    &.{},
+                    null,
+                );
+            },
+            .bad_query => unreachable,
+        }
+    }
+
+    fn encodeSignedMessage(
+        self: *const Runtime,
+        response_message: dns_message.Message,
+        output: []u8,
+        auth: TsigAuth,
+        error_code: u16,
+        other_data: []const u8,
+        time_signed: ?u64,
+    ) ![]const u8 {
+        var message = response_message;
+        defer message.deinit();
+
+        const algorithm = tsig.algorithmForName(&auth.final.tsig.algorithm) catch return Error.EncodeFailed;
+        const digest_len = tsig.digestLength(algorithm);
+        var value = auth.final.tsig;
+        value.time_signed = time_signed orelse self.currentTsigTime();
+        value.original_id = auth.final.tsig.original_id;
+        value.mac_len = @intCast(digest_len);
+        @memset(value.mac[0..digest_len], 0);
+        value.error_code = error_code;
+        value.other_len = @intCast(other_data.len);
+        @memcpy(value.other_data[0..other_data.len], other_data);
+        try message.additionals.append(.{
+            .owner = auth.final.owner,
+            .rrtype = .TSIG,
+            .class = .ANY,
+            .ttl = 0,
+            .rdata = .{ .TSIG = value },
+        });
+        message.header.additional_count = @intCast(message.additionals.len);
+
+        var writer = dns_writer.Writer.init(output);
+        message.encode(&writer) catch return Error.EncodeFailed;
+        const encoded = output[0..writer.len()];
+        const final = (tsig.parseFinalAdditional(encoded) catch return Error.EncodeFailed) orelse return Error.EncodeFailed;
+        const signed = tsig.sign(
+            encoded,
+            auth.key.secretBytes(),
+            final.owner,
+            final.tsig,
+            if (auth.request_mac.len == 0) null else auth.request_mac.slice(),
+        ) catch return Error.EncodeFailed;
+        tsig.patchMac(@constCast(encoded), final, signed.slice()) catch return Error.EncodeFailed;
+        return encoded;
+    }
+
+    fn encodeUnsignedTsigErrorMessage(
+        self: *const Runtime,
+        response_message: dns_message.Message,
+        output: []u8,
+        request: tsig.FinalAdditional,
+        error_code: u16,
+    ) ![]const u8 {
+        var message = response_message;
+        defer message.deinit();
+
+        var value = request.tsig;
+        value.time_signed = self.currentTsigTime();
+        value.original_id = request.tsig.original_id;
+        value.mac_len = 0;
+        value.error_code = error_code;
+        value.other_len = 0;
+        try message.additionals.append(.{
+            .owner = request.owner,
+            .rrtype = .TSIG,
+            .class = .ANY,
+            .ttl = 0,
+            .rdata = .{ .TSIG = value },
+        });
+        message.header.additional_count = @intCast(message.additionals.len);
+        var writer = dns_writer.Writer.init(output);
+        message.encode(&writer) catch return Error.EncodeFailed;
+        return output[0..writer.len()];
+    }
+
+    fn answerIncoming(
+        self: *Runtime,
+        allocator: std.mem.Allocator,
+        query_bytes: []const u8,
+        output: []u8,
+        client: ?*const std.Io.net.IpAddress,
+    ) ![]const u8 {
+        const parsed = try self.parseIncoming(allocator, query_bytes);
+        switch (parsed) {
+            .failure => |failure| return self.encodeFailure(allocator, query_bytes, output, failure),
+            .incoming => |incoming| {
+                if (incoming.auth) |auth| {
+                    return self.encodeSignedMessage(try self.buildMessage(incoming.query), output, auth, 0, &.{}, null);
+                }
+                if (client) |address| return self.answerFromUnlocked(query_bytes, output, address, incoming.query);
+                return self.encodeMessage(try self.buildMessage(incoming.query), output);
+            },
+        }
+    }
+
     pub fn answer(self: *const Runtime, query_bytes: []const u8, output: []u8) ![]const u8 {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
-
-        const query = dns_message.Message.parseQuery(arena.allocator(), query_bytes) catch |err| switch (err) {
-            error.MalformedEcsOption => {
-                const partial = dns_message.Message.parseHeaderQuestion(arena.allocator(), query_bytes) catch return Error.BadQuery;
-                return self.encodeMessage(try response.buildFormerrResponse(partial), output);
-            },
-            else => return Error.BadQuery,
-        };
         self.lock();
         defer self.unlock();
-        const message = try self.buildMessage(query);
-        var writer = dns_writer.Writer.init(output);
-        message.encode(&writer) catch return Error.EncodeFailed;
-        return writer.written();
+        const parsed = try self.parseIncoming(arena.allocator(), query_bytes);
+        switch (parsed) {
+            .failure => |failure| return self.encodeFailure(arena.allocator(), query_bytes, output, failure),
+            .incoming => |incoming| {
+                if (incoming.auth) |auth| {
+                    return self.encodeSignedMessage(try self.buildMessage(incoming.query), output, auth, 0, &.{}, null);
+                }
+                return self.encodeMessage(try self.buildMessage(incoming.query), output);
+            },
+        }
     }
 
     pub fn answerFrom(self: *Runtime, query_bytes: []const u8, output: []u8, client: *const std.Io.net.IpAddress) ![]const u8 {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
-        const query = dns_message.Message.parseQuery(arena.allocator(), query_bytes) catch |err| switch (err) {
-            error.MalformedEcsOption => {
-                const partial = dns_message.Message.parseHeaderQuestion(arena.allocator(), query_bytes) catch return Error.BadQuery;
-                return self.encodeMessage(try response.buildFormerrResponse(partial), output);
-            },
-            else => return Error.BadQuery,
-        };
         self.lock();
         defer self.unlock();
-        return self.answerFromUnlocked(query_bytes, output, client, query);
+        return self.answerIncoming(arena.allocator(), query_bytes, output, client);
+    }
+
+    pub fn truncateUdpResponse(self: *Runtime, query_bytes: []const u8, response_bytes: []const u8, output: []u8) ![]const u8 {
+        const response_final = (tsig.parseFinalAdditional(response_bytes) catch null) orelse {
+            return response.truncateClassicUdpResponse(response_bytes, output) catch return Error.EncodeFailed;
+        };
+        if (response_final.tsig.macBytes().len == 0) {
+            return response.truncateSignedClassicUdpResponse(response_bytes, output) catch return Error.EncodeFailed;
+        }
+
+        self.lock();
+        defer self.unlock();
+        const request_final = (tsig.parseFinalAdditional(query_bytes) catch return Error.EncodeFailed) orelse return Error.EncodeFailed;
+        const key = self.keyring.find(request_final.owner) orelse return Error.EncodeFailed;
+        const truncated = response.truncateSignedClassicUdpResponse(response_bytes, output) catch return Error.EncodeFailed;
+        const final = (tsig.parseFinalAdditional(truncated) catch return Error.EncodeFailed) orelse return Error.EncodeFailed;
+        const signed = tsig.sign(
+            truncated,
+            key.secretBytes(),
+            final.owner,
+            final.tsig,
+            if (request_final.tsig.macBytes().len == 0) null else request_final.tsig.macBytes(),
+        ) catch return Error.EncodeFailed;
+        tsig.patchMac(@constCast(truncated), final, signed.slice()) catch return Error.EncodeFailed;
+        return truncated;
     }
 
     fn answerFromUnlocked(self: *Runtime, query_bytes: []const u8, output: []u8, client: *const std.Io.net.IpAddress, query: dns_message.Message) ![]const u8 {
@@ -180,17 +526,7 @@ pub const Runtime = struct {
         defer self.unlock();
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
-        const query = dns_message.Message.parseQuery(arena.allocator(), query_bytes) catch |err| switch (err) {
-            error.MalformedEcsOption => {
-                const partial = dns_message.Message.parseHeaderQuestion(arena.allocator(), query_bytes) catch return Error.BadQuery;
-                return self.encodeMessage(try response.buildFormerrResponse(partial), output) catch |encode_err| {
-                    if (encode_err == Error.EncodeFailed) counters.encode_failures_total += 1;
-                    return encode_err;
-                };
-            },
-            else => return Error.BadQuery,
-        };
-        const result = self.answerFromUnlocked(query_bytes, output, client, query) catch |err| {
+        const result = self.answerIncoming(arena.allocator(), query_bytes, output, client) catch |err| {
             if (err == Error.BadQuery) counters.bad_queries_total += 1;
             if (err == Error.EncodeFailed) counters.encode_failures_total += 1;
             return err;
@@ -203,35 +539,25 @@ pub const Runtime = struct {
         counters.queries_total += 1;
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
-
-        const query = dns_message.Message.parseQuery(arena.allocator(), query_bytes) catch |err| switch (err) {
-            error.MalformedEcsOption => {
-                counters.bad_queries_total += 1;
-                const partial = dns_message.Message.parseHeaderQuestion(arena.allocator(), query_bytes) catch {
-                    return Error.BadQuery;
-                };
-                const result = self.encodeMessage(try response.buildFormerrResponse(partial), output) catch {
-                    counters.encode_failures_total += 1;
-                    return Error.EncodeFailed;
-                };
-                counters.responses_total += 1;
-                return result;
-            },
-            else => {
-                counters.bad_queries_total += 1;
-                return Error.BadQuery;
-            },
-        };
         self.lock();
         defer self.unlock();
-        const message = try self.buildMessage(query);
-        var writer = dns_writer.Writer.init(output);
-        message.encode(&writer) catch {
-            counters.encode_failures_total += 1;
-            return Error.EncodeFailed;
+        const parsed = self.parseIncoming(arena.allocator(), query_bytes) catch |err| {
+            counters.bad_queries_total += 1;
+            return err;
+        };
+        const result = switch (parsed) {
+            .failure => |failure| self.encodeFailure(arena.allocator(), query_bytes, output, failure),
+            .incoming => |incoming| if (incoming.auth) |auth|
+                self.encodeSignedMessage(try self.buildMessage(incoming.query), output, auth, 0, &.{}, null)
+            else
+                self.encodeMessage(try self.buildMessage(incoming.query), output),
+        } catch |err| {
+            if (err == Error.BadQuery) counters.bad_queries_total += 1;
+            if (err == Error.EncodeFailed) counters.encode_failures_total += 1;
+            return err;
         };
         counters.responses_total += 1;
-        return writer.written();
+        return result;
     }
 
     fn encodeMessage(self: *const Runtime, response_message: dns_message.Message, output: []u8) ![]const u8 {
@@ -296,6 +622,255 @@ test "authoritative runtime answers raw query bytes" {
     try std.testing.expect(parsed.header.qr);
     try std.testing.expectEqual(@as(u16, 1), parsed.header.answer_count);
     try std.testing.expectEqualSlices(u8, &.{ 192, 168, 1, 1 }, &parsed.answers.items[0].rdata.A);
+}
+
+test "authoritative runtime preserves bad-query errors for truncated unsigned sections" {
+    var runtime = try Runtime.fromZoneText(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
+        \\
+    );
+    defer runtime.deinit();
+
+    var output: [512]u8 = undefined;
+    const truncated = [_]u8{
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        3,    'd',  'n',  's',  4,    'h',  'o',  'm',  'e',  4,    'a',  'r',
+        'p',  'a',  0,    0x00, 0x01, 0x00, 0x01,
+    };
+    try std.testing.expectError(Error.BadQuery, runtime.answer(&truncated, &output));
+}
+
+test "runtime authenticates a signed query and signs the authoritative response" {
+    const now = 1_700_000_000;
+    var keyring = try keyring_mod.Keyring.parse("key \"key.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };");
+    var runtime = try Runtime.fromZoneTextWithKeyring(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
+        \\
+    , &keyring);
+    defer runtime.deinit();
+    runtime.setTsigNow(now);
+
+    var query = try makeSignedQueryWithEdns(now, 32);
+    var output: [1024]u8 = undefined;
+    const response_bytes = try runtime.answer(query.packet[0..query.len], &output);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@as(@TypeOf(parsed.header.rcode), .no_error), parsed.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.answer_count);
+    try std.testing.expect(parsed.edns != null);
+    const request_final = (try tsig.parseFinalAdditional(query.packet[0..query.len])).?;
+    const response_final = (try tsig.parseFinalAdditional(response_bytes)).?;
+    try std.testing.expectEqual(@as(u16, 0), response_final.tsig.error_code);
+    try std.testing.expectEqual(@as(usize, 32), response_final.tsig.macBytes().len);
+    _ = try tsig.verify(response_bytes, "01234567890123456789012345678901", request_final.tsig.macBytes(), 32);
+}
+
+test "runtime accepts a signed query whose Original ID differs from the packet ID" {
+    const now = 1_700_000_000;
+    var keyring = try keyring_mod.Keyring.parse("key \"key.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };");
+    var runtime = try Runtime.fromZoneTextWithKeyring(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
+        \\
+    , &keyring);
+    defer runtime.deinit();
+    runtime.setTsigNow(now);
+
+    var query = try makeSignedQuery(now, 32);
+    std.mem.writeInt(u16, query.packet[0..2], 0x5678, .big);
+    var output: [1024]u8 = undefined;
+    const response_bytes = try runtime.answer(query.packet[0..query.len], &output);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@as(u16, 0x5678), parsed.header.id);
+    try std.testing.expectEqual(@as(@TypeOf(parsed.header.rcode), .no_error), parsed.header.rcode);
+    const request_final = (try tsig.parseFinalAdditional(query.packet[0..query.len])).?;
+    const response_final = (try tsig.parseFinalAdditional(response_bytes)).?;
+    try std.testing.expectEqual(@as(u16, 0x1234), response_final.tsig.original_id);
+    _ = try tsig.verify(response_bytes, "01234567890123456789012345678901", request_final.tsig.macBytes(), 32);
+}
+
+test "runtime maps TSIG key and MAC failures before query dispatch" {
+    const now = 1_700_000_000;
+    var keyring = try keyring_mod.Keyring.parse("key \"key.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };");
+    var runtime = try Runtime.fromZoneTextWithKeyring(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
+        \\
+    , &keyring);
+    defer runtime.deinit();
+    runtime.setTsigNow(now);
+
+    var unknown = try makeSignedQuery(now, 32);
+    std.mem.writeInt(u16, unknown.packet[0..2], 0x5678, .big);
+    unknown.packet[unknown.owner_start + 1] = 'b';
+    unknown.packet[unknown.owner_start + 2] = 'a';
+    unknown.packet[unknown.owner_start + 3] = 'd';
+    var output: [1024]u8 = undefined;
+    var response_bytes = try runtime.answer(unknown.packet[0..unknown.len], &output);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@as(@TypeOf(parsed.header.rcode), .notauth), parsed.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.additional_count);
+    try std.testing.expectEqual(@as(u16, 17), parsed.additionals.items[0].rdata.TSIG.error_code);
+    try std.testing.expectEqual(@as(u16, 0x1234), parsed.additionals.items[0].rdata.TSIG.original_id);
+    try std.testing.expectEqual(@as(usize, 0), parsed.additionals.items[0].rdata.TSIG.macBytes().len);
+
+    var bad_mac = try makeSignedQuery(now, 32);
+    std.mem.writeInt(u16, bad_mac.packet[0..2], 0x5678, .big);
+    bad_mac.packet[bad_mac.question_start + 1] ^= 1;
+    response_bytes = try runtime.answer(bad_mac.packet[0..bad_mac.len], &output);
+    parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@as(@TypeOf(parsed.header.rcode), .notauth), parsed.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.additional_count);
+    try std.testing.expectEqual(@as(u16, 16), parsed.additionals.items[0].rdata.TSIG.error_code);
+    try std.testing.expectEqual(@as(u16, 0x1234), parsed.additionals.items[0].rdata.TSIG.original_id);
+    try std.testing.expectEqual(@as(usize, 0), parsed.additionals.items[0].rdata.TSIG.macBytes().len);
+}
+
+test "runtime signs BADTIME and BADTRUNC responses" {
+    const request_time = 1_700_000_000;
+    var keyring = try keyring_mod.Keyring.parse("key \"key.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };");
+    var runtime = try Runtime.fromZoneTextWithKeyring(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
+        \\
+    , &keyring);
+    defer runtime.deinit();
+
+    var query = try makeSignedQuery(request_time, 32);
+    runtime.setTsigNow(request_time + 1000);
+    var output: [1024]u8 = undefined;
+    var response_bytes = try runtime.answer(query.packet[0..query.len], &output);
+    var response_final = (try tsig.parseFinalAdditional(response_bytes)).?;
+    try std.testing.expectEqual(@as(u16, 18), response_final.tsig.error_code);
+    try std.testing.expectEqual(@as(usize, 6), response_final.tsig.otherData().len);
+    const request_final = (try tsig.parseFinalAdditional(query.packet[0..query.len])).?;
+    try std.testing.expectEqual(request_final.tsig.time_signed, response_final.tsig.time_signed);
+    try std.testing.expectEqual(request_final.tsig.fudge, response_final.tsig.fudge);
+    var expected_server_time: [6]u8 = undefined;
+    expected_server_time[0] = @intCast(((request_time + 1000) >> 40) & 0xff);
+    expected_server_time[1] = @intCast(((request_time + 1000) >> 32) & 0xff);
+    expected_server_time[2] = @intCast(((request_time + 1000) >> 24) & 0xff);
+    expected_server_time[3] = @intCast(((request_time + 1000) >> 16) & 0xff);
+    expected_server_time[4] = @intCast(((request_time + 1000) >> 8) & 0xff);
+    expected_server_time[5] = @intCast((request_time + 1000) & 0xff);
+    try std.testing.expectEqualSlices(u8, &expected_server_time, response_final.tsig.otherData());
+    _ = try tsig.verify(response_bytes, "01234567890123456789012345678901", request_final.tsig.macBytes(), 32);
+
+    query = try makeSignedQuery(request_time, 16);
+    runtime.setTsigNow(request_time);
+    response_bytes = try runtime.answer(query.packet[0..query.len], &output);
+    response_final = (try tsig.parseFinalAdditional(response_bytes)).?;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@as(@TypeOf(parsed.header.rcode), .notauth), parsed.header.rcode);
+    try std.testing.expectEqual(@as(u16, 22), response_final.tsig.error_code);
+    try std.testing.expectEqual(@as(usize, 32), response_final.tsig.macBytes().len);
+    const badtrunc_request_final = (try tsig.parseFinalAdditional(query.packet[0..query.len])).?;
+    _ = try tsig.verify(response_bytes, "01234567890123456789012345678901", badtrunc_request_final.tsig.macBytes(), 32);
+}
+
+test "runtime returns FORMERR for non-final TSIG placement" {
+    const now = 1_700_000_000;
+    var keyring = try keyring_mod.Keyring.parse("key \"key.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };");
+    var runtime = try Runtime.fromZoneTextWithKeyring(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
+        \\
+    , &keyring);
+    defer runtime.deinit();
+    runtime.setTsigNow(now);
+
+    var query = try makeSignedQuery(now, 32);
+    std.mem.writeInt(u16, query.packet[10..12], 2, .big);
+    var output: [1024]u8 = undefined;
+    const response_bytes = try runtime.answer(query.packet[0..query.len], &output);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@as(@TypeOf(parsed.header.rcode), .formerr), parsed.header.rcode);
+}
+
+const SignedQuery = struct {
+    packet: [512]u8,
+    len: usize,
+    question_start: usize,
+    owner_start: usize,
+};
+
+fn makeSignedQuery(time_signed: u64, mac_len: usize) !SignedQuery {
+    return makeSignedQueryWithEdnsOption(time_signed, mac_len, false);
+}
+
+fn makeSignedQueryWithEdns(time_signed: u64, mac_len: usize) !SignedQuery {
+    return makeSignedQueryWithEdnsOption(time_signed, mac_len, true);
+}
+
+fn makeSignedQueryWithEdnsOption(time_signed: u64, mac_len: usize, include_edns: bool) !SignedQuery {
+    const algorithm = try @import("../dns/name.zig").Name.fromText("hmac-sha256.");
+    const owner = try @import("../dns/name.zig").Name.fromText("key.");
+    const root = @import("../dns/name.zig").Name.root();
+    var packet: [512]u8 = undefined;
+    var writer = dns_writer.Writer.init(&packet);
+    const additional_count: u16 = if (include_edns) 2 else 1;
+    try writer.writeBytes(&.{
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+    });
+    try writer.writeU16(additional_count);
+    const question_start = writer.len();
+    try writer.writeBytes(&.{ 3, 'd', 'n', 's', 4, 'h', 'o', 'm', 'e', 4, 'a', 'r', 'p', 'a', 0 });
+    try writer.writeU16(1);
+    try writer.writeU16(1);
+    if (include_edns) {
+        try (@import("../dns/record.zig").ResourceRecord{
+            .owner = root,
+            .rrtype = .OPT,
+            .class = @import("../dns/types.zig").Class.fromCode(1232),
+            .ttl = 0,
+            .rdata = .{ .OPT = .{} },
+        }).encode(&writer);
+    }
+    const owner_start = writer.len();
+    var zeros: [32]u8 = @splat(0);
+    const value = try @import("../dns/rdata.zig").Tsig.init(algorithm, time_signed, 300, zeros[0..mac_len], 0x1234, 0, &.{});
+    try (@import("../dns/record.zig").ResourceRecord{
+        .owner = owner,
+        .rrtype = .TSIG,
+        .class = .ANY,
+        .ttl = 0,
+        .rdata = .{ .TSIG = value },
+    }).encode(&writer);
+    const final = (try tsig.parseFinalAdditional(writer.written())).?;
+    const signed = try tsig.sign(writer.written(), "01234567890123456789012345678901", final.owner, final.tsig, null);
+    try tsig.patchMac(packet[0..writer.len()], final, signed.slice()[0..mac_len]);
+    return .{ .packet = packet, .len = writer.len(), .question_start = question_start, .owner_start = owner_start };
 }
 
 test "runtime returns bare FORMERR for malformed ECS with a valid question" {
