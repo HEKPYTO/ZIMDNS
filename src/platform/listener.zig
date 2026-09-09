@@ -12,6 +12,7 @@ const dns_rdata = @import("../dns/rdata.zig");
 const dns_record = @import("../dns/record.zig");
 const dns_name = @import("../dns/name.zig");
 const dns_writer = @import("../dns/writer.zig");
+const transfer_mod = @import("../zone/transfer.zig");
 const tcp_deadline = @import("tcp_deadline.zig");
 
 pub const UDP_CLASSIC_MESSAGE_SIZE: usize = response_mod.CLASSIC_UDP_MESSAGE_SIZE;
@@ -917,6 +918,10 @@ const unix_tcp_deadlines = if (TCP_DEADLINES_SUPPORTED) struct {
                 if (err == error.Truncated) return Error.BadTcpFrame;
                 return err;
             };
+            if (transfer_mod.peekIsTransferRequest(request)) {
+                try serveTransfer(request, stream, io, runtime, timeout, counters);
+                continue;
+            }
             const response_bytes = if (counters) |value|
                 try runtime.answerWithMetrics(request, &response_buffer, value)
             else
@@ -929,6 +934,22 @@ const unix_tcp_deadlines = if (TCP_DEADLINES_SUPPORTED) struct {
             try tcp_deadline.writeExact(stream.socket.handle, io, &prefix, write_deadline);
             try tcp_deadline.writeExact(stream.socket.handle, io, response_bytes, write_deadline);
         }
+    }
+
+    fn serveTransfer(
+        request: []const u8,
+        stream: std.Io.net.Stream,
+        io: std.Io,
+        runtime: *const Runtime,
+        timeout: TcpIoTimeout,
+        counters: ?*metrics.Counters,
+    ) !void {
+        if (counters) |value| value.queries_total += 1;
+        const blob = try runtime.encodeTransferFrames(std.heap.page_allocator, request);
+        defer std.heap.page_allocator.free(blob);
+        const write_deadline = tcp_deadline.deadline(io, timeout);
+        try tcp_deadline.writeExact(stream.socket.handle, io, blob, write_deadline);
+        if (counters) |value| value.responses_total += 1;
     }
 
     fn setSocketTimeout(stream: std.Io.net.Stream, timeout: std.posix.timeval) !void {

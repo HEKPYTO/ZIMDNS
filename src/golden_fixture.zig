@@ -189,6 +189,12 @@ fn parseRecordType(text: []const u8) RecordType {
     if (std.mem.eql(u8, text, "APL")) return .APL;
     if (std.mem.eql(u8, text, "URI")) return .URI;
     if (std.mem.eql(u8, text, "CAA")) return .CAA;
+    if (std.mem.eql(u8, text, "DS")) return .DS;
+    if (std.mem.eql(u8, text, "RRSIG")) return .RRSIG;
+    if (std.mem.eql(u8, text, "NSEC")) return .NSEC;
+    if (std.mem.eql(u8, text, "DNSKEY")) return .DNSKEY;
+    if (std.mem.eql(u8, text, "NSEC3")) return .NSEC3;
+    if (std.mem.eql(u8, text, "NSEC3PARAM")) return .NSEC3PARAM;
     return RecordType.fromCode(0xffff);
 }
 

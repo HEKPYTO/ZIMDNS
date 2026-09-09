@@ -12,6 +12,8 @@ const blocklist_mod = @import("../blocklist.zig");
 const resolver_mod = @import("../resolver.zig");
 const keyring_mod = @import("keyring.zig");
 const tsig = @import("../dns/tsig.zig");
+const transfer = @import("../zone/transfer.zig");
+const journal_mod = @import("../zone/journal.zig");
 
 pub const Error = error{
     BadQuery,
@@ -58,6 +60,9 @@ pub const Runtime = struct {
     resolver: ?resolver_mod.Resolver = null,
     keyring: keyring_mod.Keyring = .{},
     tsig_now: ?u64 = null,
+    /// Volatile RFC 1995 serial transitions feeding IXFR delta decisions.
+    /// Single-zone deployments stay exact; see transfer for multi-zone notes.
+    transfer_deltas: journal_mod.DeltaLog = .{},
     // ceiling: global runtime lock serializes all zone reads/reloads; use per-zone or read/write locks if contention matters.
     mutex: std.Io.Mutex = .init,
 
@@ -164,14 +169,26 @@ pub const Runtime = struct {
         const origin = replacement.originText();
         for (self.zones.items) |*zone| {
             if (!std.ascii.eqlIgnoreCase(zone.originText(), origin)) continue;
+            const old_serial = zoneSerial(zone.*);
+            const new_serial = zoneSerial(replacement);
             var old_zone = zone.*;
             zone.* = replacement;
             old_zone.deinit();
+            if (old_serial != null and new_serial != null) {
+                self.transfer_deltas.record(old_serial.?, new_serial.?) catch {};
+            }
             return;
         }
         var unowned = replacement;
         unowned.deinit();
         return Error.UnknownZoneOrigin;
+    }
+
+    fn zoneSerial(zone: zone_index.Zone) ?u32 {
+        const soa_record = zone.soa orelse return null;
+        const rdata = zone_parser.parseRData(.SOA, soa_record.rdataText()) catch return null;
+        if (rdata != .SOA) return null;
+        return rdata.SOA.serial;
     }
 
     fn lock(self: *const Runtime) void {
@@ -205,7 +222,12 @@ pub const Runtime = struct {
                 const query = dns_message.Message.parseQuery(allocator, packet) catch |parse_err| switch (parse_err) {
                     error.MalformedEcsOption => return .{ .failure = .{ .code = .formerr } },
                     error.OutOfMemory => return parse_err,
-                    else => return .{ .failure = .{ .code = .bad_query } },
+                    else => {
+                        if (parseTransferFallback(allocator, packet)) |fallback| {
+                            return .{ .incoming = .{ .query = fallback } };
+                        }
+                        return .{ .failure = .{ .code = .bad_query } };
+                    },
                 };
                 return .{ .incoming = .{ .query = query } };
             },
@@ -214,7 +236,12 @@ pub const Runtime = struct {
             const query = dns_message.Message.parseQuery(allocator, packet) catch |err| switch (err) {
                 error.MalformedEcsOption => return .{ .failure = .{ .code = .formerr } },
                 error.OutOfMemory => return err,
-                else => return .{ .failure = .{ .code = .bad_query } },
+                else => {
+                    if (parseTransferFallback(allocator, packet)) |fallback| {
+                        return .{ .incoming = .{ .query = fallback } };
+                    }
+                    return .{ .failure = .{ .code = .bad_query } };
+                },
             };
             return .{ .incoming = .{ .query = query } };
         };
@@ -257,6 +284,7 @@ pub const Runtime = struct {
             } };
         }
 
+        const auth = TsigAuth{ .final = final_record, .key = key, .request_mac = request_mac };
         const query = dns_message.Message.parseQueryWithoutTsig(
             allocator,
             packet,
@@ -264,12 +292,47 @@ pub const Runtime = struct {
             final_record.record_end,
         ) catch |err| switch (err) {
             error.OutOfMemory => return err,
-            else => return .{ .failure = .{ .code = .formerr, .final = final_record } },
+            else => {
+                if (parseSignedTransferFallback(allocator, packet, final_record)) |fallback| {
+                    return .{ .incoming = .{ .query = fallback, .auth = auth } };
+                }
+                return .{ .failure = .{ .code = .formerr, .final = final_record } };
+            },
         };
-        return .{ .incoming = .{
-            .query = query,
-            .auth = .{ .final = final_record, .key = key, .request_mac = request_mac },
-        } };
+        return .{ .incoming = .{ .query = query, .auth = auth } };
+    }
+
+    /// Parses an unsigned request that strict query parsing rejects but the
+    /// transfer profile accepts: IXFR authority SOAs and NOTIFY answer SOAs.
+    /// Returns null when the bytes are not a valid transfer request.
+    fn parseTransferFallback(allocator: std.mem.Allocator, packet: []const u8) ?dns_message.Message {
+        var message = dns_message.Message.parse(allocator, packet) catch return null;
+        if (transfer.isNotifyMessage(&message)) return message;
+        if (transfer.validateTransferRequest(&message)) |_| return message else |_| {}
+        message.deinit();
+        return null;
+    }
+
+    /// Parses a TSIG-verified request that strict query parsing rejects but
+    /// the transfer profile accepts. Authentication already succeeded; only
+    /// the section layout differs.
+    fn parseSignedTransferFallback(
+        allocator: std.mem.Allocator,
+        packet: []const u8,
+        final_record: tsig.FinalAdditional,
+    ) ?dns_message.Message {
+        const stripped = transfer.stripTsigRecord(
+            allocator,
+            packet,
+            final_record.record_start,
+            final_record.record_end,
+        ) catch return null;
+        defer allocator.free(stripped);
+        var message = dns_message.Message.parse(allocator, stripped) catch return null;
+        if (transfer.isNotifyMessage(&message)) return message;
+        if (transfer.validateTransferRequest(&message)) |_| return message else |_| {}
+        message.deinit();
+        return null;
     }
 
     fn writeTsigTime(now: u64, output: *[6]u8) void {
@@ -477,6 +540,172 @@ pub const Runtime = struct {
         return truncated;
     }
 
+    /// Serves one AXFR/IXFR query as an owned length-prefixed TCP blob, one
+    /// two-octet frame per message. Unsigned and TSIG-signed requests share
+    /// this path; signed sequences chain one TSIG per message through the
+    /// chainedMac primitive starting from the request MAC. Non-transfer
+    /// queries and failures yield a single frame so the client always gets an
+    /// answer. The caller owns the returned blob.
+    pub fn encodeTransferFrames(
+        self: *const Runtime,
+        allocator: std.mem.Allocator,
+        request_bytes: []const u8,
+    ) ![]u8 {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        self.lock();
+        defer self.unlock();
+        const parsed = try self.parseIncoming(arena.allocator(), request_bytes);
+        switch (parsed) {
+            .failure => |failure| {
+                var output: [transfer.tcp_max_frame_size]u8 = undefined;
+                const single = try self.encodeFailure(arena.allocator(), request_bytes, &output, failure);
+                return frameSingle(allocator, single);
+            },
+            .incoming => |incoming| {
+                const q = incoming.query.question orelse return Error.BadQuery;
+                if (transfer.classify(q.qtype, q.qclass) == .none) {
+                    var output: [transfer.tcp_max_frame_size]u8 = undefined;
+                    const single = if (incoming.auth) |auth|
+                        try self.encodeSignedMessage(
+                            try self.buildMessage(incoming.query),
+                            &output,
+                            auth,
+                            0,
+                            &.{},
+                            null,
+                        )
+                    else
+                        try self.encodeMessage(try self.buildMessage(incoming.query), &output);
+                    return frameSingle(allocator, single);
+                }
+                var qname_text_buffer: [256]u8 = undefined;
+                const qname_text = q.name.toText(&qname_text_buffer) catch return Error.BadQuery;
+                const zone = self.selectZone(qname_text) orelse {
+                    var output: [transfer.tcp_max_frame_size]u8 = undefined;
+                    const single = try self.encodeMessage(
+                        try response.buildRefusedResponse(incoming.query),
+                        &output,
+                    );
+                    return frameSingle(allocator, single);
+                };
+                return self.encodeZoneTransfer(allocator, arena.allocator(), &incoming, zone);
+            },
+        }
+    }
+
+    fn frameSingle(allocator: std.mem.Allocator, single: []const u8) ![]u8 {
+        if (single.len == 0 or single.len > transfer.tcp_max_frame_size) return Error.EncodeFailed;
+        var blob: std.ArrayList(u8) = .empty;
+        errdefer blob.deinit(allocator);
+        var prefix: [2]u8 = undefined;
+        std.mem.writeInt(u16, &prefix, @intCast(single.len), .big);
+        blob.appendSlice(allocator, &prefix) catch return Error.EncodeFailed;
+        blob.appendSlice(allocator, single) catch return Error.EncodeFailed;
+        return blob.toOwnedSlice(allocator) catch return Error.EncodeFailed;
+    }
+
+    fn encodeZoneTransfer(
+        self: *const Runtime,
+        allocator: std.mem.Allocator,
+        scratch: std.mem.Allocator,
+        incoming: *const Incoming,
+        zone: *const zone_index.Zone,
+    ) ![]u8 {
+        const query = incoming.query;
+        const q = query.question orelse return Error.BadQuery;
+        const kind = transfer.classify(q.qtype, q.qclass);
+        const serial = zoneSerial(zone.*) orelse return Error.EncodeFailed;
+
+        var single_slot: ?dns_message.Message = null;
+        defer if (single_slot) |*message| message.deinit();
+        var one: [1]dns_message.Message = undefined;
+        var messages: []dns_message.Message = &.{};
+        var sequence: []dns_message.Message = &.{};
+        defer if (sequence.len != 0) scratch.free(sequence);
+        switch (kind) {
+            .axfr => {
+                sequence = transfer.buildAxfrMessages(
+                    scratch,
+                    &query,
+                    zone,
+                    transfer.default_records_per_message,
+                ) catch return Error.EncodeFailed;
+                messages = sequence;
+            },
+            .ixfr => {
+                const client = transfer.clientSerialFromMessage(&query);
+                switch (transfer.decideIxfr(serial, client, &self.transfer_deltas)) {
+                    .up_to_date => {
+                        single_slot = transfer.buildIxfrUpToDateMessage(scratch, &query, zone) catch
+                            return Error.EncodeFailed;
+                        one[0] = single_slot.?;
+                        messages = one[0..];
+                    },
+                    .incremental => {
+                        const client_serial = client orelse return Error.EncodeFailed;
+                        single_slot = transfer.buildIxfrIncrementalMessages(
+                            scratch,
+                            &query,
+                            zone,
+                            client_serial,
+                        ) catch return Error.EncodeFailed;
+                        one[0] = single_slot.?;
+                        messages = one[0..];
+                    },
+                    .fallback_axfr => {
+                        sequence = transfer.buildAxfrMessages(
+                            scratch,
+                            &query,
+                            zone,
+                            transfer.default_records_per_message,
+                        ) catch return Error.EncodeFailed;
+                        messages = sequence;
+                    },
+                }
+            },
+            .none => return Error.BadQuery,
+        }
+        defer for (sequence) |*message| message.deinit();
+
+        var prior_mac: ?tsig.Mac = if (incoming.auth) |auth| auth.request_mac else null;
+        const now = self.currentTsigTime();
+        var blob: std.ArrayList(u8) = .empty;
+        errdefer blob.deinit(allocator);
+        var frame: [transfer.tcp_max_frame_size]u8 = undefined;
+        for (messages) |*message| {
+            if (incoming.auth) |auth| {
+                transfer.appendTsigStub(
+                    message,
+                    auth.final.owner,
+                    auth.key.algorithm,
+                    query.header.id,
+                    now,
+                ) catch return Error.EncodeFailed;
+            }
+            var writer = dns_writer.Writer.init(&frame);
+            message.encode(&writer) catch return Error.EncodeFailed;
+            if (writer.len() == 0 or writer.len() > transfer.tcp_max_frame_size) return Error.EncodeFailed;
+            if (prior_mac != null) {
+                const auth = incoming.auth.?;
+                const signed = transfer.signTransferMessage(
+                    frame[0..writer.len()],
+                    auth.key.algorithm,
+                    auth.key.secretBytes(),
+                    prior_mac.?.slice(),
+                ) catch return Error.EncodeFailed;
+                var next = tsig.Mac{ .len = @intCast(signed.slice().len) };
+                @memcpy(next.bytes[0..signed.slice().len], signed.slice());
+                prior_mac = next;
+            }
+            var prefix: [2]u8 = undefined;
+            std.mem.writeInt(u16, &prefix, @intCast(writer.len()), .big);
+            blob.appendSlice(allocator, &prefix) catch return Error.EncodeFailed;
+            blob.appendSlice(allocator, frame[0..writer.len()]) catch return Error.EncodeFailed;
+        }
+        return blob.toOwnedSlice(allocator) catch return Error.EncodeFailed;
+    }
+
     fn answerFromUnlocked(self: *Runtime, query_bytes: []const u8, output: []u8, client: *const std.Io.net.IpAddress, query: dns_message.Message) ![]const u8 {
         const q = query.question orelse return Error.BadQuery;
         if (query.header.opcode != .query) {
@@ -571,10 +800,23 @@ pub const Runtime = struct {
 
     fn buildMessage(self: *const Runtime, query: dns_message.Message) !dns_message.Message {
         const q = query.question orelse return response.Error.MissingQuestion;
+        if (query.header.opcode == .notify) {
+            if (!transfer.isNotifyMessage(&query)) return response.buildFormerrResponse(query);
+            var notify_name_buffer: [256]u8 = undefined;
+            const notify_name = q.name.toText(&notify_name_buffer) catch return response.Error.BadQName;
+            if (self.blocklist.blocks(notify_name)) return response.buildRefusedResponse(query);
+            const zone = self.selectZone(notify_name) orelse return response.buildRefusedResponse(query);
+            _ = zone;
+            return transfer.buildNotifyResponse(query.allocator, &query) catch return Error.EncodeFailed;
+        }
         if (query.header.opcode != .query) return response.buildNotImplementedResponse(query);
         var qname_text_buffer: [256]u8 = undefined;
         const qname_text = q.name.toText(&qname_text_buffer) catch return response.Error.BadQName;
         if (self.blocklist.blocks(qname_text)) return response.buildRefusedResponse(query);
+        // Zone transfers are served only as multi-frame TCP sequences through
+        // encodeTransferFrames. The single-message path refuses them so a
+        // partial zone can never leak through one datagram or frame.
+        if (transfer.classify(q.qtype, q.qclass) != .none) return response.buildRefusedResponse(query);
         const selected = self.selectZone(qname_text) orelse return response.buildRefusedResponse(query);
         return response.buildResponse(query, selected);
     }
@@ -1212,4 +1454,109 @@ test "runtime rejects a replacement whose origin cannot be caller-mislabeled" {
 fn parseTestZone(text: []const u8) !zone_index.Zone {
     var zone_file = try zone_parser.ZoneFile.parse(text);
     return zone_index.Zone.fromZoneFile(&zone_file);
+}
+
+const transfer_test_axfr_query = [_]u8{
+    0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x07, 'e',  'x',  'a',  'm',  'p',  'l',  'e',  0x00, 0x00, 0xfc, 0x00,
+    0x01,
+};
+
+test "runtime answers NOTIFY with a mirrored response and refuses transfers singly" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var runtime = try Runtime.fromZoneText(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 10 3600 900 1209600 3600
+        \\@ IN NS ns.example.
+        \\www IN A 192.0.2.1
+        \\
+    );
+    defer runtime.deinit();
+
+    var output: [512]u8 = undefined;
+    const notify_query = [_]u8{
+        0x43, 0x21, 0x20, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x07, 'e',  'x',  'a',  'm',  'p',  'l',  'e',  0x00, 0x00, 0x06, 0x00,
+        0x01,
+    };
+    const notify_bytes = try runtime.answer(&notify_query, &output);
+    const notify_response = try dns_message.Message.parse(arena.allocator(), notify_bytes);
+    try std.testing.expect(notify_response.header.qr);
+    try std.testing.expect(notify_response.header.opcode == .notify);
+    try std.testing.expectEqual(@as(u16, 0x4321), notify_response.header.id);
+
+    const axfr_bytes = try runtime.answer(&transfer_test_axfr_query, &output);
+    const axfr_response = try dns_message.Message.parse(arena.allocator(), axfr_bytes);
+    try std.testing.expectEqual(@as(u16, 0x1234), axfr_response.header.id);
+    try std.testing.expectEqual(@as(@TypeOf(axfr_response.header.rcode), .refused), axfr_response.header.rcode);
+    try std.testing.expectEqual(@as(u16, 0), axfr_response.header.answer_count);
+}
+
+test "runtime serves AXFR as one bounded TCP blob opening and closing with SOA" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var runtime = try Runtime.fromZoneText(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 10 3600 900 1209600 3600
+        \\@ IN NS ns.example.
+        \\www IN A 192.0.2.1
+        \\
+    );
+    defer runtime.deinit();
+
+    const blob = try runtime.encodeTransferFrames(std.testing.allocator, &transfer_test_axfr_query);
+    defer std.testing.allocator.free(blob);
+    try std.testing.expect(blob.len > 2);
+
+    var offset: usize = 0;
+    var frames: usize = 0;
+    while (offset < blob.len) {
+        const frame_len = std.mem.readInt(u16, blob[offset..][0..2], .big);
+        try std.testing.expect(frame_len > 0);
+        const parsed = try dns_message.Message.parse(arena.allocator(), blob[offset + 2 ..][0..frame_len]);
+        try std.testing.expect(parsed.header.qr);
+        try std.testing.expect(parsed.header.authoritative);
+        try std.testing.expectEqual(@as(u16, 0x1234), parsed.header.id);
+        try std.testing.expect(parsed.answers.len > 0);
+        offset += 2 + frame_len;
+        frames += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), frames);
+
+    const only_len = std.mem.readInt(u16, blob[0..2], .big);
+    const only = try dns_message.Message.parse(arena.allocator(), blob[2..][0..only_len]);
+    try std.testing.expect(only.answers.items[0].rrtype.eql(.SOA));
+    try std.testing.expect(only.answers.items[only.answers.len - 1].rrtype.eql(.SOA));
+    try std.testing.expectEqual(@as(u32, 10), only.answers.items[0].rdata.SOA.serial);
+    try std.testing.expectEqual(@as(u32, 10), only.answers.items[only.answers.len - 1].rdata.SOA.serial);
+}
+
+test "runtime records serial deltas across replacements for IXFR decisions" {
+    var runtime = try Runtime.fromZoneText(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 10 3600 900 1209600 3600
+        \\@ IN NS ns.example.
+        \\www IN A 192.0.2.1
+        \\
+    );
+    defer runtime.deinit();
+
+    const replacement = try parseTestZone(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 11 3600 900 1209600 3600
+        \\@ IN NS ns.example.
+        \\www IN A 192.0.2.2
+        \\
+    );
+    try runtime.replaceZone(replacement);
+
+    try std.testing.expect(runtime.transfer_deltas.hasSerial(10));
+    try std.testing.expect(runtime.transfer_deltas.hasSerial(11));
+    try std.testing.expect(runtime.transfer_deltas.canServeIncremental(10, 11));
+    try std.testing.expect(!runtime.transfer_deltas.canServeIncremental(9, 11));
 }

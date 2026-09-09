@@ -4,6 +4,8 @@ const dns_message = @import("../dns/message.zig");
 const dns_name = @import("../dns/name.zig");
 const dns_question = @import("../dns/question.zig");
 const dns_types = @import("../dns/types.zig");
+const dns_rdata = @import("../dns/rdata.zig");
+const dns_dnssec = @import("../dns/dnssec.zig");
 const dns_writer = @import("../dns/writer.zig");
 const listener = @import("../platform/listener.zig");
 const resolver = @import("../resolver.zig");
@@ -149,6 +151,23 @@ pub fn writeResponse(response: dns_message.Message, writer: *std.Io.Writer) !voi
         } else if (record.rrtype.eql(.APL)) {
             try writer.writeAll("APL");
             try writeApl(writer, record.rdata.APL.bytes());
+        } else if (record.rrtype.eql(.SVCB) or record.rrtype.eql(.HTTPS)) {
+            const svcb = if (record.rrtype.eql(.SVCB)) record.rdata.SVCB else record.rdata.HTTPS;
+            try writer.writeAll(if (record.rrtype.eql(.SVCB)) "SVCB " else "HTTPS ");
+            try writer.print("{} ", .{svcb.priority});
+            const target = svcb.target.toText(&value_buffer) catch return Error.BadResponse;
+            try writer.writeAll(target);
+            try writeSvcbParams(writer, svcb.paramsBytes());
+        } else if (dns_dnssec.isDnssecType(record.rrtype)) {
+            // DNSSEC RRs are served opaque: render RFC 3597 generic form.
+            try writer.writeAll("TYPE");
+            try writer.print("{} \\# ", .{record.rrtype.code()});
+            const raw = switch (record.rdata) {
+                .Unknown => |*unknown| unknown.bytes(),
+                else => return Error.BadResponse,
+            };
+            if (raw.len > 2048) return Error.BadResponse;
+            for (raw) |byte| try writer.print("{x:0>2}", .{byte});
         } else {
             try writer.writeAll("TYPE");
             try writer.print("{}", .{record.rrtype.code()});
@@ -184,6 +203,117 @@ fn writeApl(writer: *std.Io.Writer, bytes: []const u8) !void {
         }
         try writer.print("/{}", .{prefix});
         offset += 4 + afd_len;
+    }
+}
+
+/// Print SVCB/HTTPS SvcParams in zone-file shape: ` alpn="h2" port=443` with a
+/// bare ` no-default-alpn` flag, base64 `ech`, and hex `keyNNNN` values.
+fn writeSvcbParams(writer: *std.Io.Writer, params: []const u8) !void {
+    var offset: usize = 0;
+    while (offset < params.len) {
+        if (params.len - offset < 4) return Error.BadResponse;
+        const key = std.mem.readInt(u16, params[offset..][0..2], .big);
+        const value_len = std.mem.readInt(u16, params[offset + 2 ..][0..2], .big);
+        if (value_len > params.len - offset - 4) return Error.BadResponse;
+        const value = params[offset + 4 .. offset + 4 + value_len];
+
+        try writer.writeAll(" ");
+        try writeSvcbKeyName(writer, key);
+        switch (key) {
+            dns_rdata.SVCB_NO_DEFAULT_ALPN_KEY => {
+                if (value.len != 0) return Error.BadResponse;
+            },
+            dns_rdata.SVCB_MANDATORY_KEY => {
+                if (value.len == 0 or value.len % 2 != 0) return Error.BadResponse;
+                try writer.writeAll("=");
+                var index: usize = 0;
+                while (index < value.len) : (index += 2) {
+                    if (index != 0) try writer.writeAll(",");
+                    try writeSvcbKeyName(writer, std.mem.readInt(u16, value[index..][0..2], .big));
+                }
+            },
+            dns_rdata.SVCB_ALPN_KEY => {
+                var joined: [512]u8 = undefined;
+                var joined_len: usize = 0;
+                var cursor: usize = 0;
+                var first = true;
+                while (cursor < value.len) {
+                    const id_len = value[cursor];
+                    if (id_len == 0 or @as(usize, id_len) > value.len - cursor - 1) return Error.BadResponse;
+                    if (joined_len + @as(usize, id_len) + @intFromBool(!first) > joined.len) return Error.BadResponse;
+                    if (!first) {
+                        joined[joined_len] = ',';
+                        joined_len += 1;
+                    }
+                    first = false;
+                    @memcpy(joined[joined_len..][0..id_len], value[cursor + 1 ..][0..id_len]);
+                    joined_len += id_len;
+                    cursor += 1 + id_len;
+                }
+                if (first) return Error.BadResponse;
+                try writer.writeAll("=");
+                try writeQuoted(writer, joined[0..joined_len], false);
+            },
+            dns_rdata.SVCB_PORT_KEY => {
+                if (value.len != 2) return Error.BadResponse;
+                try writer.print("={}", .{std.mem.readInt(u16, value[0..2], .big)});
+            },
+            dns_rdata.SVCB_IPV4HINT_KEY => {
+                if (value.len == 0 or value.len % 4 != 0) return Error.BadResponse;
+                try writer.writeAll("=");
+                var index: usize = 0;
+                while (index < value.len) : (index += 4) {
+                    if (index != 0) try writer.writeAll(",");
+                    try writer.print("{}.{}.{}.{}", .{ value[index], value[index + 1], value[index + 2], value[index + 3] });
+                }
+            },
+            dns_rdata.SVCB_ECH_KEY => {
+                if (value.len == 0) return Error.BadResponse;
+                const encoder = std.base64.standard.Encoder;
+                var encoded: [676]u8 = undefined;
+                if (encoder.calcSize(value.len) > encoded.len) return Error.BadResponse;
+                try writer.writeAll("=");
+                try writer.writeAll(encoder.encode(&encoded, value));
+            },
+            dns_rdata.SVCB_IPV6HINT_KEY => {
+                if (value.len == 0 or value.len % 16 != 0) return Error.BadResponse;
+                try writer.writeAll("=");
+                var index: usize = 0;
+                while (index < value.len) : (index += 16) {
+                    if (index != 0) try writer.writeAll(",");
+                    const address = value[index..][0..16];
+                    try writer.print("{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}", .{
+                        address[0],  address[1],  address[2],  address[3],
+                        address[4],  address[5],  address[6],  address[7],
+                        address[8],  address[9],  address[10], address[11],
+                        address[12], address[13], address[14], address[15],
+                    });
+                }
+            },
+            dns_rdata.SVCB_DOHPATH_KEY => {
+                try writer.writeAll("=");
+                try writeQuoted(writer, value, true);
+            },
+            else => {
+                try writer.writeAll("=");
+                for (value) |byte| try writer.print("{x:0>2}", .{byte});
+            },
+        }
+        offset += 4 + value_len;
+    }
+}
+
+fn writeSvcbKeyName(writer: *std.Io.Writer, key: u16) !void {
+    switch (key) {
+        dns_rdata.SVCB_MANDATORY_KEY => try writer.writeAll("mandatory"),
+        dns_rdata.SVCB_ALPN_KEY => try writer.writeAll("alpn"),
+        dns_rdata.SVCB_NO_DEFAULT_ALPN_KEY => try writer.writeAll("no-default-alpn"),
+        dns_rdata.SVCB_PORT_KEY => try writer.writeAll("port"),
+        dns_rdata.SVCB_IPV4HINT_KEY => try writer.writeAll("ipv4hint"),
+        dns_rdata.SVCB_ECH_KEY => try writer.writeAll("ech"),
+        dns_rdata.SVCB_IPV6HINT_KEY => try writer.writeAll("ipv6hint"),
+        dns_rdata.SVCB_DOHPATH_KEY => try writer.writeAll("dohpath"),
+        else => try writer.print("key{}", .{key}),
     }
 }
 
@@ -406,6 +536,26 @@ test "query formatter prints A and CNAME answers" {
     try std.testing.expect(std.mem.indexOf(u8, text, "A 192.0.2.1") != null);
 }
 
+test "query formatter prints DNSSEC RRs in RFC 3597 generic form" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const response = try dns_message.Message.parse(arena.allocator(), &.{
+        0x44, 0x01, 0x85, 0x00, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
+        0x03, 'w',  'w',  'w',  0x07, 'e',  'x',  'a',  'm',  'p',  'l',  'e',
+        0x00, 0x00, 0x01, 0x00, 0x01, 0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00,
+        0x00, 0x00, 0x3c, 0x00, 0x04, 192,  0,    2,    1,    0xc0, 0x0c, 0x00,
+        0x2e, 0x00, 0x01, 0x00, 0x00, 0x0e, 0x10, 0x00, 0x04, 0x00, 0x01, 0x08,
+        0x02,
+    });
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try writeResponse(response, &output.writer);
+    const text = output.written();
+    try std.testing.expect(std.mem.indexOf(u8, text, "A 192.0.2.1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "TYPE46 \\# 00010802") != null);
+}
+
 test "query formatter prints SSHFP selectors and lowercase fingerprint" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -510,6 +660,49 @@ test "query formatter prints APL items in wire order" {
     try writeResponse(response, &output.writer);
     try std.testing.expectEqualStrings(
         "host.home.arpa. 3600 IN APL !1:192.0.2.0/24 2:2001:db8:1::/48 1:192.0.2.0/24\n",
+        output.written(),
+    );
+}
+
+test "query formatter prints HTTPS service mode in zone shape" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const response = try dns_message.Message.parse(arena.allocator(), &.{
+        0x12, 0x34, 0x85, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x03, 's',  'v',  'c',  0x07, 'e',  'x',  'a',  'm',  'p',  'l',  'e',
+        0x00, 0x00, 0x41, 0x00, 0x01, 0xc0, 0x0c, 0x00, 0x41, 0x00, 0x01, 0x00,
+        0x00, 0x0e, 0x10, 0x00, 0x2a, 0x00, 0x01, 0x06, 't',  'a',  'r',  'g',
+        'e',  't',  0x07, 'e',  'x',  'a',  'm',  'p',  'l',  'e',  0x00, 0x00,
+        0x01, 0x00, 0x06, 0x02, 'h',  '2',  0x02, 'h',  '3',  0x00, 0x03, 0x00,
+        0x02, 0x01, 0xbb, 0x00, 0x04, 0x00, 0x04, 192,  0,    2,    1,
+    });
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try writeResponse(response, &output.writer);
+    try std.testing.expectEqualStrings(
+        "svc.example. 3600 IN HTTPS 1 target.example. alpn=\"h2,h3\" port=443 ipv4hint=192.0.2.1\n",
+        output.written(),
+    );
+}
+
+test "query formatter prints SVCB flags mandatory list and generic keys" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const response = try dns_message.Message.parse(arena.allocator(), &.{
+        0x12, 0x34, 0x85, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x03, 's',  'v',  'c',  0x07, 'e',  'x',  'a',  'm',  'p',  'l',  'e',
+        0x00, 0x00, 0x40, 0x00, 0x01, 0xc0, 0x0c, 0x00, 0x40, 0x00, 0x01, 0x00,
+        0x00, 0x0e, 0x10, 0x00, 0x15, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x04,
+        0x00, 0x02, 0x00, 0x0a, 0x00, 0x02, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x02,
+        0x00, 0xff,
+    });
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try writeResponse(response, &output.writer);
+    try std.testing.expectEqualStrings(
+        "svc.example. 3600 IN SVCB 1 . mandatory=no-default-alpn,key10 no-default-alpn key10=00ff\n",
         output.written(),
     );
 }

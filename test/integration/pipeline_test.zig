@@ -1405,6 +1405,61 @@ fn expectForwarderExchange(mode: UpstreamMode) !void {
     try expectForwardedAResponse(response, 0x7000);
 }
 
+test "forwarder preserves full QNAME upstream with QMIN enabled" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+    var capture = QminCaptureArgs{ .io = io, .udp = &upstream_socket };
+    const capture_thread = try std.Thread.spawn(.{}, serveQminCapture, .{&capture});
+
+    const policy = resolver.Policy{
+        .forwarder = .{ .address = upstream_socket.address },
+        .qmin_mode = .relaxed,
+    };
+    var upstream = try Resolver.init(std.testing.allocator, io, policy);
+    defer upstream.deinit();
+
+    var query_buffer: [512]u8 = undefined;
+    const query_bytes = try cli_query.buildQueryPacket(&query_buffer, 0x7010, "www.example.com.", .A);
+    var query_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer query_arena.deinit();
+    const query = try dns_message.Message.parseQuery(query_arena.allocator(), query_bytes);
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 41010);
+    var output: [resolver.MAX_UPSTREAM_MESSAGE]u8 = undefined;
+    const response_bytes = try upstream.answer(query_bytes, query, &client, &output);
+    capture_thread.join();
+    try std.testing.expect(capture.ok);
+    // The forwarder hook keeps the full QNAME on the wire: observing a
+    // minimized `example.com.` here would prove the hook leaked minimization
+    // into forwarder-to-recursive traffic.
+    try std.testing.expectEqualStrings("www.example.com.", capture.qname[0..capture.qname_len]);
+    const response = try dns_message.Message.parse(query_arena.allocator(), response_bytes);
+    try expectForwardedAResponse(response, 0x7010);
+}
+
+const QminCaptureArgs = struct {
+    io: std.Io,
+    udp: *const std.Io.net.Socket,
+    qname: [256]u8 = [_]u8{0} ** 256,
+    qname_len: usize = 0,
+    ok: bool = false,
+};
+
+fn serveQminCapture(args: *QminCaptureArgs) void {
+    var request_buffer: [resolver.MAX_UPSTREAM_MESSAGE]u8 = undefined;
+    const incoming = args.udp.receiveTimeout(args.io, &request_buffer, TestTimeout) catch return;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = dns_message.Message.parseQuery(arena.allocator(), incoming.data) catch return;
+    const question = parsed.question orelse return;
+    const text = question.name.toText(&args.qname) catch return;
+    args.qname_len = text.len;
+    const valid = makeAResponse(incoming.data, false, false, false);
+    args.udp.send(args.io, &incoming.from, valid.bytes[0..valid.len]) catch return;
+    args.ok = true;
+}
+
 fn expectForwardedAResponse(response: dns_message.Message, expected_id: u16) !void {
     try std.testing.expect(response.header.qr);
     try std.testing.expectEqual(expected_id, response.header.id);
@@ -1422,7 +1477,8 @@ fn expectEde(response: dns_message.Message, expected_code: u16) !void {
             const option_len = std.mem.readInt(u16, data[offset + 2 ..][0..2], .big);
             offset += 4;
             if (offset + option_len > data.len) break;
-            if (option_code == resolver.EDE_OPTION_CODE and option_len == 2) {
+            // INFO-CODE is the first two octets; RFC 8914 EXTRA-TEXT may follow.
+            if (option_code == resolver.EDE_OPTION_CODE and option_len >= 2) {
                 try std.testing.expectEqual(expected_code, std.mem.readInt(u16, data[offset..][0..2], .big));
                 return;
             }

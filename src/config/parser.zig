@@ -16,7 +16,7 @@ pub const Error = error{
     TooManyItems,
 };
 
-pub const Transport = enum { udp, tcp };
+pub const Transport = enum { udp, tcp, dot, doh };
 
 const Text = struct {
     bytes: [max_text]u8 = undefined,
@@ -161,6 +161,22 @@ pub const Config = struct {
     blocklists: List(BlocklistFile) = .{},
     tsig_key_file: Text = .{},
     has_tsig_key_file: bool = false,
+    tls_cert_file: Text = .{},
+    has_tls_cert_file: bool = false,
+    tls_key_file: Text = .{},
+    has_tls_key_file: bool = false,
+    encrypted_dns: bool = false,
+    has_encrypted_dns: bool = false,
+
+    pub fn tlsCertFileText(self: *const Config) ?[]const u8 {
+        if (!self.has_tls_cert_file) return null;
+        return self.tls_cert_file.text();
+    }
+
+    pub fn tlsKeyFileText(self: *const Config) ?[]const u8 {
+        if (!self.has_tls_key_file) return null;
+        return self.tls_key_file.text();
+    }
 
     pub fn tsigKeyFileText(self: *const Config) ?[]const u8 {
         if (!self.has_tsig_key_file) return null;
@@ -189,6 +205,9 @@ pub const Config = struct {
         if (std.mem.eql(u8, first, "zone")) return self.parseZone(&tokens);
         if (std.mem.eql(u8, first, "blocklist")) return self.parseBlocklist(&tokens);
         if (std.mem.eql(u8, first, "tsig-key-file")) return self.parseTsigKeyFile(&tokens);
+        if (std.mem.eql(u8, first, "tls-cert-file")) return self.parseTlsCertFile(&tokens);
+        if (std.mem.eql(u8, first, "tls-key-file")) return self.parseTlsKeyFile(&tokens);
+        if (std.mem.eql(u8, first, "encrypted-dns")) return self.parseEncryptedDns(&tokens);
         return Error.UnknownDirective;
     }
 
@@ -264,6 +283,38 @@ pub const Config = struct {
         try self.tsig_key_file.set(path);
         self.has_tsig_key_file = true;
     }
+
+    fn parseTlsCertFile(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        if (self.has_tls_cert_file) return Error.BadDirective;
+        const path = tokens.next() orelse return Error.BadDirective;
+        try requireNoTrailingTokens(tokens);
+        if (path.len == 0) return Error.BadDirective;
+        try self.tls_cert_file.set(path);
+        self.has_tls_cert_file = true;
+    }
+
+    fn parseTlsKeyFile(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        if (self.has_tls_key_file) return Error.BadDirective;
+        const path = tokens.next() orelse return Error.BadDirective;
+        try requireNoTrailingTokens(tokens);
+        if (path.len == 0) return Error.BadDirective;
+        try self.tls_key_file.set(path);
+        self.has_tls_key_file = true;
+    }
+
+    fn parseEncryptedDns(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        if (self.has_encrypted_dns) return Error.BadDirective;
+        const value = tokens.next() orelse return Error.BadDirective;
+        try requireNoTrailingTokens(tokens);
+        if (std.mem.eql(u8, value, "on")) {
+            self.encrypted_dns = true;
+        } else if (std.mem.eql(u8, value, "off")) {
+            self.encrypted_dns = false;
+        } else {
+            return Error.BadDirective;
+        }
+        self.has_encrypted_dns = true;
+    }
 };
 
 fn requireNoTrailingTokens(tokens: *std.mem.TokenIterator(u8, .any)) Error!void {
@@ -273,6 +324,8 @@ fn requireNoTrailingTokens(tokens: *std.mem.TokenIterator(u8, .any)) Error!void 
 fn parseTransport(text: []const u8) !Transport {
     if (std.mem.eql(u8, text, "udp")) return .udp;
     if (std.mem.eql(u8, text, "tcp")) return .tcp;
+    if (std.mem.eql(u8, text, "dot")) return .dot;
+    if (std.mem.eql(u8, text, "doh")) return .doh;
     return Error.BadDirective;
 }
 
@@ -361,6 +414,38 @@ test "config parser requires bracketed IPv6 endpoints and one cookie policy" {
     try std.testing.expectError(error.BadDirective, Config.parse("cookies validate current previous\ncookies validate next\n"));
     const config = try Config.parse("forwarder [2001:db8::53]:53\n");
     try std.testing.expectEqualStrings("2001:db8::53", config.forwarder.?.addressText());
+}
+
+test "config parser accepts opt-in encrypted DNS listeners and TLS identity" {
+    const config = try Config.parse(
+        \\listen dns dot 127.0.0.1:853
+        \\listen dns doh 127.0.0.1:8443
+        \\tls-cert-file /etc/zimdns/tls/cert.pem
+        \\tls-key-file /etc/zimdns/tls/key.pem
+        \\encrypted-dns on
+        \\
+    );
+    try std.testing.expectEqual(@as(usize, 2), config.listeners.len);
+    try std.testing.expectEqual(Transport.dot, config.listeners.items[0].transport);
+    try std.testing.expectEqual(@as(u16, 853), config.listeners.items[0].port);
+    try std.testing.expectEqual(Transport.doh, config.listeners.items[1].transport);
+    try std.testing.expectEqualStrings("/etc/zimdns/tls/cert.pem", config.tlsCertFileText().?);
+    try std.testing.expectEqualStrings("/etc/zimdns/tls/key.pem", config.tlsKeyFileText().?);
+    try std.testing.expect(config.encrypted_dns);
+
+    const off = try Config.parse("encrypted-dns off\n");
+    try std.testing.expect(!off.encrypted_dns);
+    const empty = try Config.parse("listen dns udp 127.0.0.1:1053\n");
+    try std.testing.expect(!empty.encrypted_dns);
+    try std.testing.expect(empty.tlsCertFileText() == null);
+    try std.testing.expectError(error.BadDirective, Config.parse("encrypted-dns yes\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("encrypted-dns on\nencrypted-dns off\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse(
+        "tls-cert-file /a\ntls-cert-file /b\n",
+    ));
+    try std.testing.expectError(error.BadDirective, Config.parse(
+        "tls-key-file /a\ntls-key-file /b\n",
+    ));
 }
 
 test "config parser accepts one TSIG key-file path and no secret directive" {

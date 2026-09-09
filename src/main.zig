@@ -7,9 +7,13 @@ pub const dns_tsig = @import("dns/tsig.zig");
 pub const dns_writer = @import("dns/writer.zig");
 pub const dns_rdata = @import("dns/rdata.zig");
 pub const dns_record = @import("dns/record.zig");
+pub const dns_dnssec = @import("dns/dnssec.zig");
 pub const zone_parser = @import("zone/parser.zig");
 pub const zone_index = @import("zone/index.zig");
 pub const zone_store = @import("zone/store.zig");
+pub const zone_journal = @import("zone/journal.zig");
+pub const zone_transfer = @import("zone/transfer.zig");
+pub const zone_secondary = @import("zone/secondary.zig");
 pub const auth_response = @import("auth/response.zig");
 pub const auth_runtime = @import("auth/runtime.zig");
 pub const auth_keyring = @import("auth/keyring.zig");
@@ -18,10 +22,17 @@ pub const cli_query = @import("cli/query.zig");
 pub const config_parser = @import("config/parser.zig");
 pub const config_loader = @import("config/loader.zig");
 pub const metrics = @import("metrics.zig");
+pub const transport_tls = @import("transport/tls.zig");
+pub const transport_dot = @import("transport/dot.zig");
+pub const transport_doh = @import("transport/doh.zig");
+pub const transfer_axfr = @import("transfer/axfr.zig");
+pub const transfer_xfr_tls = @import("transfer/xfr_tls.zig");
+pub const discovery_svcb = @import("discovery/svcb.zig");
 pub const blocklist = @import("blocklist.zig");
 pub const resolver = @import("resolver.zig");
+pub const qname_minimize = @import("qname_minimize.zig");
 
-const ServerRunMode = enum { none, udp_once, tcp_once, udp_loop, tcp_loop };
+const ServerRunMode = enum { none, udp_once, tcp_once, udp_loop, tcp_loop, dot_loop, doh_loop, xfr_loop };
 const version_text = "0.0.0";
 
 test {
@@ -31,6 +42,7 @@ test {
     _ = @import("dns/name.zig");
     _ = @import("dns/types.zig");
     _ = @import("dns/rdata.zig");
+    _ = @import("dns/dnssec.zig");
     _ = @import("dns/record.zig");
     _ = @import("dns/question.zig");
     _ = @import("dns/message.zig");
@@ -40,16 +52,25 @@ test {
     _ = zone_parser;
     _ = zone_index;
     _ = zone_store;
+    _ = @import("zone/transfer.zig");
+    _ = @import("zone/secondary.zig");
     _ = auth_response;
     _ = auth_runtime;
     _ = auth_keyring;
     _ = listener;
+    _ = transport_tls;
+    _ = transport_dot;
+    _ = transport_doh;
+    _ = transfer_axfr;
+    _ = transfer_xfr_tls;
+    _ = discovery_svcb;
     _ = cli_query;
     _ = config_parser;
     _ = config_loader;
     _ = metrics;
     _ = blocklist;
     _ = resolver;
+    _ = qname_minimize;
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -105,6 +126,7 @@ fn printHelp(writer: *std.Io.Writer) !void {
         \\  zimdns server run --zone-file examples/zones/home.arpa.zone --once-udp 1053 --max-queries 2 --print-metrics
         \\  zimdns server run --zone-file examples/zones/home.arpa.zone --once-tcp 1053
         \\  zimdns server run --config examples/config.gdns --serve-udp --max-requests 2
+        \\  zimdns server run --zone-file examples/zones/home.arpa.zone --serve-dot --enable-encrypted-dns --tls-cert-file tls/cert.pem --tls-key-file tls/key.pem
         \\  zimdns query @127.0.0.1 -p 1053 example.com A
         \\
         \\Implemented now:
@@ -175,25 +197,40 @@ fn handleQuery(args: []const []const u8, io: std.Io, allocator: std.mem.Allocato
 }
 
 fn parseQueryType(text: []const u8) !@import("dns/types.zig").RecordType {
-    if (std.mem.eql(u8, text, "A")) return .A;
-    if (std.mem.eql(u8, text, "AAAA")) return .AAAA;
-    if (std.mem.eql(u8, text, "NS")) return .NS;
-    if (std.mem.eql(u8, text, "CNAME")) return .CNAME;
-    if (std.mem.eql(u8, text, "MX")) return .MX;
-    if (std.mem.eql(u8, text, "TXT")) return .TXT;
-    if (std.mem.eql(u8, text, "SOA")) return .SOA;
-    if (std.mem.eql(u8, text, "RP")) return .RP;
-    if (std.mem.eql(u8, text, "RT")) return .RT;
-    if (std.mem.eql(u8, text, "AFSDB")) return .AFSDB;
-    if (std.mem.eql(u8, text, "X25")) return .X25;
-    if (std.mem.eql(u8, text, "ISDN")) return .ISDN;
-    if (std.mem.eql(u8, text, "SSHFP")) return .SSHFP;
-    if (std.mem.eql(u8, text, "TLSA")) return .TLSA;
-    if (std.mem.eql(u8, text, "NAPTR")) return .NAPTR;
-    if (std.mem.eql(u8, text, "APL")) return .APL;
-    if (std.mem.eql(u8, text, "URI")) return .URI;
-    if (std.mem.eql(u8, text, "CAA")) return .CAA;
-    if (std.mem.eql(u8, text, "SRV")) return .SRV;
+    const RecordType = @import("dns/types.zig").RecordType;
+    if (std.ascii.eqlIgnoreCase(text, "A")) return .A;
+    if (std.ascii.eqlIgnoreCase(text, "AAAA")) return .AAAA;
+    if (std.ascii.eqlIgnoreCase(text, "NS")) return .NS;
+    if (std.ascii.eqlIgnoreCase(text, "CNAME")) return .CNAME;
+    if (std.ascii.eqlIgnoreCase(text, "MX")) return .MX;
+    if (std.ascii.eqlIgnoreCase(text, "TXT")) return .TXT;
+    if (std.ascii.eqlIgnoreCase(text, "SOA")) return .SOA;
+    if (std.ascii.eqlIgnoreCase(text, "PTR")) return .PTR;
+    if (std.ascii.eqlIgnoreCase(text, "DNAME")) return .DNAME;
+    if (std.ascii.eqlIgnoreCase(text, "RP")) return .RP;
+    if (std.ascii.eqlIgnoreCase(text, "RT")) return .RT;
+    if (std.ascii.eqlIgnoreCase(text, "AFSDB")) return .AFSDB;
+    if (std.ascii.eqlIgnoreCase(text, "X25")) return .X25;
+    if (std.ascii.eqlIgnoreCase(text, "ISDN")) return .ISDN;
+    if (std.ascii.eqlIgnoreCase(text, "SSHFP")) return .SSHFP;
+    if (std.ascii.eqlIgnoreCase(text, "TLSA")) return .TLSA;
+    if (std.ascii.eqlIgnoreCase(text, "NAPTR")) return .NAPTR;
+    if (std.ascii.eqlIgnoreCase(text, "APL")) return .APL;
+    if (std.ascii.eqlIgnoreCase(text, "URI")) return .URI;
+    if (std.ascii.eqlIgnoreCase(text, "CAA")) return .CAA;
+    if (std.ascii.eqlIgnoreCase(text, "SRV")) return .SRV;
+    if (std.ascii.eqlIgnoreCase(text, "SVCB")) return RecordType.fromCode(64);
+    if (std.ascii.eqlIgnoreCase(text, "HTTPS")) return RecordType.fromCode(65);
+    if (std.ascii.eqlIgnoreCase(text, "DS")) return RecordType.fromCode(43);
+    if (std.ascii.eqlIgnoreCase(text, "RRSIG")) return RecordType.fromCode(46);
+    if (std.ascii.eqlIgnoreCase(text, "NSEC")) return RecordType.fromCode(47);
+    if (std.ascii.eqlIgnoreCase(text, "DNSKEY")) return RecordType.fromCode(48);
+    if (std.ascii.eqlIgnoreCase(text, "NSEC3")) return RecordType.fromCode(50);
+    if (std.ascii.eqlIgnoreCase(text, "NSEC3PARAM")) return RecordType.fromCode(51);
+    if (text.len > 4 and std.ascii.eqlIgnoreCase(text[0..4], "TYPE")) {
+        const code = std.fmt.parseInt(u16, text[4..], 10) catch return error.UnsupportedType;
+        return RecordType.fromCode(code);
+    }
     return error.UnsupportedType;
 }
 
@@ -236,6 +273,9 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
     var max_queries: usize = 1;
     var max_requests: ?usize = null;
     var print_metrics = false;
+    var encrypted_dns_flag = false;
+    var tls_cert_file: ?[]const u8 = null;
+    var tls_key_file: ?[]const u8 = null;
 
     var index: usize = 3;
     while (index < args.len) {
@@ -278,6 +318,28 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
             mode = .udp_loop;
         } else if (std.mem.eql(u8, arg, "--serve-tcp")) {
             mode = .tcp_loop;
+        } else if (std.mem.eql(u8, arg, "--serve-dot")) {
+            mode = .dot_loop;
+        } else if (std.mem.eql(u8, arg, "--serve-doh")) {
+            mode = .doh_loop;
+        } else if (std.mem.eql(u8, arg, "--serve-xfr")) {
+            mode = .xfr_loop;
+        } else if (std.mem.eql(u8, arg, "--enable-encrypted-dns")) {
+            encrypted_dns_flag = true;
+        } else if (std.mem.eql(u8, arg, "--tls-cert-file")) {
+            index += 1;
+            if (index >= args.len) {
+                try writer.writeAll("error: --tls-cert-file requires a path\n");
+                try exitUsage(writer);
+            }
+            tls_cert_file = args[index];
+        } else if (std.mem.eql(u8, arg, "--tls-key-file")) {
+            index += 1;
+            if (index >= args.len) {
+                try writer.writeAll("error: --tls-key-file requires a path\n");
+                try exitUsage(writer);
+            }
+            tls_key_file = args[index];
         } else if (std.mem.eql(u8, arg, "--max-queries")) {
             index += 1;
             if (index >= args.len) {
@@ -322,8 +384,40 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
     }
 
     if (mode == .none) {
-        try writer.writeAll("error: server run currently requires --once-udp or --once-tcp\n");
+        try writer.writeAll("error: server run currently requires --once-udp, --once-tcp, --serve-udp, --serve-tcp, --serve-dot, --serve-doh, or --serve-xfr\n");
         try exitUsage(writer);
+    }
+
+    if (mode == .dot_loop or mode == .doh_loop or mode == .xfr_loop) {
+        const cert_path = tls_cert_file orelse (if (server_context) |*context| context.config.tlsCertFileText() else null);
+        const key_path = tls_key_file orelse (if (server_context) |*context| context.config.tlsKeyFileText() else null);
+        const enabled = encrypted_dns_flag or (if (server_context) |*context| context.config.encrypted_dns else false);
+        transport_tls.requireEnabled(enabled) catch {
+            try writer.writeAll("error: encrypted listeners require --enable-encrypted-dns or 'encrypted-dns on'\n");
+            try exitUsage(writer);
+        };
+        if (cert_path == null or key_path == null) {
+            try writer.writeAll("error: encrypted listeners require --tls-cert-file and --tls-key-file (or tls-cert-file/tls-key-file)\n");
+            try exitUsage(writer);
+        }
+        transport_tls.validatePaths(cert_path.?, key_path.?) catch {
+            try writer.writeAll("error: TLS certificate and key paths must be set and distinct\n");
+            try exitUsage(writer);
+        };
+        const cert_bytes = std.Io.Dir.cwd().readFileAlloc(io, cert_path.?, allocator, .limited(1024 * 1024)) catch {
+            try writer.writeAll("error: cannot read TLS certificate file\n");
+            try exitUsage(writer);
+        };
+        defer allocator.free(cert_bytes);
+        const key_bytes = std.Io.Dir.cwd().readFileAlloc(io, key_path.?, allocator, .limited(1024 * 1024)) catch {
+            try writer.writeAll("error: cannot read TLS key file\n");
+            try exitUsage(writer);
+        };
+        defer allocator.free(key_bytes);
+        transport_tls.validatePemPair(cert_bytes, key_bytes) catch {
+            try writer.writeAll("error: TLS identity failed validation (certificate must be PEM, key must be nonempty)\n");
+            try exitUsage(writer);
+        };
     }
 
     var runtime: auth_runtime.Runtime = undefined;
@@ -425,6 +519,44 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
                 try listener.serveTcpLoopOnAddress(tcp_io, &runtime, &address, max_requests);
             }
         },
+        .dot_loop, .doh_loop, .xfr_loop => {
+            if (print_metrics) {
+                try writer.writeAll("error: --print-metrics is currently supported for UDP runs\n");
+                try exitUsage(writer);
+            }
+            var io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{
+                .concurrent_limit = .limited(transport_dot.MAX_CONNECTION_WORKERS),
+            });
+            defer io_backend.deinit();
+            const encrypted_io = io_backend.io();
+            switch (mode) {
+                .dot_loop => {
+                    if (configured_address) |*address| {
+                        try transport_dot.serveDotLoopOnAddress(encrypted_io, &runtime, address, max_requests);
+                    } else {
+                        const address = defaultListenerAddress(port);
+                        try transport_dot.serveDotLoopOnAddress(encrypted_io, &runtime, &address, max_requests);
+                    }
+                },
+                .doh_loop => {
+                    if (configured_address) |*address| {
+                        try transport_doh.serveDohLoopOnAddress(encrypted_io, &runtime, address, max_requests);
+                    } else {
+                        const address = defaultListenerAddress(port);
+                        try transport_doh.serveDohLoopOnAddress(encrypted_io, &runtime, &address, max_requests);
+                    }
+                },
+                .xfr_loop => {
+                    if (configured_address) |*address| {
+                        try transfer_xfr_tls.serveXfrLoopOnAddress(encrypted_io, &runtime, .tls, address, max_requests);
+                    } else {
+                        const address = defaultListenerAddress(port);
+                        try transfer_xfr_tls.serveXfrLoopOnAddress(encrypted_io, &runtime, .tls, &address, max_requests);
+                    }
+                },
+                else => unreachable,
+            }
+        },
         .none => unreachable,
     }
 
@@ -439,6 +571,8 @@ fn findListenerAddress(config: *const config_parser.Config, mode: ServerRunMode)
     const want: config_parser.Transport = switch (mode) {
         .udp_once, .udp_loop => .udp,
         .tcp_once, .tcp_loop => .tcp,
+        .dot_loop, .xfr_loop => .dot,
+        .doh_loop => .doh,
         .none => return null,
     };
     var index: usize = 0;
@@ -459,6 +593,8 @@ test "configured loop modes use their transport listener endpoint" {
     const config = try config_parser.Config.parse(
         \\listen dns udp 127.0.0.1:12053
         \\listen dns tcp 127.0.0.1:12054
+        \\listen dns dot 127.0.0.1:12055
+        \\listen dns doh 127.0.0.1:12056
         \\
     );
     const expected_udp = try std.Io.net.IpAddress.parse("127.0.0.1", 12053);
@@ -468,6 +604,16 @@ test "configured loop modes use their transport listener endpoint" {
     const expected_tcp = try std.Io.net.IpAddress.parse("127.0.0.1", 12054);
     const tcp = try findListenerAddress(&config, .tcp_loop) orelse return error.TestExpectedEqual;
     try std.testing.expect(tcp.eql(&expected_tcp));
+
+    const expected_dot = try std.Io.net.IpAddress.parse("127.0.0.1", 12055);
+    const dot = try findListenerAddress(&config, .dot_loop) orelse return error.TestExpectedEqual;
+    try std.testing.expect(dot.eql(&expected_dot));
+    const xfr = try findListenerAddress(&config, .xfr_loop) orelse return error.TestExpectedEqual;
+    try std.testing.expect(xfr.eql(&expected_dot));
+
+    const expected_doh = try std.Io.net.IpAddress.parse("127.0.0.1", 12056);
+    const doh = try findListenerAddress(&config, .doh_loop) orelse return error.TestExpectedEqual;
+    try std.testing.expect(doh.eql(&expected_doh));
 }
 
 test "no-config listener default is loopback" {
@@ -531,6 +677,72 @@ test "query parser accepts RT" {
 
 test "query parser accepts SRV" {
     try std.testing.expectEqual(@import("dns/types.zig").RecordType.SRV, try parseQueryType("SRV"));
+}
+
+test "query parser accepts PTR case-insensitively" {
+    const RecordType = @import("dns/types.zig").RecordType;
+    try std.testing.expectEqual(RecordType.PTR, try parseQueryType("PTR"));
+    try std.testing.expectEqual(RecordType.PTR, try parseQueryType("ptr"));
+    try std.testing.expectEqual(RecordType.PTR, try parseQueryType("Ptr"));
+}
+
+test "query parser accepts DNAME case-insensitively" {
+    const RecordType = @import("dns/types.zig").RecordType;
+    try std.testing.expectEqual(RecordType.DNAME, try parseQueryType("DNAME"));
+    try std.testing.expectEqual(RecordType.DNAME, try parseQueryType("dname"));
+    try std.testing.expectEqual(RecordType.DNAME, try parseQueryType("Dname"));
+}
+
+test "query parser accepts SVCB and HTTPS case-insensitively" {
+    const RecordType = @import("dns/types.zig").RecordType;
+    try std.testing.expectEqual(RecordType.fromCode(64), try parseQueryType("SVCB"));
+    try std.testing.expectEqual(RecordType.fromCode(64), try parseQueryType("svcb"));
+    try std.testing.expectEqual(RecordType.fromCode(64), try parseQueryType("SvCb"));
+    try std.testing.expectEqual(RecordType.fromCode(65), try parseQueryType("HTTPS"));
+    try std.testing.expectEqual(RecordType.fromCode(65), try parseQueryType("https"));
+    try std.testing.expectEqual(RecordType.fromCode(65), try parseQueryType("Https"));
+}
+
+test "query parser accepts DNSSEC types case-insensitively" {
+    const RecordType = @import("dns/types.zig").RecordType;
+    try std.testing.expectEqual(RecordType.fromCode(43), try parseQueryType("DS"));
+    try std.testing.expectEqual(RecordType.fromCode(43), try parseQueryType("ds"));
+    try std.testing.expectEqual(RecordType.fromCode(46), try parseQueryType("RRSIG"));
+    try std.testing.expectEqual(RecordType.fromCode(46), try parseQueryType("rrsig"));
+    try std.testing.expectEqual(RecordType.fromCode(47), try parseQueryType("NSEC"));
+    try std.testing.expectEqual(RecordType.fromCode(47), try parseQueryType("nsec"));
+    try std.testing.expectEqual(RecordType.fromCode(48), try parseQueryType("DNSKEY"));
+    try std.testing.expectEqual(RecordType.fromCode(48), try parseQueryType("dnskey"));
+    try std.testing.expectEqual(RecordType.fromCode(50), try parseQueryType("NSEC3"));
+    try std.testing.expectEqual(RecordType.fromCode(50), try parseQueryType("nsec3"));
+    try std.testing.expectEqual(RecordType.fromCode(51), try parseQueryType("NSEC3PARAM"));
+    try std.testing.expectEqual(RecordType.fromCode(51), try parseQueryType("nsec3param"));
+}
+
+test "query parser accepts generic TYPE codes case-insensitively" {
+    const RecordType = @import("dns/types.zig").RecordType;
+    try std.testing.expectEqual(RecordType.fromCode(1), try parseQueryType("TYPE1"));
+    try std.testing.expectEqual(RecordType.fromCode(65), try parseQueryType("TYPE65"));
+    try std.testing.expectEqual(RecordType.fromCode(65), try parseQueryType("type65"));
+    try std.testing.expectEqual(RecordType.fromCode(64), try parseQueryType("Type64"));
+    try std.testing.expectEqual(RecordType.fromCode(255), try parseQueryType("TYPE255"));
+    try std.testing.expectEqual(RecordType.fromCode(65535), try parseQueryType("TYPE65535"));
+}
+
+test "query parser rejects malformed TYPE codes" {
+    try std.testing.expectError(error.UnsupportedType, parseQueryType("TYPE"));
+    try std.testing.expectError(error.UnsupportedType, parseQueryType("type"));
+    try std.testing.expectError(error.UnsupportedType, parseQueryType("TYPE65536"));
+    try std.testing.expectError(error.UnsupportedType, parseQueryType("TYPEabc"));
+    try std.testing.expectError(error.UnsupportedType, parseQueryType("TYPE-1"));
+    try std.testing.expectError(error.UnsupportedType, parseQueryType("FOO"));
+}
+
+test "query parser matches named types case-insensitively" {
+    const RecordType = @import("dns/types.zig").RecordType;
+    try std.testing.expectEqual(RecordType.A, try parseQueryType("a"));
+    try std.testing.expectEqual(RecordType.AAAA, try parseQueryType("aaaa"));
+    try std.testing.expectEqual(RecordType.SRV, try parseQueryType("srv"));
 }
 
 test "query command renders a maximum escaped URI target" {

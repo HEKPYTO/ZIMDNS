@@ -333,6 +333,18 @@ fn parseRecordType(text: []const u8) ?RecordType {
     if (std.mem.eql(u8, text, "TLSA")) return .TLSA;
     if (std.mem.eql(u8, text, "URI")) return .URI;
     if (std.mem.eql(u8, text, "APL")) return .APL;
+    if (std.mem.eql(u8, text, "SVCB")) return .SVCB;
+    if (std.mem.eql(u8, text, "HTTPS")) return .HTTPS;
+    if (std.mem.eql(u8, text, "DS")) return .DS;
+    if (std.mem.eql(u8, text, "RRSIG")) return .RRSIG;
+    if (std.mem.eql(u8, text, "NSEC")) return .NSEC;
+    if (std.mem.eql(u8, text, "DNSKEY")) return .DNSKEY;
+    if (std.mem.eql(u8, text, "NSEC3")) return .NSEC3;
+    if (std.mem.eql(u8, text, "NSEC3PARAM")) return .NSEC3PARAM;
+    if (text.len > 4 and std.ascii.eqlIgnoreCase(text[0..4], "TYPE")) {
+        const code = std.fmt.parseInt(u16, text[4..], 10) catch return null;
+        return RecordType.fromCode(code);
+    }
     return null;
 }
 
@@ -364,7 +376,248 @@ pub fn parseRData(rrtype: RecordType, text: []const u8) Error!dns_rdata.RData {
     if (rrtype.eql(.TLSA)) return .{ .TLSA = try parseTlsa(text) };
     if (rrtype.eql(.URI)) return .{ .URI = try parseUri(text) };
     if (rrtype.eql(.APL)) return .{ .APL = try parseApl(text) };
+    if (rrtype.eql(.SVCB)) return .{ .SVCB = try parseSvcb(text) };
+    if (rrtype.eql(.HTTPS)) return .{ .HTTPS = try parseSvcb(text) };
+    if (rrtype.eql(.DNSKEY)) return .{ .Unknown = try parseDnskey(text) };
+    if (rrtype.eql(.DS)) return .{ .Unknown = try parseDs(text) };
+    if (rrtype.eql(.RRSIG)) return .{ .Unknown = try parseRrsig(text) };
+    if (rrtype.eql(.NSEC)) return .{ .Unknown = try parseNsec(text) };
+    if (rrtype.eql(.NSEC3)) return .{ .Unknown = try parseNsec3(text) };
+    if (rrtype.eql(.NSEC3PARAM)) return .{ .Unknown = try parseNsec3Param(text) };
     return Error.BadRecord;
+}
+
+/// DNSSEC zone RDATA is served opaque (RFC 4034/5155 wire bytes in an Unknown
+/// slot). Every parser below also accepts the RFC 3597 generic form
+/// `\# <hex>` so operators can paste wire bytes directly.
+fn parseDnssecGeneric(text: []const u8) ?dns_rdata.Unknown {
+    const input = std.mem.trim(u8, text, " \t\r\n");
+    if (input.len < 2 or input[0] != '\\' or input[1] != '#') return null;
+    const hex = std.mem.trim(u8, input[2..], " \t\r\n");
+    return decodeHexBlob(hex) catch null;
+}
+
+fn decodeHexBlob(hex: []const u8) Error!dns_rdata.Unknown {
+    var compact: [4096]u8 = undefined;
+    var compact_len: usize = 0;
+    for (hex) |byte| {
+        if (std.ascii.isWhitespace(byte)) continue;
+        if (compact_len >= compact.len) return Error.BadRecord;
+        compact[compact_len] = byte;
+        compact_len += 1;
+    }
+    if (compact_len % 2 != 0 or compact_len / 2 > 2048) return Error.BadRecord;
+    var out = dns_rdata.Unknown{};
+    var i: usize = 0;
+    while (i < compact_len) : (i += 2) {
+        const high = parseHexDigit(compact[i]) orelse return Error.BadRecord;
+        const low = parseHexDigit(compact[i + 1]) orelse return Error.BadRecord;
+        out.data[out.len] = (high << 4) | low;
+        out.len += 1;
+    }
+    return out;
+}
+
+fn decodeBase64Blob(text: []const u8, out: []u8) Error!usize {
+    var compact: [4096]u8 = undefined;
+    var compact_len: usize = 0;
+    for (text) |byte| {
+        if (std.ascii.isWhitespace(byte)) continue;
+        if (compact_len >= compact.len) return Error.BadRecord;
+        compact[compact_len] = byte;
+        compact_len += 1;
+    }
+    if (compact_len == 0) return Error.BadRecord;
+    const decoder = std.base64.standard.Decoder;
+    const exact = decoder.calcSizeForSlice(compact[0..compact_len]) catch return Error.BadRecord;
+    if (exact > out.len) return Error.BadRecord;
+    decoder.decode(out[0..exact], compact[0..compact_len]) catch return Error.BadRecord;
+    return exact;
+}
+
+fn parseDnskey(text: []const u8) Error!dns_rdata.Unknown {
+    if (parseDnssecGeneric(text)) |generic| return generic;
+    var tokens = std.mem.tokenizeAny(u8, text, " \t\r\n");
+    const flags = parseStrictDecimal(u16, tokens.next() orelse return Error.BadRecord) orelse return Error.BadRecord;
+    const protocol = parseStrictDecimal(u8, tokens.next() orelse return Error.BadRecord) orelse return Error.BadRecord;
+    const algorithm = parseStrictDecimal(u8, tokens.next() orelse return Error.BadRecord) orelse return Error.BadRecord;
+    const key_text = tokens.next() orelse return Error.BadRecord;
+    if (tokens.next() != null) return Error.BadRecord;
+    var out = dns_rdata.Unknown{};
+    std.mem.writeInt(u16, out.data[0..2], flags, .big);
+    out.data[2] = protocol;
+    out.data[3] = algorithm;
+    out.len = 4;
+    const key_len = try decodeBase64Blob(key_text, out.data[4..]);
+    out.len += @intCast(key_len);
+    return out;
+}
+
+fn parseDs(text: []const u8) Error!dns_rdata.Unknown {
+    if (parseDnssecGeneric(text)) |generic| return generic;
+    var tokens = std.mem.tokenizeAny(u8, text, " \t\r\n");
+    const key_tag = parseStrictDecimal(u16, tokens.next() orelse return Error.BadRecord) orelse return Error.BadRecord;
+    const algorithm = parseStrictDecimal(u8, tokens.next() orelse return Error.BadRecord) orelse return Error.BadRecord;
+    const digest_type = parseStrictDecimal(u8, tokens.next() orelse return Error.BadRecord) orelse return Error.BadRecord;
+    const digest_text = tokens.next() orelse return Error.BadRecord;
+    if (tokens.next() != null) return Error.BadRecord;
+    var digest = try decodeHexBlob(digest_text);
+    var out = dns_rdata.Unknown{};
+    if (4 + digest.len > out.data.len) return Error.BadRecord;
+    std.mem.writeInt(u16, out.data[0..2], key_tag, .big);
+    out.data[2] = algorithm;
+    out.data[3] = digest_type;
+    @memcpy(out.data[4 .. 4 + digest.len], digest.bytes());
+    out.len = @intCast(4 + digest.len);
+    return out;
+}
+
+fn parseTypeCovered(text: []const u8) Error!u16 {
+    if (parseRecordType(text)) |rrtype| return rrtype.code();
+    return Error.BadRecord;
+}
+
+fn parseRrsig(text: []const u8) Error!dns_rdata.Unknown {
+    if (parseDnssecGeneric(text)) |generic| return generic;
+    var tokens = std.mem.tokenizeAny(u8, text, " \t\r\n");
+    const covered = try parseTypeCovered(tokens.next() orelse return Error.BadRecord);
+    const algorithm = parseStrictDecimal(u8, tokens.next() orelse return Error.BadRecord) orelse return Error.BadRecord;
+    const labels = parseStrictDecimal(u8, tokens.next() orelse return Error.BadRecord) orelse return Error.BadRecord;
+    const orig_ttl = std.fmt.parseInt(u32, tokens.next() orelse return Error.BadRecord, 10) catch return Error.BadRecord;
+    const expiration = std.fmt.parseInt(u32, tokens.next() orelse return Error.BadRecord, 10) catch return Error.BadRecord;
+    const inception = std.fmt.parseInt(u32, tokens.next() orelse return Error.BadRecord, 10) catch return Error.BadRecord;
+    const key_tag = parseStrictDecimal(u16, tokens.next() orelse return Error.BadRecord) orelse return Error.BadRecord;
+    const signer_text = tokens.next() orelse return Error.BadRecord;
+    const signer = dns_name.Name.fromText(signer_text) catch return Error.BadRecord;
+    const sig_text = tokens.next() orelse return Error.BadRecord;
+    if (tokens.next() != null) return Error.BadRecord;
+    var out = dns_rdata.Unknown{};
+    const header_len = 18 + signer.asWire().len;
+    if (header_len > out.data.len) return Error.BadRecord;
+    std.mem.writeInt(u16, out.data[0..2], covered, .big);
+    out.data[2] = algorithm;
+    out.data[3] = labels;
+    std.mem.writeInt(u32, out.data[4..8], orig_ttl, .big);
+    std.mem.writeInt(u32, out.data[8..12], expiration, .big);
+    std.mem.writeInt(u32, out.data[12..16], inception, .big);
+    std.mem.writeInt(u16, out.data[16..18], key_tag, .big);
+    @memcpy(out.data[18..header_len], signer.asWire());
+    out.len = @intCast(header_len);
+    const sig_len = try decodeBase64Blob(sig_text, out.data[header_len..]);
+    out.len += @intCast(sig_len);
+    return out;
+}
+
+/// Build a windowed type bitmap (RFC 4034 section 4.1.2) from presentation
+/// type mnemonics. Supports windows 0-255; at most 64 types per NSEC.
+fn buildTypeBitmap(tokens: *std.mem.TokenIterator(u8, .any), out: []u8) Error!usize {
+    var codes: [64]u16 = undefined;
+    var count: usize = 0;
+    while (tokens.next()) |token| {
+        if (count >= codes.len) return Error.BadRecord;
+        codes[count] = try parseTypeCovered(token);
+        count += 1;
+    }
+    if (count == 0) return Error.BadRecord;
+    std.mem.sort(u16, codes[0..count], {}, std.sort.asc(u16));
+    var prev: ?u16 = null;
+    for (codes[0..count]) |code| {
+        if (prev != null and prev.? == code) return Error.BadRecord;
+        prev = code;
+    }
+    var len: usize = 0;
+    var index: usize = 0;
+    while (index < count) {
+        const window: u8 = @intCast(codes[index] / 256);
+        var bits: [32]u8 = [_]u8{0} ** 32;
+        var max_byte: usize = 0;
+        while (index < count and codes[index] / 256 == window) : (index += 1) {
+            const bit: u16 = codes[index] % 256;
+            bits[bit / 8] |= @as(u8, 0x80) >> @intCast(bit % 8);
+            max_byte = @max(max_byte, bit / 8);
+        }
+        if (len + 2 + max_byte + 1 > out.len) return Error.BadRecord;
+        out[len] = window;
+        out[len + 1] = @intCast(max_byte + 1);
+        @memcpy(out[len + 2 .. len + 3 + max_byte], bits[0 .. max_byte + 1]);
+        len += 3 + max_byte;
+    }
+    return len;
+}
+
+fn parseNsec(text: []const u8) Error!dns_rdata.Unknown {
+    if (parseDnssecGeneric(text)) |generic| return generic;
+    var tokens = std.mem.tokenizeAny(u8, text, " \t\r\n");
+    const next_text = tokens.next() orelse return Error.BadRecord;
+    const next = dns_name.Name.fromText(next_text) catch return Error.BadRecord;
+    var out = dns_rdata.Unknown{};
+    if (next.asWire().len > out.data.len) return Error.BadRecord;
+    @memcpy(out.data[0..next.asWire().len], next.asWire());
+    out.len = @intCast(next.asWire().len);
+    const bitmap_len = try buildTypeBitmap(&tokens, out.data[out.len..]);
+    out.len += @intCast(bitmap_len);
+    return out;
+}
+
+fn parseHexOrDash(text: []const u8, out: []u8) Error!usize {
+    if (std.mem.eql(u8, text, "-")) return 0;
+    if (text.len % 2 != 0) return Error.BadRecord;
+    if (text.len / 2 > out.len) return Error.BadRecord;
+    var i: usize = 0;
+    while (i < text.len) : (i += 2) {
+        const high = parseHexDigit(text[i]) orelse return Error.BadRecord;
+        const low = parseHexDigit(text[i + 1]) orelse return Error.BadRecord;
+        out[i / 2] = (high << 4) | low;
+    }
+    return text.len / 2;
+}
+
+fn parseNsec3Param(text: []const u8) Error!dns_rdata.Unknown {
+    if (parseDnssecGeneric(text)) |generic| return generic;
+    var tokens = std.mem.tokenizeAny(u8, text, " \t\r\n");
+    const algorithm = parseStrictDecimal(u8, tokens.next() orelse return Error.BadRecord) orelse return Error.BadRecord;
+    const flags = parseStrictDecimal(u8, tokens.next() orelse return Error.BadRecord) orelse return Error.BadRecord;
+    const iterations = parseStrictDecimal(u16, tokens.next() orelse return Error.BadRecord) orelse return Error.BadRecord;
+    const salt_text = tokens.next() orelse return Error.BadRecord;
+    if (tokens.next() != null) return Error.BadRecord;
+    var out = dns_rdata.Unknown{};
+    out.data[0] = algorithm;
+    out.data[1] = flags;
+    std.mem.writeInt(u16, out.data[2..4], iterations, .big);
+    const salt_len = try parseHexOrDash(salt_text, out.data[5..]);
+    if (salt_len > 255) return Error.BadRecord;
+    out.data[4] = @intCast(salt_len);
+    out.len = @intCast(5 + salt_len);
+    return out;
+}
+
+fn parseNsec3(text: []const u8) Error!dns_rdata.Unknown {
+    if (parseDnssecGeneric(text)) |generic| return generic;
+    var tokens = std.mem.tokenizeAny(u8, text, " \t\r\n");
+    const algorithm = parseStrictDecimal(u8, tokens.next() orelse return Error.BadRecord) orelse return Error.BadRecord;
+    const flags = parseStrictDecimal(u8, tokens.next() orelse return Error.BadRecord) orelse return Error.BadRecord;
+    const iterations = parseStrictDecimal(u16, tokens.next() orelse return Error.BadRecord) orelse return Error.BadRecord;
+    const salt_text = tokens.next() orelse return Error.BadRecord;
+    const next_text = tokens.next() orelse return Error.BadRecord;
+    var out = dns_rdata.Unknown{};
+    out.data[0] = algorithm;
+    out.data[1] = flags;
+    std.mem.writeInt(u16, out.data[2..4], iterations, .big);
+    const salt_len = try parseHexOrDash(salt_text, out.data[5..]);
+    if (salt_len > 255) return Error.BadRecord;
+    out.data[4] = @intCast(salt_len);
+    var cursor: usize = 5 + salt_len;
+    var next_hash: [64]u8 = undefined;
+    const next_len = try decodeBase64Blob(next_text, &next_hash);
+    if (next_len == 0 or next_len > 255 or cursor + 1 + next_len > out.data.len) return Error.BadRecord;
+    out.data[cursor] = @intCast(next_len);
+    cursor += 1;
+    @memcpy(out.data[cursor .. cursor + next_len], next_hash[0..next_len]);
+    cursor += next_len;
+    const bitmap_len = try buildTypeBitmap(&tokens, out.data[cursor..]);
+    cursor += bitmap_len;
+    out.len = @intCast(cursor);
+    return out;
 }
 
 fn parseIpv4(text: []const u8) Error![4]u8 {
@@ -783,6 +1036,218 @@ fn parseUri(text: []const u8) Error!dns_rdata.Uri {
     return uri;
 }
 
+/// Parse RFC 9460 SVCB/HTTPS presentation text:
+/// `priority target [key=value ...]`, with a bare `no-default-alpn` for the
+/// zero-length flag. Keys must appear in increasing numeric order; generic
+/// keys use `keyNNNN=<hex>`, and `ech` uses standard base64.
+fn parseSvcb(text: []const u8) Error!dns_rdata.Svcb {
+    var tokens = std.mem.tokenizeAny(u8, text, " \t\r\n");
+    const priority = parseStrictDecimal(u16, tokens.next() orelse return Error.BadRecord) orelse return Error.BadRecord;
+    const target = try parseRdataName(tokens.next() orelse return Error.BadRecord);
+
+    var params: [dns_rdata.max_svcb_params_len]u8 = undefined;
+    var params_len: usize = 0;
+    var prev_key: ?u16 = null;
+    var seen: [128]u16 = undefined;
+    var seen_count: usize = 0;
+    var mandatory: [128]u16 = undefined;
+    var mandatory_count: ?usize = null;
+
+    while (tokens.next()) |token| {
+        const eq = std.mem.indexOfScalar(u8, token, '=');
+        const key_text = if (eq) |index| token[0..index] else token;
+        const value_text = if (eq) |index| token[index + 1 ..] else "";
+        const key = svcbKeyFromName(key_text) orelse return Error.BadRecord;
+        if (prev_key != null and key <= prev_key.?) return Error.BadRecord;
+        prev_key = key;
+        if (seen_count >= seen.len) return Error.BadRecord;
+        seen[seen_count] = key;
+        seen_count += 1;
+
+        var value: [dns_rdata.max_svcb_params_len]u8 = undefined;
+        const value_len = try encodeSvcbParamValue(key, value_text, &value);
+        if (key == dns_rdata.SVCB_MANDATORY_KEY) {
+            if (value_len == 0 or value_len % 2 != 0) return Error.BadRecord;
+            if (value_len / 2 > mandatory.len) return Error.BadRecord;
+            mandatory_count = value_len / 2;
+            var index: usize = 0;
+            while (index < value_len) : (index += 2) {
+                mandatory[index / 2] = std.mem.readInt(u16, value[index..][0..2], .big);
+            }
+        }
+        if (params_len + 4 + value_len > params.len) return Error.BadRecord;
+        std.mem.writeInt(u16, params[params_len..][0..2], key, .big);
+        std.mem.writeInt(u16, params[params_len + 2 ..][0..2], @intCast(value_len), .big);
+        @memcpy(params[params_len + 4 ..][0..value_len], value[0..value_len]);
+        params_len += 4 + value_len;
+    }
+
+    if (mandatory_count) |count| {
+        for (mandatory[0..count]) |required| {
+            if (required == dns_rdata.SVCB_MANDATORY_KEY) return Error.BadRecord;
+            var covered = false;
+            for (seen[0..seen_count]) |present| {
+                if (present == required) {
+                    covered = true;
+                    break;
+                }
+            }
+            if (!covered) return Error.BadRecord;
+        }
+    }
+
+    return dns_rdata.Svcb.init(priority, target, params[0..params_len]) catch Error.BadRecord;
+}
+
+fn svcbKeyFromName(text: []const u8) ?u16 {
+    if (std.ascii.eqlIgnoreCase(text, "mandatory")) return dns_rdata.SVCB_MANDATORY_KEY;
+    if (std.ascii.eqlIgnoreCase(text, "alpn")) return dns_rdata.SVCB_ALPN_KEY;
+    if (std.ascii.eqlIgnoreCase(text, "no-default-alpn")) return dns_rdata.SVCB_NO_DEFAULT_ALPN_KEY;
+    if (std.ascii.eqlIgnoreCase(text, "port")) return dns_rdata.SVCB_PORT_KEY;
+    if (std.ascii.eqlIgnoreCase(text, "ipv4hint")) return dns_rdata.SVCB_IPV4HINT_KEY;
+    if (std.ascii.eqlIgnoreCase(text, "ech")) return dns_rdata.SVCB_ECH_KEY;
+    if (std.ascii.eqlIgnoreCase(text, "ipv6hint")) return dns_rdata.SVCB_IPV6HINT_KEY;
+    if (std.ascii.eqlIgnoreCase(text, "dohpath")) return dns_rdata.SVCB_DOHPATH_KEY;
+    if (text.len > 3 and std.ascii.eqlIgnoreCase(text[0..3], "key")) {
+        return parseStrictDecimal(u16, text[3..]);
+    }
+    return null;
+}
+
+fn encodeSvcbParamValue(key: u16, value_text: []const u8, out: []u8) Error!usize {
+    switch (key) {
+        dns_rdata.SVCB_MANDATORY_KEY => {
+            if (value_text.len == 0) return Error.BadRecord;
+            var length: usize = 0;
+            var items = std.mem.splitScalar(u8, value_text, ',');
+            while (items.next()) |item| {
+                const entry = svcbKeyFromName(item) orelse return Error.BadRecord;
+                if (entry == dns_rdata.SVCB_MANDATORY_KEY) return Error.BadRecord;
+                if (length + 2 > out.len) return Error.BadRecord;
+                std.mem.writeInt(u16, out[length..][0..2], entry, .big);
+                length += 2;
+            }
+            return length;
+        },
+        dns_rdata.SVCB_ALPN_KEY => {
+            var decoded: [dns_rdata.max_svcb_params_len]u8 = undefined;
+            const decoded_len = try decodeSvcbString(value_text, &decoded);
+            if (decoded_len == 0) return Error.BadRecord;
+            var length: usize = 0;
+            var items = std.mem.splitScalar(u8, decoded[0..decoded_len], ',');
+            while (items.next()) |item| {
+                if (item.len == 0 or item.len > 255 or length + 1 + item.len > out.len) return Error.BadRecord;
+                out[length] = @intCast(item.len);
+                @memcpy(out[length + 1 ..][0..item.len], item);
+                length += 1 + item.len;
+            }
+            return length;
+        },
+        dns_rdata.SVCB_NO_DEFAULT_ALPN_KEY => {
+            if (value_text.len != 0) return Error.BadRecord;
+            return 0;
+        },
+        dns_rdata.SVCB_PORT_KEY => {
+            const port = parseStrictDecimal(u16, value_text) orelse return Error.BadRecord;
+            if (out.len < 2) return Error.BadRecord;
+            std.mem.writeInt(u16, out[0..2], port, .big);
+            return 2;
+        },
+        dns_rdata.SVCB_IPV4HINT_KEY => {
+            if (value_text.len == 0) return Error.BadRecord;
+            var length: usize = 0;
+            var items = std.mem.splitScalar(u8, value_text, ',');
+            while (items.next()) |item| {
+                if (length + 4 > out.len) return Error.BadRecord;
+                @memcpy(out[length..][0..4], &try parseIpv4(item));
+                length += 4;
+            }
+            return length;
+        },
+        dns_rdata.SVCB_ECH_KEY => {
+            const raw = stripSvcbQuotes(value_text) orelse return Error.BadRecord;
+            if (raw.len == 0) return Error.BadRecord;
+            const decoder = std.base64.standard.Decoder;
+            const exact = decoder.calcSizeForSlice(raw) catch return Error.BadRecord;
+            if (exact == 0 or exact > out.len) return Error.BadRecord;
+            decoder.decode(out[0..exact], raw) catch return Error.BadRecord;
+            return exact;
+        },
+        dns_rdata.SVCB_IPV6HINT_KEY => {
+            if (value_text.len == 0) return Error.BadRecord;
+            var length: usize = 0;
+            var items = std.mem.splitScalar(u8, value_text, ',');
+            while (items.next()) |item| {
+                if (length + 16 > out.len) return Error.BadRecord;
+                @memcpy(out[length..][0..16], &try parseIpv6(item));
+                length += 16;
+            }
+            return length;
+        },
+        dns_rdata.SVCB_DOHPATH_KEY => {
+            const decoded_len = try decodeSvcbString(value_text, out);
+            if (decoded_len == 0) return Error.BadRecord;
+            return decoded_len;
+        },
+        else => {
+            if (value_text.len % 2 != 0) return Error.BadRecord;
+            if (value_text.len / 2 > out.len) return Error.BadRecord;
+            var index: usize = 0;
+            while (index < value_text.len) : (index += 2) {
+                const high = parseHexDigit(value_text[index]) orelse return Error.BadRecord;
+                const low = parseHexDigit(value_text[index + 1]) orelse return Error.BadRecord;
+                out[index / 2] = (high << 4) | low;
+            }
+            return value_text.len / 2;
+        },
+    }
+}
+
+/// Decode one SVCB presentation string: surrounding quotes are stripped and
+/// `\DDD` decimal plus `\X` escapes resolved; unquoted values pass through
+/// unless they contain a double quote.
+fn decodeSvcbString(text: []const u8, out: []u8) Error!usize {
+    if (text.len >= 2 and text[0] == '"') {
+        if (text[text.len - 1] != '"') return Error.BadRecord;
+        const inner = text[1 .. text.len - 1];
+        var length: usize = 0;
+        var index: usize = 0;
+        while (index < inner.len) {
+            if (length >= out.len) return Error.BadRecord;
+            if (inner[index] != '\\') {
+                out[length] = inner[index];
+                length += 1;
+                index += 1;
+                continue;
+            }
+            index += 1;
+            if (index >= inner.len) return Error.BadRecord;
+            if (inner[index] >= '0' and inner[index] <= '9') {
+                if (index + 3 > inner.len) return Error.BadRecord;
+                const digits = inner[index .. index + 3];
+                if (digits[1] < '0' or digits[1] > '9' or digits[2] < '0' or digits[2] > '9') return Error.BadRecord;
+                out[length] = parseStrictDecimal(u8, digits) orelse return Error.BadRecord;
+                length += 1;
+                index += 3;
+            } else {
+                out[length] = inner[index];
+                length += 1;
+                index += 1;
+            }
+        }
+        return length;
+    }
+    if (std.mem.indexOfScalar(u8, text, '"') != null) return Error.BadRecord;
+    if (text.len > out.len) return Error.BadRecord;
+    @memcpy(out[0..text.len], text);
+    return text.len;
+}
+
+fn stripSvcbQuotes(text: []const u8) ?[]const u8 {
+    if (text.len >= 2 and text[0] == '"' and text[text.len - 1] == '"') return text[1 .. text.len - 1];
+    return text;
+}
+
 fn parseNaptr(text: []const u8) Error!dns_rdata.Naptr {
     const input = std.mem.trim(u8, text, " \t\r\n");
     var index: usize = 0;
@@ -896,7 +1361,7 @@ fn parseSoa(text: []const u8) Error!dns_rdata.Soa {
 }
 
 fn normalizeRData(allocator: std.mem.Allocator, rrtype: RecordType, origin: []const u8, text: []const u8) ![]const u8 {
-    const minimum_tokens: usize = if (rrtype.eql(.MX)) 2 else if (rrtype.eql(.SRV)) 4 else if (rrtype.eql(.SOA)) 2 else if (rrtype.eql(.NS) or rrtype.eql(.CNAME) or rrtype.eql(.DNAME) or rrtype.eql(.PTR)) 1 else 0;
+    const minimum_tokens: usize = if (rrtype.eql(.MX)) 2 else if (rrtype.eql(.SRV)) 4 else if (rrtype.eql(.SOA)) 2 else if (rrtype.eql(.SVCB) or rrtype.eql(.HTTPS)) 2 else if (rrtype.eql(.NS) or rrtype.eql(.CNAME) or rrtype.eql(.DNAME) or rrtype.eql(.PTR)) 1 else 0;
     if (minimum_tokens == 0) return ZoneFile.copyText(allocator, text);
 
     var tokens = std.mem.tokenizeAny(u8, text, " \t\r\n()");
@@ -932,6 +1397,7 @@ fn normalizeRData(allocator: std.mem.Allocator, rrtype: RecordType, origin: []co
 fn isDomainField(rrtype: RecordType, index: usize) bool {
     if (rrtype.eql(.NS) or rrtype.eql(.CNAME) or rrtype.eql(.DNAME) or rrtype.eql(.PTR)) return index == 0;
     if (rrtype.eql(.MX)) return index == 1;
+    if (rrtype.eql(.SVCB) or rrtype.eql(.HTTPS)) return index == 1;
     if (rrtype.eql(.SRV)) return index == 3;
     if (rrtype.eql(.SOA)) return index == 0 or index == 1;
     return false;
@@ -964,6 +1430,31 @@ fn writeExpandedName(output: []u8, offset: *usize, token: []const u8, origin: []
 
 fn ensureTrailingDot(text: []const u8) []const u8 {
     return text;
+}
+
+test "zone parser loads opaque DNSSEC records in presentation and generic form" {
+    const dnskey = try parseRData(.DNSKEY, "257 3 8 QUJDRA==");
+    try std.testing.expectEqual(@as(u16, 8), dnskey.Unknown.len);
+    try std.testing.expectEqual(@as(u16, 257), std.mem.readInt(u16, dnskey.Unknown.bytes()[0..2], .big));
+
+    const ds = try parseRData(.DS, "1234 8 2 DEADBEEF");
+    try std.testing.expectEqual(@as(u16, 8), ds.Unknown.len);
+
+    const rrsig = try parseRData(.RRSIG, "A 8 2 3600 2000000000 1000000000 1234 example. QUJD");
+    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, rrsig.Unknown.bytes()[0..2], .big));
+
+    const nsec = try parseRData(.NSEC, "next.example. A RRSIG NSEC");
+    try std.testing.expect(nsec.Unknown.len > 14);
+
+    const param = try parseRData(.NSEC3PARAM, "1 0 10 -");
+    try std.testing.expectEqual(@as(u16, 5), param.Unknown.len);
+
+    const generic = try parseRData(.DNSKEY, "\\# 00010003 08AABBCC");
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x01, 0x00, 0x03, 0x08, 0xaa, 0xbb, 0xcc }, generic.Unknown.bytes());
+
+    try std.testing.expectError(Error.BadRecord, parseRData(.DNSKEY, "257 3"));
+    try std.testing.expectError(Error.BadRecord, parseRData(.NSEC, "next.example."));
+    try std.testing.expectError(Error.BadRecord, parseRData(.DS, "1 2 3 ODD"));
 }
 
 test "zone parser loads origin ttl and basic records" {
@@ -1860,10 +2351,100 @@ test "APL zone text rejects malformed fields addresses families prefixes and bou
     };
     for (invalid) |text| try std.testing.expectError(Error.BadRecord, parseRData(.APL, text));
 
+    // 513 zero-prefix IPv4 items encode 2052 wire bytes, over the 2048
+    // bounded opaque-RDATA profile shared with src/dns/rdata.zig.
     var overlong: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer overlong.deinit();
-    for (0..129) |_| try overlong.writer.writeAll("1:192.0.2.0/0 ");
+    for (0..513) |_| try overlong.writer.writeAll("1:192.0.2.0/0 ");
     try std.testing.expectError(Error.BadRecord, parseRData(.APL, overlong.written()));
+}
+
+test "SVCB zone text parses service mode parameters in order" {
+    const svcb = try parseRData(.SVCB, "1 foo.example. alpn=h2,h3 port=443 ipv4hint=192.0.2.1,198.51.100.1");
+    try std.testing.expectEqual(@as(u16, 1), svcb.SVCB.priority);
+    var target: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("foo.example.", try svcb.SVCB.target.toText(&target));
+    try std.testing.expectEqualSlices(u8, &.{
+        0x00, 0x01, 0x00, 0x06, 0x02, 'h',  '2',  0x02, 'h',  '3',
+        0x00, 0x03, 0x00, 0x02, 0x01, 0xbb, 0x00, 0x04, 0x00, 0x08,
+        192,  0,    2,    1,    198,  51,   100,  1,
+    }, svcb.SVCB.paramsBytes());
+
+    const https = try parseRData(.HTTPS, "0 alias.example.");
+    try std.testing.expectEqual(@as(u16, 0), https.HTTPS.priority);
+    try std.testing.expectEqual(@as(usize, 0), https.HTTPS.paramsBytes().len);
+}
+
+test "SVCB zone text accepts sorted optional parameters with base64 ech" {
+    const svcb = try parseRData(
+        .SVCB,
+        "1 svc.example. alpn=h2 no-default-alpn port=8443 ipv4hint=192.0.2.1 ech=aGk= ipv6hint=2001:db8::1 key10=00ff",
+    );
+    try std.testing.expectEqual(@as(u16, 1), svcb.SVCB.priority);
+    var offset: usize = 0;
+    var prev: u16 = 0;
+    var first = true;
+    var saw_ech = false;
+    while (offset < svcb.SVCB.paramsBytes().len) {
+        const params = svcb.SVCB.paramsBytes();
+        const key = std.mem.readInt(u16, params[offset..][0..2], .big);
+        const len = std.mem.readInt(u16, params[offset + 2 ..][0..2], .big);
+        if (!first) try std.testing.expect(prev < key);
+        first = false;
+        prev = key;
+        if (key == 5) {
+            saw_ech = true;
+            try std.testing.expectEqualSlices(u8, "hi", params[offset + 4 .. offset + 4 + len]);
+        }
+        if (key == 10) {
+            try std.testing.expectEqualSlices(u8, &.{ 0x00, 0xff }, params[offset + 4 .. offset + 4 + len]);
+        }
+        offset += 4 + len;
+    }
+    try std.testing.expect(saw_ech);
+    try std.testing.expectEqual(@as(u16, 10), prev);
+}
+
+test "SVCB zone text rejects unsorted duplicate uncovered and alias parameters" {
+    const invalid = [_][]const u8{
+        "1 foo.example. port=443 alpn=h2",
+        "1 foo.example. port=443 port=80",
+        "1 foo.example. mandatory=alpn",
+        "1 foo.example. mandatory=mandatory",
+        "1 foo.example. mandatory=port alpn=h2",
+        "0 alias.example. port=443",
+        "1 foo.example. port=99999",
+        "1 foo.example. no-default-alpn=1",
+        "1 foo.example. alpn=",
+        "1 foo.example. ech=!!!",
+        "1 foo.example. key10=0",
+        "1 foo.example. bogus=1",
+        "1",
+        "one foo.example.",
+    };
+    for (invalid) |text| {
+        try std.testing.expectError(Error.BadRecord, parseRData(.SVCB, text));
+        try std.testing.expectError(Error.BadRecord, parseRData(.HTTPS, text));
+    }
+}
+
+test "zone parser expands relative SVCB targets against origin" {
+    var zone = try ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns hostmaster 1 3600 900 1209600 3600
+        \\@ IN NS ns
+        \\svc IN SVCB 1 target alpn=h2
+        \\alias IN HTTPS 0 target
+        \\
+    );
+    defer zone.deinit();
+    try std.testing.expectEqualStrings("1 target.example. alpn=h2", zone.records.items[2].rdataText());
+    const svcb = try parseRData(.SVCB, zone.records.items[2].rdataText());
+    var target: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("target.example.", try svcb.SVCB.target.toText(&target));
+    const https = try parseRData(.HTTPS, zone.records.items[3].rdataText());
+    try std.testing.expectEqual(@as(u16, 0), https.HTTPS.priority);
 }
 
 test "NAPTR zone text parses strict fields and absolute replacement" {

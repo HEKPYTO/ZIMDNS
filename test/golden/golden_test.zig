@@ -387,6 +387,29 @@ test "authoritative semantics fixture asserts exact encoded wildcard response" {
     try std.testing.expectEqualStrings("other.example.", try parsed.answers.items[0].owner.toText(&owner));
 }
 
+test "DNSSEC response fixture asserts exact DO-bit wire with covering RRSIG" {
+    const fixture = try Fixture.parse(@embedFile("dnssec-response.gdns-fixture"));
+    try fixture.run();
+
+    var runtime = try zimdns.auth_runtime.Runtime.fromZoneText(dnssec_fixture_zone);
+    defer runtime.deinit();
+
+    var output: [512]u8 = undefined;
+    const actual = try runtime.answer(fixture.inputBytes(), &output);
+    try std.testing.expectEqualSlices(u8, fixture.responseBytes(), actual);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try zimdns.dns_message.Message.parse(arena.allocator(), actual);
+    try std.testing.expectEqual(@as(u16, 2), parsed.header.answer_count);
+    try std.testing.expect(parsed.answers.items[0].rrtype.eql(.A));
+    try std.testing.expect(parsed.answers.items[1].rrtype.eql(.RRSIG));
+    try std.testing.expect(parsed.edns.?.dnssec_ok);
+    try std.testing.expect(!parsed.header.authenticated_data);
+    const covers = try zimdns.dns_dnssec.rrsigCovers(parsed.answers.items[1].rdata.Unknown.bytes());
+    try std.testing.expectEqual(@as(u16, 1), covers);
+}
+
 test "EDNS unknown option response is exact and empty" {
     var runtime = try zimdns.auth_runtime.Runtime.fromZoneText(test_zone);
     defer runtime.deinit();
@@ -491,6 +514,17 @@ const test_zone =
     \\_443._tcp IN TLSA 0 0 1 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
     \\_https._tcp IN URI 10 20 "https://example.test/path"
     \\naptr IN NAPTR 100 10 "U" "E2U+sip" "" replacement.example.
+    \\
+;
+
+const dnssec_fixture_zone =
+    \\$ORIGIN example.
+    \\$TTL 3600
+    \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+    \\@ IN NS ns.example.
+    \\@ IN DNSKEY 257 3 8 QUJDRA==
+    \\www IN A 192.0.2.1
+    \\www IN RRSIG A 8 2 3600 2000000000 1000000000 1234 example. QUJD
     \\
 ;
 

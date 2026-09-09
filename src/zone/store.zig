@@ -407,3 +407,29 @@ fn failJournalBegin(journal: journal_mod.Journal, _: []const u8, _: []const u8) 
     try file.sync(journal.io);
     return error.InjectedJournalBegin;
 }
+
+test "store serial transitions feed the delta log for IXFR fallback choices" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "zone.snapshot", .data = initial_zone });
+
+    var store = try Store.init(tmp.dir, io, "zone.snapshot");
+    defer store.deinit();
+    try std.testing.expectEqual(@as(u32, 10), store.serial);
+
+    var deltas = journal_mod.DeltaLog{};
+    const before = store.serial;
+    var replacement = try store.replaceText(newer_zone);
+    defer replacement.deinit();
+    try deltas.record(before, store.serial);
+
+    try std.testing.expect(deltas.canServeIncremental(10, 11));
+    try std.testing.expect(!deltas.canServeIncremental(9, 11));
+
+    // A rejected older candidate leaves both the snapshot and the delta log alone.
+    try std.testing.expectError(Store.Error.SerialOlder, store.replaceText(initial_zone));
+    try std.testing.expectEqual(@as(u32, 11), store.serial);
+    try std.testing.expect(!deltas.hasSerial(9));
+    try std.testing.expect(deltas.canServeIncremental(10, 11));
+}

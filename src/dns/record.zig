@@ -66,7 +66,8 @@ pub const ResourceRecord = struct {
         try writer.writeU16(self.class.code());
         try writer.writeU32(self.ttl);
 
-        var rdata_buffer: [512]u8 = undefined;
+        // Sized for the largest opaque RDATA (DNSKEY/RRSIG/NSEC, 2048 bytes).
+        var rdata_buffer: [2048]u8 = undefined;
         var rdata_writer = Writer.init(&rdata_buffer);
         try self.rdata.encode(&rdata_writer);
         try writer.writeU16(@intCast(rdata_writer.len()));

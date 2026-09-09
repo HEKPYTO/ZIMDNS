@@ -45,9 +45,19 @@ pub const RecordType = struct {
     pub const SSHFP = RecordType{ .value = 44 };
     pub const TLSA = RecordType{ .value = 52 };
     pub const URI = RecordType{ .value = 256 };
+    pub const SVCB = RecordType{ .value = 64 };
+    pub const HTTPS = RecordType{ .value = 65 };
     pub const OPT = RecordType{ .value = 41 };
     pub const CAA = RecordType{ .value = 257 };
     pub const TSIG = RecordType{ .value = 250 };
+    pub const IXFR = RecordType{ .value = 251 };
+    pub const AXFR = RecordType{ .value = 252 };
+    pub const DS = RecordType{ .value = 43 };
+    pub const RRSIG = RecordType{ .value = 46 };
+    pub const NSEC = RecordType{ .value = 47 };
+    pub const DNSKEY = RecordType{ .value = 48 };
+    pub const NSEC3 = RecordType{ .value = 50 };
+    pub const NSEC3PARAM = RecordType{ .value = 51 };
 
     pub fn fromCode(value: u16) RecordType {
         return .{ .value = value };
@@ -129,4 +139,28 @@ test "X25 record type uses wire code 19" {
 test "RT record type uses wire code 21" {
     try std.testing.expectEqual(@as(u16, 21), RecordType.RT.code());
     try std.testing.expectEqual(RecordType.RT, RecordType.fromCode(21));
+}
+
+test "AXFR and IXFR record types use RFC 5936 and RFC 1995 wire codes" {
+    try std.testing.expectEqual(@as(u16, 252), RecordType.AXFR.code());
+    try std.testing.expectEqual(RecordType.AXFR, RecordType.fromCode(252));
+    try std.testing.expectEqual(@as(u16, 251), RecordType.IXFR.code());
+    try std.testing.expectEqual(RecordType.IXFR, RecordType.fromCode(251));
+}
+
+test "DNSSEC record types use RFC 4034 and RFC 5155 wire codes" {
+    try std.testing.expectEqual(@as(u16, 43), RecordType.DS.code());
+    try std.testing.expectEqual(@as(u16, 46), RecordType.RRSIG.code());
+    try std.testing.expectEqual(@as(u16, 47), RecordType.NSEC.code());
+    try std.testing.expectEqual(@as(u16, 48), RecordType.DNSKEY.code());
+    try std.testing.expectEqual(@as(u16, 50), RecordType.NSEC3.code());
+    try std.testing.expectEqual(@as(u16, 51), RecordType.NSEC3PARAM.code());
+    try std.testing.expectEqual(RecordType.DNSKEY, RecordType.fromCode(48));
+}
+
+test "SVCB and HTTPS record types use RFC 9460 wire codes" {
+    try std.testing.expectEqual(@as(u16, 64), RecordType.SVCB.code());
+    try std.testing.expectEqual(RecordType.SVCB, RecordType.fromCode(64));
+    try std.testing.expectEqual(@as(u16, 65), RecordType.HTTPS.code());
+    try std.testing.expectEqual(RecordType.HTTPS, RecordType.fromCode(65));
 }

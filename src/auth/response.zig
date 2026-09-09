@@ -195,8 +195,117 @@ pub fn buildResponse(request: dns_message.Message, zone: *const zone_index.Zone)
         .servfail, .not_authoritative => {},
     }
 
+    // DNSSEC minimum (RFC 4035 section 3.1, RFC 5155): RRSIGs covering the
+    // answer RRsets and NSEC/NSEC3 denial proofs ride along only when the
+    // query set DO=1; without DO, proof RRsets are stripped unless the
+    // QTYPE asked for them explicitly. The AD bit is never set: this server
+    // does not perform cryptographic validation.
+    const dnssec_ok = if (request.edns) |edns| edns.dnssec_ok else false;
+    if (dnssec_ok) {
+        appendCoveringRrsigs(&response, zone, q.qtype) catch {};
+        if (lookup.kind == .nodata or lookup.kind == .nxdomain) {
+            appendDenialProofs(&response, zone, qname_text, q.qtype) catch {};
+        }
+    } else {
+        stripProofRecords(&response, q.qtype);
+    }
+
     try setHeaderCounts(&response);
     return response;
+}
+
+/// Append zone RRSIGs whose owner matches an answer record and whose
+/// type-covered field equals that record's type. Malformed candidates are
+/// skipped so one bad RRSIG cannot fail the whole response.
+fn appendCoveringRrsigs(response: *dns_message.Message, zone: *const zone_index.Zone, qtype: dns_types.RecordType) !void {
+    _ = qtype;
+    // Snapshot the pre-proof length: appended RRSIGs must not be rescanned,
+    // and section storage may move on append.
+    const original_len = response.answers.len;
+    var answer_index: usize = 0;
+    while (answer_index < original_len) : (answer_index += 1) {
+        const answer = response.answers.items[answer_index];
+        if (answer.rrtype.eql(.RRSIG)) continue;
+        var index: usize = 0;
+        while (index < zone.records.len) : (index += 1) {
+            const candidate = zone.records.items[index];
+            if (!candidate.rrtype.eql(.RRSIG)) continue;
+            const owner = dns_name.Name.fromText(candidate.ownerText()) catch continue;
+            if (!owner.eql(&answer.owner)) continue;
+            const rr = toResourceRecord(candidate, null) catch continue;
+            const raw = switch (rr.rdata) {
+                .Unknown => |unknown| unknown.bytes(),
+                else => continue,
+            };
+            const covers = @import("../dns/dnssec.zig").rrsigCovers(raw) catch continue;
+            if (covers != answer.rrtype.code()) continue;
+            if (response.answers.len >= std.math.maxInt(u16)) return Error.TooManyRecords;
+            try response.answers.append(rr);
+        }
+    }
+}
+
+/// Best-effort authenticated denial for NODATA/NXDOMAIN when DO=1: attach an
+/// exact-owner NSEC that denies the QTYPE, else any zone NSEC whose span
+/// covers the QNAME, plus apex NSEC3PARAM RRsets. Capped so denial proofs
+/// cannot amplify a small query into a large response.
+fn appendDenialProofs(response: *dns_message.Message, zone: *const zone_index.Zone, qname_text: []const u8, qtype: dns_types.RecordType) !void {
+    const dnssec = @import("../dns/dnssec.zig");
+    const qname = dns_name.Name.fromText(qname_text) catch return;
+    var attached: usize = 0;
+    var index: usize = 0;
+    while (index < zone.records.len and attached < 4) : (index += 1) {
+        const candidate = zone.records.items[index];
+        if (!candidate.rrtype.eql(.NSEC)) continue;
+        const rr = toResourceRecord(candidate, null) catch continue;
+        const raw = switch (rr.rdata) {
+            .Unknown => |unknown| unknown.bytes(),
+            else => continue,
+        };
+        const denies = dnssec.nsecDeniesType(raw, qtype.code()) catch continue;
+        if (!denies) continue;
+        const owner = dns_name.Name.fromText(candidate.ownerText()) catch continue;
+        if (owner.eql(&qname)) {
+            try response.authorities.append(rr);
+            attached += 1;
+            continue;
+        }
+        const next = dns_name.Name.parse(raw, 0) catch continue;
+        if (dnssec.nsecCovers(owner, next.name, qname)) {
+            try response.authorities.append(rr);
+            attached += 1;
+        }
+    }
+    index = 0;
+    while (index < zone.records.len and attached < 6) : (index += 1) {
+        const candidate = zone.records.items[index];
+        if (!candidate.rrtype.eql(.NSEC3PARAM)) continue;
+        if (!std.ascii.eqlIgnoreCase(candidate.ownerText(), zone.originText())) continue;
+        const rr = toResourceRecord(candidate, null) catch continue;
+        try response.authorities.append(rr);
+        attached += 1;
+    }
+}
+
+/// Drop proof RRsets (RRSIG/NSEC/NSEC3/NSEC3PARAM) from every section unless
+/// the QTYPE named them explicitly. DNSKEY/DS answers are ordinary data and
+/// are always kept.
+fn stripProofRecords(response: *dns_message.Message, qtype: dns_types.RecordType) void {
+    stripProofSection(&response.answers, qtype);
+    stripProofSection(&response.authorities, qtype);
+    stripProofSection(&response.additionals, qtype);
+}
+
+fn stripProofSection(section: *dns_message.RecordSection, qtype: dns_types.RecordType) void {
+    var write_index: usize = 0;
+    var read_index: usize = 0;
+    while (read_index < section.len) : (read_index += 1) {
+        const record = section.items[read_index];
+        if (!@import("../dns/dnssec.zig").shouldInclude(record.rrtype, qtype, false)) continue;
+        section.items[write_index] = record;
+        write_index += 1;
+    }
+    section.len = write_index;
 }
 
 pub fn buildRefusedResponse(request: dns_message.Message) !dns_message.Message {
@@ -302,6 +411,10 @@ fn setHeaderCounts(response: *dns_message.Message) Error!void {
     response.header.answer_count = @intCast(response.answers.len);
     response.header.authority_count = @intCast(response.authorities.len);
     response.header.additional_count = @intCast(response.additionals.len);
+}
+
+pub fn zoneRecordToResourceRecord(record: zone_parser.ZoneRecord, owner_override: ?[]const u8) !dns_record.ResourceRecord {
+    return toResourceRecord(record, owner_override);
 }
 
 fn toResourceRecord(record: zone_parser.ZoneRecord, owner_override: ?[]const u8) !dns_record.ResourceRecord {
@@ -482,11 +595,165 @@ test "authoritative response builder converts PTR zone records" {
     try std.testing.expectEqualStrings("target.example.", try ptr_record.rdata.PTR.toText(&target));
 }
 
+test "authoritative response builder serves typed SVCB and HTTPS records" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(
+        \\$ORIGIN example.test.
+        \\$TTL 3600
+        \\@ IN SOA ns1.example.test. hostmaster.example.test. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.example.test.
+        \\svc IN SVCB 1 target alpn=h2 port=443
+        \\alias IN HTTPS 0 target
+        \\
+    );
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    const svcb_request = try dns_message.Message.parseQuery(arena.allocator(), &.{
+        0xab, 0xcd, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x03, 's',  'v',  'c',  0x07, 'e',  'x',  'a',  'm',  'p',  'l',  'e',
+        0x04, 't',  'e',  's',  't',  0x00, 0x00, 0x40, 0x00, 0x01,
+    });
+    const svcb_response = try buildResponse(svcb_request, &zone);
+    try std.testing.expectEqual(@as(u16, 1), svcb_response.header.answer_count);
+    const svcb_answer = svcb_response.answers.items[0];
+    try std.testing.expect(svcb_answer.rrtype.eql(.SVCB));
+    try std.testing.expectEqual(@as(u16, 1), svcb_answer.rdata.SVCB.priority);
+    var target: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("target.example.test.", try svcb_answer.rdata.SVCB.target.toText(&target));
+
+    var encoded: [512]u8 = undefined;
+    var writer = @import("../dns/writer.zig").Writer.init(&encoded);
+    try svcb_response.encode(&writer);
+    const expected = [_]u8{
+        0xab, 0xcd, 0x85, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x03, 's',  'v',  'c',  0x07, 'e',  'x',  'a',  'm',  'p',  'l',  'e',
+        0x04, 't',  'e',  's',  't',  0x00, 0x00, 0x40, 0x00, 0x01, 0xc0, 0x0c,
+        0x00, 0x40, 0x00, 0x01, 0x00, 0x00, 0x0e, 0x10, 0x00, 0x24, 0x00, 0x01,
+        0x06, 't',  'a',  'r',  'g',  'e',  't',  0x07, 'e',  'x',  'a',  'm',
+        'p',  'l',  'e',  0x04, 't',  'e',  's',  't',  0x00, 0x00, 0x01, 0x00,
+        0x03, 0x02, 'h',  '2',  0x00, 0x03, 0x00, 0x02, 0x01, 0xbb,
+    };
+    try std.testing.expectEqualSlices(u8, &expected, writer.written());
+    const round_trip = try dns_message.Message.parse(arena.allocator(), writer.written());
+    try std.testing.expect(round_trip.answers.items[0].rrtype.eql(.SVCB));
+    try std.testing.expectEqual(@as(u16, 1), round_trip.answers.items[0].rdata.SVCB.priority);
+
+    const https_request = try dns_message.Message.parseQuery(arena.allocator(), &.{
+        0xab, 0xce, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x05, 'a',  'l',  'i',  'a',  's',  0x07, 'e',  'x',  'a',  'm',  'p',
+        'l',  'e',  0x04, 't',  'e',  's',  't',  0x00, 0x00, 0x41, 0x00, 0x01,
+    });
+    const https_response = try buildResponse(https_request, &zone);
+    try std.testing.expectEqual(@as(u16, 1), https_response.header.answer_count);
+    try std.testing.expect(https_response.answers.items[0].rrtype.eql(.HTTPS));
+    try std.testing.expectEqual(@as(u16, 0), https_response.answers.items[0].rdata.HTTPS.priority);
+}
+
 test "rejects response section counts beyond the DNS wire limit" {
     var response = dns_message.Message{ .header = .{ .id = 0x1234 } };
     response.answers.len = @as(usize, std.math.maxInt(u16)) + 1;
 
     try std.testing.expectError(Error.TooManyRecords, setHeaderCounts(&response));
+}
+
+const dnssec_test_zone =
+    \\$ORIGIN example.
+    \\$TTL 3600
+    \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+    \\@ IN NS ns.example.
+    \\@ IN DNSKEY 257 3 8 QUJDRA==
+    \\www IN A 192.0.2.1
+    \\www IN RRSIG A 8 2 3600 2000000000 1000000000 1234 example. QUJD
+    \\www IN NSEC www.example. A RRSIG NSEC
+    \\
+;
+
+fn testDoQuery(allocator: std.mem.Allocator, id: u16, name_text: []const u8, qtype: dns_types.RecordType, dnssec_ok: bool) !dns_message.Message {
+    var message = try testQuery(allocator, name_text, qtype);
+    message.header.id = id;
+    message.edns = .{
+        .udp_payload_size = 1232,
+        .extended_rcode = 0,
+        .version = 0,
+        .dnssec_ok = dnssec_ok,
+    };
+    try message.additionals.append(.{
+        .owner = dns_name.Name.root(),
+        .rrtype = .OPT,
+        .class = dns_types.Class.fromCode(1232),
+        .ttl = if (dnssec_ok) 0x8000 else 0,
+        .rdata = .{ .OPT = .{} },
+    });
+    message.header.additional_count = 1;
+    return message;
+}
+
+test "DO-bit query receives covering RRSIGs, plain query does not" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(dnssec_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    const do_response = try buildResponse(try testDoQuery(arena.allocator(), 0x4401, "www.example.", .A, true), &zone);
+    try std.testing.expectEqual(@as(u16, 2), do_response.header.answer_count);
+    try std.testing.expect(do_response.answers.items[0].rrtype.eql(.A));
+    try std.testing.expect(do_response.answers.items[1].rrtype.eql(.RRSIG));
+    try std.testing.expect(do_response.edns.?.dnssec_ok);
+
+    const plain_response = try buildResponse(try testDoQuery(arena.allocator(), 0x4402, "www.example.", .A, false), &zone);
+    try std.testing.expectEqual(@as(u16, 1), plain_response.header.answer_count);
+    try std.testing.expect(plain_response.answers.items[0].rrtype.eql(.A));
+
+    var encoded: [512]u8 = undefined;
+    var writer = @import("../dns/writer.zig").Writer.init(&encoded);
+    try do_response.encode(&writer);
+    const round_trip = try dns_message.Message.parse(arena.allocator(), writer.written());
+    try std.testing.expectEqual(@as(u16, 2), round_trip.header.answer_count);
+    try std.testing.expect(round_trip.answers.items[1].rrtype.eql(.RRSIG));
+    try std.testing.expectEqual(@as(u16, 1), try @import("../dns/dnssec.zig").rrsigCovers(round_trip.answers.items[1].rdata.Unknown.bytes()));
+}
+
+test "explicit DNSKEY query is answered with or without DO" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(dnssec_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    const plain = try buildResponse(try testDoQuery(arena.allocator(), 0x4403, "example.", .DNSKEY, false), &zone);
+    try std.testing.expectEqual(@as(u16, 1), plain.header.answer_count);
+    try std.testing.expect(plain.answers.items[0].rrtype.eql(.DNSKEY));
+
+    const flagged = try buildResponse(try testDoQuery(arena.allocator(), 0x4404, "example.", .DNSKEY, true), &zone);
+    try std.testing.expectEqual(@as(u16, 1), flagged.header.answer_count);
+}
+
+test "NODATA with DO carries an NSEC denial proof, without DO only SOA" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(dnssec_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    const do_response = try buildResponse(try testDoQuery(arena.allocator(), 0x4405, "www.example.", .AAAA, true), &zone);
+    try std.testing.expectEqual(header.Rcode.no_error, do_response.header.rcode);
+    try std.testing.expect(do_response.header.authority_count >= 2);
+    var saw_nsec = false;
+    for (do_response.authorities.slice()) |record| {
+        if (record.rrtype.eql(.NSEC)) saw_nsec = true;
+    }
+    try std.testing.expect(saw_nsec);
+
+    const plain_response = try buildResponse(try testDoQuery(arena.allocator(), 0x4406, "www.example.", .AAAA, false), &zone);
+    try std.testing.expectEqual(@as(u16, 1), plain_response.header.authority_count);
+    try std.testing.expect(plain_response.authorities.items[0].rrtype.eql(.SOA));
 }
 
 fn testQuery(allocator: std.mem.Allocator, name_text: []const u8, qtype: dns_types.RecordType) !dns_message.Message {

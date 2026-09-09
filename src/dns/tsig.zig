@@ -206,6 +206,21 @@ pub fn verifyChained(
     return expected;
 }
 
+/// Signs one already-encoded transfer message that carries its own zeroed
+/// final TSIG record. The digest covers the previous chain MAC plus the
+/// unsigned message form, matching what verifyChained recomputes for a
+/// single-packet chain. Use the returned MAC as the prior for the next
+/// message in the sequence.
+pub fn signChainedFinal(
+    packet: []const u8,
+    final: FinalAdditional,
+    key: []const u8,
+    tsig: Tsig,
+    prior_mac: []const u8,
+) Error!Mac {
+    return chainedMac(&.{packet}, final, key, tsig, prior_mac);
+}
+
 pub fn digestLength(algorithm: Algorithm) usize {
     return switch (algorithm) {
         .hmac_sha1 => 20,

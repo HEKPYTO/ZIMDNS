@@ -9,7 +9,14 @@ const NameParseResult = @import("name.zig").ParseResult;
 const RecordType = @import("types.zig").RecordType;
 
 const max_txt_len = 255;
-const max_unknown_len = 512;
+// Bounded opaque-RDATA profile: untyped types (DNSKEY/RRSIG and future
+// types), APL, CAA, and the NAPTR size check share this bound. 2048 covers a
+// 4096-bit RSA DNSKEY (~520 bytes) and a 4096-bit RSA RRSIG (~570 bytes with
+// signer name), while still rejecting oversize typed RDATA instead of growing
+// to the 64 KB wire maximum. Keep this far below message limits; do not
+// reintroduce per-type fallbacks. SVCB/HTTPS stay typed under their own
+// 512-byte cap below and never use this bound.
+const max_unknown_len = 2048;
 const max_opt_data_len = 512;
 const max_caa_payload_len = max_unknown_len - 2;
 const max_sshfp_fingerprint_len = 32;
@@ -22,6 +29,24 @@ const max_tsig_time: u64 = 0x0000ffffffffffff;
 
 pub const EDNS_ECS_OPTION_CODE: u16 = 8;
 pub const EDNS_PADDING_OPTION_CODE: u16 = 12;
+
+/// RFC 9460 SVCB/HTTPS SvcParam keys with assigned presentation names.
+pub const SVCB_MANDATORY_KEY: u16 = 0;
+pub const SVCB_ALPN_KEY: u16 = 1;
+pub const SVCB_NO_DEFAULT_ALPN_KEY: u16 = 2;
+pub const SVCB_PORT_KEY: u16 = 3;
+pub const SVCB_IPV4HINT_KEY: u16 = 4;
+pub const SVCB_ECH_KEY: u16 = 5;
+pub const SVCB_IPV6HINT_KEY: u16 = 6;
+pub const SVCB_DOHPATH_KEY: u16 = 7;
+
+/// RFC 9460 SVCB/HTTPS RDATA never uses the Unknown fallback, so it keeps its
+/// own 512-byte cap independent of the raised opaque-RDATA bound above.
+pub const max_svcb_rdata_len = 512;
+
+/// SvcPriority (2) plus the shortest TargetName (root, 1) leave this budget
+/// for SvcParams inside one 512-byte RDATA.
+pub const max_svcb_params_len = 509;
 
 pub fn validSshfp(algorithm: u8, fingerprint_type: u8, fingerprint_len: usize) bool {
     const valid_algorithm = switch (algorithm) {
@@ -269,6 +294,128 @@ pub const Uri = struct {
     }
 };
 
+/// RFC 9460 SVCB/HTTPS RDATA shared by types 64 and 65.
+/// `params` holds the raw SvcParams wire bytes (key, length, value triples);
+/// every constructor and encoder revalidates ordering, duplication, the
+/// mandatory list, per-key shapes, alias-mode emptiness, and the 512-byte bound.
+pub const Svcb = struct {
+    priority: u16,
+    target: Name,
+    params: [max_svcb_params_len]u8 = undefined,
+    params_len: u16 = 0,
+
+    pub fn paramsBytes(self: *const Svcb) []const u8 {
+        return self.params[0..self.params_len];
+    }
+
+    pub fn init(priority: u16, target: Name, params: []const u8) Error!Svcb {
+        if (params.len > max_svcb_params_len) return Error.InvalidLength;
+        if (@as(usize, 2) + target.asWire().len + params.len > max_svcb_rdata_len) return Error.InvalidLength;
+        try validateSvcParams(params, priority);
+        var value = Svcb{
+            .priority = priority,
+            .target = target,
+            .params_len = @intCast(params.len),
+        };
+        @memcpy(value.params[0..params.len], params);
+        return value;
+    }
+
+    pub fn encode(self: Svcb, writer: *Writer) !void {
+        if (@as(usize, 2) + self.target.asWire().len + @as(usize, self.params_len) > max_svcb_rdata_len) {
+            return Error.InvalidLength;
+        }
+        try validateSvcParams(self.paramsBytes(), self.priority);
+        try writer.writeU16(self.priority);
+        try self.target.encode(writer);
+        try writer.writeBytes(self.paramsBytes());
+    }
+};
+
+/// Validate one SvcParams byte string for `priority`:
+/// strictly increasing keys, known-key value shapes, alias-mode emptiness,
+/// and mandatory-list coverage.
+pub fn validateSvcParams(params: []const u8, priority: u16) Error!void {
+    if (priority == 0 and params.len != 0) return Error.InvalidLength;
+
+    var offset: usize = 0;
+    var prev_key: ?u16 = null;
+    var keys: [128]u16 = undefined;
+    var key_count: usize = 0;
+    var mandatory: ?[]const u8 = null;
+
+    while (offset < params.len) {
+        if (params.len - offset < 4) return Error.InvalidLength;
+        const key = std.mem.readInt(u16, params[offset..][0..2], .big);
+        const value_len = std.mem.readInt(u16, params[offset + 2 ..][0..2], .big);
+        if (value_len > params.len - offset - 4) return Error.InvalidLength;
+        if (prev_key != null and key <= prev_key.?) return Error.InvalidLength;
+        prev_key = key;
+        if (key_count >= keys.len) return Error.InvalidLength;
+        keys[key_count] = key;
+        key_count += 1;
+
+        const value = params[offset + 4 .. offset + 4 + value_len];
+        try validateSvcParamValue(key, value);
+        if (key == SVCB_MANDATORY_KEY) mandatory = value;
+        offset += 4 + value_len;
+    }
+
+    if (mandatory) |list| {
+        if (list.len == 0 or list.len % 2 != 0) return Error.InvalidLength;
+        var index: usize = 0;
+        while (index < list.len) : (index += 2) {
+            const required = std.mem.readInt(u16, list[index..][0..2], .big);
+            if (required == SVCB_MANDATORY_KEY) return Error.InvalidLength;
+            var earlier: usize = 0;
+            while (earlier < index) : (earlier += 2) {
+                if (std.mem.readInt(u16, list[earlier..][0..2], .big) == required) return Error.InvalidLength;
+            }
+            var seen_required = false;
+            for (keys[0..key_count]) |present| {
+                if (present == required) {
+                    seen_required = true;
+                    break;
+                }
+            }
+            if (!seen_required) return Error.InvalidLength;
+        }
+    }
+}
+
+fn validateSvcParamValue(key: u16, value: []const u8) Error!void {
+    switch (key) {
+        SVCB_MANDATORY_KEY => {
+            if (value.len == 0 or value.len % 2 != 0) return Error.InvalidLength;
+        },
+        SVCB_ALPN_KEY => {
+            if (value.len == 0) return Error.InvalidLength;
+            var offset: usize = 0;
+            while (offset < value.len) {
+                const id_len = value[offset];
+                if (id_len == 0 or @as(usize, id_len) > value.len - offset - 1) return Error.InvalidLength;
+                offset += 1 + id_len;
+            }
+        },
+        SVCB_NO_DEFAULT_ALPN_KEY => {
+            if (value.len != 0) return Error.InvalidLength;
+        },
+        SVCB_PORT_KEY => {
+            if (value.len != 2) return Error.InvalidLength;
+        },
+        SVCB_IPV4HINT_KEY => {
+            if (value.len == 0 or value.len % 4 != 0) return Error.InvalidLength;
+        },
+        SVCB_ECH_KEY => {
+            if (value.len == 0) return Error.InvalidLength;
+        },
+        SVCB_IPV6HINT_KEY => {
+            if (value.len == 0 or value.len % 16 != 0) return Error.InvalidLength;
+        },
+        else => {},
+    }
+}
+
 pub const Naptr = struct {
     order: u16,
     preference: u16,
@@ -417,6 +564,8 @@ pub const RData = union(enum) {
     SSHFP: Sshfp,
     TLSA: Tlsa,
     URI: Uri,
+    SVCB: Svcb,
+    HTTPS: Svcb,
     OPT: Opt,
     TSIG: Tsig,
     Unknown: Unknown,
@@ -572,6 +721,10 @@ pub const RData = union(enum) {
                 @memcpy(uri.target[0..target_len], message[offset + 4 .. end]);
                 break :blk .{ .URI = uri };
             },
+            RecordType.SVCB.value, RecordType.HTTPS.value => blk: {
+                const svcb = try parseSvcb(message, offset, end);
+                break :blk if (rrtype.code() == RecordType.SVCB.value) .{ .SVCB = svcb } else .{ .HTTPS = svcb };
+            },
             RecordType.OPT.value => blk: {
                 if (len > max_opt_data_len) return Error.OptionsTooLong;
                 var opt = Opt{ .len = @intCast(len) };
@@ -673,6 +826,7 @@ pub const RData = union(enum) {
                 try writer.writeU16(uri.weight);
                 try writer.writeBytes(uri.targetBytes());
             },
+            .SVCB, .HTTPS => |svcb| try svcb.encode(writer),
             .OPT => |opt| try writer.writeBytes(opt.bytes()),
             .TSIG => |tsig| try tsig.encode(writer),
             .Unknown => |unknown| try writer.writeBytes(unknown.bytes()),
@@ -752,12 +906,53 @@ pub const RData = union(enum) {
                 try writer.writeU16(uri.weight);
                 try writer.writeBytes(uri.targetBytes());
             },
+            // TargetName stays uncompressed so SVCB/HTTPS records remain
+            // self-contained like SRV targets.
+            .SVCB, .HTTPS => |svcb| try svcb.encode(writer),
             .OPT => |opt| try writer.writeBytes(opt.bytes()),
             .TSIG => |tsig| try tsig.encode(writer),
             .Unknown => |unknown| try writer.writeBytes(unknown.bytes()),
         }
     }
 };
+
+/// Parse one RFC 9460 SVCB/HTTPS RDATA. Types 64 and 65 never use the
+/// Unknown fallback: malformed bytes are typed errors.
+fn parseSvcb(message: []const u8, offset: usize, end: usize) Error!Svcb {
+    const len = if (end >= offset and end <= message.len and offset <= message.len) end - offset else return Error.EndOfInput;
+    if (len > max_svcb_rdata_len) return Error.InvalidLength;
+    if (len < 3) return Error.InvalidLength;
+    const priority = std.mem.readInt(u16, message[offset..][0..2], .big);
+    const target_result = parseSvcbTarget(message, offset + 2, end) catch |err| switch (err) {
+        Error.BadName => return Error.BadName,
+        else => return Error.InvalidLength,
+    };
+    const params = message[target_result.next_offset..end];
+    if (params.len > max_svcb_params_len) return Error.InvalidLength;
+    return Svcb.init(priority, target_result.name, params) catch |err| switch (err) {
+        Error.BadName => return Error.BadName,
+        else => return Error.InvalidLength,
+    };
+}
+
+/// Scan one uncompressed TargetName inside `[offset, end)` and return it with
+/// the offset of the following SvcParams. Pointers are rejected so the target
+/// cannot alias bytes outside this RDATA.
+fn parseSvcbTarget(message: []const u8, offset: usize, end: usize) Error!NameParseResult {
+    if (offset >= end or end > message.len) return Error.EndOfInput;
+    var cursor = offset;
+    while (cursor < end) {
+        const len = message[cursor];
+        if ((len & 0xc0) == 0xc0) return Error.BadName;
+        if (len == 0) break;
+        if ((len & 0xc0) != 0 or len > 63 or cursor + 1 + len > end) return Error.BadName;
+        cursor += 1 + len;
+    }
+    if (cursor >= end) return Error.BadName;
+    const result = Name.parse(message, offset) catch return Error.BadName;
+    if (result.next_offset > end) return Error.BadName;
+    return result;
+}
 
 fn parseNameOnly(message: []const u8, offset: usize, end: usize) Error!Name {
     const result = Name.parse(message, offset) catch return Error.BadName;
@@ -1384,7 +1579,7 @@ test "CAA accepts the full RDATA bound with maximum tag and value" {
 
     const caa = try RData.parse(.CAA, &bytes, 0, bytes.len);
     try std.testing.expectEqual(@as(usize, 255), caa.CAA.tagText().len);
-    try std.testing.expectEqual(@as(usize, 255), caa.CAA.valueText().len);
+    try std.testing.expectEqual(@as(usize, max_unknown_len - 257), caa.CAA.valueText().len);
     try std.testing.expectEqualSlices(u8, bytes[2..257], caa.CAA.tagText());
     try std.testing.expectEqualSlices(u8, bytes[257..], caa.CAA.valueText());
 
@@ -1394,7 +1589,7 @@ test "CAA accepts the full RDATA bound with maximum tag and value" {
     try std.testing.expectEqualSlices(u8, &bytes, writer.written());
 }
 
-test "CAA accepts a one-byte tag with a 509-byte value" {
+test "CAA accepts a one-byte tag with a bound-sized value" {
     var bytes: [max_unknown_len]u8 = undefined;
     bytes[0] = 128;
     bytes[1] = 1;
@@ -1403,7 +1598,7 @@ test "CAA accepts a one-byte tag with a 509-byte value" {
 
     const caa = try RData.parse(.CAA, &bytes, 0, bytes.len);
     try std.testing.expectEqualStrings("z", caa.CAA.tagText());
-    try std.testing.expectEqual(@as(usize, 509), caa.CAA.valueText().len);
+    try std.testing.expectEqual(@as(usize, max_unknown_len - 3), caa.CAA.valueText().len);
     try std.testing.expectEqualSlices(u8, bytes[3..], caa.CAA.valueText());
 }
 
@@ -1436,6 +1631,32 @@ test "rdata keeps unknown wire data within the declared bounded profile" {
 
     var overlong: [max_unknown_len + 1]u8 = undefined;
     try std.testing.expectError(Error.UnknownTooLong, RData.parse(RecordType.fromCode(65280), &overlong, 0, overlong.len));
+}
+
+test "rdata preserves DNSKEY and RRSIG sizes within the bounded profile" {
+    // Representative opaque sizes: 4096-bit RSA DNSKEY (~520 bytes), 4096-bit
+    // RSA RRSIG (~570 bytes with signer name). SVCB/HTTPS stay typed under
+    // their own 512-byte cap and never take the Unknown path.
+    inline for ([_]struct { code: u16, len: usize }{ .{ .code = 48, .len = 520 }, .{ .code = 46, .len = 570 } }) |case| {
+        var payload: [570]u8 = undefined;
+        for (&payload, 0..) |*byte, index| byte.* = @intCast(index & 0xff);
+        const parsed = try RData.parse(RecordType.fromCode(case.code), &payload, 0, case.len);
+        try std.testing.expectEqual(case.len, parsed.Unknown.bytes().len);
+        try std.testing.expectEqualSlices(u8, payload[0..case.len], parsed.Unknown.bytes());
+
+        var output: [max_unknown_len]u8 = undefined;
+        var writer = Writer.init(&output);
+        try parsed.encode(&writer);
+        try std.testing.expectEqualSlices(u8, payload[0..case.len], writer.written());
+    }
+}
+
+test "rdata rejects oversize DNSKEY and RRSIG payloads as typed" {
+    inline for ([_]u16{ 48, 46 }) |code| {
+        var oversized: [max_unknown_len + 1]u8 = undefined;
+        @memset(&oversized, 0x5a);
+        try std.testing.expectError(Error.UnknownTooLong, RData.parse(RecordType.fromCode(code), &oversized, 0, oversized.len));
+    }
 }
 
 test "rdata parses and encodes DNAME targets without compression" {
@@ -1787,14 +2008,22 @@ test "NAPTR wire rejects malformed fields and oversized RDATA" {
     try std.testing.expectError(Error.InvalidLength, RData.parse(.NAPTR, &.{ 0, 1, 0, 2, 0, 0, 1, '!', 1, 'x', 0 }, 0, 11));
     try std.testing.expectError(Error.TrailingData, RData.parse(.NAPTR, &.{ 0, 1, 0, 2, 0, 0, 0, 0, 0xaa }, 0, 9));
 
-    var oversized: [513]u8 = undefined;
-    oversized[0..4].* = .{ 0, 1, 0, 2 };
-    oversized[4] = 250;
-    @memset(oversized[5..255], 'A');
-    oversized[255] = 255;
-    @memset(oversized[256..511], 'x');
-    oversized[511] = 0;
-    oversized[512] = 0;
+    // A structurally valid 513-byte NAPTR (250-byte flags, 255-byte services)
+    // exceeds the old 512 pre-check but fits the raised bounded profile.
+    var boundary: [513]u8 = undefined;
+    boundary[0..4].* = .{ 0, 1, 0, 2 };
+    boundary[4] = 250;
+    @memset(boundary[5..255], 'A');
+    boundary[255] = 255;
+    @memset(boundary[256..511], 'x');
+    boundary[511] = 0;
+    boundary[512] = 0;
+    const naptr = try RData.parse(.NAPTR, &boundary, 0, boundary.len);
+    try std.testing.expectEqual(@as(u8, 250), naptr.NAPTR.flags_len);
+    try std.testing.expectEqual(@as(u8, 255), naptr.NAPTR.services_len);
+
+    var oversized: [max_unknown_len + 1]u8 = undefined;
+    @memset(&oversized, 0);
     try std.testing.expectError(Error.InvalidLength, RData.parse(.NAPTR, &oversized, 0, oversized.len));
 }
 
@@ -1861,4 +2090,187 @@ test "APL wire rejects RDATA over the bounded payload" {
     var oversized: [max_unknown_len + 1]u8 = undefined;
     @memset(&oversized, 0);
     try std.testing.expectError(Error.UnknownTooLong, RData.parse(.APL, &oversized, 0, oversized.len));
+}
+
+const svcb_service_wire = [_]u8{
+    0x00, 0x01,
+    0x03, 'f',
+    'o',  'o',
+    0x07, 'e',
+    'x',  'a',
+    'm',  'p',
+    'l',  'e',
+    0x00, 0x00,
+    0x01, 0x00,
+    0x06, 0x02,
+    'h',  '2',
+    0x02, 'h',
+    '3',  0x00,
+    0x03, 0x00,
+    0x02, 0x01,
+    0xbb, 0x00,
+    0x04, 0x00,
+    0x04, 192,
+    0,    2,
+    1,
+};
+
+const svcb_alias_wire = [_]u8{
+    0x00, 0x00,
+    0x05, 'a',
+    'l',  'i',
+    'a',  's',
+    0x07, 'e',
+    'x',  'a',
+    'm',  'p',
+    'l',  'e',
+    0x00,
+};
+
+test "SVCB and HTTPS wire round trips service mode without Unknown fallback" {
+    inline for ([_]RecordType{ .SVCB, .HTTPS }) |rrtype| {
+        const parsed = try RData.parse(rrtype, &svcb_service_wire, 0, svcb_service_wire.len);
+        const svcb = if (rrtype.code() == RecordType.SVCB.value) parsed.SVCB else parsed.HTTPS;
+        try std.testing.expectEqual(@as(u16, 1), svcb.priority);
+        var target_text: [64]u8 = undefined;
+        try std.testing.expectEqualStrings("foo.example.", try svcb.target.toText(&target_text));
+
+        var encoded: [svcb_service_wire.len]u8 = undefined;
+        var writer = Writer.init(&encoded);
+        try parsed.encode(&writer);
+        try std.testing.expectEqualSlices(u8, &svcb_service_wire, writer.written());
+
+        var compressed: [svcb_service_wire.len + 32]u8 = undefined;
+        var compressed_writer = Writer.init(&compressed);
+        var table = CompressionTable{};
+        try table.writeName(&compressed_writer, &.{ 0x03, 'f', 'o', 'o', 0x07, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0x00 });
+        const rdata_offset = compressed_writer.len();
+        try parsed.encodeCompressed(&compressed_writer, &table);
+        // TargetName stays uncompressed even when the table knows the suffix.
+        try std.testing.expectEqualSlices(u8, &svcb_service_wire, compressed[rdata_offset..compressed_writer.len()]);
+        const reparsed = try RData.parse(rrtype, compressed_writer.written(), rdata_offset, compressed_writer.len() - rdata_offset);
+        const again = if (rrtype.code() == RecordType.SVCB.value) reparsed.SVCB else reparsed.HTTPS;
+        try std.testing.expectEqual(@as(u16, 1), again.priority);
+    }
+}
+
+test "SVCB alias mode round trips an empty parameter set" {
+    const parsed = try RData.parse(.HTTPS, &svcb_alias_wire, 0, svcb_alias_wire.len);
+    try std.testing.expectEqual(@as(u16, 0), parsed.HTTPS.priority);
+    try std.testing.expectEqual(@as(usize, 0), parsed.HTTPS.paramsBytes().len);
+
+    var encoded: [svcb_alias_wire.len]u8 = undefined;
+    var writer = Writer.init(&encoded);
+    try parsed.encode(&writer);
+    try std.testing.expectEqualSlices(u8, &svcb_alias_wire, writer.written());
+}
+
+test "SVCB wire rejects unsorted and duplicated keys" {
+    // Keys 3 then 1: increasing order violated.
+    const unsorted = [_]u8{
+        0x00, 0x01, 0x00,
+        0x00, 0x03, 0x00,
+        0x02, 0x01, 0xbb,
+        0x00, 0x01, 0x00,
+        0x03, 0x02, 'h',
+        '2',
+    };
+    try std.testing.expectError(Error.InvalidLength, RData.parse(.SVCB, &unsorted, 0, unsorted.len));
+
+    // Key 3 twice: duplicate.
+    const duplicated = [_]u8{
+        0x00, 0x01, 0x00,
+        0x00, 0x03, 0x00,
+        0x02, 0x01, 0xbb,
+        0x00, 0x03, 0x00,
+        0x02, 0x01, 0xbb,
+    };
+    try std.testing.expectError(Error.InvalidLength, RData.parse(.HTTPS, &duplicated, 0, duplicated.len));
+}
+
+test "SVCB mandatory parameter requires coverage without self reference" {
+    // mandatory lists keys 1 and 3, both present and sorted.
+    const covered = [_]u8{
+        0x00, 0x01, 0x00,
+        0x00, 0x00, 0x00,
+        0x04, 0x00, 0x01,
+        0x00, 0x03, 0x00,
+        0x01, 0x00, 0x03,
+        0x02, 'h',  '2',
+        0x00, 0x03, 0x00,
+        0x02, 0x01, 0xbb,
+    };
+    const parsed = try RData.parse(.SVCB, &covered, 0, covered.len);
+    try std.testing.expectEqual(@as(u16, 1), parsed.SVCB.priority);
+
+    // Mandatory lists key 4, which is absent.
+    const missing = [_]u8{
+        0x00, 0x01, 0x00,
+        0x00, 0x00, 0x00,
+        0x02, 0x00, 0x04,
+        0x00, 0x01, 0x00,
+        0x03, 0x02, 'h',
+        '2',
+    };
+    try std.testing.expectError(Error.InvalidLength, RData.parse(.SVCB, &missing, 0, missing.len));
+
+    // Mandatory lists itself.
+    const self_ref = [_]u8{
+        0x00, 0x01, 0x00,
+        0x00, 0x00, 0x00,
+        0x02, 0x00, 0x00,
+    };
+    try std.testing.expectError(Error.InvalidLength, RData.parse(.SVCB, &self_ref, 0, self_ref.len));
+}
+
+test "SVCB wire rejects alias params, compressed targets, and bad key shapes" {
+    // Alias mode with parameters.
+    const alias_params = [_]u8{
+        0x00, 0x00, 0x00,
+        0x00, 0x03, 0x00,
+        0x02, 0x01, 0xbb,
+    };
+    try std.testing.expectError(Error.InvalidLength, RData.parse(.HTTPS, &alias_params, 0, alias_params.len));
+
+    // Compressed TargetName pointer.
+    const compressed_target = [_]u8{ 0x00, 0x01, 0xc0, 0x00 };
+    try std.testing.expectError(Error.BadName, RData.parse(.SVCB, &compressed_target, 0, compressed_target.len));
+
+    // Port value with the wrong length.
+    const bad_port = [_]u8{
+        0x00, 0x01, 0x00,
+        0x00, 0x03, 0x00,
+        0x01, 0xbb,
+    };
+    try std.testing.expectError(Error.InvalidLength, RData.parse(.SVCB, &bad_port, 0, bad_port.len));
+
+    // Empty alpn value.
+    const empty_alpn = [_]u8{
+        0x00, 0x01, 0x00,
+        0x00, 0x01, 0x00,
+        0x00,
+    };
+    try std.testing.expectError(Error.InvalidLength, RData.parse(.SVCB, &empty_alpn, 0, empty_alpn.len));
+
+    // Non-empty no-default-alpn value.
+    const noisy_flag = [_]u8{
+        0x00, 0x01, 0x00,
+        0x00, 0x02, 0x00,
+        0x01, 0x00,
+    };
+    try std.testing.expectError(Error.InvalidLength, RData.parse(.SVCB, &noisy_flag, 0, noisy_flag.len));
+
+    // Truncated parameter framing.
+    const truncated = [_]u8{ 0x00, 0x01, 0x00, 0x00, 0x03 };
+    try std.testing.expectError(Error.InvalidLength, RData.parse(.SVCB, &truncated, 0, truncated.len));
+}
+
+test "SVCB wire rejects RDATA over the 512-byte bound" {
+    var oversized: [max_svcb_rdata_len + 1]u8 = undefined;
+    @memset(&oversized, 0);
+    oversized[0] = 0;
+    oversized[1] = 1;
+    oversized[2] = 0;
+    try std.testing.expectError(Error.InvalidLength, RData.parse(.SVCB, &oversized, 0, oversized.len));
+    try std.testing.expectError(Error.InvalidLength, RData.parse(.HTTPS, &oversized, 0, oversized.len));
 }

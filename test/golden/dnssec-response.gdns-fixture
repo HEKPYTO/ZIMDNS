@@ -1,0 +1,22 @@
+name: dnssec-response
+rfc: RFC 4035 section 3.1 and RFC 6891 section 4
+phase: dnssec-minimum
+description: DO-bit A query and exact authoritative response with covering RRSIG and DO-echo OPT.
+input_hex:
+  44 01 01 00 00 01 00 00 00 00 00 01
+  03 77 77 77 07 65 78 61 6d 70 6c 65 00 00 01 00 01
+  00 00 29 04 d0 00 00 80 00 00 00
+response_hex:
+  44 01 85 00 00 01 00 02 00 00 00 01
+  03 77 77 77 07 65 78 61 6d 70 6c 65 00 00 01 00 01
+  c0 0c 00 01 00 01 00 00 0e 10 00 04 c0 00 02 01
+  c0 0c 00 2e 00 01 00 00 0e 10 00 1e 00 01 08 02
+  00 00 0e 10 77 35 94 00 3b 9a ca 00 04 d2 07 65
+  78 61 6d 70 6c 65 00 41 42 43
+  00 00 29 04 d0 00 00 80 00 00 00
+expect:
+  parse_ok: true
+  id: 0x4401
+  qname: www.example.
+  qtype: A
+  qclass: IN

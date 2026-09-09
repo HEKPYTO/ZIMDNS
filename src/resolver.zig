@@ -1,5 +1,8 @@
 /// Contract: Performs one bounded, UDP-first forwarding exchange and owns its
 /// in-memory cache and cookie policy. No iterative recursion or upstream pool.
+/// Locally generated EDE options carry an INFO-CODE plus purpose text; error
+/// responses preserve the query CD/DO policy. Cookie replay tracking is opt-in
+/// and ring-bounded. deinit zeroizes cookie secrets.
 /// Ownership: Policy is copied into Resolver; cache responses are allocator-owned.
 const std = @import("std");
 const builtin = @import("builtin");
@@ -11,6 +14,8 @@ const dns_record = @import("dns/record.zig");
 const dns_rdata = @import("dns/rdata.zig");
 const dns_types = @import("dns/types.zig");
 const dns_writer = @import("dns/writer.zig");
+const dnssec = @import("dns/dnssec.zig");
+const qname_minimize = @import("qname_minimize.zig");
 const tcp_deadline = @import("platform/tcp_deadline.zig");
 
 pub const MAX_CACHE_ENTRIES = 64;
@@ -33,6 +38,30 @@ pub const EDE_OPTION_CODE: u16 = 15;
 pub const EDE_STALE_ANSWER: u16 = 3;
 pub const EDE_STALE_NXDOMAIN: u16 = 22;
 pub const EDE_NETWORK_ERROR: u16 = 23;
+/// RFC 8914 DNSSEC-bogus INFO-CODEs (see dns/dnssec.zig for purpose text).
+pub const EDE_DNSSEC_BOGUS: u16 = dnssec.EDE_DNSSEC_BOGUS;
+pub const EDE_SIGNATURE_EXPIRED: u16 = dnssec.EDE_SIGNATURE_EXPIRED;
+pub const EDE_SIGNATURE_NOT_YET_VALID: u16 = dnssec.EDE_SIGNATURE_NOT_YET_VALID;
+pub const EDE_DNSKEY_MISSING: u16 = dnssec.EDE_DNSKEY_MISSING;
+pub const EDE_RRSIGS_MISSING: u16 = dnssec.EDE_RRSIGS_MISSING;
+/// Strict-mode cookie replay window. Fixed ring, no allocator, FIFO overwrite.
+pub const MAX_COOKIE_REPLAY_ENTRIES = 32;
+
+/// RFC 8914 EXTRA-TEXT purpose string for a locally generated EDE INFO-CODE.
+pub fn edeText(code: u16) []const u8 {
+    return switch (code) {
+        EDE_STALE_ANSWER => "stale answer",
+        EDE_STALE_NXDOMAIN => "stale nxdomain",
+        EDE_NETWORK_ERROR => "network error",
+        EDE_DNSSEC_BOGUS,
+        EDE_SIGNATURE_EXPIRED,
+        EDE_SIGNATURE_NOT_YET_VALID,
+        EDE_DNSKEY_MISSING,
+        EDE_RRSIGS_MISSING,
+        => dnssec.edeText(code),
+        else => "",
+    };
+}
 
 pub const Error = error{
     NoForwarder,
@@ -53,6 +82,9 @@ pub const Policy = struct {
     recursion_allow_len: usize = 0,
     forwarder: ?Endpoint = null,
     cookies: CookiePolicy = .{},
+    /// RFC 9156 minimization mode for the future iterative path. A forwarder
+    /// always sends the full QNAME upstream; see the hook in `answer`.
+    qmin_mode: qname_minimize.Mode = .disabled,
 
     pub fn fromConfig(value: *const config.Config) !Policy {
         var policy = Policy{};
@@ -87,6 +119,11 @@ pub const CookiePolicy = struct {
     current_len: usize = 0,
     previous: [256]u8 = undefined,
     previous_len: usize = 0,
+    /// Opt-in strict mode: reject a full cookie already seen from the same
+    /// client within the bounded ring. Off by default so legitimate clients
+    /// that reuse cookies keep working.
+    replay_protection: bool = false,
+    replay_db: CookieReplayDb = .{},
 
     pub fn init(current: []const u8, previous: ?[]const u8) CookiePolicy {
         var policy = CookiePolicy{};
@@ -97,6 +134,15 @@ pub const CookiePolicy = struct {
             @memcpy(policy.previous[0..policy.previous_len], secret[0..policy.previous_len]);
         }
         return policy;
+    }
+
+    pub fn deinit(self: *CookiePolicy) void {
+        std.crypto.secureZero(u8, &self.current);
+        std.crypto.secureZero(u8, &self.previous);
+        self.current_len = 0;
+        self.previous_len = 0;
+        self.replay_protection = false;
+        self.replay_db.deinit();
     }
 
     pub fn enabled(self: *const CookiePolicy) bool {
@@ -143,6 +189,60 @@ pub const CookiePolicy = struct {
         };
         @memcpy(input[address_len .. address_len + 8], client_cookie);
         std.crypto.auth.hmac.sha2.HmacSha256.create(output, input[0 .. address_len + 8], secret);
+    }
+};
+
+/// Fixed-capacity ring of recently seen full cookies keyed by client address.
+/// Never grows: once full, each track overwrites the oldest entry.
+pub const CookieReplayDb = struct {
+    const Entry = struct {
+        ip_tag: u8 = 0,
+        ip: [16]u8 = [_]u8{0} ** 16,
+        cookie: [40]u8 = [_]u8{0} ** 40,
+        cookie_len: u8 = 0,
+    };
+
+    entries: [MAX_COOKIE_REPLAY_ENTRIES]Entry = [_]Entry{.{}} ** MAX_COOKIE_REPLAY_ENTRIES,
+    next: usize = 0,
+
+    pub fn contains(self: *const CookieReplayDb, client: *const std.Io.net.IpAddress, cookie: []const u8) bool {
+        const identity = clientIdentity(client);
+        for (&self.entries) |*entry| {
+            if (entry.ip_tag == 0) continue;
+            if (entry.ip_tag != identity.tag or entry.cookie_len != cookie.len) continue;
+            if (!std.mem.eql(u8, entry.ip[0..], identity.bytes[0..])) continue;
+            if (std.mem.eql(u8, entry.cookie[0..entry.cookie_len], cookie)) return true;
+        }
+        return false;
+    }
+
+    pub fn track(self: *CookieReplayDb, client: *const std.Io.net.IpAddress, cookie: []const u8) void {
+        if (cookie.len > self.entries[0].cookie.len) return;
+        const identity = clientIdentity(client);
+        const entry = &self.entries[self.next];
+        self.next = (self.next + 1) % self.entries.len;
+        entry.ip_tag = identity.tag;
+        entry.ip = identity.bytes;
+        @memcpy(entry.cookie[0..cookie.len], cookie);
+        entry.cookie_len = @intCast(cookie.len);
+    }
+
+    pub fn deinit(self: *CookieReplayDb) void {
+        std.crypto.secureZero(Entry, &self.entries);
+        self.next = 0;
+    }
+
+    const ClientIdentity = struct { tag: u8, bytes: [16]u8 };
+
+    fn clientIdentity(client: *const std.Io.net.IpAddress) ClientIdentity {
+        return switch (client.*) {
+            .ip4 => |ip4| blk: {
+                var bytes = [_]u8{0} ** 16;
+                @memcpy(bytes[0..4], &ip4.bytes);
+                break :blk .{ .tag = 4, .bytes = bytes };
+            },
+            .ip6 => |ip6| .{ .tag = 6, .bytes = ip6.bytes },
+        };
     }
 };
 
@@ -240,6 +340,8 @@ const Cache = struct {
     }
 
     fn lookup(self: *Cache, key: *const CacheKey, query: dns_message.Message, now: i64, output: []u8, allow_stale: bool) !?LookupResult {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
         var index: usize = 0;
         while (index < self.len) : (index += 1) {
             const entry = &self.entries[index];
@@ -254,8 +356,6 @@ const Cache = struct {
                 return null;
             }
 
-            var arena = std.heap.ArenaAllocator.init(self.allocator);
-            defer arena.deinit();
             var message = dns_message.Message.parse(arena.allocator(), entry.response.?) catch return null;
             ageMessage(&message, @intCast(elapsed), if (fresh) null else STALE_TTL);
             message.header.id = query.header.id;
@@ -331,6 +431,11 @@ pub const Resolver = struct {
     policy: Policy,
     upstream: ?std.Io.net.IpAddress,
     cache: Cache,
+    /// RFC 8198 aggressive-NSEC cache. Fed from upstream NSEC proofs on the
+    /// forward path and consulted before forwarding when the client set DO
+    /// without CD. No cryptographic validation is claimed for its denials:
+    /// they restate proofs a signed zone already published.
+    dnssec_aggressive: dnssec.AggressiveCache = .{},
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, policy: Policy) !Resolver {
         return .{
@@ -344,9 +449,10 @@ pub const Resolver = struct {
 
     pub fn deinit(self: *Resolver) void {
         self.cache.deinit();
+        self.policy.cookies.deinit();
     }
 
-    pub fn validateCookie(self: *const Resolver, query: dns_message.Message, client: *const std.Io.net.IpAddress) Error!?[24]u8 {
+    pub fn validateCookie(self: *Resolver, query: dns_message.Message, client: *const std.Io.net.IpAddress) Error!?[24]u8 {
         return switch (self.clientCookie(query, client)) {
             .disabled, .absent => null,
             .invalid => Error.BadCookie,
@@ -380,6 +486,25 @@ pub const Resolver = struct {
         }
 
         if (self.upstream == null) return Error.NoForwarder;
+        // RFC 8198 section 3: a cached NSEC proof answers denial queries
+        // without an upstream round trip. Only when the client asked for
+        // DNSSEC proofs (DO) and did not disable checking (CD).
+        if (wantsDnssecProofs(query)) {
+            if (query.question) |question| {
+                if (self.dnssec_aggressive.deny(question.name, question.qtype)) |denial| {
+                    const bytes = try self.aggressiveAnswer(query, denial, output);
+                    if (cookie == .valid) return self.addCachedCookie(output, query, cookie.valid);
+                    return bytes;
+                }
+            }
+        }
+        if (query.question) |question| {
+            // Forwarder QMIN hook (RFC 9156): minimization is an iterative-query
+            // policy, so a forwarder always sends the full QNAME to its recursive
+            // upstream. Keep the decision explicit for the future iterative path.
+            const upstream_name = qname_minimize.forwarderQueryName(&question.name, self.policy.qmin_mode);
+            std.debug.assert(upstream_name.eql(&question.name));
+        }
         var response = self.queryUdp(query_bytes, query) catch |err| switch (err) {
             Error.UpstreamFailure,
             Error.BadUpstreamResponse,
@@ -401,20 +526,81 @@ pub const Resolver = struct {
         response.question = query.question;
         stripOptions(&response);
         self.cache.put(key, &response, now) catch {};
+        self.harvestNsecProofs(response);
         if (query.edns) |edns| try appendOpt(&response, edns);
+        // DNSSEC presence signals (RFC 8914 6-10) ride along as informational
+        // EDE on the relayed response. They never change the RCODE here: this
+        // forwarder does not perform cryptographic validation.
+        if (wantsDnssecProofs(query)) {
+            if (dnssecPresenceEde(response, @intCast(@max(now, 0)))) |code| {
+                appendEde(&response, code) catch {};
+            }
+        }
         if (cookie == .valid) try appendCookie(&response, cookie.valid);
         var writer = dns_writer.Writer.init(output);
         response.encode(&writer) catch return Error.ResponseTooLarge;
         return writer.written();
     }
 
+    /// SERVFAIL answer carrying a DNSSEC-bogus EDE code for callers that DID
+    /// cryptographically validate (or applied policy) and found the data
+    /// bogus. The forwarder never calls this on its own presence signals.
+    pub fn buildDnssecBogusResponse(query: dns_message.Message, ede_code: u16) !dns_message.Message {
+        return errorResponse(query, .servfail, ede_code);
+    }
+
+    fn harvestNsecProofs(self: *Resolver, response: dns_message.Message) void {
+        harvestSectionNsec(&self.dnssec_aggressive, response.answers.slice());
+        harvestSectionNsec(&self.dnssec_aggressive, response.authorities.slice());
+    }
+
+    fn aggressiveAnswer(self: *const Resolver, query: dns_message.Message, denial: dnssec.Denial, output: []u8) ![]const u8 {
+        _ = self;
+        const q = query.question orelse return Error.BadUpstreamResponse;
+        var message = dns_message.Message{
+            .allocator = query.allocator,
+            .header = .{
+                .id = query.header.id,
+                .qr = true,
+                .recursion_desired = query.header.recursion_desired,
+                .recursion_available = true,
+                .rcode = switch (denial) {
+                    .nxdomain => .nxdomain,
+                    .nodata => .no_error,
+                },
+                .question_count = 1,
+            },
+            .question = q,
+            .answers = try dns_message.RecordSection.init(query.allocator, 0),
+            .authorities = try dns_message.RecordSection.init(query.allocator, 0),
+            .additionals = try dns_message.RecordSection.init(query.allocator, 0),
+            .edns = if (query.edns) |edns| .{
+                .udp_payload_size = @max(dns_message.CLASSIC_UDP_PAYLOAD_SIZE, @min(edns.udp_payload_size, dns_message.DEFAULT_EDNS_UDP_PAYLOAD_SIZE)),
+                .extended_rcode = 0,
+                .version = dns_message.EDNS_VERSION,
+                .dnssec_ok = edns.dnssec_ok,
+            } else null,
+        };
+        errdefer message.deinit();
+        if (query.edns) |edns| try appendOpt(&message, edns);
+        var writer = dns_writer.Writer.init(output);
+        message.encode(&writer) catch return Error.ResponseTooLarge;
+        return writer.written();
+    }
+
     const CookieDecision = union(enum) { disabled, absent, valid: [24]u8, invalid };
 
-    fn clientCookie(self: *const Resolver, query: dns_message.Message, client: *const std.Io.net.IpAddress) CookieDecision {
+    fn clientCookie(self: *Resolver, query: dns_message.Message, client: *const std.Io.net.IpAddress) CookieDecision {
         if (!self.policy.cookies.enabled()) return .disabled;
         const option = findOption(query, COOKIE_OPTION_CODE) orelse return .absent;
         if (!self.policy.cookies.validLength(option.len)) return .invalid;
         if (!self.policy.cookies.validates(client, option)) return .invalid;
+        // Challenges carry no server cookie and clients legitimately retry
+        // them, so only full cookies enter the bounded replay window.
+        if (option.len != 8 and self.policy.cookies.replay_protection) {
+            if (self.policy.cookies.replay_db.contains(client, option)) return .invalid;
+            self.policy.cookies.replay_db.track(client, option);
+        }
         var server_cookie: [24]u8 = undefined;
         self.policy.cookies.makeServerCookie(client, option[0..8], &server_cookie);
         return .{ .valid = server_cookie };
@@ -444,6 +630,15 @@ pub const Resolver = struct {
         const upstream = self.upstream orelse return Error.NoForwarder;
         var query_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
         if (query_bytes.len < 2 or query_bytes.len > query_buffer.len) return Error.UpstreamFailure;
+        // One socket for the whole exchange: retries reuse it and late
+        // duplicates from an earlier attempt are rejected by the per-attempt
+        // randomized query ID check below.
+        var local = switch (upstream) {
+            .ip4 => std.Io.net.IpAddress{ .ip4 = .unspecified(0) },
+            .ip6 => std.Io.net.IpAddress{ .ip6 = .unspecified(0) },
+        };
+        var socket = std.Io.net.IpAddress.bind(&local, self.io, .{ .mode = .dgram, .protocol = .udp }) catch return Error.UpstreamFailure;
+        defer socket.close(self.io);
         var response_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
         var attempt: usize = 0;
         while (attempt < UDP_ATTEMPTS) : (attempt += 1) {
@@ -453,27 +648,15 @@ pub const Resolver = struct {
             @memcpy(query_buffer[0..2], &randomized_id);
             const expected_id = std.mem.readInt(u16, &randomized_id, .big);
 
-            var local = switch (upstream) {
-                .ip4 => std.Io.net.IpAddress{ .ip4 = .unspecified(0) },
-                .ip6 => std.Io.net.IpAddress{ .ip6 = .unspecified(0) },
-            };
-            var socket = std.Io.net.IpAddress.bind(&local, self.io, .{ .mode = .dgram, .protocol = .udp }) catch continue;
-            defer socket.close(self.io);
             socket.send(self.io, &upstream, query_buffer[0..upstream_query.len]) catch continue;
             while (true) {
-                const incoming = socket.receiveTimeout(self.io, &response_buffer, UDP_TIMEOUT) catch |err| switch (err) {
-                    error.Timeout => break,
-                    else => break,
-                };
+                const incoming = socket.receiveTimeout(self.io, &response_buffer, UDP_TIMEOUT) catch break;
                 if (!incoming.from.eql(&upstream)) continue;
-                var arena = std.heap.ArenaAllocator.init(self.allocator);
-                defer arena.deinit();
-                const response = dns_message.Message.parse(arena.allocator(), incoming.data) catch continue;
-                if (!validUpstreamResponse(response, query, expected_id)) continue;
-                if (response.header.truncated) {
-                    return self.queryTcpAfterTruncation(query_buffer[0..upstream_query.len], query, expected_id, UPSTREAM_TCP_DEADLINES_SUPPORTED);
+                switch (classifyUpstreamPacket(self.allocator, query, expected_id, incoming.data)) {
+                    .ignore => continue,
+                    .truncated => return self.queryTcpAfterTruncation(query_buffer[0..upstream_query.len], query, expected_id, UPSTREAM_TCP_DEADLINES_SUPPORTED),
+                    .ready => |message| return message,
                 }
-                return cloneMessage(self.allocator, response);
             }
         }
         return Error.UpstreamFailure;
@@ -521,6 +704,23 @@ pub const Resolver = struct {
         return cloneMessage(self.allocator, response);
     }
 };
+
+const UpstreamPacket = union(enum) {
+    ignore,
+    truncated,
+    ready: dns_message.Message,
+};
+
+/// Parses and validates one UDP datagram with a scratch arena owned by this
+/// call, so the receive loop holds no deferred cleanups across iterations.
+fn classifyUpstreamPacket(allocator: std.mem.Allocator, query: dns_message.Message, expected_id: u16, data: []const u8) UpstreamPacket {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const response = dns_message.Message.parse(arena.allocator(), data) catch return .ignore;
+    if (!validUpstreamResponse(response, query, expected_id)) return .ignore;
+    if (response.header.truncated) return .truncated;
+    return .{ .ready = cloneMessage(allocator, response) catch return .ignore };
+}
 
 fn buildUpstreamQuery(original: []const u8, query: dns_message.Message, output: []u8) ![]const u8 {
     if (query.edns == null) {
@@ -661,6 +861,54 @@ test "upstream TCP connector rejects an unbounded timeout" {
     }));
 }
 
+fn wantsDnssecProofs(query: dns_message.Message) bool {
+    if (query.header.checking_disabled) return false;
+    const edns = query.edns orelse return false;
+    return edns.dnssec_ok;
+}
+
+fn harvestSectionNsec(cache: *dnssec.AggressiveCache, records: []const dns_record.ResourceRecord) void {
+    for (records) |*record| {
+        if (!record.rrtype.eql(.NSEC)) continue;
+        const raw = switch (record.rdata) {
+            .Unknown => |*unknown| unknown.bytes(),
+            else => continue,
+        };
+        const next = dns_name.Name.parse(raw, 0) catch continue;
+        cache.insertNsec(record.owner, next.name, raw[next.next_offset..]);
+    }
+}
+
+/// Presence-only DNSSEC classifier over a response already received. Reports
+/// freshness failures (EDE 7/8) and missing-signature cases (EDE 10) from
+/// opaque RRSIG/NSEC bytes. Unsigned data yields null (insecure, not bogus).
+/// This is NOT cryptographic validation: a null result must never set AD.
+fn dnssecPresenceEde(message: dns_message.Message, now: u32) ?u16 {
+    var saw_rrsig = false;
+    var saw_signed_signal = false;
+    const sections = [_][]const dns_record.ResourceRecord{
+        message.answers.slice(),
+        message.authorities.slice(),
+    };
+    for (sections) |records| {
+        for (records) |*record| {
+            if (record.rrtype.eql(.RRSIG)) {
+                const raw = switch (record.rdata) {
+                    .Unknown => |*unknown| unknown.bytes(),
+                    else => continue,
+                };
+                saw_rrsig = true;
+                const status = dnssec.rrsigTimeStatus(raw, now) catch continue;
+                if (dnssec.rrsigTimeEde(status)) |code| return code;
+            } else if (record.rrtype.eql(.DNSKEY) or record.rrtype.eql(.NSEC) or record.rrtype.eql(.NSEC3)) {
+                saw_signed_signal = true;
+            }
+        }
+    }
+    if (!saw_rrsig and saw_signed_signal) return EDE_RRSIGS_MISSING;
+    return null;
+}
+
 fn findOption(message: dns_message.Message, code: u16) ?[]const u8 {
     for (message.additionals.items[0..message.additionals.len]) |*record| {
         if (!record.rrtype.eql(.OPT)) continue;
@@ -704,6 +952,7 @@ fn errorResponse(request: dns_message.Message, rcode: dns_header.Rcode, ede_code
             .qr = true,
             .recursion_desired = request.header.recursion_desired,
             .recursion_available = true,
+            .checking_disabled = request.header.checking_disabled,
             .rcode = rcode,
             .question_count = 1,
         },
@@ -736,8 +985,15 @@ pub fn buildNetworkErrorResponse(request: dns_message.Message) !dns_message.Mess
 
 fn appendEde(message: *dns_message.Message, code: u16) !void {
     if (message.edns == null) return;
-    const ede = [_]u8{ @intCast(code >> 8), @intCast(code & 0xff) };
-    try appendOption(message, EDE_OPTION_CODE, &ede);
+    // RFC 8914 OPTION-DATA: two-octet INFO-CODE followed by EXTRA-TEXT.
+    // Sized for the longest emitted purpose text ("signature not yet valid").
+    const text = edeText(code);
+    var ede: [2 + 32]u8 = undefined;
+    std.debug.assert(text.len <= 32);
+    ede[0] = @intCast(code >> 8);
+    ede[1] = @intCast(code & 0xff);
+    @memcpy(ede[2..][0..text.len], text);
+    try appendOption(message, EDE_OPTION_CODE, ede[0 .. 2 + text.len]);
 }
 
 pub fn appendCookie(message: *dns_message.Message, cookie: [24]u8) !void {
@@ -816,7 +1072,7 @@ test "cache ages positive and negative responses and emits stale EDE" {
     const stale_message = try dns_message.Message.parse(arena.allocator(), stale.bytes);
     try std.testing.expect(stale.stale);
     try std.testing.expectEqual(@as(u32, STALE_TTL), stale_message.answers.items[0].ttl);
-    try std.testing.expectEqualSlices(u8, &.{ 0, EDE_STALE_ANSWER }, findOption(stale_message, EDE_OPTION_CODE).?);
+    try expectEde(stale_message, EDE_STALE_ANSWER, "stale answer");
     try std.testing.expect((try cache.lookup(&key, query, 1000 + 60 + STALE_WINDOW_SECONDS + 1, &output, true)) == null);
 
     var negative = try makeNegativeResponse(arena.allocator(), 60, 30);
@@ -829,7 +1085,7 @@ test "cache ages positive and negative responses and emits stale EDE" {
     const negative_message = try dns_message.Message.parse(arena.allocator(), negative_stale.bytes);
     try std.testing.expect(negative_stale.stale);
     try std.testing.expectEqual(@as(u32, STALE_TTL), negative_message.authorities.items[0].ttl);
-    try std.testing.expectEqualSlices(u8, &.{ 0, EDE_STALE_NXDOMAIN }, findOption(negative_message, EDE_OPTION_CODE).?);
+    try expectEde(negative_message, EDE_STALE_NXDOMAIN, "stale nxdomain");
 
     var nodata = try makeNegativeResponse(arena.allocator(), 60, 30);
     defer nodata.deinit();
@@ -837,7 +1093,7 @@ test "cache ages positive and negative responses and emits stale EDE" {
     try cache.put(negative_key, &nodata, 3000);
     const nodata_stale = (try cache.lookup(&negative_key, negative_query, 3100, &output, true)).?;
     const nodata_message = try dns_message.Message.parse(arena.allocator(), nodata_stale.bytes);
-    try std.testing.expectEqualSlices(u8, &.{ 0, EDE_STALE_ANSWER }, findOption(nodata_message, EDE_OPTION_CODE).?);
+    try expectEde(nodata_message, EDE_STALE_ANSWER, "stale answer");
 }
 
 test "cache excludes failures truncation and upstream option data" {
@@ -917,7 +1173,7 @@ test "network failures add EDE only when the query has EDNS" {
     var response = try buildNetworkErrorResponse(edns_query);
     defer response.deinit();
     try std.testing.expectEqual(@as(@TypeOf(response.header.rcode), .servfail), response.header.rcode);
-    try std.testing.expectEqualSlices(u8, &.{ 0, EDE_NETWORK_ERROR }, findOption(response, EDE_OPTION_CODE).?);
+    try expectEde(response, EDE_NETWORK_ERROR, "network error");
 
     var classic_query = try makeTestQuery(arena.allocator(), 0x2501, "example.com.", false);
     defer classic_query.deinit();
@@ -1022,10 +1278,10 @@ test "cache separates CD and EDNS DO variants" {
     var cd = try makeTestQuery(arena.allocator(), 0x2701, "example.com.", true);
     defer cd.deinit();
     cd.header.checking_disabled = true;
-    var dnssec = try makeTestQuery(arena.allocator(), 0x2702, "example.com.", true);
-    defer dnssec.deinit();
-    dnssec.edns.?.dnssec_ok = true;
-    dnssec.additionals.items[0].ttl |= 0x8000;
+    var dnssec_query = try makeTestQuery(arena.allocator(), 0x2702, "example.com.", true);
+    defer dnssec_query.deinit();
+    dnssec_query.edns.?.dnssec_ok = true;
+    dnssec_query.additionals.items[0].ttl |= 0x8000;
 
     var response = try makePositiveResponse(arena.allocator(), 60);
     defer response.deinit();
@@ -1036,8 +1292,306 @@ test "cache separates CD and EDNS DO variants" {
     var output: [2048]u8 = undefined;
     const cd_key = try CacheKey.fromQuestion(cd);
     try std.testing.expect((try cache.lookup(&cd_key, cd, 4001, &output, false)) == null);
-    const dnssec_key = try CacheKey.fromQuestion(dnssec);
-    try std.testing.expect((try cache.lookup(&dnssec_key, dnssec, 4001, &output, false)) == null);
+    const dnssec_key = try CacheKey.fromQuestion(dnssec_query);
+    try std.testing.expect((try cache.lookup(&dnssec_key, dnssec_query, 4001, &output, false)) == null);
+}
+
+fn expectEde(message: dns_message.Message, code: u16, text: []const u8) !void {
+    const option = findOption(message, EDE_OPTION_CODE).?;
+    try std.testing.expectEqual(@as(usize, 2 + text.len), option.len);
+    try std.testing.expectEqual(code, std.mem.readInt(u16, option[0..2], .big));
+    try std.testing.expectEqualSlices(u8, text, option[2..]);
+}
+
+test "ede purpose text covers emitted codes" {
+    try std.testing.expectEqualStrings("stale answer", edeText(EDE_STALE_ANSWER));
+    try std.testing.expectEqualStrings("stale nxdomain", edeText(EDE_STALE_NXDOMAIN));
+    try std.testing.expectEqualStrings("network error", edeText(EDE_NETWORK_ERROR));
+    try std.testing.expectEqualStrings("dnssec bogus", edeText(EDE_DNSSEC_BOGUS));
+    try std.testing.expectEqualStrings("signature expired", edeText(EDE_SIGNATURE_EXPIRED));
+    try std.testing.expectEqualStrings("signature not yet valid", edeText(EDE_SIGNATURE_NOT_YET_VALID));
+    try std.testing.expectEqualStrings("dnskey missing", edeText(EDE_DNSKEY_MISSING));
+    try std.testing.expectEqualStrings("rrsigs missing", edeText(EDE_RRSIGS_MISSING));
+    try std.testing.expectEqualStrings("", edeText(0));
+}
+
+fn makeTestRrsig(now_expired: bool) dns_rdata.Unknown {
+    // Covers A(1), alg 8; expiration/inception chosen relative to now=1_500_000_000.
+    const expiration: u32 = if (now_expired) 1_400_000_000 else 2_000_000_000;
+    var raw = dns_rdata.Unknown{};
+    raw.data[0] = 0x00;
+    raw.data[1] = 0x01;
+    raw.data[2] = 0x08;
+    raw.data[3] = 0x03;
+    std.mem.writeInt(u32, raw.data[4..8], 3600, .big);
+    std.mem.writeInt(u32, raw.data[8..12], expiration, .big);
+    std.mem.writeInt(u32, raw.data[12..16], 1_000_000_000, .big);
+    std.mem.writeInt(u16, raw.data[16..18], 1234, .big);
+    @memcpy(raw.data[18..27], &[_]u8{ 0x07, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0x00 });
+    raw.data[27] = 0xAB;
+    raw.len = 28;
+    return raw;
+}
+
+fn makeTestNsec() dns_rdata.Unknown {
+    // next = zzz.example., window-0 bitmap with A only.
+    var raw = dns_rdata.Unknown{};
+    const next = [_]u8{ 0x03, 'z', 'z', 'z', 0x07, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0x00 };
+    @memcpy(raw.data[0..next.len], &next);
+    raw.data[next.len] = 0x00;
+    raw.data[next.len + 1] = 0x01;
+    raw.data[next.len + 2] = 0x40;
+    raw.len = @intCast(next.len + 3);
+    return raw;
+}
+
+test "dnssec presence classifier reports freshness and missing signatures" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var fresh = try makePositiveResponse(arena.allocator(), 60);
+    defer fresh.deinit();
+    try fresh.answers.append(.{
+        .owner = try dns_name.Name.fromText("example.com."),
+        .rrtype = .RRSIG,
+        .class = .IN,
+        .ttl = 60,
+        .rdata = .{ .Unknown = makeTestRrsig(false) },
+    });
+    try std.testing.expect(dnssecPresenceEde(fresh, 1_500_000_000) == null);
+    try std.testing.expectEqual(@as(?u16, EDE_SIGNATURE_EXPIRED), dnssecPresenceEde(fresh, 2_000_000_001));
+
+    var premature = try makePositiveResponse(arena.allocator(), 60);
+    defer premature.deinit();
+    try premature.answers.append(.{
+        .owner = try dns_name.Name.fromText("example.com."),
+        .rrtype = .RRSIG,
+        .class = .IN,
+        .ttl = 60,
+        .rdata = .{ .Unknown = makeTestRrsig(false) },
+    });
+    try std.testing.expectEqual(@as(?u16, EDE_SIGNATURE_NOT_YET_VALID), dnssecPresenceEde(premature, 999_999_999));
+
+    var unsigned = try makePositiveResponse(arena.allocator(), 60);
+    defer unsigned.deinit();
+    try std.testing.expect(dnssecPresenceEde(unsigned, 1_500_000_000) == null);
+
+    var no_sigs = try makePositiveResponse(arena.allocator(), 60);
+    defer no_sigs.deinit();
+    try no_sigs.authorities.append(.{
+        .owner = try dns_name.Name.fromText("example.com."),
+        .rrtype = .NSEC,
+        .class = .IN,
+        .ttl = 60,
+        .rdata = .{ .Unknown = makeTestNsec() },
+    });
+    try std.testing.expectEqual(@as(?u16, EDE_RRSIGS_MISSING), dnssecPresenceEde(no_sigs, 1_500_000_000));
+}
+
+test "dnssec bogus responses carry SERVFAIL with the EDE code and text" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2703, "example.com.", true);
+    defer query.deinit();
+
+    var bogus = try Resolver.buildDnssecBogusResponse(query, EDE_DNSSEC_BOGUS);
+    defer bogus.deinit();
+    try std.testing.expectEqual(dns_header.Rcode.servfail, bogus.header.rcode);
+    try expectEde(bogus, EDE_DNSSEC_BOGUS, "dnssec bogus");
+
+    var expired = try Resolver.buildDnssecBogusResponse(query, EDE_SIGNATURE_EXPIRED);
+    defer expired.deinit();
+    try expectEde(expired, EDE_SIGNATURE_EXPIRED, "signature expired");
+}
+
+test "aggressive NSEC answers denials without upstream and honors CD" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var resolver = try Resolver.init(std.testing.allocator, io, .{});
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // Seed the aggressive cache as harvestSectionNsec would from an NSEC proof.
+    resolver.dnssec_aggressive.insertNsec(
+        try dns_name.Name.fromText("www.example."),
+        try dns_name.Name.fromText("zzz.example."),
+        &[_]u8{ 0x00, 0x01, 0x40 },
+    );
+
+    var query = try makeTestQuery(arena.allocator(), 0x2704, "x.example.", true);
+    defer query.deinit();
+    query.edns.?.dnssec_ok = true;
+    query.additionals.items[0].ttl |= 0x8000;
+    try std.testing.expect(wantsDnssecProofs(query));
+
+    var output: [2048]u8 = undefined;
+    const denial = resolver.dnssec_aggressive.deny(
+        (query.question orelse return error.TestUnexpectedResult).name,
+        (query.question orelse return error.TestUnexpectedResult).qtype,
+    );
+    try std.testing.expectEqual(dnssec.Denial.nxdomain, denial.?);
+    const bytes = try resolver.aggressiveAnswer(query, denial.?, &output);
+    const parsed = try dns_message.Message.parse(arena.allocator(), bytes);
+    try std.testing.expectEqual(dns_header.Rcode.nxdomain, parsed.header.rcode);
+    try std.testing.expect(parsed.edns.?.dnssec_ok);
+
+    var cd_query = try makeTestQuery(arena.allocator(), 0x2705, "x.example.", true);
+    defer cd_query.deinit();
+    cd_query.header.checking_disabled = true;
+    cd_query.edns.?.dnssec_ok = true;
+    try std.testing.expect(!wantsDnssecProofs(cd_query));
+}
+
+test "error responses preserve query CD and DO policy" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2502, "example.com.", true);
+    defer query.deinit();
+    query.header.checking_disabled = true;
+    query.edns.?.dnssec_ok = true;
+    query.additionals.items[0].ttl |= 0x8000;
+
+    var response = try buildNetworkErrorResponse(query);
+    defer response.deinit();
+    try std.testing.expect(response.header.checking_disabled);
+    try std.testing.expect(response.edns.?.dnssec_ok);
+    try expectEde(response, EDE_NETWORK_ERROR, "network error");
+
+    var classic = try makeTestQuery(arena.allocator(), 0x2503, "example.com.", true);
+    defer classic.deinit();
+    var classic_response = try buildNetworkErrorResponse(classic);
+    defer classic_response.deinit();
+    try std.testing.expect(!classic_response.header.checking_disabled);
+    try std.testing.expect(!classic_response.edns.?.dnssec_ok);
+}
+
+test "cookie secrets are zeroized on deinit" {
+    var policy = CookiePolicy.init("current-secret", "previous-secret");
+    try std.testing.expect(policy.current_len != 0);
+    try std.testing.expect(policy.previous_len != 0);
+    policy.deinit();
+    try std.testing.expectEqual(@as(usize, 0), policy.current_len);
+    try std.testing.expectEqual(@as(usize, 0), policy.previous_len);
+    for (policy.current) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+    for (policy.previous) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var resolver = try Resolver.init(std.testing.allocator, io, .{ .cookies = CookiePolicy.init("current-secret", null) });
+    resolver.deinit();
+    try std.testing.expectEqual(@as(usize, 0), resolver.policy.cookies.current_len);
+    for (resolver.policy.cookies.current) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+}
+
+test "cookie replay window is bounded" {
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 5353);
+    const other = try std.Io.net.IpAddress.parse("127.0.0.2", 5353);
+    var db = CookieReplayDb{};
+    var cookie: [24]u8 = undefined;
+    @memset(&cookie, 0xab);
+    try std.testing.expect(!db.contains(&client, &cookie));
+    db.track(&client, &cookie);
+    try std.testing.expect(db.contains(&client, &cookie));
+    try std.testing.expect(!db.contains(&other, &cookie));
+
+    var distinct: [MAX_COOKIE_REPLAY_ENTRIES + 1][24]u8 = undefined;
+    var index: usize = 0;
+    while (index < distinct.len) : (index += 1) {
+        @memset(&distinct[index], 0);
+        distinct[index][23] = @intCast(index);
+        db.track(&client, &distinct[index]);
+    }
+    try std.testing.expect(!db.contains(&client, &distinct[0]));
+    index = 1;
+    while (index < distinct.len) : (index += 1) {
+        try std.testing.expect(db.contains(&client, &distinct[index]));
+    }
+    db.deinit();
+    try std.testing.expect(!db.contains(&client, &distinct[1]));
+    try std.testing.expectEqual(@as(usize, 0), db.next);
+}
+
+test "cookie replay enforcement rejects a reused full cookie when enabled" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 5354);
+    const other = try std.Io.net.IpAddress.parse("127.0.0.2", 5354);
+    const client_cookie = [_]u8{ 9, 8, 7, 6, 5, 4, 3, 2 };
+
+    var cookie_policy = CookiePolicy.init("current-secret", null);
+    var server_cookie: [24]u8 = undefined;
+    cookie_policy.makeServerCookie(&client, &client_cookie, &server_cookie);
+    cookie_policy.replay_protection = true;
+
+    var resolver = try Resolver.init(std.testing.allocator, io, .{ .cookies = cookie_policy });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2604, "example.com.", true);
+    defer query.deinit();
+    try setCookieOption(&query, &server_cookie);
+
+    _ = try resolver.validateCookie(query, &client);
+    try std.testing.expectError(Error.BadCookie, resolver.validateCookie(query, &client));
+    // Cookies are bound to the client address, so another address fails
+    // validation without touching the replay window.
+    try std.testing.expectError(Error.BadCookie, resolver.validateCookie(query, &other));
+    try setCookieOption(&query, &client_cookie);
+    _ = try resolver.validateCookie(query, &client);
+    _ = try resolver.validateCookie(query, &client);
+}
+
+test "upstream packet classification isolates validation and truncation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2606, "example.com.", false);
+    defer query.deinit();
+
+    try std.testing.expect(classifyUpstreamPacket(arena.allocator(), query, 0x2606, &.{ 1, 2, 3 }) == .ignore);
+
+    var truncated = try makePositiveResponse(arena.allocator(), 60);
+    defer truncated.deinit();
+    truncated.header.id = query.header.id;
+    truncated.header.truncated = true;
+    var wire: [2048]u8 = undefined;
+    const truncated_bytes = try encodeTestMessage(truncated, &wire);
+    try std.testing.expect(classifyUpstreamPacket(arena.allocator(), query, 0x9999, truncated_bytes) == .ignore);
+    try std.testing.expect(classifyUpstreamPacket(arena.allocator(), query, query.header.id, truncated_bytes) == .truncated);
+
+    var good = try makePositiveResponse(arena.allocator(), 60);
+    defer good.deinit();
+    good.header.id = query.header.id;
+    const good_bytes = try encodeTestMessage(good, &wire);
+    var ready = classifyUpstreamPacket(std.testing.allocator, query, query.header.id, good_bytes);
+    switch (ready) {
+        .ready => |*message| {
+            defer message.deinit();
+            try std.testing.expectEqual(query.header.id, message.header.id);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "cookie reuse stays accepted when replay protection is off" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 5355);
+    const client_cookie = [_]u8{ 9, 8, 7, 6, 5, 4, 3, 2 };
+
+    var cookie_policy = CookiePolicy.init("current-secret", null);
+    try std.testing.expect(!cookie_policy.replay_protection);
+    var server_cookie: [24]u8 = undefined;
+    cookie_policy.makeServerCookie(&client, &client_cookie, &server_cookie);
+
+    var resolver = try Resolver.init(std.testing.allocator, io, .{ .cookies = cookie_policy });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2605, "example.com.", true);
+    defer query.deinit();
+    try setCookieOption(&query, &server_cookie);
+
+    _ = try resolver.validateCookie(query, &client);
+    _ = try resolver.validateCookie(query, &client);
 }
 
 fn makeTestQuery(allocator: std.mem.Allocator, id: u16, name_text: []const u8, with_edns: bool) !dns_message.Message {
