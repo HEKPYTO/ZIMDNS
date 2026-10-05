@@ -390,7 +390,7 @@ test "DoH GET serves a base64url query with DNS media type" {
     defer server_stream.close(io);
 
     var query_buffer: [512]u8 = undefined;
-    const query = try @import("../cli/query.zig").buildQueryPacket(&query_buffer, 0xabcd, "dns.home.arpa.", .A);
+    const query = try @import("../cli/query.zig").buildQueryPacket(&query_buffer, 0xabcd, "dns.home.arpa.", .A, false);
     var encoded: [1024]u8 = undefined;
     const encoded_query = std.base64.url_safe_no_pad.Encoder.encode(&encoded, query);
 
@@ -440,7 +440,7 @@ test "DoH POST serves an application/dns-message body" {
     defer server_stream.close(io);
 
     var query_buffer: [512]u8 = undefined;
-    const query = try @import("../cli/query.zig").buildQueryPacket(&query_buffer, 0xdcba, "dns.home.arpa.", .A);
+    const query = try @import("../cli/query.zig").buildQueryPacket(&query_buffer, 0xdcba, "dns.home.arpa.", .A, false);
     var request_buffer: [2048]u8 = undefined;
     var request_stream = std.Io.Writer.fixed(&request_buffer);
     try request_stream.print("POST /dns-query HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/dns-message\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{query.len});
@@ -517,7 +517,7 @@ test "DoH keep-alive serves pipelined exchanges with bounded per-exchange state"
     var client_writer = client_stream.writer(io, &client_write_buffer);
     for ([2]u16{ 0x1111, 0x2222 }) |id| {
         var query_buffer: [512]u8 = undefined;
-        const query = try @import("../cli/query.zig").buildQueryPacket(&query_buffer, id, "dns.home.arpa.", .A);
+        const query = try @import("../cli/query.zig").buildQueryPacket(&query_buffer, id, "dns.home.arpa.", .A, false);
         var encoded: [1024]u8 = undefined;
         const encoded_query = std.base64.url_safe_no_pad.Encoder.encode(&encoded, query);
         try client_writer.interface.print("GET /dns-query?dns={s} HTTP/1.1\r\nHost: localhost\r\n\r\n", .{encoded_query});

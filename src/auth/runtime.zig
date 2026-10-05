@@ -63,6 +63,10 @@ pub const Runtime = struct {
     /// (RFC 7793 section 2, RFC 6598 section 3). `local-zones off` is the
     /// RFC 6303 section 3 mechanism to disable it.
     local_zones: bool = true,
+    /// What an authoritative answer may carry back in its OPT record, from the
+    /// `nsid` and `zoneversion` directives. `nsid` is heap-owned so it outlives
+    /// the config text it was decoded from.
+    edns: response.EdnsPolicy = .{},
     keyring: keyring_mod.Keyring = .{},
     tsig_now: ?u64 = null,
     /// Volatile per-zone RFC 1995 serial transitions feeding IXFR delta
@@ -166,6 +170,8 @@ pub const Runtime = struct {
         self.transfer_delta_logs.deinit(self.allocator);
         self.transfer_delta_logs = .empty;
         self.blocklist = .{};
+        if (self.edns.nsid) |nsid| self.allocator.free(nsid);
+        self.edns = .{};
     }
 
     pub fn setTsigNow(self: *Runtime, now: u64) void {
@@ -182,13 +188,6 @@ pub const Runtime = struct {
             return &self.transfer_delta_logs.items[index];
         }
         return null;
-    }
-
-    fn zoneSerial(zone: zone_index.Zone) ?u32 {
-        const soa_record = zone.soa orelse return null;
-        const rdata = zone_parser.parseRData(.SOA, soa_record.rdataText()) catch return null;
-        if (rdata != .SOA) return null;
-        return rdata.SOA.serial;
     }
 
     fn lock(self: *const Runtime) void {
@@ -223,6 +222,9 @@ pub const Runtime = struct {
             else => {
                 const query = dns_message.Message.parseQuery(allocator, packet) catch |parse_err| switch (parse_err) {
                     error.MalformedEcsOption => return .{ .failure = .{ .code = .formerr } },
+                    // RFC 9619 section 4: OPCODE 0 with QDCOUNT > 1 is
+                    // incorrectly formatted, so the answer is FORMERR.
+                    error.TooManyQuestions => return .{ .failure = .{ .code = .formerr } },
                     error.OutOfMemory => return parse_err,
                     else => {
                         if (parseTransferFallback(allocator, packet)) |fallback| {
@@ -237,6 +239,9 @@ pub const Runtime = struct {
         const final_record = final orelse {
             const query = dns_message.Message.parseQuery(allocator, packet) catch |err| switch (err) {
                 error.MalformedEcsOption => return .{ .failure = .{ .code = .formerr } },
+                // RFC 9619 section 4: OPCODE 0 with QDCOUNT > 1 is
+                // incorrectly formatted, so the answer is FORMERR.
+                error.TooManyQuestions => return .{ .failure = .{ .code = .formerr } },
                 error.OutOfMemory => return err,
                 else => {
                     if (parseTransferFallback(allocator, packet)) |fallback| {
@@ -620,7 +625,7 @@ pub const Runtime = struct {
         const query = incoming.query;
         const q = query.question orelse return Error.BadQuery;
         const kind = transfer.classify(q.qtype, q.qclass);
-        const serial = zoneSerial(zone.*) orelse return Error.EncodeFailed;
+        const serial = zone.soaSerial() orelse return Error.EncodeFailed;
 
         var single_slot: ?dns_message.Message = null;
         defer if (single_slot) |*message| message.deinit();
@@ -829,6 +834,12 @@ pub const Runtime = struct {
     }
 
     fn buildMessage(self: *const Runtime, query: dns_message.Message) !dns_message.Message {
+        // RFC 2136 section 3 answers an unimplemented UPDATE with NOTIMP,
+        // and section 3.4.1.3 lets it carry no zone section, so the
+        // refusal is built before a question is required.
+        if (query.header.opcode != .query and query.header.opcode != .notify) {
+            return response.buildNotImplementedResponse(query);
+        }
         const q = query.question orelse return response.Error.MissingQuestion;
         if (query.header.opcode == .notify) {
             if (!transfer.isNotifyMessage(&query)) return response.buildFormerrResponse(query);
@@ -839,7 +850,6 @@ pub const Runtime = struct {
             _ = zone;
             return transfer.buildNotifyResponse(query.allocator, &query) catch return Error.EncodeFailed;
         }
-        if (query.header.opcode != .query) return response.buildNotImplementedResponse(query);
         var qname_text_buffer: [256]u8 = undefined;
         const qname_text = q.name.toText(&qname_text_buffer) catch return response.Error.BadQName;
         if (self.blocklist.blocks(qname_text)) return response.buildRefusedResponse(query);
@@ -848,7 +858,7 @@ pub const Runtime = struct {
         // partial zone can never leak through one datagram or frame.
         if (transfer.classify(q.qtype, q.qclass) != .none) return response.buildRefusedResponse(query);
         const selected = self.selectZone(qname_text) orelse return response.buildRefusedResponse(query);
-        return response.buildResponse(query, selected);
+        return response.buildResponseWithEdns(query, selected, self.edns);
     }
 
     fn appendZoneText(self: *Runtime, text: []const u8) !void {
@@ -1190,6 +1200,65 @@ test "runtime returns bare FORMERR for malformed ECS with a valid question" {
     try std.testing.expect(parsed.edns == null);
 }
 
+test "RFC 9619: an OPCODE 0 query with QDCOUNT 2 is answered FORMERR" {
+    var runtime = try Runtime.fromZoneText(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
+        \\
+    );
+    defer runtime.deinit();
+
+    // Section 4: "A DNS message with OPCODE = 0 and QDCOUNT > 1 MUST be
+    // treated as an incorrectly formatted message. The value of the RCODE
+    // parameter in the response message MUST be set to 1 (FORMERR)."
+    const two_question_query = [_]u8{
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        3,    'd',  'n',  's',  4,    'h',  'o',  'm',  'e',  4,    'a',  'r',
+        'p',  'a',  0,    0x00, 0x01, 0x00, 0x01, 5,    'a',  'l',  'i',  'a',
+        's',  4,    'h',  'o',  'm',  'e',  4,    'a',  'r',  'p',  'a',  0,
+        0x00, 0x01, 0x00, 0x01,
+    };
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 53004);
+    var output: [512]u8 = undefined;
+    const response_bytes = try runtime.answerFrom(&two_question_query, &output, &client);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expect(parsed.header.qr);
+    try std.testing.expectEqual(@as(@TypeOf(parsed.header.rcode), .formerr), parsed.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.question_count);
+    try std.testing.expectEqual(@as(u16, 0), parsed.header.answer_count);
+    var text: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("dns.home.arpa.", try parsed.question.?.name.toText(&text));
+}
+
+test "RFC 9619: an OPCODE 0 query with QDCOUNT 0 is never answered FORMERR" {
+    var runtime = try Runtime.fromZoneText(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
+        \\
+    );
+    defer runtime.deinit();
+
+    // Section 4: "Such firewalls MUST NOT treat messages with OPCODE = 0 and
+    // QDCOUNT = 0 as malformed." The profile serves no RFC 7873 cookie
+    // request, so it declines the query without an RCODE rather than
+    // answering FORMERR.
+    const zero_question_query = [_]u8{
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    };
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 53005);
+    var output: [512]u8 = undefined;
+    try std.testing.expectError(Error.BadQuery, runtime.answerFrom(&zero_question_query, &output, &client));
+}
+
 test "authoritative runtime records metrics for successful and bad queries" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1315,6 +1384,100 @@ test "authoritative runtime answers unassigned opcodes with local NOTIMP" {
     try std.testing.expect(parsed.header.qr);
     try std.testing.expectEqual(@as(@TypeOf(parsed.header.opcode), .unassigned_3), parsed.header.opcode);
     try std.testing.expectEqual(@as(@TypeOf(parsed.header.rcode), .notimp), parsed.header.rcode);
+}
+
+test "authoritative runtime answers RFC 2136 UPDATE with NOTIMP" {
+    const dns_name = @import("../dns/name.zig");
+    const dns_record = @import("../dns/record.zig");
+    const dns_types = @import("../dns/types.zig");
+
+    var runtime = try Runtime.fromZoneText(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
+        \\
+    );
+    defer runtime.deinit();
+
+    const soa_record: dns_record.ResourceRecord = .{
+        .owner = try dns_name.Name.fromText("home.arpa."),
+        .rrtype = dns_types.RecordType.SOA,
+        .class = dns_types.Class.IN,
+        .ttl = 3600,
+        .rdata = .{ .SOA = .{
+            .mname = try dns_name.Name.fromText("ns1.home.arpa."),
+            .rname = try dns_name.Name.fromText("hostmaster.home.arpa."),
+            .serial = 1,
+            .refresh = 3600,
+            .retry = 900,
+            .expire = 1209600,
+            .minimum = 3600,
+        } },
+    };
+    var request_bytes: [512]u8 = undefined;
+    var output: [512]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // nsupdate shape: ZOCOUNT 1 carrying the zone SOA, UPCOUNT 1 carrying
+    // the record being added, and no additional section.
+    var update = dns_message.Message{
+        .header = .{
+            .id = 0x1234,
+            .opcode = .update,
+            .question_count = 1,
+            .answer_count = 1,
+            .authority_count = 1,
+        },
+        .question = .{
+            .name = try dns_name.Name.fromText("home.arpa."),
+            .qtype = dns_types.RecordType.SOA,
+            .qclass = dns_types.Class.IN,
+        },
+    };
+    defer update.deinit();
+    try update.answers.append(soa_record);
+    try update.authorities.append(.{
+        .owner = try dns_name.Name.fromText("dns.home.arpa."),
+        .rrtype = dns_types.RecordType.A,
+        .class = dns_types.Class.IN,
+        .ttl = 3600,
+        .rdata = .{ .A = .{ 192, 168, 1, 99 } },
+    });
+    var update_writer = dns_writer.Writer.init(&request_bytes);
+    try update.encode(&update_writer);
+
+    const wire = try dns_message.Message.parse(arena.allocator(), update_writer.written());
+    try std.testing.expectEqual(@as(@TypeOf(wire.header.opcode), .update), wire.header.opcode);
+    try std.testing.expectEqual(@as(u16, 1), wire.header.answer_count);
+    try std.testing.expectEqual(@as(u16, 1), wire.header.authority_count);
+
+    const response_bytes = try runtime.answer(update_writer.written(), &output);
+    const parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expect(parsed.header.qr);
+    try std.testing.expectEqual(@as(@TypeOf(parsed.header.opcode), .update), parsed.header.opcode);
+    try std.testing.expectEqual(@as(@TypeOf(parsed.header.rcode), .notimp), parsed.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.question_count);
+    try std.testing.expectEqual(@as(u16, 0), parsed.header.answer_count);
+
+    // RFC 2136 section 3.4.1.3: the zone section may be empty when the zone
+    // comes from a prerequisite SOA, leaving QDCOUNT 0 and no question.
+    var zoneless = dns_message.Message{
+        .header = .{ .id = 0x4321, .opcode = .update, .authority_count = 1 },
+    };
+    defer zoneless.deinit();
+    try zoneless.authorities.append(soa_record);
+    var zoneless_writer = dns_writer.Writer.init(&request_bytes);
+    try zoneless.encode(&zoneless_writer);
+
+    const zoneless_response = try runtime.answer(zoneless_writer.written(), &output);
+    const zoneless_parsed = try dns_message.Message.parse(arena.allocator(), zoneless_response);
+    try std.testing.expect(zoneless_parsed.header.qr);
+    try std.testing.expectEqual(@as(@TypeOf(zoneless_parsed.header.opcode), .update), zoneless_parsed.header.opcode);
+    try std.testing.expectEqual(@as(@TypeOf(zoneless_parsed.header.rcode), .notimp), zoneless_parsed.header.rcode);
+    try std.testing.expectEqual(@as(u16, 0), zoneless_parsed.header.question_count);
 }
 
 test "authoritative runtime applies configured Cookie validation" {

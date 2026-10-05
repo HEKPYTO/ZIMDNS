@@ -23,7 +23,10 @@ const max_txt_data_len = 512;
 // to the 64 KB wire maximum. Keep this far below message limits; do not
 // reintroduce per-type fallbacks. SVCB/HTTPS stay typed under their own
 // 512-byte cap below and never use this bound.
-const max_unknown_len = 2048;
+// Public because the DNSSEC signer builds its own opaque RDATA and reuses
+// this ceiling instead of inventing a second bound it would have to keep in
+// step with the parser.
+pub const max_unknown_len = 2048;
 const max_opt_data_len = 512;
 const max_caa_payload_len = max_unknown_len - 2;
 const max_sshfp_fingerprint_len = 32;
@@ -39,6 +42,14 @@ pub const min_zonemd_digest_len = 12;
 
 pub const EDNS_ECS_OPTION_CODE: u16 = 8;
 pub const EDNS_PADDING_OPTION_CODE: u16 = 12;
+/// RFC 5001 section 2.3 NSID: the name server's own opaque identifier.
+pub const EDNS_NSID_OPTION_CODE: u16 = 3;
+/// RFC 8145 section 4 edns-key-tag: one or more 16-bit DNSSEC Key Tags.
+pub const EDNS_KEY_TAG_OPTION_CODE: u16 = 14;
+/// RFC 9660 section 2.1 ZONEVERSION: the version of the zone an answer came
+/// from. Code 9 is RFC 7314 EDNS EXPIRE and code 11 is RFC 7828
+/// edns-tcp-keepalive, neither of which this server interprets.
+pub const EDNS_ZONEVERSION_OPTION_CODE: u16 = 19;
 
 /// RFC 9460 SVCB/HTTPS SvcParam keys with assigned presentation names.
 pub const SVCB_MANDATORY_KEY: u16 = 0;
@@ -141,6 +152,13 @@ pub fn validIsdnSubaddress(subaddress: []const u8) bool {
 /// Validate bounded EDNS option framing and the known RFC 7871/RFC 7830 options.
 /// `query_scope_zero` applies the RFC 7871 query-side scope rule; responses may
 /// carry a non-zero scope prefix.
+///
+/// RFC 5001 NSID (3), RFC 8145 edns-key-tag (14), and RFC 9660 ZONEVERSION
+/// (19) carry no rule here. Each one's payload is the responder's business:
+/// RFC 5001 section 2.2 tells a server to ignore query NSID payload data, RFC
+/// 8145 section 4.3 forbids a responder from answering with the option at
+/// all, and RFC 9660 section 3.2.1 is a FORMERR the response builder raises.
+/// Every other option stays unknown and is ignored per RFC 6891 section 6.1.2.
 pub fn validateEdnsOptions(data: []const u8, query_scope_zero: bool) Error!void {
     var offset: usize = 0;
     var saw_ecs = false;
@@ -522,7 +540,35 @@ pub const Opt = struct {
     pub fn bytes(self: *const Opt) []const u8 {
         return self.data[0..self.len];
     }
+
+    /// RFC 6891 section 6.1.2 framing appended in place. False when the
+    /// option would cross the OPT RDATA bound, leaving the value untouched.
+    pub fn appendOption(self: *Opt, code: u16, data: []const u8) bool {
+        const old_len = self.bytes().len;
+        if (old_len + 4 + data.len > self.data.len) return false;
+        std.mem.writeInt(u16, self.data[old_len..][0..2], code, .big);
+        std.mem.writeInt(u16, self.data[old_len + 2 ..][0..2], @intCast(data.len), .big);
+        @memcpy(self.data[old_len + 4 ..][0..data.len], data);
+        self.len = @intCast(old_len + 4 + data.len);
+        return true;
+    }
 };
+
+/// The first option carrying `code` inside an OPT RDATA value, or null. The
+/// RFC 6891 section 6.1.2 framing walks code, length, payload; an option whose
+/// length overruns the record ends the walk rather than reading past it.
+pub fn findOption(options: []const u8, code: u16) ?[]const u8 {
+    var offset: usize = 0;
+    while (offset + 4 <= options.len) {
+        const option_code = std.mem.readInt(u16, options[offset..][0..2], .big);
+        const option_len = std.mem.readInt(u16, options[offset + 2 ..][0..2], .big);
+        offset += 4;
+        if (option_len > options.len - offset) return null;
+        if (option_code == code) return options[offset..][0..option_len];
+        offset += option_len;
+    }
+    return null;
+}
 
 pub const Tsig = struct {
     algorithm: Name,
@@ -1902,6 +1948,67 @@ test "rdata rejects duplicate and semantically invalid known EDNS options" {
     for ([_][]const u8{ &bad_family, &bad_source_prefix, &bad_address_length, &bad_trailing_bits }) |bytes| {
         try std.testing.expectError(Error.MalformedEcsOption, RData.parse(.OPT, bytes, 0, bytes.len));
     }
+}
+
+test "rdata parses NSID, edns-key-tag, and ZONEVERSION options as opaque framing" {
+    // RFC 5001 section 2.1: the querier sends an empty NSID option.
+    const nsid = [_]u8{ 0, 3, 0, 0 };
+    try std.testing.expect((try RData.parse(.OPT, &nsid, 0, nsid.len)) == .OPT);
+
+    // RFC 8145 section 4.1: one or more 16-bit Key Tag values, and section
+    // 4.2.2.1 shows a querier sending the option more than once.
+    const one_tag = [_]u8{ 0, 14, 0, 2, 0x4a, 0x4c };
+    try std.testing.expect((try RData.parse(.OPT, &one_tag, 0, one_tag.len)) == .OPT);
+    const two_instances = [_]u8{
+        0, 14, 0, 2, 0x4a, 0x4c,
+        0, 14, 0, 2, 0x87, 0x53,
+    };
+    try std.testing.expect((try RData.parse(.OPT, &two_instances, 0, two_instances.len)) == .OPT);
+
+    // RFC 9660 section 2.1: an empty query option, and a TYPE 0 SOA-SERIAL
+    // response carrying LABELCOUNT, TYPE, and the 4-octet VERSION.
+    const zoneversion_request = [_]u8{ 0, 19, 0, 0 };
+    try std.testing.expect((try RData.parse(.OPT, &zoneversion_request, 0, zoneversion_request.len)) == .OPT);
+    const zoneversion_answer = [_]u8{ 0, 19, 0, 6, 2, 0, 0x78, 0x95, 0xa4, 0xe9 };
+    try std.testing.expect((try RData.parse(.OPT, &zoneversion_answer, 0, zoneversion_answer.len)) == .OPT);
+
+    // None of these three is a recognized option, so a duplicate is not a
+    // parse error: RFC 6891 section 6.1.2 leaves an unknown code to be ignored
+    // and a responder, not the parser, decides what its own options mean.
+    const duplicate_nsid = [_]u8{
+        0, 3, 0, 0,
+        0, 3, 0, 0,
+    };
+    try std.testing.expect((try RData.parse(.OPT, &duplicate_nsid, 0, duplicate_nsid.len)) == .OPT);
+}
+
+test "findOption walks RFC 6891 option framing and bounds each length" {
+    var opt = Opt{};
+    try std.testing.expect(opt.appendOption(EDNS_NSID_OPTION_CODE, &.{}));
+    try std.testing.expect(opt.appendOption(EDNS_KEY_TAG_OPTION_CODE, &.{ 0x4a, 0x4c }));
+    try std.testing.expect(opt.appendOption(EDNS_ZONEVERSION_OPTION_CODE, &.{ 2, 0, 0x78, 0x95, 0xa4, 0xe9 }));
+
+    const options = opt.bytes();
+    try std.testing.expectEqualSlices(u8, &.{}, findOption(options, EDNS_NSID_OPTION_CODE).?);
+    try std.testing.expectEqualSlices(u8, &.{ 0x4a, 0x4c }, findOption(options, EDNS_KEY_TAG_OPTION_CODE).?);
+    try std.testing.expectEqualSlices(u8, &.{ 2, 0, 0x78, 0x95, 0xa4, 0xe9 }, findOption(options, EDNS_ZONEVERSION_OPTION_CODE).?);
+    try std.testing.expect(findOption(options, 12) == null);
+    try std.testing.expect(findOption(&.{}, EDNS_NSID_OPTION_CODE) == null);
+
+    // A trailing stub shorter than the 4-octet header and an option that
+    // overruns the record both end the walk without reading past it.
+    try std.testing.expect(findOption(&.{ 0, 3, 0 }, EDNS_NSID_OPTION_CODE) == null);
+    try std.testing.expect(findOption(&.{ 0, 3, 0, 4, 0xaa }, EDNS_NSID_OPTION_CODE) == null);
+}
+
+test "Opt appendOption refuses to cross the OPT RDATA bound" {
+    var opt = Opt{};
+    const fill = opt.data.len - 4;
+    var payload: [512]u8 = @splat(0xaa);
+    try std.testing.expect(opt.appendOption(EDNS_NSID_OPTION_CODE, payload[0..fill]));
+    try std.testing.expectEqual(opt.data.len, opt.bytes().len);
+    try std.testing.expect(!opt.appendOption(EDNS_NSID_OPTION_CODE, &.{0xaa}));
+    try std.testing.expectEqual(opt.data.len, opt.bytes().len);
 }
 
 test "rdata accepts ECS prefix boundaries response scope and unknown coexistence" {

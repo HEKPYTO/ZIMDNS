@@ -56,6 +56,8 @@ pub const RecordType = struct {
     pub const RRSIG = RecordType{ .value = 46 };
     pub const NSEC = RecordType{ .value = 47 };
     pub const DNSKEY = RecordType{ .value = 48 };
+    /// RFC 8482: meta-query for some or all records at the name.
+    pub const ANY = RecordType{ .value = 255 };
     pub const NSEC3 = RecordType{ .value = 50 };
     pub const ZONEMD = RecordType{ .value = 63 };
     pub const NSEC3PARAM = RecordType{ .value = 51 };

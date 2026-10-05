@@ -1,5 +1,14 @@
 # ZIMDNS example configuration.
 # Strict line-oriented configuration loaded by the current parser.
+#
+# A `listen` line supplies the ADDRESS a mode binds. It does not select the
+# mode: one CLI flag (--once-udp, --once-tcp, --serve-udp, --serve-tcp,
+# --serve-dot, --serve-doh, --serve-xfr) still decides what runs, and each is
+# matched to the `listen` entry with the same transport. So `--config
+# examples/config.gdns` on its own starts nothing and exits 2 with
+# "server run currently requires --once-udp, --once-tcp, --serve-udp,
+# --serve-tcp, --serve-dot, --serve-doh, or --serve-xfr"; add a mode flag, for
+# example `--serve-udp` to bind 0.0.0.0:1053 from the udp line below.
 
 listen dns udp 0.0.0.0:1053
 listen dns tcp 0.0.0.0:1053

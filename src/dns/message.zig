@@ -15,6 +15,9 @@ pub const Error = error{
     EndOfInput,
     ResponseNotQuery,
     UnsupportedQuestionCount,
+    /// RFC 9619 section 4: OPCODE 0 with QDCOUNT > 1 is an incorrectly
+    /// formatted message and the responder MUST answer RCODE 1 (FORMERR).
+    TooManyQuestions,
     BadRecord,
     AllocationBudgetExceeded,
     TrailingData,
@@ -87,7 +90,9 @@ pub const Message = struct {
     pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !Message {
         var reader = Reader.init(bytes);
         const header = header_mod.Header.parse(&reader) catch return Error.EndOfInput;
-        if (header.question_count > 1) return Error.UnsupportedQuestionCount;
+        if (header.question_count > 1) {
+            return if (header.opcode == .query) Error.TooManyQuestions else Error.UnsupportedQuestionCount;
+        }
 
         var message = Message{ .allocator = allocator, .header = header };
         errdefer {
@@ -116,16 +121,23 @@ pub const Message = struct {
             message.deinit();
             return Error.ResponseNotQuery;
         }
-        if (message.header.question_count != 1) {
-            message.deinit();
-            return Error.UnsupportedQuestionCount;
-        }
-        if (message.header.answer_count != 0 or message.header.authority_count != 0 or
-            message.header.additional_count > 1 or
-            (message.header.additional_count == 1 and message.edns == null))
-        {
-            message.deinit();
-            return Error.UnsupportedQuestionCount;
+        // RFC 2136 section 2.2 carries the zone, prerequisite and update
+        // sections in QDCOUNT, ANCOUNT and NSCOUNT, and section 3.4.1.3
+        // allows an empty zone section, so the query-only shape checked
+        // here never holds for an UPDATE. RFC 2136 section 3 answers an
+        // unimplemented UPDATE with NOTIMP.
+        if (message.header.opcode != .update) {
+            if (message.header.question_count != 1) {
+                message.deinit();
+                return Error.UnsupportedQuestionCount;
+            }
+            if (message.header.answer_count != 0 or message.header.authority_count != 0 or
+                message.header.additional_count > 1 or
+                (message.header.additional_count == 1 and message.edns == null))
+            {
+                message.deinit();
+                return Error.UnsupportedQuestionCount;
+            }
         }
         for (message.additionals.slice()) |record| {
             if (!record.rrtype.eql(.OPT)) continue;
@@ -172,11 +184,13 @@ pub const Message = struct {
 
     /// Parse only the header and one question for a protocol error response.
     /// The remaining sections are intentionally ignored after the question.
+    /// A QDCOUNT above 1 still yields the first question so the RFC 9619
+    /// FORMERR answer echoes a question like every other error response.
     pub fn parseHeaderQuestion(allocator: std.mem.Allocator, bytes: []const u8) !Message {
         var reader = Reader.init(bytes);
         const header = try header_mod.Header.parse(&reader);
         if (header.qr) return Error.ResponseNotQuery;
-        if (header.question_count != 1) return Error.UnsupportedQuestionCount;
+        if (header.question_count == 0) return Error.UnsupportedQuestionCount;
         const parsed_question = try question_mod.Question.parse(bytes, reader.position());
         var message = Message{
             .allocator = allocator,
@@ -305,7 +319,10 @@ test "message accepts unassigned opcode and rejects unsupported question count" 
         0,    0x00, 0x01, 0x00, 0x01,
     });
     try std.testing.expectEqual(@as(@TypeOf(unassigned.header.opcode), .unassigned_15), unassigned.header.opcode);
-    try std.testing.expectError(Error.UnsupportedQuestionCount, Message.parseQuery(arena.allocator(), &.{
+    // RFC 9619 section 4: OPCODE 0 with QDCOUNT 2 is an incorrectly
+    // formatted message, so the parser reports the dedicated error that the
+    // responder turns into RCODE 1 (FORMERR).
+    try std.testing.expectError(Error.TooManyQuestions, Message.parseQuery(arena.allocator(), &.{
         0x12, 0x34, 0x01, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     }));
 }

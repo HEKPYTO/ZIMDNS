@@ -68,7 +68,7 @@ test "UDP request pipeline answers A query and records metrics" {
 
     var counters = metrics.Counters{};
     var query_buffer: [512]u8 = undefined;
-    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4242, "dns.home.arpa.", .A);
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4242, "dns.home.arpa.", .A, false);
     try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, query);
     try listener.serveUdpOnceWithMetrics(&server_socket, io, &runtime, &counters);
 
@@ -140,7 +140,7 @@ test "TCP request pipeline answers A query and records metrics" {
     defer server_stream.close(io);
 
     var query_buffer: [512]u8 = undefined;
-    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4243, "dns.home.arpa.", .A);
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4243, "dns.home.arpa.", .A, false);
     try cli_query.sendTcpQuery(client_stream, io, query);
     try client_stream.shutdown(io, .send);
 
@@ -170,7 +170,7 @@ test "UDP request pipeline answers SSHFP query" {
     defer client_socket.close(io);
 
     var query_buffer: [512]u8 = undefined;
-    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4247, "host.home.arpa.", .SSHFP);
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4247, "host.home.arpa.", .SSHFP, false);
     try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, query);
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
@@ -197,7 +197,7 @@ test "TCP request pipeline answers SSHFP query" {
     defer server_stream.close(io);
 
     var query_buffer: [512]u8 = undefined;
-    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4248, "host.home.arpa.", .SSHFP);
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4248, "host.home.arpa.", .SSHFP, false);
     try cli_query.sendTcpQuery(client_stream, io, query);
     try client_stream.shutdown(io, .send);
 
@@ -225,7 +225,7 @@ test "UDP request pipeline answers TLSA query" {
     defer client_socket.close(io);
 
     var query_buffer: [512]u8 = undefined;
-    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4249, "_443._tcp.home.arpa.", .TLSA);
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4249, "_443._tcp.home.arpa.", .TLSA, false);
     try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, query);
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
@@ -252,7 +252,7 @@ test "TCP request pipeline answers TLSA query" {
     defer server_stream.close(io);
 
     var query_buffer: [512]u8 = undefined;
-    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4250, "_443._tcp.home.arpa.", .TLSA);
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4250, "_443._tcp.home.arpa.", .TLSA, false);
     try cli_query.sendTcpQuery(client_stream, io, query);
     try client_stream.shutdown(io, .send);
 
@@ -280,7 +280,7 @@ test "UDP request pipeline answers URI query" {
     defer client_socket.close(io);
 
     var query_buffer: [512]u8 = undefined;
-    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4251, "_https._tcp.home.arpa.", .URI);
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4251, "_https._tcp.home.arpa.", .URI, false);
     try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, query);
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
@@ -307,7 +307,7 @@ test "TCP request pipeline answers URI query" {
     defer server_stream.close(io);
 
     var query_buffer: [512]u8 = undefined;
-    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4252, "_https._tcp.home.arpa.", .URI);
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4252, "_https._tcp.home.arpa.", .URI, false);
     try cli_query.sendTcpQuery(client_stream, io, query);
     try client_stream.shutdown(io, .send);
 
@@ -335,7 +335,7 @@ test "UDP request pipeline answers NAPTR query with nonroot replacement" {
     defer client_socket.close(io);
 
     var query_buffer: [512]u8 = undefined;
-    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4253, "naptr.home.arpa.", .NAPTR);
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4253, "naptr.home.arpa.", .NAPTR, false);
     try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, query);
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
@@ -362,7 +362,7 @@ test "TCP request pipeline answers NAPTR query with root replacement" {
     defer server_stream.close(io);
 
     var query_buffer: [512]u8 = undefined;
-    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4254, "naptr-root.home.arpa.", .NAPTR);
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4254, "naptr-root.home.arpa.", .NAPTR, false);
     try cli_query.sendTcpQuery(client_stream, io, query);
     try client_stream.shutdown(io, .send);
 
@@ -390,7 +390,7 @@ test "UDP request pipeline answers RP query without synthesized TXT additional" 
     defer client_socket.close(io);
 
     var query_buffer: [512]u8 = undefined;
-    const query = try cli_query.buildQueryPacket(&query_buffer, 0x425b, "rp.home.arpa.", .RP);
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x425b, "rp.home.arpa.", .RP, false);
     try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, query);
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
@@ -417,7 +417,7 @@ test "TCP request pipeline answers RP query without synthesized TXT additional" 
     defer server_stream.close(io);
 
     var query_buffer: [512]u8 = undefined;
-    const query = try cli_query.buildQueryPacket(&query_buffer, 0x425c, "rp.home.arpa.", .RP);
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x425c, "rp.home.arpa.", .RP, false);
     try cli_query.sendTcpQuery(client_stream, io, query);
     try client_stream.shutdown(io, .send);
 
@@ -445,7 +445,7 @@ test "UDP request pipeline answers ordered APL query" {
     defer client_socket.close(io);
 
     var query_buffer: [512]u8 = undefined;
-    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4255, "apl.home.arpa.", .APL);
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4255, "apl.home.arpa.", .APL, false);
     try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, query);
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
@@ -472,7 +472,7 @@ test "TCP request pipeline answers ordered APL query" {
     defer server_stream.close(io);
 
     var query_buffer: [512]u8 = undefined;
-    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4256, "apl.home.arpa.", .APL);
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4256, "apl.home.arpa.", .APL, false);
     try cli_query.sendTcpQuery(client_stream, io, query);
     try client_stream.shutdown(io, .send);
 
@@ -500,7 +500,7 @@ test "UDP request pipeline answers CAA query with raw value bytes" {
     defer client_socket.close(io);
 
     var query_buffer: [512]u8 = undefined;
-    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4259, "caa.home.arpa.", .CAA);
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4259, "caa.home.arpa.", .CAA, false);
     try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, query);
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
@@ -527,7 +527,7 @@ test "TCP request pipeline answers CAA query with raw value bytes" {
     defer server_stream.close(io);
 
     var query_buffer: [512]u8 = undefined;
-    const query = try cli_query.buildQueryPacket(&query_buffer, 0x425a, "caa.home.arpa.", .CAA);
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x425a, "caa.home.arpa.", .CAA, false);
     try cli_query.sendTcpQuery(client_stream, io, query);
     try client_stream.shutdown(io, .send);
 
@@ -555,7 +555,7 @@ test "UDP request pipeline answers AFSDB query without synthesized additional A"
     defer client_socket.close(io);
 
     var query_buffer: [512]u8 = undefined;
-    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4257, "afsdb.home.arpa.", .AFSDB);
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4257, "afsdb.home.arpa.", .AFSDB, false);
     try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, query);
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
@@ -582,7 +582,7 @@ test "TCP request pipeline answers AFSDB query without synthesized additional A"
     defer server_stream.close(io);
 
     var query_buffer: [512]u8 = undefined;
-    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4258, "afsdb.home.arpa.", .AFSDB);
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4258, "afsdb.home.arpa.", .AFSDB, false);
     try cli_query.sendTcpQuery(client_stream, io, query);
     try client_stream.shutdown(io, .send);
 
@@ -610,7 +610,7 @@ test "UDP request pipeline answers X25 query without synthesized additional" {
     defer client_socket.close(io);
 
     var query_buffer: [512]u8 = undefined;
-    const query = try cli_query.buildQueryPacket(&query_buffer, 0x425d, "x25.home.arpa.", .X25);
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x425d, "x25.home.arpa.", .X25, false);
     try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, query);
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
@@ -637,7 +637,7 @@ test "TCP request pipeline answers X25 query without synthesized additional" {
     defer server_stream.close(io);
 
     var query_buffer: [512]u8 = undefined;
-    const query = try cli_query.buildQueryPacket(&query_buffer, 0x425e, "x25.home.arpa.", .X25);
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x425e, "x25.home.arpa.", .X25, false);
     try cli_query.sendTcpQuery(client_stream, io, query);
     try client_stream.shutdown(io, .send);
 
@@ -665,7 +665,7 @@ test "UDP request pipeline answers ISDN query without synthesized additional" {
     defer client_socket.close(io);
 
     var query_buffer: [512]u8 = undefined;
-    const query = try cli_query.buildQueryPacket(&query_buffer, 0x425f, "isdn.home.arpa.", .ISDN);
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x425f, "isdn.home.arpa.", .ISDN, false);
     try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, query);
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
@@ -692,7 +692,7 @@ test "TCP request pipeline answers ISDN query without synthesized additional" {
     defer server_stream.close(io);
 
     var query_buffer: [512]u8 = undefined;
-    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4260, "isdn.home.arpa.", .ISDN);
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4260, "isdn.home.arpa.", .ISDN, false);
     try cli_query.sendTcpQuery(client_stream, io, query);
     try client_stream.shutdown(io, .send);
 
@@ -720,7 +720,7 @@ test "UDP request pipeline answers RT query without synthesized additionals" {
     defer client_socket.close(io);
 
     var query_buffer: [512]u8 = undefined;
-    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4261, "rt.home.arpa.", .RT);
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4261, "rt.home.arpa.", .RT, false);
     try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, query);
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
@@ -747,7 +747,7 @@ test "TCP request pipeline answers RT query without synthesized additionals" {
     defer server_stream.close(io);
 
     var query_buffer: [512]u8 = undefined;
-    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4262, "rt.home.arpa.", .RT);
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4262, "rt.home.arpa.", .RT, false);
     try cli_query.sendTcpQuery(client_stream, io, query);
     try client_stream.shutdown(io, .send);
 
@@ -775,7 +775,7 @@ test "UDP request pipeline answers SRV query without synthesized A or AAAA addit
     defer client_socket.close(io);
 
     var query_buffer: [512]u8 = undefined;
-    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4263, "srv.home.arpa.", .SRV);
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4263, "srv.home.arpa.", .SRV, false);
     try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, query);
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
@@ -802,7 +802,7 @@ test "TCP request pipeline answers SRV query without synthesized A or AAAA addit
     defer server_stream.close(io);
 
     var query_buffer: [512]u8 = undefined;
-    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4264, "srv.home.arpa.", .SRV);
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4264, "srv.home.arpa.", .SRV, false);
     try cli_query.sendTcpQuery(client_stream, io, query);
     try client_stream.shutdown(io, .send);
 
@@ -830,8 +830,8 @@ test "TCP request pipeline preserves FIFO responses for pipelined queries" {
 
     var first_query_buffer: [512]u8 = undefined;
     var second_query_buffer: [512]u8 = undefined;
-    const first_query = try cli_query.buildQueryPacket(&first_query_buffer, 0x4245, "dns.home.arpa.", .A);
-    const second_query = try cli_query.buildQueryPacket(&second_query_buffer, 0x4246, "dns.home.arpa.", .A);
+    const first_query = try cli_query.buildQueryPacket(&first_query_buffer, 0x4245, "dns.home.arpa.", .A, false);
+    const second_query = try cli_query.buildQueryPacket(&second_query_buffer, 0x4246, "dns.home.arpa.", .A, false);
     try cli_query.sendTcpQuery(client_stream, io, first_query);
     try cli_query.sendTcpQuery(client_stream, io, second_query);
     try client_stream.shutdown(io, .send);
@@ -870,7 +870,7 @@ test "CLI TCP exchange uses the bounded connection path" {
     defer server.deinit(io);
 
     var query_buffer: [512]u8 = undefined;
-    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4244, "dns.home.arpa.", .A);
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4244, "dns.home.arpa.", .A, false);
     var args = CliTcpArgs{ .io = io, .server = &server, .runtime = &runtime };
     const thread = try std.Thread.spawn(.{}, serveCliTcp, .{&args});
     var response_buffer: [512]u8 = undefined;
@@ -897,7 +897,7 @@ test "TCP AXFR carries a length-framed SOA-bounded transfer sequence" {
     defer client_stream.close(io);
 
     var query_buffer: [512]u8 = undefined;
-    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4a01, "home.arpa.", axfr_type);
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4a01, "home.arpa.", axfr_type, false);
     try cli_query.sendTcpQuery(client_stream, io, query);
     try client_stream.shutdown(io, .send);
 
@@ -968,8 +968,8 @@ test "configured two-zone UDP loop dispatches by longest origin" {
 
     var parent_query_buffer: [512]u8 = undefined;
     var child_query_buffer: [512]u8 = undefined;
-    const parent_query = try cli_query.buildQueryPacket(&parent_query_buffer, 0x5101, "www.example.", .A);
-    const child_query = try cli_query.buildQueryPacket(&child_query_buffer, 0x5102, "www.sub.example.", .A);
+    const parent_query = try cli_query.buildQueryPacket(&parent_query_buffer, 0x5101, "www.example.", .A, false);
+    const child_query = try cli_query.buildQueryPacket(&child_query_buffer, 0x5102, "www.sub.example.", .A, false);
     try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, parent_query);
     try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, child_query);
     try listener.serveUdpLoop(&server_socket, io, &runtime, 2);
@@ -1004,8 +1004,8 @@ test "configured two-zone TCP loop accepts bounded independent connections" {
 
     var parent_query_buffer: [512]u8 = undefined;
     var child_query_buffer: [512]u8 = undefined;
-    const parent_query = try cli_query.buildQueryPacket(&parent_query_buffer, 0x5201, "www.example.", .A);
-    const child_query = try cli_query.buildQueryPacket(&child_query_buffer, 0x5202, "www.sub.example.", .A);
+    const parent_query = try cli_query.buildQueryPacket(&parent_query_buffer, 0x5201, "www.example.", .A, false);
+    const child_query = try cli_query.buildQueryPacket(&child_query_buffer, 0x5202, "www.sub.example.", .A, false);
     try cli_query.sendTcpQuery(parent_client, io, parent_query);
     try cli_query.sendTcpQuery(child_client, io, child_query);
     try parent_client.shutdown(io, .send);
@@ -1042,13 +1042,13 @@ test "authoritative TCP loop caps active connections at eight" {
     var client_query_slices: [listener.TCP_MAX_CONNECTION_WORKERS][]const u8 = undefined;
     for (&clients, 0..) |*client, index| {
         client.* = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
-        client_query_slices[index] = try cli_query.buildQueryPacket(&client_queries[index], @intCast(0x5300 + index), "dns.home.arpa.", .A);
+        client_query_slices[index] = try cli_query.buildQueryPacket(&client_queries[index], @intCast(0x5300 + index), "dns.home.arpa.", .A, false);
         try cli_query.sendTcpQuery(client.*.?, io, client_query_slices[index]);
     }
 
     var excess_client: ?std.Io.net.Stream = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
     var excess_query_buffer: [512]u8 = undefined;
-    const excess_query = try cli_query.buildQueryPacket(&excess_query_buffer, 0x53ff, "dns.home.arpa.", .A);
+    const excess_query = try cli_query.buildQueryPacket(&excess_query_buffer, 0x53ff, "dns.home.arpa.", .A, false);
     try cli_query.sendTcpQuery(excess_client.?, io, excess_query);
     try excess_client.?.shutdown(io, .send);
 
@@ -1195,7 +1195,7 @@ test "resolver falls back from UDP truncation to one TCP exchange" {
     var upstream = try Resolver.init(std.testing.allocator, io, policy);
     defer upstream.deinit();
     var query_buffer: [512]u8 = undefined;
-    const query_bytes = try cli_query.buildQueryPacket(&query_buffer, 0x7001, "example.com.", .A);
+    const query_bytes = try cli_query.buildQueryPacket(&query_buffer, 0x7001, "example.com.", .A, false);
     var query_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer query_arena.deinit();
     const query = try dns_message.Message.parseQuery(query_arena.allocator(), query_bytes);
@@ -1255,7 +1255,7 @@ test "recursive ACL rejects before contacting an upstream" {
     defer runtime.deinit();
 
     var query_buffer: [512]u8 = undefined;
-    const query_bytes = try cli_query.buildQueryPacket(&query_buffer, 0x7002, "outside.example.", .A);
+    const query_bytes = try cli_query.buildQueryPacket(&query_buffer, 0x7002, "outside.example.", .A, false);
     var output: [resolver.MAX_UPSTREAM_MESSAGE]u8 = undefined;
     const denied_client = try std.Io.net.IpAddress.parse("198.51.100.7", 41002);
     const response_bytes = try runtime.answerFrom(query_bytes, &output, &denied_client);
@@ -1292,7 +1292,7 @@ test "authorized UDP listener request reaches a local upstream" {
     var client_socket = try std.Io.net.IpAddress.bind(&client_addr, io, .{ .mode = .dgram, .protocol = .udp });
     defer client_socket.close(io);
     var query_buffer: [512]u8 = undefined;
-    const query = try cli_query.buildQueryPacket(&query_buffer, 0x7003, "example.com.", .A);
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x7003, "example.com.", .A, false);
     try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, query);
     try listener.serveUdpOnce(&server_socket, io, &runtime);
     upstream_thread.join();
@@ -1315,7 +1315,7 @@ test "locally served zones win over a configured forwarder and never reach it" {
 
     const client = try std.Io.net.IpAddress.parse("127.0.0.1", 41031);
     var query_buffer: [512]u8 = undefined;
-    const query = try cli_query.buildQueryPacket(&query_buffer, 0x7a11, "1.2.3.10.in-addr.arpa.", .A);
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x7a11, "1.2.3.10.in-addr.arpa.", .A, false);
 
     // Control: with locally served zones off the question reaches the
     // forwarder and is answered positively, so the upstream really does answer
@@ -1357,7 +1357,7 @@ test "locally served zones win over a configured forwarder and never reach it" {
     var warm_args = UpstreamArgs{ .io = io, .udp = &upstream_socket, .mode = .valid };
     const warm_thread = try std.Thread.spawn(.{}, serveUpstream, .{&warm_args});
     var cached_buffer: [512]u8 = undefined;
-    const cached_query = try cli_query.buildQueryPacket(&cached_buffer, 0x7a12, "host.in-addr.arpa.", .A);
+    const cached_query = try cli_query.buildQueryPacket(&cached_buffer, 0x7a12, "host.in-addr.arpa.", .A, false);
     var cached_output: [resolver.MAX_UPSTREAM_MESSAGE]u8 = undefined;
     const cached_bytes = try default_runtime.answerFrom(cached_query, &cached_output, &client);
     warm_thread.join();
@@ -1413,7 +1413,7 @@ test "locally served zone answers over UDP from a config with no forwarder" {
     defer client_socket.close(io);
 
     var query_buffer: [512]u8 = undefined;
-    const query = try cli_query.buildQueryPacket(&query_buffer, 0x7a21, "1.0.0.127.in-addr.arpa.", .PTR);
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x7a21, "1.0.0.127.in-addr.arpa.", .PTR, false);
     try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, query);
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
@@ -1424,7 +1424,7 @@ test "locally served zone answers over UDP from a config with no forwarder" {
     try expectLocalNxdomain(response, 0x7a21, "127.in-addr.arpa.");
 
     // The operator's own zone is untouched by the local-zone table.
-    const zone_query = try cli_query.buildQueryPacket(&query_buffer, 0x7a22, "www.one.example.", .A);
+    const zone_query = try cli_query.buildQueryPacket(&query_buffer, 0x7a22, "www.one.example.", .A, false);
     try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, zone_query);
     try listener.serveUdpOnce(&server_socket, io, &runtime);
     var zone_response_buffer: [512]u8 = undefined;
@@ -1455,7 +1455,7 @@ test "the shipped --config invocation loads through the cwd Dir and answers a qu
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var query_buffer: [512]u8 = undefined;
-    const query = try cli_query.buildQueryPacket(&query_buffer, 0x5a11, "dns.home.arpa.", .A);
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x5a11, "dns.home.arpa.", .A, false);
     try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, query);
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
@@ -1496,7 +1496,7 @@ test "resolver caches a live upstream NXDOMAIN response" {
     defer upstream.deinit();
 
     var query_buffer: [512]u8 = undefined;
-    const query_bytes = try cli_query.buildQueryPacket(&query_buffer, 0x7004, "missing.example.", .A);
+    const query_bytes = try cli_query.buildQueryPacket(&query_buffer, 0x7004, "missing.example.", .A, false);
     var query_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer query_arena.deinit();
     const query = try dns_message.Message.parseQuery(query_arena.allocator(), query_bytes);
@@ -1514,7 +1514,7 @@ test "resolver caches a live upstream NXDOMAIN response" {
     try std.testing.expectEqual(@as(usize, 1), upstream_args.requests);
 
     var second_query_buffer: [512]u8 = undefined;
-    const second_query_bytes = try cli_query.buildQueryPacket(&second_query_buffer, 0x7005, "missing.example.", .A);
+    const second_query_bytes = try cli_query.buildQueryPacket(&second_query_buffer, 0x7005, "missing.example.", .A, false);
     const second_query = try dns_message.Message.parseQuery(query_arena.allocator(), second_query_bytes);
     const second_bytes = try upstream.answer(second_query_bytes, second_query, &client, &output);
     const second = try dns_message.Message.parse(query_arena.allocator(), second_bytes);
@@ -1538,7 +1538,7 @@ test "non-query opcode returns NOTIMP before cache or upstream reuse" {
     defer runtime.deinit();
 
     var query_buffer: [512]u8 = undefined;
-    const query = try cli_query.buildQueryPacket(&query_buffer, 0x7006, "example.com.", .A);
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x7006, "example.com.", .A, false);
     var output: [resolver.MAX_UPSTREAM_MESSAGE]u8 = undefined;
     const client = try std.Io.net.IpAddress.parse("127.0.0.1", 41006);
     const first_response_bytes = try runtime.answerFrom(query, &output, &client);
@@ -1571,7 +1571,7 @@ fn expectForwarderExchange(mode: UpstreamMode) !void {
     var upstream = try Resolver.init(std.testing.allocator, io, policy);
     defer upstream.deinit();
     var query_buffer: [512]u8 = undefined;
-    const query_bytes = try cli_query.buildQueryPacket(&query_buffer, 0x7000, "example.com.", .A);
+    const query_bytes = try cli_query.buildQueryPacket(&query_buffer, 0x7000, "example.com.", .A, false);
     var query_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer query_arena.deinit();
     const query = try dns_message.Message.parseQuery(query_arena.allocator(), query_bytes);
@@ -1596,7 +1596,7 @@ test "upstream UDP attempts each bind a fresh ephemeral source port" {
     var upstream = try Resolver.init(std.testing.allocator, io, policy);
     defer upstream.deinit();
     var query_buffer: [512]u8 = undefined;
-    const query_bytes = try cli_query.buildQueryPacket(&query_buffer, 0x7020, "example.com.", .A);
+    const query_bytes = try cli_query.buildQueryPacket(&query_buffer, 0x7020, "example.com.", .A, false);
     var query_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer query_arena.deinit();
     const query = try dns_message.Message.parseQuery(query_arena.allocator(), query_bytes);
@@ -1666,7 +1666,7 @@ test "forwarder preserves full QNAME upstream with QMIN enabled" {
     defer upstream.deinit();
 
     var query_buffer: [512]u8 = undefined;
-    const query_bytes = try cli_query.buildQueryPacket(&query_buffer, 0x7010, "www.example.com.", .A);
+    const query_bytes = try cli_query.buildQueryPacket(&query_buffer, 0x7010, "www.example.com.", .A, false);
     var query_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer query_arena.deinit();
     const query = try dns_message.Message.parseQuery(query_arena.allocator(), query_bytes);
@@ -1769,13 +1769,13 @@ fn concurrentQueryFixture(connection_index: usize, frame_index: usize) Concurren
 fn buildConcurrentQuery(buffer: []u8, connection_index: usize, frame_index: usize) ![]const u8 {
     const fixture = concurrentQueryFixture(connection_index, frame_index);
     const id = @as(u16, @intCast(0x5400 + connection_index * listener.TCP_MAX_FRAMES_PER_CONNECTION + frame_index));
-    return cli_query.buildQueryPacket(buffer, id, fixture.name, .A);
+    return cli_query.buildQueryPacket(buffer, id, fixture.name, .A, false);
 }
 
 /// RFC 1995 IXFR request: the question plus the client's serial in an
 /// authority SOA owned by the question name.
 fn buildIxfrQuery(buffer: []u8, id: u16, client_serial: u32) ![]const u8 {
-    const base = try cli_query.buildQueryPacket(buffer, id, "home.arpa.", ixfr_type);
+    const base = try cli_query.buildQueryPacket(buffer, id, "home.arpa.", ixfr_type, false);
     std.mem.writeInt(u16, buffer[8..10], 1, .big);
     const client_soa = dns_record.ResourceRecord{
         .owner = try dns_name.Name.fromText("home.arpa."),
@@ -1914,7 +1914,7 @@ fn serveUpstream(args: *UpstreamArgs) void {
 }
 
 fn buildEdnsQuery(buffer: []u8, id: u16) ![]const u8 {
-    const base = try cli_query.buildQueryPacket(buffer, id, "example.com.", .A);
+    const base = try cli_query.buildQueryPacket(buffer, id, "example.com.", .A, false);
     if (base.len + 11 > buffer.len) return error.BufferTooSmall;
     std.mem.writeInt(u16, buffer[10..12], 1, .big);
     var offset = base.len;
@@ -2316,3 +2316,212 @@ const child_zone =
     \\www IN A 192.0.2.2
     \\
 ;
+
+// ------------------------------------------------- validating forwarder (AD)
+
+const SignedUpstreamArgs = struct {
+    io: std.Io,
+    udp: *const std.Io.net.Socket,
+    zone: *const zimdns.zone_index.Zone,
+    /// Flip one octet of the answer, so the signature no longer covers it.
+    tamper: bool,
+    ok: bool = false,
+};
+
+/// Serves the A RRset and its RRSIG out of an already-signed zone, exactly as
+/// an upstream recursive server would for a DO=1 query.
+fn serveSignedUpstream(args: *SignedUpstreamArgs) void {
+    var request_buffer: [resolver.MAX_UPSTREAM_MESSAGE]u8 = undefined;
+    const incoming = args.udp.receiveTimeout(args.io, &request_buffer, TestTimeout) catch return;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = dns_message.Message.parseQuery(arena.allocator(), incoming.data) catch return;
+
+    var message = dns_message.Message{
+        .allocator = arena.allocator(),
+        .header = .{
+            .id = parsed.header.id,
+            .qr = true,
+            .recursion_desired = true,
+            .recursion_available = true,
+            .question_count = 1,
+        },
+        .question = parsed.question,
+        .answers = dns_message.RecordSection.init(arena.allocator(), 0) catch return,
+        .authorities = dns_message.RecordSection.init(arena.allocator(), 0) catch return,
+        .additionals = dns_message.RecordSection.init(arena.allocator(), 0) catch return,
+        .edns = null,
+    };
+    for (args.zone.records.items[0..args.zone.records.len]) |*record| {
+        const is_answer = record.rrtype.eql(.A) or record.rrtype.eql(.RRSIG);
+        if (!is_answer) continue;
+        const owner_is_www = std.ascii.eqlIgnoreCase(record.ownerText(), "www.signed.example.");
+        if (!owner_is_www) continue;
+        var wire = dns_record.ResourceRecord{
+            .owner = dns_name.Name.fromText(record.ownerText()) catch return,
+            .rrtype = record.rrtype,
+            .class = .IN,
+            .ttl = record.ttl,
+            .rdata = zimdns.zone_parser.parseRData(record.rrtype, record.rdataText()) catch return,
+        };
+        if (args.tamper and wire.rrtype.eql(.A)) wire.rdata.A[3] ^= 0xff;
+        message.answers.append(wire) catch return;
+    }
+    message.header.answer_count = @intCast(message.answers.len);
+
+    var buffer: [4096]u8 = undefined;
+    var writer = dns_writer.Writer.init(&buffer);
+    message.encode(&writer) catch return;
+    args.udp.send(args.io, &incoming.from, writer.written()) catch return;
+    args.ok = true;
+}
+
+/// A forwarder policy carrying one DNSKEY anchor. The resolver takes ownership
+/// of the anchor RDATA and frees it with its own allocator, so the copy is
+/// taken here rather than borrowed from a caller's arena.
+fn anchoredForwardPolicy(address: std.Io.net.IpAddress, key: *const zimdns.zone_signer.Key) !resolver.Policy {
+    const borrowed = try key.dnskeyRdata(std.testing.allocator);
+    defer std.testing.allocator.free(borrowed);
+    const rdata = try std.testing.allocator.dupe(u8, borrowed);
+    var policy = resolver.Policy{ .forwarder = .{ .address = address } };
+    policy.anchors.items[0] = .{
+        .owner = try dns_name.Name.fromText("signed.example."),
+        .rrtype = .DNSKEY,
+        .rdata = rdata,
+    };
+    policy.anchors.len = 1;
+    return policy;
+}
+
+const signed_forward_zone =
+    \\$ORIGIN signed.example.
+    \\$TTL 3600
+    \\@ IN SOA ns1.signed.example. hostmaster.signed.example. 1 3600 900 1209600 3600
+    \\@ IN NS ns1.signed.example.
+    \\ns1 IN A 192.0.2.53
+    \\www IN A 192.0.2.80
+    \\
+;
+
+// The full operator path: a configured anchor, a forwarded DO=1 query, and
+// the AD bit set only because this server verified every RRset itself.
+test "validating forwarder sets AD on a verified answer and SERVFAILs with an EDE on a forged one" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const work = arena.allocator();
+
+    var zone_file = try zimdns.zone_parser.ZoneFile.parse(signed_forward_zone);
+    defer zone_file.deinit();
+    var zone = try zimdns.zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+    var key = try zimdns.zone_signer.parseKey("ed25519 DSSF3o0s0f+ElWzj9E/Osxw8hLpk55chkmx0LYN5WiY=\n");
+    defer key.deinit();
+    // Fixed window and clock so the signatures are byte-for-byte reproducible.
+    try zimdns.zone_signer.signZone(work, &zone, &key, .{ .inception = 1_000_000_000, .expiration = 2_000_000_000 });
+
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 41099);
+
+    // --- verified answer: AD must be set.
+    {
+        var args = SignedUpstreamArgs{ .io = io, .udp = &upstream_socket, .zone = &zone, .tamper = false };
+        const thread = try std.Thread.spawn(.{}, serveSignedUpstream, .{&args});
+
+        var forwarder = try Resolver.init(std.testing.allocator, io, try anchoredForwardPolicy(upstream_socket.address, &key));
+        defer forwarder.deinit();
+
+        var query_buffer: [512]u8 = undefined;
+        const query_bytes = try cli_query.buildQueryPacket(&query_buffer, 0x7110, "www.signed.example.", .A, true);
+        var query_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer query_arena.deinit();
+        const query = try dns_message.Message.parseQuery(query_arena.allocator(), query_bytes);
+        var output: [resolver.MAX_UPSTREAM_MESSAGE]u8 = undefined;
+        const response_bytes = try forwarder.answer(query_bytes, query, &client, &output);
+        thread.join();
+        try std.testing.expect(args.ok);
+
+        const response = try dns_message.Message.parse(query_arena.allocator(), response_bytes);
+        try std.testing.expectEqual(@as(@TypeOf(response.header.rcode), .no_error), response.header.rcode);
+        // RFC 4035 section 3.2.3: AD because the resolver side vouched for it.
+        try std.testing.expect(response.header.authenticated_data);
+    }
+
+    // --- forged answer: SERVFAIL carrying the RFC 8914 INFO-CODE.
+    {
+        var args = SignedUpstreamArgs{ .io = io, .udp = &upstream_socket, .zone = &zone, .tamper = true };
+        const thread = try std.Thread.spawn(.{}, serveSignedUpstream, .{&args});
+
+        var forwarder = try Resolver.init(std.testing.allocator, io, try anchoredForwardPolicy(upstream_socket.address, &key));
+        defer forwarder.deinit();
+
+        var query_buffer: [512]u8 = undefined;
+        const query_bytes = try cli_query.buildQueryPacket(&query_buffer, 0x7111, "www.signed.example.", .A, true);
+        var query_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer query_arena.deinit();
+        const query = try dns_message.Message.parseQuery(query_arena.allocator(), query_bytes);
+        var output: [resolver.MAX_UPSTREAM_MESSAGE]u8 = undefined;
+        const response_bytes = try forwarder.answer(query_bytes, query, &client, &output);
+        thread.join();
+        try std.testing.expect(args.ok);
+
+        const response = try dns_message.Message.parse(query_arena.allocator(), response_bytes);
+        // RFC 4035 section 5.5: a response that fails validation is not
+        // returned, and the EDE says why in the wire format of RFC 8914.
+        try std.testing.expectEqual(@as(@TypeOf(response.header.rcode), .servfail), response.header.rcode);
+        try std.testing.expect(!response.header.authenticated_data);
+        try expectEde(response, resolver.EDE_DNSSEC_BOGUS);
+        try std.testing.expectEqualStrings("dnssec bogus", resolver.edeText(resolver.EDE_DNSSEC_BOGUS));
+    }
+}
+
+// An upstream that sets AD is not evidence: this server did no validation, so
+// it must not relay the claim (RFC 4035 section 3.2.3).
+test "a forwarder with no configured anchor never relays an upstream AD bit" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    var args = AdUpstreamArgs{ .io = io, .udp = &upstream_socket };
+    const thread = try std.Thread.spawn(.{}, serveAdUpstream, .{&args});
+
+    const policy = resolver.Policy{ .forwarder = .{ .address = upstream_socket.address } };
+    var forwarder = try Resolver.init(std.testing.allocator, io, policy);
+    defer forwarder.deinit();
+
+    var query_buffer: [512]u8 = undefined;
+    const query_bytes = try cli_query.buildQueryPacket(&query_buffer, 0x7112, "www.example.com.", .A, false);
+    var query_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer query_arena.deinit();
+    const query = try dns_message.Message.parseQuery(query_arena.allocator(), query_bytes);
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 41098);
+    var output: [resolver.MAX_UPSTREAM_MESSAGE]u8 = undefined;
+    const response_bytes = try forwarder.answer(query_bytes, query, &client, &output);
+    thread.join();
+    try std.testing.expect(args.ok);
+
+    const response = try dns_message.Message.parse(query_arena.allocator(), response_bytes);
+    try std.testing.expect(!response.header.authenticated_data);
+}
+
+const AdUpstreamArgs = struct {
+    io: std.Io,
+    udp: *const std.Io.net.Socket,
+    ok: bool = false,
+};
+
+fn serveAdUpstream(args: *AdUpstreamArgs) void {
+    var request_buffer: [resolver.MAX_UPSTREAM_MESSAGE]u8 = undefined;
+    const incoming = args.udp.receiveTimeout(args.io, &request_buffer, TestTimeout) catch return;
+    var valid = makeAResponse(incoming.data, false, false, false);
+    // Claim the answer is authentic; the forwarder must not pass that on.
+    // AD is 0x0020, which lives in the low flags octet.
+    valid.bytes[3] |= 0x20;
+    args.udp.send(args.io, &incoming.from, valid.bytes[0..valid.len]) catch return;
+    args.ok = true;
+}

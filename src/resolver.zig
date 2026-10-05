@@ -15,6 +15,7 @@ const dns_rdata = @import("dns/rdata.zig");
 const dns_types = @import("dns/types.zig");
 const dns_writer = @import("dns/writer.zig");
 const dnssec = @import("dns/dnssec.zig");
+const validate = @import("dns/validate.zig");
 const qname_minimize = @import("qname_minimize.zig");
 const tcp_deadline = @import("platform/tcp_deadline.zig");
 
@@ -85,6 +86,12 @@ pub const Policy = struct {
     /// RFC 9156 minimization mode for the future iterative path. A forwarder
     /// always sends the full QNAME upstream; see the hook in `answer`.
     qmin_mode: qname_minimize.Mode = .disabled,
+
+    /// RFC 4035 section 5.2 trust anchors. Empty unless `trust-anchor-file`
+    /// named one, so a forwarder with no configured anchor validates nothing
+    /// and never sets AD. Owned here because the Policy is copied into the
+    /// Resolver that outlives the config load.
+    anchors: validate.Anchors = .{},
 
     pub fn fromConfig(value: *const config.Config) !Policy {
         var policy = Policy{};
@@ -456,6 +463,7 @@ pub const Resolver = struct {
     pub fn deinit(self: *Resolver) void {
         self.cache.deinit();
         self.policy.cookies.deinit();
+        self.policy.anchors.deinit(self.allocator);
     }
 
     pub fn validateCookie(self: *Resolver, query: dns_message.Message, client: *const std.Io.net.IpAddress) Error!?[24]u8 {
@@ -538,19 +546,44 @@ pub const Resolver = struct {
         };
         defer response.deinit();
 
+        // RFC 4035 section 3.2.3: the name server side of a validating
+        // forwarder sets AD only when the resolver side vouched for every
+        // RRset. That verdict is computed below, so the upstream's own bit is
+        // cleared first: a forwarder that does not validate must never relay
+        // another server's claim of authenticity.
+        response.header.authenticated_data = false;
         response.header.id = query.header.id;
         response.header.recursion_desired = query.header.recursion_desired;
         response.header.recursion_available = true;
         response.header.checking_disabled = query.header.checking_disabled;
         response.question = query.question;
         stripOptions(&response);
+        // Validation runs before the cache so a bogus answer is never stored
+        // (RFC 4035 section 4.7) and so the AD bit a client sees is the one
+        // this server computed rather than one re-derived on a cache hit.
+        const validated = self.validating(query);
+        if (validated) {
+            const result = try self.checkDnssec(query, response, @intCast(@max(now, 0)));
+            switch (result.status) {
+                .secure => response.header.authenticated_data = true,
+                // RFC 4035 section 5.5: a response that fails validation MUST
+                // not be returned, and the client gets SERVFAIL carrying the
+                // RFC 8914 INFO-CODE that says why. `wantsDnssecProofs` is
+                // false when CD is set, and that is exactly the case section
+                // 5.5 says must be returned in full instead.
+                .bogus => return self.relayBogus(query, cookie, result.ede, output),
+                .insecure => {},
+            }
+        }
         self.cache.put(key, &response, now) catch {};
         self.harvestNsecProofs(response, now);
         if (query.edns) |edns| try appendOpt(&response, edns);
         // DNSSEC presence signals (RFC 8914 6-10) ride along as informational
-        // EDE on the relayed response. They never change the RCODE here: this
-        // forwarder does not perform cryptographic validation.
-        if (wantsDnssecProofs(query)) {
+        // EDE on a relayed response this server did NOT validate. Once the
+        // validator has spoken above, its verdict is the answer: emitting a
+        // presence-based DNSSEC-bogus code alongside a secure or insecure
+        // verdict would contradict it.
+        if (!validated and wantsDnssecProofs(query)) {
             if (dnssecPresenceEde(response, @intCast(@max(now, 0)))) |code| {
                 appendEde(&response, code) catch {};
             }
@@ -558,6 +591,35 @@ pub const Resolver = struct {
         if (cookie == .valid) try appendCookie(&response, cookie.valid);
         var writer = dns_writer.Writer.init(output);
         response.encode(&writer) catch return Error.ResponseTooLarge;
+        return writer.written();
+    }
+
+    /// True when this response is one this server validates itself: a
+    /// configured trust anchor, a client that asked for the proofs (DO=1), and
+    /// no CD. DO gates validation because the forwarder relays the client's
+    /// DO bit upstream unchanged, so a query without DO never carries RRSIGs
+    /// back and there would be nothing to check. Failing closed there is what
+    /// keeps a plain query from being answered SERVFAIL: AD is simply not set.
+    fn validating(self: *const Resolver, query: dns_message.Message) bool {
+        return self.policy.anchors.len != 0 and wantsDnssecProofs(query);
+    }
+
+    fn checkDnssec(self: *Resolver, query: dns_message.Message, response: dns_message.Message, now: u32) validate.Error!validate.Result {
+        // `extra` is empty: the forward path answers from the response alone,
+        // so a DS-only anchor has no child DNSKEY RRset to match and the
+        // answer is honestly insecure rather than secure.
+        return validate.validate(self.allocator, &self.policy.anchors, query, response, &.{}, now);
+    }
+
+    /// SERVFAIL plus the RFC 8914 DNSSEC-bogus INFO-CODE the validator
+    /// produced, with the cookie the same answer path would have carried.
+    fn relayBogus(self: *Resolver, query: dns_message.Message, cookie: CookieDecision, ede_code: u16, output: []u8) ![]const u8 {
+        _ = self;
+        var message = try Resolver.buildDnssecBogusResponse(query, ede_code);
+        defer message.deinit();
+        if (cookie == .valid) try appendCookie(&message, cookie.valid);
+        var writer = dns_writer.Writer.init(output);
+        message.encode(&writer) catch return Error.ResponseTooLarge;
         return writer.written();
     }
 
@@ -663,7 +725,7 @@ pub const Resolver = struct {
             defer socket.close(self.io);
             var randomized_id: [2]u8 = undefined;
             self.io.randomSecure(&randomized_id) catch return Error.UpstreamFailure;
-            const upstream_query = try buildUpstreamQuery(query_bytes, query, &query_buffer);
+            const upstream_query = try buildUpstreamQuery(query_bytes, query, &query_buffer, &self.policy.anchors);
             @memcpy(query_buffer[0..2], &randomized_id);
             const expected_id = std.mem.readInt(u16, &randomized_id, .big);
 
@@ -741,7 +803,12 @@ fn classifyUpstreamPacket(allocator: std.mem.Allocator, query: dns_message.Messa
     return .{ .ready = cloneMessage(allocator, response) catch return .ignore };
 }
 
-fn buildUpstreamQuery(original: []const u8, query: dns_message.Message, output: []u8) ![]const u8 {
+fn buildUpstreamQuery(
+    original: []const u8,
+    query: dns_message.Message,
+    output: []u8,
+    anchors: *const validate.Anchors,
+) ![]const u8 {
     if (query.edns == null) {
         if (original.len > output.len) return Error.UpstreamFailure;
         @memcpy(output[0..original.len], original);
@@ -758,9 +825,24 @@ fn buildUpstreamQuery(original: []const u8, query: dns_message.Message, output: 
     };
     errdefer sanitized.deinit();
     try appendOpt(&sanitized, query.edns.?);
+    appendKeyTags(&sanitized, query, anchors);
     var writer = dns_writer.Writer.init(output);
     sanitized.encode(&writer) catch return Error.UpstreamFailure;
     return writer.written();
+}
+
+/// RFC 8145 section 4.2.2.1: a validating resolver signals the Key Tags it
+/// will use on a DNSKEY query for a zone a configured anchor speaks for.
+/// Section 4.2 forbids the option on any other query, and section 4.3 forbids
+/// putting it in a response, so this appears on the way out only. A querier
+/// that sent no OPT gets its bytes forwarded untouched, option and all.
+fn appendKeyTags(message: *dns_message.Message, query: dns_message.Message, anchors: *const validate.Anchors) void {
+    const question = query.question orelse return;
+    if (!question.qtype.eql(.DNSKEY)) return;
+    var tags: [2 * validate.max_anchors]u8 = undefined;
+    const count = anchors.keyTags(question.name, &tags);
+    if (count == 0) return;
+    appendOption(message, dns_rdata.EDNS_KEY_TAG_OPTION_CODE, tags[0 .. count * 2]) catch {};
 }
 
 /// `std.Io.Threaded` currently rejects a non-none connect timeout on POSIX.
@@ -928,16 +1010,10 @@ fn dnssecPresenceEde(message: dns_message.Message, now: u32) ?u16 {
 fn findOption(message: dns_message.Message, code: u16) ?[]const u8 {
     for (message.additionals.items[0..message.additionals.len]) |*record| {
         if (!record.rrtype.eql(.OPT)) continue;
-        var offset: usize = 0;
-        const data = record.rdata.OPT.bytes();
-        while (offset + 4 <= data.len) {
-            const option_code = std.mem.readInt(u16, data[offset..][0..2], .big);
-            const option_len = std.mem.readInt(u16, data[offset + 2 ..][0..2], .big);
-            offset += 4;
-            if (option_len > data.len - offset) return null;
-            if (option_code == code) return data[offset .. offset + option_len];
-            offset += option_len;
-        }
+        return switch (record.rdata) {
+            .OPT => |*opt| dns_rdata.findOption(opt.bytes(), code),
+            else => unreachable,
+        };
     }
     return null;
 }
@@ -1030,20 +1106,12 @@ pub fn appendCookie(message: *dns_message.Message, cookie: [24]u8) !void {
 }
 
 fn appendOption(message: *dns_message.Message, code: u16, data: []const u8) !void {
-    var opt: ?*dns_record.ResourceRecord = null;
     for (message.additionals.items[0..message.additionals.len]) |*record| {
-        if (record.rrtype.eql(.OPT)) {
-            opt = record;
-            break;
-        }
+        if (!record.rrtype.eql(.OPT)) continue;
+        if (!record.rdata.OPT.appendOption(code, data)) return Error.ResponseTooLarge;
+        return;
     }
-    const record = opt orelse return Error.BadUpstreamResponse;
-    const old_len = record.rdata.OPT.bytes().len;
-    if (old_len + 4 + data.len > record.rdata.OPT.data.len) return Error.ResponseTooLarge;
-    std.mem.writeInt(u16, record.rdata.OPT.data[old_len..][0..2], code, .big);
-    std.mem.writeInt(u16, record.rdata.OPT.data[old_len + 2 ..][0..2], @intCast(data.len), .big);
-    @memcpy(record.rdata.OPT.data[old_len + 4 .. old_len + 4 + data.len], data);
-    record.rdata.OPT.len = @intCast(old_len + 4 + data.len);
+    return Error.BadUpstreamResponse;
 }
 
 test "resolver ACL and cookie contracts" {
@@ -1367,7 +1435,7 @@ test "buildUpstreamQuery strips client EDNS options but preserves payload size a
     try appendOption(&query, 65000, &.{ 9, 8, 7 });
 
     var output: [512]u8 = undefined;
-    const encoded = try buildUpstreamQuery(&.{ 0xde, 0xad }, query, &output);
+    const encoded = try buildUpstreamQuery(&.{ 0xde, 0xad }, query, &output, &.{});
 
     var parsed_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer parsed_arena.deinit();
@@ -1379,6 +1447,67 @@ test "buildUpstreamQuery strips client EDNS options but preserves payload size a
     try std.testing.expect(findOption(upstream, dns_rdata.EDNS_ECS_OPTION_CODE) == null);
     try std.testing.expect(findOption(upstream, COOKIE_OPTION_CODE) == null);
     try std.testing.expect(findOption(upstream, 65000) == null);
+}
+
+test "RFC 8145: an upstream DNSKEY query carries the anchors' key tags and nothing else does" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var anchors = try validate.Anchors.parse(arena.allocator(),
+        \\example.com. DNSKEY 257 3 8 QUJDRA==
+        \\other.test. DS 60485 8 2 aabbccdd
+        \\
+    );
+    defer anchors.deinit(arena.allocator());
+
+    var output: [512]u8 = undefined;
+    var parsed_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer parsed_arena.deinit();
+
+    var dnskey_query = try makeTestQuery(arena.allocator(), 0x2605, "example.com.", true);
+    defer dnskey_query.deinit();
+    dnskey_query.question.?.qtype = .DNSKEY;
+    const dnskey_upstream = try dns_message.Message.parse(
+        parsed_arena.allocator(),
+        try buildUpstreamQuery(&.{ 0xde, 0xad }, dnskey_query, &output, &anchors),
+    );
+    // 34959 is the RFC 4034 Appendix B checksum of the DNSKEY RDATA
+    // 01 01 03 08 41 42 43 44 that `257 3 8 QUJDRA==` encodes.
+    const tags = findOption(dnskey_upstream, dns_rdata.EDNS_KEY_TAG_OPTION_CODE).?;
+    try std.testing.expectEqualSlices(u8, &.{ 0x88, 0x8f }, tags);
+
+    // A DS anchor speaks for its own zone only, and the tag is the Key Tag
+    // field its RDATA already carries (RFC 4034 section 5.1.4).
+    var ds_query = try makeTestQuery(arena.allocator(), 0x2606, "other.test.", true);
+    defer ds_query.deinit();
+    ds_query.question.?.qtype = .DNSKEY;
+    const ds_upstream = try dns_message.Message.parse(
+        parsed_arena.allocator(),
+        try buildUpstreamQuery(&.{ 0xbe, 0xef }, ds_query, &output, &anchors),
+    );
+    try std.testing.expectEqualSlices(u8, &.{ 0xec, 0x45 }, findOption(ds_upstream, dns_rdata.EDNS_KEY_TAG_OPTION_CODE).?);
+
+    // Section 4.2: the option is for DNSKEY queries only, so an ordinary query
+    // for an anchored name carries nothing extra.
+    var a_query = try makeTestQuery(arena.allocator(), 0x2607, "example.com.", true);
+    defer a_query.deinit();
+    const a_upstream = try dns_message.Message.parse(
+        parsed_arena.allocator(),
+        try buildUpstreamQuery(&.{ 0xbe, 0xef }, a_query, &output, &anchors),
+    );
+    try std.testing.expect(findOption(a_upstream, dns_rdata.EDNS_KEY_TAG_OPTION_CODE) == null);
+    try std.testing.expectEqual(@as(usize, 0), a_upstream.additionals.items[0].rdata.OPT.bytes().len);
+
+    // A forwarder with no trust anchor is not a validating resolver and has
+    // no key tags to signal.
+    var unanchored = try makeTestQuery(arena.allocator(), 0x2608, "example.com.", true);
+    defer unanchored.deinit();
+    unanchored.question.?.qtype = .DNSKEY;
+    const plain_upstream = try dns_message.Message.parse(
+        parsed_arena.allocator(),
+        try buildUpstreamQuery(&.{ 0xbe, 0xef }, unanchored, &output, &.{}),
+    );
+    try std.testing.expect(findOption(plain_upstream, dns_rdata.EDNS_KEY_TAG_OPTION_CODE) == null);
 }
 
 test "cache separates CD and EDNS DO variants" {

@@ -7,6 +7,7 @@ const dns_types = @import("../dns/types.zig");
 const dns_rdata = @import("../dns/rdata.zig");
 const dns_dnssec = @import("../dns/dnssec.zig");
 const dns_writer = @import("../dns/writer.zig");
+const dns_record = @import("../dns/record.zig");
 const listener = @import("../platform/listener.zig");
 const resolver = @import("../resolver.zig");
 const tcp_deadline = @import("../platform/tcp_deadline.zig");
@@ -26,7 +27,18 @@ pub const TCP_DEADLINES_SUPPORTED = switch (builtin.os.tag) {
     else => false,
 };
 
-pub fn buildQueryPacket(buffer: []u8, id: u16, name_text: []const u8, qtype: dns_types.RecordType) ![]const u8 {
+/// Builds the query packet. `dnssec_ok` sets the RFC 6891 section 6.1.1 DO
+/// bit: one OPT pseudo-record in the additional section whose CLASS carries
+/// the requestor's UDP payload size and whose TTL carries DO, version, and
+/// extended RCODE. Without it the server strips RRSIG and NSEC, so an
+/// operator could never ask for the proofs this server signs.
+pub fn buildQueryPacket(
+    buffer: []u8,
+    id: u16,
+    name_text: []const u8,
+    qtype: dns_types.RecordType,
+    dnssec_ok: bool,
+) ![]const u8 {
     var writer = dns_writer.Writer.init(buffer);
     const qname = dns_name.Name.fromText(name_text) catch return Error.BadName;
     const message = dns_message.Message{
@@ -34,6 +46,7 @@ pub fn buildQueryPacket(buffer: []u8, id: u16, name_text: []const u8, qtype: dns
             .id = id,
             .recursion_desired = true,
             .question_count = 1,
+            .additional_count = @intFromBool(dnssec_ok),
         },
         .question = dns_question.Question{
             .name = qname,
@@ -42,12 +55,21 @@ pub fn buildQueryPacket(buffer: []u8, id: u16, name_text: []const u8, qtype: dns
         },
     };
     try message.encode(&writer);
+    if (dnssec_ok) {
+        // owner is root, type OPT, CLASS is the payload size, TTL carries
+        // extended RCODE (high byte), version, and DO (0x8000); RDLENGTH 0.
+        try writer.writeU8(0);
+        try writer.writeU16(dns_types.RecordType.OPT.code());
+        try writer.writeU16(dns_message.DEFAULT_EDNS_UDP_PAYLOAD_SIZE);
+        try writer.writeU32(0x8000);
+        try writer.writeU16(0);
+    }
     return writer.written();
 }
 
 pub fn writeResponse(response: dns_message.Message, writer: *std.Io.Writer) !void {
-    var name_buffer: [256]u8 = undefined;
-    var value_buffer: [256]u8 = undefined;
+    // Proof and glue records are rendered by the same per-type renderer the
+    // answer section uses, so one format covers every record in a response.
 
     if (response.answers.len == 0) {
         if (response.header.rcode != .no_error) {
@@ -55,153 +77,181 @@ pub fn writeResponse(response: dns_message.Message, writer: *std.Io.Writer) !voi
             try writer.writeAll(rcodeName(response.header.rcode));
             try writer.writeAll("\n");
         }
-        try writer.writeAll("no answers\n");
-        return;
+        if (response.authorities.len == 0 and response.additionals.len == 0) {
+            try writer.writeAll("no answers\n");
+            return;
+        }
     }
 
     for (response.answers.slice()) |record| {
-        const owner = record.owner.toText(&name_buffer) catch return Error.BadResponse;
-        try writer.writeAll(owner);
-        try writer.writeAll(" ");
-        try writer.print("{}", .{record.ttl});
-        try writer.writeAll(" IN ");
-        if (record.rrtype.eql(.A)) {
-            try writer.writeAll("A ");
-            try writer.print("{}.{}.{}.{}", .{ record.rdata.A[0], record.rdata.A[1], record.rdata.A[2], record.rdata.A[3] });
-        } else if (record.rrtype.eql(.AAAA)) {
-            try writer.writeAll("AAAA ");
-            try writer.print("{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}", .{
-                record.rdata.AAAA[0],  record.rdata.AAAA[1],  record.rdata.AAAA[2],  record.rdata.AAAA[3],
-                record.rdata.AAAA[4],  record.rdata.AAAA[5],  record.rdata.AAAA[6],  record.rdata.AAAA[7],
-                record.rdata.AAAA[8],  record.rdata.AAAA[9],  record.rdata.AAAA[10], record.rdata.AAAA[11],
-                record.rdata.AAAA[12], record.rdata.AAAA[13], record.rdata.AAAA[14], record.rdata.AAAA[15],
-            });
-        } else if (record.rrtype.eql(.CNAME)) {
-            const target = record.rdata.CNAME.toText(&value_buffer) catch return Error.BadResponse;
-            try writer.writeAll("CNAME ");
-            try writer.writeAll(target);
-        } else if (record.rrtype.eql(.NS)) {
-            const target = record.rdata.NS.toText(&value_buffer) catch return Error.BadResponse;
-            try writer.writeAll("NS ");
-            try writer.writeAll(target);
-        } else if (record.rrtype.eql(.MX)) {
-            const mx = record.rdata.MX;
-            const exchange = mx.exchange.toText(&value_buffer) catch return Error.BadResponse;
-            try writer.print("MX {} {s}", .{ mx.preference, exchange });
-        } else if (record.rrtype.eql(.SOA)) {
-            const soa = record.rdata.SOA;
-            const mname = soa.mname.toText(&value_buffer) catch return Error.BadResponse;
-            var rname_buffer: [256]u8 = undefined;
-            const rname = soa.rname.toText(&rname_buffer) catch return Error.BadResponse;
-            try writer.print("SOA {s} {s} {} {} {} {} {}", .{ mname, rname, soa.serial, soa.refresh, soa.retry, soa.expire, soa.minimum });
-        } else if (record.rrtype.eql(.PTR)) {
-            const target = record.rdata.PTR.toText(&value_buffer) catch return Error.BadResponse;
-            try writer.writeAll("PTR ");
-            try writer.writeAll(target);
-        } else if (record.rrtype.eql(.DNAME)) {
-            const target = record.rdata.DNAME.toText(&value_buffer) catch return Error.BadResponse;
-            try writer.writeAll("DNAME ");
-            try writer.writeAll(target);
-        } else if (record.rrtype.eql(.TXT)) {
-            try writer.writeAll("TXT \"");
-            try writer.writeAll(record.rdata.TXT.text());
-            try writer.writeAll("\"");
-        } else if (record.rrtype.eql(.NAPTR)) {
-            const naptr = record.rdata.NAPTR;
-            try writer.print("NAPTR {} {} ", .{ naptr.order, naptr.preference });
-            try writeQuoted(writer, naptr.flagsText(), false);
-            try writer.writeAll(" ");
-            try writeQuoted(writer, naptr.servicesText(), false);
-            try writer.writeAll(" ");
-            try writeQuoted(writer, naptr.regexpText(), false);
-            try writer.writeAll(" ");
-            const replacement = naptr.replacement.toText(&value_buffer) catch return Error.BadResponse;
-            try writer.writeAll(replacement);
-        } else if (record.rrtype.eql(.SSHFP)) {
-            const sshfp = record.rdata.SSHFP;
-            try writer.writeAll("SSHFP ");
-            try writer.print("{} {} ", .{ sshfp.algorithm, sshfp.fingerprint_type });
-            for (sshfp.fingerprintBytes()) |byte| try writer.print("{x:0>2}", .{byte});
-        } else if (record.rrtype.eql(.TLSA)) {
-            const tlsa = record.rdata.TLSA;
-            const usage = dns_rdata.tlsaUsageAcronym(tlsa.usage) orelse return Error.BadResponse;
-            const selector = dns_rdata.tlsaSelectorAcronym(tlsa.selector) orelse return Error.BadResponse;
-            const matching_type = dns_rdata.tlsaMatchingTypeAcronym(tlsa.matching_type) orelse return Error.BadResponse;
-            try writer.print("TLSA {s} {s} {s} ", .{ usage, selector, matching_type });
-            for (tlsa.association[0..tlsa.association_len]) |byte| try writer.print("{x:0>2}", .{byte});
-        } else if (record.rrtype.eql(.URI)) {
-            const uri = record.rdata.URI;
-            try writer.print("URI {} {} ", .{ uri.priority, uri.weight });
-            try writeQuoted(writer, uri.targetBytes(), true);
-        } else if (record.rrtype.eql(.AFSDB)) {
-            const afsdb = record.rdata.AFSDB;
-            const hostname = afsdb.exchange.toText(&value_buffer) catch return Error.BadResponse;
-            try writer.print("AFSDB {} {s}", .{ afsdb.preference, hostname });
-        } else if (record.rrtype.eql(.RP)) {
-            const rp = record.rdata.RP;
-            const mbox = rp.mbox.toText(&value_buffer) catch return Error.BadResponse;
-            var txt_buffer: [256]u8 = undefined;
-            const txt = rp.txt.toText(&txt_buffer) catch return Error.BadResponse;
-            try writer.print("RP {s} {s}", .{ mbox, txt });
-        } else if (record.rrtype.eql(.RT)) {
-            const rt = record.rdata.RT;
-            const exchange = rt.exchange.toText(&value_buffer) catch return Error.BadResponse;
-            try writer.print("RT {} {s}", .{ rt.preference, exchange });
-        } else if (record.rrtype.eql(.SRV)) {
-            const srv = record.rdata.SRV;
-            const target = srv.target.toText(&value_buffer) catch return Error.BadResponse;
-            try writer.print("SRV {} {} {} {s}", .{ srv.priority, srv.weight, srv.port, target });
-        } else if (record.rrtype.eql(.CAA)) {
-            const caa = record.rdata.CAA;
-            try writer.print("CAA {} ", .{caa.flags});
-            for (caa.tagText()) |byte| try writer.print("{c}", .{std.ascii.toLower(byte)});
-            try writer.writeAll(" ");
-            try writeQuoted(writer, caa.valueText(), true);
-        } else if (record.rrtype.eql(.X25)) {
-            try writer.writeAll("X25 ");
-            try writeQuoted(writer, record.rdata.X25.text(), false);
-        } else if (record.rrtype.eql(.ISDN)) {
-            const isdn = record.rdata.ISDN;
-            try writer.writeAll("ISDN ");
-            try writeQuoted(writer, isdn.addressText(), false);
-            if (isdn.has_subaddress) {
-                try writer.writeAll(" ");
-                try writeQuoted(writer, isdn.subaddressText(), false);
-            }
-        } else if (record.rrtype.eql(.APL)) {
-            try writer.writeAll("APL");
-            try writeApl(writer, record.rdata.APL.bytes());
-        } else if (record.rrtype.eql(.SVCB) or record.rrtype.eql(.HTTPS)) {
-            const svcb = if (record.rrtype.eql(.SVCB)) record.rdata.SVCB else record.rdata.HTTPS;
-            try writer.writeAll(if (record.rrtype.eql(.SVCB)) "SVCB " else "HTTPS ");
-            try writer.print("{} ", .{svcb.priority});
-            const target = svcb.target.toText(&value_buffer) catch return Error.BadResponse;
-            try writer.writeAll(target);
-            try writeSvcbParams(writer, svcb.paramsBytes());
-        } else if (dns_dnssec.isDnssecType(record.rrtype)) {
-            // DNSSEC RRs are served opaque: render RFC 3597 generic form.
-            try writer.writeAll("TYPE");
-            try writer.print("{} \\# ", .{record.rrtype.code()});
-            const raw = switch (record.rdata) {
-                .Unknown => |*unknown| unknown.bytes(),
-                else => return Error.BadResponse,
-            };
-            if (raw.len > 2048) return Error.BadResponse;
-            for (raw) |byte| try writer.print("{x:0>2}", .{byte});
-        } else {
-            // Untyped RRs (HINFO and future types) are served opaque: render
-            // RFC 3597 generic form so the fallback never drops RDATA.
-            try writer.writeAll("TYPE");
-            try writer.print("{} \\# ", .{record.rrtype.code()});
-            const raw = switch (record.rdata) {
-                .Unknown => |*unknown| unknown.bytes(),
-                else => return Error.BadResponse,
-            };
-            if (raw.len > 2048) return Error.BadResponse;
-            for (raw) |byte| try writer.print("{x:0>2}", .{byte});
-        }
-        try writer.writeAll("\n");
+        try writeRecord(record, writer);
     }
+    // RFC 4035 section 3.1.6: a signature for an answer arrives beside it, and
+    // RFC 4035 section 3.1.4 puts the NSEC proof of a negative answer in the
+    // authority section. Printing answers alone therefore hid every signed
+    // record a DO=1 client asked for.
+    try writeSection(writer, "AUTHORITY", response.authorities.slice());
+    try writeSection(writer, "ADDITIONAL", response.additionals.slice());
+}
+
+fn writeSection(writer: *std.Io.Writer, label: []const u8, records: []const dns_record.ResourceRecord) !void {
+    var printed = false;
+    for (records) |record| {
+        // OPT is an EDNS pseudo-record, not an RRset: printing it would show
+        // an operator a TYPE41 with no RDATA and no meaning.
+        if (record.rrtype.eql(.OPT)) continue;
+        if (!printed) {
+            try writer.print(";; {s} SECTION:\n", .{label});
+            printed = true;
+        }
+        try writeRecord(record, writer);
+    }
+}
+
+fn writeRecord(record: dns_record.ResourceRecord, writer: *std.Io.Writer) !void {
+    var name_buffer: [256]u8 = undefined;
+    var value_buffer: [256]u8 = undefined;
+    const owner = record.owner.toText(&name_buffer) catch return Error.BadResponse;
+    try writer.writeAll(owner);
+    try writer.writeAll(" ");
+    try writer.print("{}", .{record.ttl});
+    try writer.writeAll(" IN ");
+    if (record.rrtype.eql(.A)) {
+        try writer.writeAll("A ");
+        try writer.print("{}.{}.{}.{}", .{ record.rdata.A[0], record.rdata.A[1], record.rdata.A[2], record.rdata.A[3] });
+    } else if (record.rrtype.eql(.AAAA)) {
+        try writer.writeAll("AAAA ");
+        try writer.print("{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}", .{
+            record.rdata.AAAA[0],  record.rdata.AAAA[1],  record.rdata.AAAA[2],  record.rdata.AAAA[3],
+            record.rdata.AAAA[4],  record.rdata.AAAA[5],  record.rdata.AAAA[6],  record.rdata.AAAA[7],
+            record.rdata.AAAA[8],  record.rdata.AAAA[9],  record.rdata.AAAA[10], record.rdata.AAAA[11],
+            record.rdata.AAAA[12], record.rdata.AAAA[13], record.rdata.AAAA[14], record.rdata.AAAA[15],
+        });
+    } else if (record.rrtype.eql(.CNAME)) {
+        const target = record.rdata.CNAME.toText(&value_buffer) catch return Error.BadResponse;
+        try writer.writeAll("CNAME ");
+        try writer.writeAll(target);
+    } else if (record.rrtype.eql(.NS)) {
+        const target = record.rdata.NS.toText(&value_buffer) catch return Error.BadResponse;
+        try writer.writeAll("NS ");
+        try writer.writeAll(target);
+    } else if (record.rrtype.eql(.MX)) {
+        const mx = record.rdata.MX;
+        const exchange = mx.exchange.toText(&value_buffer) catch return Error.BadResponse;
+        try writer.print("MX {} {s}", .{ mx.preference, exchange });
+    } else if (record.rrtype.eql(.SOA)) {
+        const soa = record.rdata.SOA;
+        const mname = soa.mname.toText(&value_buffer) catch return Error.BadResponse;
+        var rname_buffer: [256]u8 = undefined;
+        const rname = soa.rname.toText(&rname_buffer) catch return Error.BadResponse;
+        try writer.print("SOA {s} {s} {} {} {} {} {}", .{ mname, rname, soa.serial, soa.refresh, soa.retry, soa.expire, soa.minimum });
+    } else if (record.rrtype.eql(.PTR)) {
+        const target = record.rdata.PTR.toText(&value_buffer) catch return Error.BadResponse;
+        try writer.writeAll("PTR ");
+        try writer.writeAll(target);
+    } else if (record.rrtype.eql(.DNAME)) {
+        const target = record.rdata.DNAME.toText(&value_buffer) catch return Error.BadResponse;
+        try writer.writeAll("DNAME ");
+        try writer.writeAll(target);
+    } else if (record.rrtype.eql(.TXT)) {
+        try writer.writeAll("TXT \"");
+        try writer.writeAll(record.rdata.TXT.text());
+        try writer.writeAll("\"");
+    } else if (record.rrtype.eql(.NAPTR)) {
+        const naptr = record.rdata.NAPTR;
+        try writer.print("NAPTR {} {} ", .{ naptr.order, naptr.preference });
+        try writeQuoted(writer, naptr.flagsText(), false);
+        try writer.writeAll(" ");
+        try writeQuoted(writer, naptr.servicesText(), false);
+        try writer.writeAll(" ");
+        try writeQuoted(writer, naptr.regexpText(), false);
+        try writer.writeAll(" ");
+        const replacement = naptr.replacement.toText(&value_buffer) catch return Error.BadResponse;
+        try writer.writeAll(replacement);
+    } else if (record.rrtype.eql(.SSHFP)) {
+        const sshfp = record.rdata.SSHFP;
+        try writer.writeAll("SSHFP ");
+        try writer.print("{} {} ", .{ sshfp.algorithm, sshfp.fingerprint_type });
+        for (sshfp.fingerprintBytes()) |byte| try writer.print("{x:0>2}", .{byte});
+    } else if (record.rrtype.eql(.TLSA)) {
+        const tlsa = record.rdata.TLSA;
+        const usage = dns_rdata.tlsaUsageAcronym(tlsa.usage) orelse return Error.BadResponse;
+        const selector = dns_rdata.tlsaSelectorAcronym(tlsa.selector) orelse return Error.BadResponse;
+        const matching_type = dns_rdata.tlsaMatchingTypeAcronym(tlsa.matching_type) orelse return Error.BadResponse;
+        try writer.print("TLSA {s} {s} {s} ", .{ usage, selector, matching_type });
+        for (tlsa.association[0..tlsa.association_len]) |byte| try writer.print("{x:0>2}", .{byte});
+    } else if (record.rrtype.eql(.URI)) {
+        const uri = record.rdata.URI;
+        try writer.print("URI {} {} ", .{ uri.priority, uri.weight });
+        try writeQuoted(writer, uri.targetBytes(), true);
+    } else if (record.rrtype.eql(.AFSDB)) {
+        const afsdb = record.rdata.AFSDB;
+        const hostname = afsdb.exchange.toText(&value_buffer) catch return Error.BadResponse;
+        try writer.print("AFSDB {} {s}", .{ afsdb.preference, hostname });
+    } else if (record.rrtype.eql(.RP)) {
+        const rp = record.rdata.RP;
+        const mbox = rp.mbox.toText(&value_buffer) catch return Error.BadResponse;
+        var txt_buffer: [256]u8 = undefined;
+        const txt = rp.txt.toText(&txt_buffer) catch return Error.BadResponse;
+        try writer.print("RP {s} {s}", .{ mbox, txt });
+    } else if (record.rrtype.eql(.RT)) {
+        const rt = record.rdata.RT;
+        const exchange = rt.exchange.toText(&value_buffer) catch return Error.BadResponse;
+        try writer.print("RT {} {s}", .{ rt.preference, exchange });
+    } else if (record.rrtype.eql(.SRV)) {
+        const srv = record.rdata.SRV;
+        const target = srv.target.toText(&value_buffer) catch return Error.BadResponse;
+        try writer.print("SRV {} {} {} {s}", .{ srv.priority, srv.weight, srv.port, target });
+    } else if (record.rrtype.eql(.CAA)) {
+        const caa = record.rdata.CAA;
+        try writer.print("CAA {} ", .{caa.flags});
+        for (caa.tagText()) |byte| try writer.print("{c}", .{std.ascii.toLower(byte)});
+        try writer.writeAll(" ");
+        try writeQuoted(writer, caa.valueText(), true);
+    } else if (record.rrtype.eql(.X25)) {
+        try writer.writeAll("X25 ");
+        try writeQuoted(writer, record.rdata.X25.text(), false);
+    } else if (record.rrtype.eql(.ISDN)) {
+        const isdn = record.rdata.ISDN;
+        try writer.writeAll("ISDN ");
+        try writeQuoted(writer, isdn.addressText(), false);
+        if (isdn.has_subaddress) {
+            try writer.writeAll(" ");
+            try writeQuoted(writer, isdn.subaddressText(), false);
+        }
+    } else if (record.rrtype.eql(.APL)) {
+        try writer.writeAll("APL");
+        try writeApl(writer, record.rdata.APL.bytes());
+    } else if (record.rrtype.eql(.SVCB) or record.rrtype.eql(.HTTPS)) {
+        const svcb = if (record.rrtype.eql(.SVCB)) record.rdata.SVCB else record.rdata.HTTPS;
+        try writer.writeAll(if (record.rrtype.eql(.SVCB)) "SVCB " else "HTTPS ");
+        try writer.print("{} ", .{svcb.priority});
+        const target = svcb.target.toText(&value_buffer) catch return Error.BadResponse;
+        try writer.writeAll(target);
+        try writeSvcbParams(writer, svcb.paramsBytes());
+    } else if (dns_dnssec.isDnssecType(record.rrtype)) {
+        // DNSSEC RRs are served opaque: render RFC 3597 generic form.
+        try writer.writeAll("TYPE");
+        try writer.print("{} \\# ", .{record.rrtype.code()});
+        const raw = switch (record.rdata) {
+            .Unknown => |*unknown| unknown.bytes(),
+            else => return Error.BadResponse,
+        };
+        if (raw.len > 2048) return Error.BadResponse;
+        for (raw) |byte| try writer.print("{x:0>2}", .{byte});
+    } else {
+        // Untyped RRs (HINFO and future types) are served opaque: render
+        // RFC 3597 generic form so the fallback never drops RDATA.
+        try writer.writeAll("TYPE");
+        try writer.print("{} \\# ", .{record.rrtype.code()});
+        const raw = switch (record.rdata) {
+            .Unknown => |*unknown| unknown.bytes(),
+            else => return Error.BadResponse,
+        };
+        if (raw.len > 2048) return Error.BadResponse;
+        for (raw) |byte| try writer.print("{x:0>2}", .{byte});
+    }
+    try writer.writeAll("\n");
 }
 
 fn writeApl(writer: *std.Io.Writer, bytes: []const u8) !void {
@@ -491,11 +541,31 @@ test "query builder encodes standard A query" {
     defer arena.deinit();
 
     var buffer: [512]u8 = undefined;
-    const packet = try buildQueryPacket(&buffer, 0x1234, "example.com.", .A);
+    const packet = try buildQueryPacket(&buffer, 0x1234, "example.com.", .A, false);
     const parsed = try dns_message.Message.parseQuery(arena.allocator(), packet);
     try std.testing.expectEqual(@as(u16, 0x1234), parsed.header.id);
     try std.testing.expect(parsed.header.recursion_desired);
     try std.testing.expect(parsed.question.?.qtype.eql(.A));
+}
+
+test "the query packet carries the RFC 6891 DO bit only when the operator asks" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var plain_buffer: [512]u8 = undefined;
+    const plain = try buildQueryPacket(&plain_buffer, 0x1234, "www.example.", .A, false);
+    const parsed_plain = try dns_message.Message.parseQuery(arena.allocator(), plain);
+    try std.testing.expectEqual(@as(u16, 0), parsed_plain.header.additional_count);
+    try std.testing.expect(parsed_plain.edns == null);
+
+    var do_buffer: [512]u8 = undefined;
+    const packet = try buildQueryPacket(&do_buffer, 0x1234, "www.example.", .A, true);
+    const parsed = try dns_message.Message.parseQuery(arena.allocator(), packet);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.additional_count);
+    try std.testing.expect(parsed.edns.?.dnssec_ok);
+    try std.testing.expectEqual(@as(u8, 0), parsed.edns.?.version);
+    try std.testing.expectEqual(@as(u16, dns_message.DEFAULT_EDNS_UDP_PAYLOAD_SIZE), parsed.edns.?.udp_payload_size);
+    try std.testing.expect(parsed.additionals.items[0].rrtype.eql(.OPT));
 }
 
 test "response validation requires QR and the exact question" {
@@ -503,7 +573,7 @@ test "response validation requires QR and the exact question" {
     defer arena.deinit();
 
     var query_buffer: [512]u8 = undefined;
-    const query = try buildQueryPacket(&query_buffer, 0x1234, "example.com.", .A);
+    const query = try buildQueryPacket(&query_buffer, 0x1234, "example.com.", .A, false);
     const expected = try dns_message.Message.parseQuery(arena.allocator(), query);
     const question = expected.question.?;
 
@@ -968,6 +1038,34 @@ test "query formatter prints response code when there are no answers" {
     try std.testing.expectEqualStrings("rcode REFUSED\nno answers\n", text);
 }
 
+test "query formatter prints the authority section a signature proof lives in" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // One A answer, one NSEC in the authority section where RFC 4035 section
+    // 3.1.4 denial-of-existence proofs arrive, and the EDNS OPT pseudo-record
+    // that is not an RRset and must not be printed.
+    const response = try dns_message.Message.parse(arena.allocator(), &.{
+        0x44, 0x01, 0x85, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01,
+        0x03, 'w',  'w',  'w',  0x07, 'e',  'x',  'a',  'm',  'p',  'l',  'e',
+        0x00, 0x00, 0x01, 0x00, 0x01, 0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00,
+        0x00, 0x0e, 0x10, 0x00, 0x04, 0xc0, 0x00, 0x02, 0x50, 0x07, 'e',  'x',
+        'a',  'm',  'p',  'l',  'e',  0x00, 0x00, 0x2f, 0x00, 0x01, 0x00, 0x00,
+        0x0e, 0x10, 0x00, 0x15, 0x03, 'w',  'w',  'w',  0x07, 'e',  'x',  'a',
+        'm',  'p',  'l',  'e',  0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xc0, 0x00, 0x00, 0x29, 0x04, 0xd0, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00,
+    });
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try writeResponse(response, &output.writer);
+    try std.testing.expectEqualStrings(
+        "www.example. 3600 IN A 192.0.2.80\n" ++
+            ";; AUTHORITY SECTION:\n" ++
+            "example. 3600 IN TYPE47 \\# 03777777076578616d706c650000060000000000c0\n",
+        output.written(),
+    );
+}
+
 test "UDP query client ignores invalid datagrams before a valid response" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -988,7 +1086,7 @@ test "UDP query client ignores invalid datagrams before a valid response" {
     defer attacker_socket.close(io);
 
     var query_buffer: [512]u8 = undefined;
-    const query = try buildQueryPacket(&query_buffer, 0x9999, "dns.home.arpa.", .A);
+    const query = try buildQueryPacket(&query_buffer, 0x9999, "dns.home.arpa.", .A, false);
 
     // The first datagram has the wrong source. The second has the expected
     // source but is a query (QR=0), so both must be ignored before the real
@@ -1019,7 +1117,7 @@ test "TCP query client talks to authoritative stream handler" {
     defer server_stream.close(io);
 
     var query_buffer: [512]u8 = undefined;
-    const query = try buildQueryPacket(&query_buffer, 0x999a, "dns.home.arpa.", .A);
+    const query = try buildQueryPacket(&query_buffer, 0x999a, "dns.home.arpa.", .A, false);
     try sendTcpQuery(client_stream, io, query);
     try client_stream.shutdown(io, .send);
     try listener.serveTcpStreamOnce(server_stream, io, &runtime);

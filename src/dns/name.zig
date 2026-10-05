@@ -215,3 +215,36 @@ test "name builds from presentation text" {
     var text: [64]u8 = undefined;
     try std.testing.expectEqualStrings("example.com.", try name.toText(&text));
 }
+
+test "RFC 1123 2.1: host names accept a leading digit and the 63 and 255 octet bounds" {
+    // "the restriction on the first character is relaxed to allow either a
+    // letter or a digit. Host software MUST support this more liberal syntax."
+    var text: [64]u8 = undefined;
+    const digit_leading = try Name.fromText("4example.com.");
+    try std.testing.expectEqualStrings("4example.com.", try digit_leading.toText(&text));
+
+    // "Host software MUST handle host names of up to 63 characters and SHOULD
+    // handle host names of up to 255 characters."
+    var buffer: [300]u8 = undefined;
+    @memset(buffer[0..63], 'a');
+    buffer[63] = '.';
+    try std.testing.expectEqual(@as(usize, 65), (try Name.fromText(buffer[0..64])).asWire().len);
+    @memset(buffer[0..64], 'a');
+    buffer[64] = '.';
+    try std.testing.expectError(Error.LabelTooLong, Name.fromText(buffer[0..65]));
+
+    // 63 + 63 + 63 + 61 octet labels reach the 255-octet name bound exactly;
+    // one more character in the last label crosses it.
+    @memset(buffer[0..63], 'a');
+    @memset(buffer[64..127], 'a');
+    @memset(buffer[128..191], 'a');
+    @memset(buffer[192..253], 'a');
+    buffer[63] = '.';
+    buffer[127] = '.';
+    buffer[191] = '.';
+    buffer[253] = '.';
+    try std.testing.expectEqual(@as(usize, 255), (try Name.fromText(buffer[0..254])).asWire().len);
+    buffer[253] = 'a';
+    buffer[254] = '.';
+    try std.testing.expectError(Error.NameTooLong, Name.fromText(buffer[0..255]));
+}

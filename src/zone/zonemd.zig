@@ -152,7 +152,7 @@ pub fn canonicalNameOrder(a: []const u8, b: []const u8) std.math.Order {
 
 /// RFC 4034 section 6.3 octet ordering: compare as left-justified unsigned
 /// octet sequences where the absence of an octet sorts before a zero octet.
-fn octetOrder(a: []const u8, b: []const u8) std.math.Order {
+pub fn octetOrder(a: []const u8, b: []const u8) std.math.Order {
     const common = @min(a.len, b.len);
     const order = std.mem.order(u8, a[0..common], b[0..common]);
     if (order != .eq) return order;
@@ -262,16 +262,24 @@ fn computeDigest(zone: *const zone_index.Zone, hash: Hash, allocator: std.mem.Al
 fn hashEntries(entries: []const Entry, comptime Hasher: type, comptime digest_len: usize, out: *[digest_len]u8) void {
     var hasher = Hasher.init(.{});
     for (entries) |entry| {
-        var header: [10]u8 = undefined;
-        std.mem.writeInt(u16, header[0..2], entry.rrtype, .big);
-        std.mem.writeInt(u16, header[2..4], entry.class, .big);
-        std.mem.writeInt(u32, header[4..8], entry.ttl, .big);
-        std.mem.writeInt(u16, header[8..10], @intCast(entry.rdata.len), .big);
+        const header = rrHeader(entry.rrtype, entry.class, entry.ttl, entry.rdata.len);
         hasher.update(entry.owner_wire);
         hasher.update(&header);
         hasher.update(entry.rdata);
     }
     hasher.final(out);
+}
+
+/// The 10-octet canonical RR header (RFC 4034 section 6.2): type, class, TTL,
+/// and RDLENGTH. Exported so the DNSSEC signer builds signed-data RRs with the
+/// same serialisation the ZONEMD digest covers, instead of a second copy.
+pub fn rrHeader(rrtype: u16, class: u16, ttl: u32, rdata_len: usize) [10]u8 {
+    var header: [10]u8 = undefined;
+    std.mem.writeInt(u16, header[0..2], rrtype, .big);
+    std.mem.writeInt(u16, header[2..4], class, .big);
+    std.mem.writeInt(u32, header[4..8], ttl, .big);
+    std.mem.writeInt(u16, header[8..10], @intCast(rdata_len), .big);
+    return header;
 }
 
 /// Reports are NUL-terminated in place so a caller that only receives the

@@ -1,0 +1,7 @@
+$ORIGIN signed.example.
+$TTL 3600
+@   IN SOA ns1.signed.example. hostmaster.signed.example. 2026100501 3600 900 1209600 3600
+@   IN NS  ns1.signed.example.
+ns1 IN A   192.0.2.53
+www IN A   192.0.2.80
+*   IN A   192.0.2.99

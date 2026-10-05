@@ -32,6 +32,7 @@ pub const resolver = @import("resolver.zig");
 pub const qname_minimize = @import("qname_minimize.zig");
 pub const local_zone = @import("local_zone.zig");
 pub const zone_zonemd = @import("zone/zonemd.zig");
+pub const zone_signer = @import("zone/signer.zig");
 
 const ServerRunMode = enum { none, udp_once, tcp_once, udp_loop, tcp_loop, dot_loop, doh_loop, xfr_loop };
 
@@ -43,6 +44,7 @@ test {
     _ = @import("dns/types.zig");
     _ = @import("dns/rdata.zig");
     _ = @import("dns/dnssec.zig");
+    _ = @import("dns/validate.zig");
     _ = @import("dns/record.zig");
     _ = @import("dns/question.zig");
     _ = @import("dns/message.zig");
@@ -52,6 +54,7 @@ test {
     _ = zone_parser;
     _ = zone_index;
     _ = zone_zonemd;
+    _ = zone_signer;
     _ = @import("zone/transfer.zig");
     _ = @import("zone/secondary.zig");
     _ = auth_response;
@@ -140,11 +143,18 @@ fn printHelp(writer: *std.Io.Writer) !void {
         \\  zimdns server run --zone-file examples/zones/home.arpa.zone --serve-tcp
         \\  zimdns query @127.0.0.1 -p 1053 example.com A
         \\  zimdns query @127.0.0.1 -p 1054 10.in-addr.arpa. SOA
+        \\  zimdns query @127.0.0.1 -p 1055 --dnssec signed.example. A
         \\
         \\  RFC 6303/6761/7793/8375 locally served zones are on by default and
         \\  are answered ahead of the cache and the forwarder. A configuration
         \\  turns them off with 'local-zones off'; examples/local-zones.gdns
         \\  is a worked configuration.
+        \\
+        \\  --dnssec sets the RFC 6891 DO bit so the server returns its RRSIG
+        \\  and NSEC records, which arrive in the answer and authority
+        \\  sections and are printed under their section headings. Signing a
+        \\  zone is a config directive: 'dnssec-key-file <path>' in
+        \\  examples/dnssec/config.gdns is a worked configuration.
         \\
         \\  --serve-dot, --serve-doh, and --serve-xfr are accepted but always
         \\  refuse to start: this build links no TLS server, so it cannot
@@ -159,6 +169,7 @@ fn printHelp(writer: *std.Io.Writer) !void {
 
 fn handleQuery(args: []const []const u8, io: std.Io, allocator: std.mem.Allocator, writer: *std.Io.Writer) !void {
     var server_text: []const u8 = "127.0.0.1";
+    var use_dnssec = false;
     var port: u16 = 1053;
     var use_tcp = false;
     var name: ?[]const u8 = null;
@@ -181,6 +192,8 @@ fn handleQuery(args: []const []const u8, io: std.Io, allocator: std.mem.Allocato
             };
         } else if (std.mem.eql(u8, arg, "--tcp")) {
             use_tcp = true;
+        } else if (std.mem.eql(u8, arg, "--dnssec")) {
+            use_dnssec = true;
         } else if (name == null) {
             name = arg;
         } else {
@@ -203,7 +216,7 @@ fn handleQuery(args: []const []const u8, io: std.Io, allocator: std.mem.Allocato
     io.random(&query_id_bytes);
     const query_id = std.mem.readInt(u16, &query_id_bytes, .big);
     var packet_buffer: [512]u8 = undefined;
-    const query = try cli_query.buildQueryPacket(&packet_buffer, query_id, absolute_name, qtype);
+    const query = try cli_query.buildQueryPacket(&packet_buffer, query_id, absolute_name, qtype, use_dnssec);
     const server = std.Io.net.IpAddress.parse(server_text, port) catch {
         try writer.writeAll("error: query server must be an IP address for now\n");
         try exitUsage(writer);

@@ -1,0 +1,24 @@
+# ZIMDNS example configuration: a DNSSEC-signed zone.
+#
+# `dnssec-key-file` names the signing key. Every zone this configuration loads
+# is signed once at startup -- apex DNSKEY and DS, one NSEC per authoritative
+# owner, one RRSIG per RRset (RFC 4034 sections 3.1.8.1 and 5.1.4, RFC 4035
+# section 2.3) -- and the signed records are served from memory. Nothing is
+# written back to the zone file, and the SOA serial is left alone.
+#
+# Signatures are valid from the moment of signing for 30 days, and the zone is
+# re-signed on every start, so the window only has to outlast one uptime.
+#
+#   zimdns server run --config examples/dnssec/config.gdns --serve-udp
+#   zimdns query @127.0.0.1 -p 1055 --dnssec www.signed.example. A
+#   zimdns query @127.0.0.1 -p 1055 --dnssec signed.example. DNSKEY
+#   zimdns query @127.0.0.1 -p 1055 --dnssec nothing.signed.example. A   # NSEC proof
+#
+# Without --dnssec the DO bit stays clear and the server strips RRSIG and NSEC,
+# which is what an ordinary resolver wants.
+
+listen dns udp 127.0.0.1:1055
+
+zone signed.example primary examples/dnssec/signed.example.zone
+
+dnssec-key-file examples/dnssec/zsk.key

@@ -161,6 +161,14 @@ pub const Config = struct {
     blocklists: List(BlocklistFile) = .{},
     tsig_key_file: Text = .{},
     has_tsig_key_file: bool = false,
+    /// Path to the DNSSEC signing key file. One key signs every configured
+    /// zone at startup; see `dnssec-key-file` in the loader.
+    dnssec_key_file: Text = .{},
+    has_dnssec_key_file: bool = false,
+    /// Path to the DNSSEC trust-anchor file the forwarding path validates
+    /// against; see `trust-anchor-file` in the loader.
+    trust_anchor_file: Text = .{},
+    has_trust_anchor_file: bool = false,
     tls_cert_file: Text = .{},
     has_tls_cert_file: bool = false,
     tls_key_file: Text = .{},
@@ -171,6 +179,15 @@ pub const Config = struct {
     /// RFC 6303 section 3 mechanism to disable them.
     local_zones: bool = true,
     has_local_zones: bool = false,
+    /// RFC 5001 section 2.4 presentation format: the NSID payload is written
+    /// as hexadecimal digits, two per octet. There is no default, so an
+    /// unconfigured server answers no NSID at all.
+    nsid: Text = .{},
+    has_nsid: bool = false,
+    /// RFC 9660 section 3.2 lets a server decline to answer ZONEVERSION.
+    /// Default on: the value is the answer's own SOA serial.
+    zoneversion: bool = true,
+    has_zoneversion: bool = false,
 
     pub fn tlsCertFileText(self: *const Config) ?[]const u8 {
         if (!self.has_tls_cert_file) return null;
@@ -185,6 +202,21 @@ pub const Config = struct {
     pub fn tsigKeyFileText(self: *const Config) ?[]const u8 {
         if (!self.has_tsig_key_file) return null;
         return self.tsig_key_file.text();
+    }
+
+    pub fn dnssecKeyFileText(self: *const Config) ?[]const u8 {
+        if (!self.has_dnssec_key_file) return null;
+        return self.dnssec_key_file.text();
+    }
+
+    pub fn trustAnchorFileText(self: *const Config) ?[]const u8 {
+        if (!self.has_trust_anchor_file) return null;
+        return self.trust_anchor_file.text();
+    }
+
+    pub fn nsidText(self: *const Config) ?[]const u8 {
+        if (!self.has_nsid) return null;
+        return self.nsid.text();
     }
 
     pub fn parse(text: []const u8) !Config {
@@ -209,10 +241,14 @@ pub const Config = struct {
         if (std.mem.eql(u8, first, "zone")) return self.parseZone(&tokens);
         if (std.mem.eql(u8, first, "blocklist")) return self.parseBlocklist(&tokens);
         if (std.mem.eql(u8, first, "tsig-key-file")) return self.parseTsigKeyFile(&tokens);
+        if (std.mem.eql(u8, first, "dnssec-key-file")) return self.parseDnssecKeyFile(&tokens);
+        if (std.mem.eql(u8, first, "trust-anchor-file")) return self.parseTrustAnchorFile(&tokens);
         if (std.mem.eql(u8, first, "tls-cert-file")) return self.parseTlsCertFile(&tokens);
         if (std.mem.eql(u8, first, "tls-key-file")) return self.parseTlsKeyFile(&tokens);
         if (std.mem.eql(u8, first, "encrypted-dns")) return self.parseEncryptedDns(&tokens);
         if (std.mem.eql(u8, first, "local-zones")) return self.parseLocalZones(&tokens);
+        if (std.mem.eql(u8, first, "nsid")) return self.parseNsid(&tokens);
+        if (std.mem.eql(u8, first, "zoneversion")) return self.parseZoneversion(&tokens);
         return Error.UnknownDirective;
     }
 
@@ -289,6 +325,24 @@ pub const Config = struct {
         self.has_tsig_key_file = true;
     }
 
+    fn parseDnssecKeyFile(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        if (self.has_dnssec_key_file) return Error.BadDirective;
+        const path = tokens.next() orelse return Error.BadDirective;
+        try requireNoTrailingTokens(tokens);
+        if (path.len == 0) return Error.BadDirective;
+        try self.dnssec_key_file.set(path);
+        self.has_dnssec_key_file = true;
+    }
+
+    fn parseTrustAnchorFile(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        if (self.has_trust_anchor_file) return Error.BadDirective;
+        const path = tokens.next() orelse return Error.BadDirective;
+        try requireNoTrailingTokens(tokens);
+        if (path.len == 0) return Error.BadDirective;
+        try self.trust_anchor_file.set(path);
+        self.has_trust_anchor_file = true;
+    }
+
     fn parseTlsCertFile(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
         if (self.has_tls_cert_file) return Error.BadDirective;
         const path = tokens.next() orelse return Error.BadDirective;
@@ -333,6 +387,35 @@ pub const Config = struct {
             return Error.BadDirective;
         }
         self.has_local_zones = true;
+    }
+
+    fn parseNsid(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        if (self.has_nsid) return Error.BadDirective;
+        const value = tokens.next() orelse return Error.BadDirective;
+        try requireNoTrailingTokens(tokens);
+        // RFC 5001 section 2.4: a user interface reads the payload as two
+        // hexadecimal digits per octet, so an odd count or a non-hex character
+        // is a malformed directive rather than an opaque blob.
+        if (value.len == 0 or value.len % 2 != 0) return Error.BadDirective;
+        for (value) |byte| {
+            if (!std.ascii.isHex(byte)) return Error.BadDirective;
+        }
+        try self.nsid.set(value);
+        self.has_nsid = true;
+    }
+
+    fn parseZoneversion(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        if (self.has_zoneversion) return Error.BadDirective;
+        const value = tokens.next() orelse return Error.BadDirective;
+        try requireNoTrailingTokens(tokens);
+        if (std.mem.eql(u8, value, "on")) {
+            self.zoneversion = true;
+        } else if (std.mem.eql(u8, value, "off")) {
+            self.zoneversion = false;
+        } else {
+            return Error.BadDirective;
+        }
+        self.has_zoneversion = true;
     }
 };
 
@@ -476,6 +559,32 @@ test "config parser accepts one TSIG key-file path and no secret directive" {
     try std.testing.expectError(error.UnknownDirective, Config.parse("tsig-key secret-value\n"));
 }
 
+test "config parser accepts one DNSSEC signing key-file path and no inline secret" {
+    const config = try Config.parse("dnssec-key-file examples/dnssec/zsk.key\n");
+    try std.testing.expectEqualStrings("examples/dnssec/zsk.key", config.dnssecKeyFileText().?);
+    try std.testing.expect((try Config.parse("zone one.example primary one.zone\n")).dnssecKeyFileText() == null);
+    try std.testing.expectError(error.BadDirective, Config.parse(
+        "dnssec-key-file a.key\ndnssec-key-file b.key\n",
+    ));
+    try std.testing.expectError(error.BadDirective, Config.parse("dnssec-key-file\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("dnssec-key-file a.key b.key\n"));
+    try std.testing.expectError(error.UnknownDirective, Config.parse("dnssec-key ed25519-secret\n"));
+}
+
+test "config parser accepts one DNSSEC trust-anchor path and rejects every other shape" {
+    const config = try Config.parse("trust-anchor-file examples/dnssec/root.anchor\n");
+    try std.testing.expectEqualStrings("examples/dnssec/root.anchor", config.trustAnchorFileText().?);
+    try std.testing.expect((try Config.parse("zone one.example primary one.zone\n")).trustAnchorFileText() == null);
+    // Same shape as `dnssec-key-file`: one directive, exactly one value, and
+    // no inline key material.
+    try std.testing.expectError(error.BadDirective, Config.parse(
+        "trust-anchor-file a.anchor\ntrust-anchor-file b.anchor\n",
+    ));
+    try std.testing.expectError(error.BadDirective, Config.parse("trust-anchor-file\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("trust-anchor-file a.anchor b.anchor\n"));
+    try std.testing.expectError(error.UnknownDirective, Config.parse("trust-anchor ed25519-key\n"));
+}
+
 test "config parser keeps locally served zones on unless an operator turns them off" {
     const implicit = try Config.parse("zone one.example primary one.zone\n");
     try std.testing.expect(implicit.local_zones);
@@ -496,4 +605,51 @@ test "config parser keeps locally served zones on unless an operator turns them 
         "local-zones on\nlocal-zones off\n",
     ));
     try std.testing.expectError(error.UnknownDirective, Config.parse("local-zone on\n"));
+}
+
+test "config parser takes one RFC 5001 NSID as hex and rejects every other shape" {
+    const config = try Config.parse("nsid 6e73312e6578616d706c652e\n");
+    try std.testing.expectEqualStrings("6e73312e6578616d706c652e", config.nsidText().?);
+    // No default identifier: RFC 5001 section 3.1 leaves the payload to the
+    // operator, so an unconfigured server has nothing to answer with.
+    try std.testing.expect((try Config.parse("zone one.example primary one.zone\n")).nsidText() == null);
+
+    // RFC 5001 section 2.4: two hexadecimal digits per payload octet, in either
+    // case. The directive keeps the text as written and the loader decodes it.
+    try std.testing.expectEqualStrings("00FF", (try Config.parse("nsid 00FF\n")).nsidText().?);
+    for ([_][]const u8{
+        "nsid\n",
+        "nsid 6e73312e6578616d706c652e extra\n",
+        "nsid abc\n",
+        "nsid 6e73s1\n",
+        "nsid ns1.example.\n",
+    }) |text| {
+        try std.testing.expectError(error.BadDirective, Config.parse(text));
+    }
+    try std.testing.expectError(error.BadDirective, Config.parse(
+        "nsid 6e73\nnsid 6e74\n",
+    ));
+    try std.testing.expectError(error.UnknownDirective, Config.parse("nsid-hex 6e73\n"));
+}
+
+test "config parser keeps ZONEVERSION answers on unless an operator turns them off" {
+    const implicit = try Config.parse("zone one.example primary one.zone\n");
+    try std.testing.expect(implicit.zoneversion);
+    try std.testing.expect(!implicit.has_zoneversion);
+
+    const on = try Config.parse("zoneversion on\n");
+    try std.testing.expect(on.zoneversion);
+    try std.testing.expect(on.has_zoneversion);
+
+    const off = try Config.parse("zoneversion off\n");
+    try std.testing.expect(!off.zoneversion);
+    try std.testing.expect(off.has_zoneversion);
+
+    try std.testing.expectError(error.BadDirective, Config.parse("zoneversion maybe\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("zoneversion\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("zoneversion off extra\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse(
+        "zoneversion on\nzoneversion off\n",
+    ));
+    try std.testing.expectError(error.UnknownDirective, Config.parse("zoneversions on\n"));
 }

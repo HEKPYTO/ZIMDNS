@@ -218,6 +218,32 @@ fn nsecBitmapDeniesType(bitmap: []const u8, qtype: u16) Error!bool {
     return !nsecBitmapHasType(bitmap, qtype);
 }
 
+/// RFC 6840 section 4.3: a NODATA proof needs the QTYPE bit clear AND the CNAME
+/// bit clear in the same type bitmap. Without the second test an attacker can
+/// strip the CNAME RRset out of a positive response and the stripped response
+/// then reads as a valid NODATA, which is the whole attack. The bitmap is
+/// validated first: malformed input is an error, never a denial.
+pub fn bitmapDeniesTypeAndCname(bitmap: []const u8, qtype: u16) Error!bool {
+    try nsecBitmapValidate(bitmap);
+    return !nsecBitmapHasType(bitmap, qtype) and !nsecBitmapHasType(bitmap, RecordType.CNAME.code());
+}
+
+/// RFC 4034 Appendix B: the DNSKEY RDATA summed as big-endian 16-bit groups,
+/// with the carry folded back in once before the result is truncated. The fold
+/// is not decoration -- the sum exceeds 16 bits for any real DNSKEY, and
+/// leaving it out yields a tag lower than the RFC's by the carry count. An
+/// odd-length RDATA pads the final octet on the right, so that octet
+/// contributes its high byte only.
+pub fn keyTag(dnskey_rdata: []const u8) u16 {
+    var sum: u64 = 0;
+    var index: usize = 0;
+    while (index + 1 < dnskey_rdata.len) : (index += 2) {
+        sum += std.mem.readInt(u16, dnskey_rdata[index..][0..2], .big);
+    }
+    if (dnskey_rdata.len % 2 != 0) sum += @as(u64, dnskey_rdata[dnskey_rdata.len - 1]) << 8;
+    return @truncate((sum + ((sum >> 16) & 0xffff)) & 0xffff);
+}
+
 /// Canonical DNS name order (RFC 4034 section 6.1): compare labels from the
 /// root, case-insensitively. Returns <0, 0, >0 like mem.order.
 pub fn compareNames(a: Name, b: Name) i8 {

@@ -159,6 +159,37 @@ test "server context keeps locally served zones on by default and honours local-
     try std.testing.expect(!off_runtime.local_zones);
 }
 
+test "server context decodes the nsid hex and the zoneversion switch into the runtime EDNS policy" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{ .sub_path = "one.zone", .data = zone_one });
+    try dir.dir.writeFile(io, .{ .sub_path = "plain.gdns", .data = "zone one.example primary one.zone\n" });
+    try dir.dir.writeFile(io, .{ .sub_path = "edns.gdns", .data =
+        \\zone one.example primary one.zone
+        \\nsid 6e73312e6578616d706c652e
+        \\zoneversion off
+        \\
+    });
+
+    var plain = try ServerContext.load(dir.dir, io, "plain.gdns", std.testing.allocator);
+    defer plain.deinit();
+    var plain_runtime = try plain.takeRuntime(io);
+    defer plain_runtime.deinit();
+    try std.testing.expect(plain_runtime.edns.nsid == null);
+    try std.testing.expect(plain_runtime.edns.zoneversion);
+
+    var configured = try ServerContext.load(dir.dir, io, "edns.gdns", std.testing.allocator);
+    defer configured.deinit();
+    var configured_runtime = try configured.takeRuntime(io);
+    defer configured_runtime.deinit();
+    // RFC 5001 section 2.4: the hex an operator writes is the presentation
+    // format for the OPTION-DATA octets, so the payload is the decoded text.
+    try std.testing.expectEqualSlices(u8, "ns1.example.", configured_runtime.edns.nsid.?);
+    try std.testing.expect(!configured_runtime.edns.zoneversion);
+}
+
 test "the shipped local-zones example configuration loads with its zone and forwarder" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var context = try ServerContext.load(std.Io.Dir.cwd(), io, "examples/local-zones.gdns", std.testing.allocator);

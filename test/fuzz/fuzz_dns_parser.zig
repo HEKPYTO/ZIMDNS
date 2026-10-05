@@ -54,6 +54,7 @@ fn fuzzMessage(input: []const u8) !void {
         error.EndOfInput,
         error.ResponseNotQuery,
         error.UnsupportedQuestionCount,
+        error.TooManyQuestions,
         error.BadRecord,
         error.AllocationBudgetExceeded,
         error.TrailingData,

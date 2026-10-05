@@ -59,6 +59,14 @@ pub const Zone = struct {
     origin: []const u8 = &.{},
     records: parser.RecordList = .{},
     soa: ?parser.ZoneRecord = null,
+    /// Records the DNSSEC signer appended after the zone file was indexed. They
+    /// live outside `backing`: `generated` is the appended tail to release
+    /// field by field, and `generated_allocation` is the whole array the
+    /// allocator must be given back. The loaded records are slices of
+    /// `backing` and must never be freed here.
+    generated: []parser.ZoneRecord = &.{},
+    generated_allocation: []parser.ZoneRecord = &.{},
+    generated_allocator: ?std.mem.Allocator = null,
 
     /// Moves parsed-zone ownership into an index. The moved-from ZoneFile is safe
     /// to deinit and no longer owns backing storage or records.
@@ -80,6 +88,16 @@ pub const Zone = struct {
     }
 
     pub fn deinit(self: *Zone) void {
+        if (self.generated_allocator) |allocator| {
+            for (self.generated) |record| {
+                allocator.free(record.owner);
+                allocator.free(record.rdata);
+            }
+            allocator.free(self.generated_allocation);
+            self.generated = &.{};
+            self.generated_allocation = &.{};
+            self.generated_allocator = null;
+        }
         std.heap.page_allocator.free(self.backing);
         self.backing = &.{};
         self.records = .{};
@@ -101,7 +119,7 @@ pub const Zone = struct {
                 result.kind = .servfail;
                 return failResult(&result, allocator);
             }
-            if (exact_kind == .answer or exact_kind == .cname or exact_kind == .dname or exact_kind == .yxdomain) {
+            if (exact_kind == .answer or exact_kind == .cname or exact_kind == .dname or exact_kind == .yxdomain or exact_kind == .nxdomain) {
                 result.kind = exact_kind;
                 return result;
             }
@@ -168,6 +186,16 @@ pub const Zone = struct {
 
     pub fn originText(self: *const Zone) []const u8 {
         return self.origin;
+    }
+
+    /// The apex SOA serial: RFC 9660 section 4's SOA-SERIAL ZONEVERSION, and
+    /// the serial an RFC 1995 transfer compares against. Parsed on demand
+    /// rather than cached, because only these two paths ask for it.
+    pub fn soaSerial(self: *const Zone) ?u32 {
+        const record = self.soa orelse return null;
+        const rdata = parser.parseRData(.SOA, record.rdataText()) catch return null;
+        if (rdata != .SOA) return null;
+        return rdata.SOA.serial;
     }
 
     pub fn contains(self: *const Zone, qname: []const u8) bool {
@@ -253,13 +281,15 @@ pub const Zone = struct {
             // remains in visited, and all source records are zone-owned.
         }
 
-        if (saw_dname) {
+        if (saw_cname or saw_dname) {
+            // RFC 8020 section 2 Warning: in a CNAME or DNAME chain the name
+            // that does not exist is the last of the chain, not the QNAME. An
+            // in-zone target with nothing at or below it is therefore
+            // NXDOMAIN for the denied name; an out-of-zone target keeps the
+            // alias answer so the client chases the alias at its own server.
+            if (self.contains(current) and !self.nodeExists(current)) return .nxdomain;
             result.soa = null;
-            return .dname;
-        }
-        if (saw_cname) {
-            result.soa = null;
-            return .cname;
+            return if (saw_dname) .dname else .cname;
         }
         if (owner_exists) return .nodata;
         return null;
@@ -312,7 +342,9 @@ pub const Zone = struct {
         return selected;
     }
 
-    fn hasOwner(self: *const Zone, owner: []const u8) bool {
+    /// True when any record in this zone has this exact owner name. An
+    /// empty non-terminal has descendants but no record of its own.
+    pub fn hasOwner(self: *const Zone, owner: []const u8) bool {
         for (self.records.items[0..self.records.len]) |record| {
             if (std.ascii.eqlIgnoreCase(record.ownerText(), owner)) return true;
         }
@@ -550,7 +582,11 @@ test "zone index synthesizes bounded DNAME redirects" {
 
     var below = zone.lookup(arena.allocator(), "www.legacy.example.", .A);
     defer below.deinit(arena.allocator());
-    try std.testing.expectEqual(LookupKind.dname, below.kind);
+    // RFC 8020 section 2 Warning: the synthesized CNAME target
+    // www.target.example. is the last name of the chain and it does not exist
+    // in this zone, so the whole chain is answered NXDOMAIN with the SOA.
+    try std.testing.expectEqual(LookupKind.nxdomain, below.kind);
+    try std.testing.expect(below.soa != null);
     try std.testing.expectEqual(@as(usize, 1), below.records.len);
     try std.testing.expect(below.synthesized_cname != null);
     var target_text: [256]u8 = undefined;

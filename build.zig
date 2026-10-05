@@ -95,6 +95,27 @@ pub fn build(b: *std.Build) void {
 
     const integration_step = b.step("test-integration", "Run loopback DNS pipeline integration tests");
     integration_step.dependOn(&run_integration_tests.step);
+
+    // The documented-CLI guard runs the built binary, so it needs the emitted
+    // artifact path and a working directory at the project root, where the
+    // example paths in --help resolve.
+    const cli_options = b.addOptions();
+    cli_options.addOption([]const u8, "version", version);
+    cli_options.addOptionPath("exe_path", exe.getEmittedBin());
+
+    const cli_test_module = b.createModule(.{
+        .root_source_file = b.path("test/cli/documented_invocation_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    cli_test_module.addOptions("build_options", cli_options);
+    cli_test_module.addImport("zimdns", mainModule(b, target, optimize, build_options));
+    const cli_tests = b.addTest(.{ .root_module = cli_test_module });
+    const run_cli_tests = b.addRunArtifact(cli_tests);
+    run_cli_tests.setCwd(b.path("."));
+
+    const cli_step = b.step("test-cli", "Run every invocation documented in --help and examples/");
+    cli_step.dependOn(&run_cli_tests.step);
 }
 
 /// Every artifact above compiles `src/main.zig`, so the build options it reads

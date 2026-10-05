@@ -589,7 +589,7 @@ test "TCP loop rejects truncated frames before serving the next connection" {
     var valid_client = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
     defer valid_client.close(io);
     var query_buffer: [512]u8 = undefined;
-    const query = try @import("../cli/query.zig").buildQueryPacket(&query_buffer, 0x6789, "dns.home.arpa.", .A);
+    const query = try @import("../cli/query.zig").buildQueryPacket(&query_buffer, 0x6789, "dns.home.arpa.", .A, false);
     try @import("../cli/query.zig").sendTcpQuery(valid_client, io, query);
     try valid_client.shutdown(io, .send);
 
@@ -630,7 +630,7 @@ test "TCP loop does not count an empty EOF connection" {
     var valid_client = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
     defer valid_client.close(io);
     var query_buffer: [512]u8 = undefined;
-    const query = try @import("../cli/query.zig").buildQueryPacket(&query_buffer, 0x6790, "dns.home.arpa.", .A);
+    const query = try @import("../cli/query.zig").buildQueryPacket(&query_buffer, 0x6790, "dns.home.arpa.", .A, false);
     try @import("../cli/query.zig").sendTcpQuery(valid_client, io, query);
     try valid_client.shutdown(io, .send);
 
@@ -677,7 +677,7 @@ test "TCP loop rejects a length prefix without payload" {
     var valid_client = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
     defer valid_client.close(io);
     var query_buffer: [512]u8 = undefined;
-    const query = try @import("../cli/query.zig").buildQueryPacket(&query_buffer, 0x6791, "dns.home.arpa.", .A);
+    const query = try @import("../cli/query.zig").buildQueryPacket(&query_buffer, 0x6791, "dns.home.arpa.", .A, false);
     try @import("../cli/query.zig").sendTcpQuery(valid_client, io, query);
     try valid_client.shutdown(io, .send);
 
@@ -873,7 +873,7 @@ test "TCP loop ignores malformed and idle connections before a valid query" {
     var valid_client = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
     defer valid_client.close(io);
     var query_buffer: [512]u8 = undefined;
-    const query = try @import("../cli/query.zig").buildQueryPacket(&query_buffer, 0x3434, "dns.home.arpa.", .A);
+    const query = try @import("../cli/query.zig").buildQueryPacket(&query_buffer, 0x3434, "dns.home.arpa.", .A, false);
     try @import("../cli/query.zig").sendTcpQuery(valid_client, io, query);
     try valid_client.shutdown(io, .send);
 
@@ -894,7 +894,7 @@ const test_zone =
 ;
 
 fn buildLargeEdnsQuery(buffer: []u8, id: u16) ![]const u8 {
-    const base = try @import("../cli/query.zig").buildQueryPacket(buffer, id, "dns.home.arpa.", .A);
+    const base = try @import("../cli/query.zig").buildQueryPacket(buffer, id, "dns.home.arpa.", .A, false);
     const option_data_len = 480;
     const opt_len = 11 + 4 + option_data_len;
     if (base.len + opt_len > buffer.len) return error.BufferTooSmall;

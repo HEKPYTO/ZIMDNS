@@ -12,6 +12,15 @@ const zone_index = @import("../zone/index.zig");
 const zone_parser = @import("../zone/parser.zig");
 const resolver_mod = @import("../resolver.zig");
 const zonemd = @import("../zone/zonemd.zig");
+const signer = @import("../zone/signer.zig");
+
+const validate_mod = @import("../dns/validate.zig");
+/// RFC 4034 section 3.1.5 signature window for a zone signed at startup. The
+/// key file is re-read and every zone re-signed on each start, so the window
+/// only has to outlast one uptime: an operator who serves longer without
+/// restarting publishes expired signatures, which is said here plainly rather
+/// than hidden behind a refresh timer this profile does not have.
+const signature_validity_seconds: u32 = 30 * 24 * 60 * 60;
 
 pub const Error = error{
     MissingReferencedFile,
@@ -20,6 +29,8 @@ pub const Error = error{
     BadConfiguration,
     ZoneNameMismatch,
     ZonemdMismatch,
+    BadDnssecKey,
+    BadTrustAnchorFile,
 };
 
 pub const ServerContext = struct {
@@ -28,6 +39,10 @@ pub const ServerContext = struct {
     zones: std.ArrayList(zone_index.Zone) = .empty,
     blocklist: blocklist_mod.Blocklist = .{},
     keyring: keyring_mod.Keyring = .{},
+    /// RFC 4035 section 5.2 trust anchors for the forwarding path. Empty when
+    /// no `trust-anchor-file` is configured, which is what keeps the forwarder
+    /// a non-validating one.
+    anchors: validate_mod.Anchors = .{},
 
     pub fn load(dir: std.Io.Dir, io: std.Io, config_path: []const u8, allocator: std.mem.Allocator) !ServerContext {
         try ensureConfined(dir, io, config_path);
@@ -45,6 +60,29 @@ pub const ServerContext = struct {
             defer allocator.free(key_text);
             context.keyring = parseKeyTextAndClear(key_text) catch |err| return err;
         }
+
+        // The key is read before any zone is loaded, so a bad key file fails
+        // startup without leaving a half-signed zone behind. The private
+        // scalar is wiped as soon as every zone has been signed.
+        var dnssec_key: ?signer.Key = null;
+        defer if (dnssec_key) |*key| key.deinit();
+        if (context.config.dnssecKeyFileText()) |key_path| {
+            const key_text = try readReferencedFile(dir, io, key_path, allocator);
+            defer allocator.free(key_text);
+            dnssec_key = parseDnssecKeyTextAndClear(key_text) catch return Error.BadDnssecKey;
+        }
+
+        // Read before any zone is loaded, so a bad anchor file fails startup
+        // rather than leaving a forwarder running with no trust domain.
+        if (context.config.trustAnchorFileText()) |anchor_path| {
+            const anchor_text = try readReferencedFile(dir, io, anchor_path, allocator);
+            defer allocator.free(anchor_text);
+            context.anchors = validate_mod.Anchors.parse(context.allocator, anchor_text) catch return Error.BadTrustAnchorFile;
+        }
+        const now_seconds: u32 = @intCast(@divTrunc(
+            std.Io.Clock.real.now(io).nanoseconds,
+            std.time.ns_per_s,
+        ));
 
         var zone_index_value: usize = 0;
         while (zone_index_value < context.config.zones.len) : (zone_index_value += 1) {
@@ -72,6 +110,15 @@ pub const ServerContext = struct {
                 stderr_writer.interface.flush() catch {};
                 return Error.ZonemdMismatch;
             };
+            // RFC 4035 section 2.3: signing adds DNSKEY, DS, RRSIG, and NSEC to
+            // the loaded zone, so the signed RRsets are served from here on
+            // without touching the zone file on disk.
+            if (dnssec_key) |*key| {
+                signer.signZone(context.allocator, &zone, key, .{
+                    .inception = now_seconds,
+                    .expiration = now_seconds + signature_validity_seconds,
+                }) catch return Error.BadDnssecKey;
+            }
             try context.zones.append(allocator, zone);
         }
 
@@ -89,12 +136,25 @@ pub const ServerContext = struct {
 
     pub fn takeRuntime(self: *ServerContext, io: std.Io) Error!auth_runtime.Runtime {
         if (self.zones.items.len == 0) return Error.NoPrimaryZone;
-        const policy = resolver_mod.Policy.fromConfig(&self.config) catch return error.BadConfiguration;
+        // The NSID payload outlives the config text it was written in, so the
+        // runtime owns the decoded octets. Decoded before anything moves out of
+        // this context, so a failure here leaves the context whole.
+        const nsid = if (self.config.nsidText()) |text|
+            decodeNsid(self.allocator, text) catch return error.BadConfiguration
+        else
+            null;
+        var policy = resolver_mod.Policy.fromConfig(&self.config) catch return error.BadConfiguration;
+        // The anchors move into the policy the resolver keeps, so exactly one
+        // owner frees them and no reload path exists to double-free.
+        policy.anchors = self.anchors;
+        self.anchors = .{};
         var runtime = if (self.config.forwarder != null or self.config.recursion_allow.len != 0 or self.config.cookies.enabled)
             try auth_runtime.Runtime.fromZonesWithPolicyAndKeyring(self.allocator, &self.zones, self.blocklist, io, policy, &self.keyring)
         else
             auth_runtime.Runtime.fromZonesWithKeyring(self.allocator, &self.zones, self.blocklist, &self.keyring);
         runtime.local_zones = self.config.local_zones;
+        runtime.edns.nsid = nsid;
+        runtime.edns.zoneversion = self.config.zoneversion;
         self.blocklist = .{};
         self.config = .{};
         return runtime;
@@ -107,6 +167,10 @@ pub const ServerContext = struct {
         self.blocklist = .{};
         self.keyring.deinit();
         self.config = .{};
+        // Anchors that never reached a policy (load failed, or the context was
+        // dropped without takeRuntime) are still owned here.
+        self.anchors.deinit(self.allocator);
+        self.anchors = .{};
     }
 };
 
@@ -119,6 +183,16 @@ fn readReferencedFile(dir: std.Io.Dir, io: std.Io, sub_path: []const u8, allocat
         error.FileNotFound => return Error.MissingReferencedFile,
         else => return err,
     };
+}
+
+/// RFC 5001 section 2.4 hex digits to the opaque OPTION-DATA octets the wire
+/// carries. The config parser has already rejected an odd count or a non-hex
+/// character, so every failure here is the same misconfiguration.
+fn decodeNsid(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    const bytes = try allocator.alloc(u8, text.len / 2);
+    errdefer allocator.free(bytes);
+    _ = std.fmt.hexToBytes(bytes, text) catch return error.BadConfiguration;
+    return bytes;
 }
 
 fn ensureConfined(dir: std.Io.Dir, io: std.Io, sub_path: []const u8) !void {
@@ -172,6 +246,11 @@ fn parseKeyTextAndClear(key_text: []u8) keyring_mod.Error!keyring_mod.Keyring {
     return keyring_mod.Keyring.parse(key_text);
 }
 
+fn parseDnssecKeyTextAndClear(key_text: []u8) signer.Error!signer.Key {
+    defer std.crypto.secureZero(u8, key_text);
+    return signer.parseKey(key_text);
+}
+
 test "server context loads the configured TSIG key file during startup" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var dir = std.testing.tmpDir(.{});
@@ -223,6 +302,104 @@ test "server context clears the temporary TSIG key text after parsing" {
     defer ring.deinit();
 
     for (key_text) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+}
+
+/// The RFC 8080 section 6.1 Ed25519 example key. It is published in the RFC,
+/// so nothing secret enters the repository, and the DNSKEY it derives is the
+/// one the RFC's own DS digest pins.
+const dnssec_test_key = "ed25519 DSSF3o0s0f+ElWzj9E/Osxw8hLpk55chkmx0LYN5WiY=\n";
+
+const dnssec_test_zone =
+    \\$ORIGIN signed.example.
+    \\$TTL 3600
+    \\@ IN SOA ns1.signed.example. hostmaster.signed.example. 2026100501 3600 900 1209600 3600
+    \\@ IN NS ns1.signed.example.
+    \\ns1 IN A 192.0.2.1
+    \\www IN A 192.0.2.80
+    \\* IN A 192.0.2.99
+;
+
+/// The same zone with the apex DNSKEY already present. A Zig multiline literal
+/// drops its final newline, so the appended record starts with one.
+const dnssec_test_already_signed_zone = dnssec_test_zone ++
+    "\n@ IN DNSKEY \\# 36 0101030fccf9d9fd0c047bb4bc0b948fcf639f4b9451e34013936feb62713dc472048a3b\n";
+
+fn countType(zone: zone_index.Zone, rrtype: @import("../dns/types.zig").RecordType) usize {
+    var total: usize = 0;
+    for (zone.records.items[0..zone.records.len]) |record| {
+        if (record.rrtype.eql(rrtype)) total += 1;
+    }
+    return total;
+}
+
+fn hasRrsigCovering(zone: zone_index.Zone, owner: []const u8, covered: u16) bool {
+    for (zone.records.items[0..zone.records.len]) |record| {
+        if (!record.rrtype.eql(.RRSIG)) continue;
+        if (!std.ascii.eqlIgnoreCase(record.owner, owner)) continue;
+        const rdata = zone_parser.parseRData(.RRSIG, record.rdataText()) catch return false;
+        const bytes = switch (rdata) {
+            .Unknown => |unknown| unknown.bytes(),
+            else => return false,
+        };
+        if (bytes.len < 2) return false;
+        if (std.mem.readInt(u16, bytes[0..2], .big) == covered) return true;
+    }
+    return false;
+}
+
+test "server context signs every zone named by the configured DNSSEC key file" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{ .sub_path = "signed.example.zone", .data = dnssec_test_zone });
+    try dir.dir.writeFile(io, .{ .sub_path = "zsk.key", .data = dnssec_test_key });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone signed.example primary signed.example.zone\ndnssec-key-file zsk.key\n" });
+
+    // std.testing.allocator fails this test if the generated DNSKEY, DS, RRSIG,
+    // and NSEC records outlive the zone, which is the whole reason the zone
+    // now carries the allocator that made them.
+    var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+    defer context.deinit();
+
+    const zone = context.zones.items[0];
+    const RecordType = @import("../dns/types.zig").RecordType;
+    try std.testing.expectEqual(@as(usize, 1), countType(zone, .DNSKEY));
+    try std.testing.expectEqual(@as(usize, 1), countType(zone, .DS));
+    // Apex, ns1, www, and the wildcard owner are authoritative, so each joins
+    // the NSEC chain with one record.
+    try std.testing.expectEqual(@as(usize, 4), countType(zone, .NSEC));
+    // The apex has no A RRset, so it is signed for the types it does carry.
+    try std.testing.expect(hasRrsigCovering(zone, "signed.example.", RecordType.SOA.code()));
+    try std.testing.expect(hasRrsigCovering(zone, "signed.example.", RecordType.DNSKEY.code()));
+    try std.testing.expect(hasRrsigCovering(zone, "www.signed.example.", RecordType.A.code()));
+    // RFC 4034 section 3.1.3: the wildcard owner is signed with one label
+    // fewer, because the signature covers the expanded names below it.
+    try std.testing.expect(hasRrsigCovering(zone, "*.signed.example.", RecordType.A.code()));
+}
+
+test "server context refuses an unusable DNSSEC key file and an already signed zone" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{ .sub_path = "signed.example.zone", .data = dnssec_test_zone });
+    try dir.dir.writeFile(io, .{ .sub_path = "bad.key", .data = "ed25519 not-base64\n" });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone signed.example primary signed.example.zone\ndnssec-key-file bad.key\n" });
+    try std.testing.expectError(
+        error.BadDnssecKey,
+        ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator),
+    );
+
+    // A zone file that already carries DNSSEC records is refused rather than
+    // signed twice, so an operator cannot publish two sets of signatures.
+    try dir.dir.writeFile(io, .{ .sub_path = "signed.example.zone", .data = dnssec_test_already_signed_zone });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone signed.example primary signed.example.zone\ndnssec-key-file zsk.key\n" });
+    try dir.dir.writeFile(io, .{ .sub_path = "zsk.key", .data = dnssec_test_key });
+    try std.testing.expectError(
+        error.BadDnssecKey,
+        ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator),
+    );
 }
 
 test "server context rejects absolute referenced zone paths" {
