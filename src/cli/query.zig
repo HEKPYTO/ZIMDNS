@@ -84,6 +84,24 @@ pub fn writeResponse(response: dns_message.Message, writer: *std.Io.Writer) !voi
             const target = record.rdata.NS.toText(&value_buffer) catch return Error.BadResponse;
             try writer.writeAll("NS ");
             try writer.writeAll(target);
+        } else if (record.rrtype.eql(.MX)) {
+            const mx = record.rdata.MX;
+            const exchange = mx.exchange.toText(&value_buffer) catch return Error.BadResponse;
+            try writer.print("MX {} {s}", .{ mx.preference, exchange });
+        } else if (record.rrtype.eql(.SOA)) {
+            const soa = record.rdata.SOA;
+            const mname = soa.mname.toText(&value_buffer) catch return Error.BadResponse;
+            var rname_buffer: [256]u8 = undefined;
+            const rname = soa.rname.toText(&rname_buffer) catch return Error.BadResponse;
+            try writer.print("SOA {s} {s} {} {} {} {} {}", .{ mname, rname, soa.serial, soa.refresh, soa.retry, soa.expire, soa.minimum });
+        } else if (record.rrtype.eql(.PTR)) {
+            const target = record.rdata.PTR.toText(&value_buffer) catch return Error.BadResponse;
+            try writer.writeAll("PTR ");
+            try writer.writeAll(target);
+        } else if (record.rrtype.eql(.DNAME)) {
+            const target = record.rdata.DNAME.toText(&value_buffer) catch return Error.BadResponse;
+            try writer.writeAll("DNAME ");
+            try writer.writeAll(target);
         } else if (record.rrtype.eql(.TXT)) {
             try writer.writeAll("TXT \"");
             try writer.writeAll(record.rdata.TXT.text());
@@ -169,8 +187,16 @@ pub fn writeResponse(response: dns_message.Message, writer: *std.Io.Writer) !voi
             if (raw.len > 2048) return Error.BadResponse;
             for (raw) |byte| try writer.print("{x:0>2}", .{byte});
         } else {
+            // Untyped RRs (HINFO and future types) are served opaque: render
+            // RFC 3597 generic form so the fallback never drops RDATA.
             try writer.writeAll("TYPE");
-            try writer.print("{}", .{record.rrtype.code()});
+            try writer.print("{} \\# ", .{record.rrtype.code()});
+            const raw = switch (record.rdata) {
+                .Unknown => |*unknown| unknown.bytes(),
+                else => return Error.BadResponse,
+            };
+            if (raw.len > 2048) return Error.BadResponse;
+            for (raw) |byte| try writer.print("{x:0>2}", .{byte});
         }
         try writer.writeAll("\n");
     }
@@ -346,7 +372,9 @@ fn rcodeName(rcode: dns_header.Rcode) []const u8 {
         .refused => "REFUSED",
         .yxdomain => "YXDOMAIN",
         .badcookie => "BADCOOKIE",
+        .nxrrset => "NXRRSET",
         .notauth => "NOTAUTH",
+        .notzone => "NOTZONE",
     };
 }
 
@@ -388,6 +416,7 @@ pub fn receiveUdpResponse(allocator: std.mem.Allocator, socket: *const std.Io.ne
 }
 
 pub fn sendTcpQuery(stream: std.Io.net.Stream, io: std.Io, query: []const u8) !void {
+    tcp_deadline.setSocketTimeout(stream.socket.handle, TCP_IO_TIMEOUT);
     var write_buffer: [1024]u8 = undefined;
     var writer = stream.writer(io, &write_buffer);
     var prefix: [2]u8 = undefined;
@@ -400,14 +429,16 @@ pub fn sendTcpQuery(stream: std.Io.net.Stream, io: std.Io, query: []const u8) !v
 pub fn receiveTcpResponse(allocator: std.mem.Allocator, stream: std.Io.net.Stream, io: std.Io, buffer: []u8, query: []const u8) !dns_message.Message {
     var expected = dns_message.Message.parseQuery(allocator, query) catch return Error.BadResponse;
     defer expected.deinit();
-    var read_buffer: [1024]u8 = undefined;
-    var reader = stream.reader(io, &read_buffer);
-    const len_bytes = try reader.interface.takeArray(2);
-    const response_len = std.mem.readInt(u16, len_bytes, .big);
+    tcp_deadline.setSocketTimeout(stream.socket.handle, TCP_IO_TIMEOUT);
+    // Exact-read under one deadline: a dripping peer cannot stall the client
+    // past TCP_IO_TIMEOUT, and short reads loop instead of truncating.
+    const frame_deadline = tcp_deadline.deadline(io, TCP_IO_TIMEOUT);
+    var response_len_bytes: [2]u8 = undefined;
+    tcp_deadline.readExact(stream.socket.handle, io, &response_len_bytes, frame_deadline) catch return Error.BadResponse;
+    const response_len = std.mem.readInt(u16, &response_len_bytes, .big);
     if (response_len == 0 or response_len > buffer.len) return Error.BadResponse;
-    const response_bytes = try reader.interface.take(response_len);
-    @memcpy(buffer[0..response_bytes.len], response_bytes);
-    const response = try dns_message.Message.parse(allocator, buffer[0..response_bytes.len]);
+    tcp_deadline.readExact(stream.socket.handle, io, buffer[0..response_len], frame_deadline) catch return Error.BadResponse;
+    const response = try dns_message.Message.parse(allocator, buffer[0..response_len]);
     try validateResponse(response, expected.header.id, expected.header.opcode, expected.question.?);
     return response;
 }
@@ -434,7 +465,7 @@ const unix_tcp_query = if (TCP_DEADLINES_SUPPORTED) struct {
         defer stream.close(io);
 
         const frame_deadline = tcp_deadline.deadline(io, TCP_IO_TIMEOUT);
-        setSocketTimeout(stream, TCP_IO_TIMEOUT);
+        tcp_deadline.setSocketTimeout(stream.socket.handle, TCP_IO_TIMEOUT);
 
         var prefix: [2]u8 = undefined;
         std.mem.writeInt(u16, &prefix, @intCast(query.len), .big);
@@ -450,16 +481,6 @@ const unix_tcp_query = if (TCP_DEADLINES_SUPPORTED) struct {
         const response = try dns_message.Message.parse(allocator, response_buffer[0..response_len]);
         try validateResponse(response, expected.header.id, expected.header.opcode, expected.question.?);
         return response;
-    }
-
-    fn setSocketTimeout(stream: std.Io.net.Stream, timeout: tcp_deadline.Timeout) void {
-        const posix_timeout: std.posix.timeval = .{
-            .sec = @intCast(timeout.seconds),
-            .usec = @intCast(timeout.microseconds),
-        };
-        const timeout_bytes = std.mem.asBytes(&posix_timeout);
-        _ = std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, timeout_bytes) catch {};
-        _ = std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, timeout_bytes) catch {};
     }
 } else struct {};
 
@@ -765,6 +786,59 @@ test "query formatter prints RT preference and intermediate hostname" {
     try writeResponse(response, &output.writer);
     try std.testing.expectEqualStrings(
         "rt.home.arpa. 3600 IN RT 100 target.home.arpa.\n",
+        output.written(),
+    );
+}
+
+test "query formatter prints MX SOA PTR DNAME and generic HINFO" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const response = try dns_message.Message.parse(arena.allocator(), &.{
+        0x12, 0x34, 0x85, 0x00, 0x00, 0x01, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00,
+        0x04, 'm',  'a',  'i',  'l',  0x07, 'e',  'x',  'a',  'm',  'p',  'l',
+        'e',  0x00, 0x00, 0x0f, 0x00, 0x01, 0xc0, 0x0c, 0x00, 0x0f, 0x00, 0x01,
+        0x00, 0x00, 0x0e, 0x10, 0x00, 0x04, 0x00, 0x0a, 0xc0, 0x0c, 0xc0, 0x11,
+        0x00, 0x06, 0x00, 0x01, 0x00, 0x00, 0x0e, 0x10, 0x00, 0x27, 0x03, 'n',
+        's',  '1',  0xc0, 0x11, 0x0a, 'h',  'o',  's',  't',  'm',  'a',  's',
+        't',  'e',  'r',  0xc0, 0x11, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x0e,
+        0x10, 0x00, 0x00, 0x03, 0x84, 0x00, 0x12, 0x75, 0x00, 0x00, 0x00, 0x01,
+        0x2c, 0x03, 'p',  't',  'r',  0xc0, 0x11, 0x00, 0x0c, 0x00, 0x01, 0x00,
+        0x00, 0x0e, 0x10, 0x00, 0x07, 0x04, 'h',  'o',  's',  't',  0xc0, 0x11,
+        0x05, 'a',  'l',  'i',  'a',  's',  0xc0, 0x11, 0x00, 0x27, 0x00, 0x01,
+        0x00, 0x00, 0x0e, 0x10, 0x00, 0x10, 0x06, 't',  'a',  'r',  'g',  'e',
+        't',  0x07, 'e',  'x',  'a',  'm',  'p',  'l',  'e',  0x00, 0x04, 'i',
+        'n',  'f',  'o',  0xc0, 0x11, 0x00, 0x0d, 0x00, 0x01, 0x00, 0x00, 0x0e,
+        0x10, 0x00, 0x08, 0x02, 'P',  'C',  0x04, 'U',  'N',  'I',  'X',
+    });
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try writeResponse(response, &output.writer);
+    try std.testing.expectEqualStrings(
+        "mail.example. 3600 IN MX 10 mail.example.\n" ++
+            "example. 3600 IN SOA ns1.example. hostmaster.example. 1 3600 900 1209600 300\n" ++
+            "ptr.example. 3600 IN PTR host.example.\n" ++
+            "alias.example. 3600 IN DNAME target.example.\n" ++
+            "info.example. 3600 IN TYPE13 \\# 02504304554e4958\n",
+        output.written(),
+    );
+}
+
+test "query formatter keeps unknown TYPE fallback lossless in RFC 3597 form" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const response = try dns_message.Message.parse(arena.allocator(), &.{
+        0x12, 0x34, 0x85, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x04, 'h',  'o',  's',  't',  0x04, 'h',  'o',  'm',  'e',  0x04, 'a',
+        'r',  'p',  'a',  0x00, 0x00, 0x63, 0x00, 0x01, 0xc0, 0x0c, 0x00, 0x63,
+        0x00, 0x01, 0x00, 0x00, 0x0e, 0x10, 0x00, 0x03, 0xaa, 0xbb, 0xcc,
+    });
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try writeResponse(response, &output.writer);
+    try std.testing.expectEqualStrings(
+        "host.home.arpa. 3600 IN TYPE99 \\# aabbcc\n",
         output.written(),
     );
 }

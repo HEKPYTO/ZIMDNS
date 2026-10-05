@@ -161,7 +161,7 @@ pub const ZoneFile = struct {
         if (std.mem.eql(u8, first, "$ORIGIN")) {
             const origin = tokens.next() orelse return Error.BadDirective;
             if (tokens.next() != null) return Error.BadDirective;
-            const origin_text = ensureTrailingDot(origin);
+            const origin_text = try ensureTrailingDot(allocator, origin);
             try validateName(origin_text);
             if (self.records.len != 0 and !std.ascii.eqlIgnoreCase(self.originText(), origin_text)) return Error.BadDirective;
             const copied_origin = try copyText(allocator, origin_text);
@@ -418,6 +418,56 @@ fn decodeHexBlob(hex: []const u8) Error!dns_rdata.Unknown {
     return out;
 }
 
+/// Decode RFC 4648 base32hex (0-9A-V, case-insensitive) as used for the
+/// NSEC3 next-hashed-owner field (RFC 5155). Presentation has no whitespace;
+/// optional trailing `=` padding is accepted.
+fn decodeBase32Hex(text: []const u8, out: []u8) Error!usize {
+    if (text.len == 0 or text.len % 8 == 1) return Error.BadRecord;
+    var padded: usize = 0;
+    while (padded < text.len and text[text.len - 1 - padded] == '=') padded += 1;
+    if (padded > 6) return Error.BadRecord;
+    const data_len = text.len - padded;
+    if (data_len % 8 == 1 or data_len % 8 == 3 or data_len % 8 == 6) return Error.BadRecord;
+    if (padded != 0 and data_len + padded != ((data_len + 7) / 8) * 8) return Error.BadRecord;
+    const decoded_len = data_len * 5 / 8;
+    if (decoded_len == 0 or decoded_len > out.len) return Error.BadRecord;
+    var values: [8]u5 = undefined;
+    var written: usize = 0;
+    var index: usize = 0;
+    while (index < data_len) {
+        const width: usize = @min(8, data_len - index);
+        for (values[0..width], 0..) |*value, offset| {
+            value.* = base32HexValue(text[index + offset]) orelse return Error.BadRecord;
+        }
+        var quantum: u64 = 0;
+        for (values[0..width]) |value| quantum = (quantum << 5) | value;
+        const pad_bits: u6 = @intCast((8 - width) * 5);
+        quantum <<= pad_bits;
+        if (width != 8 and (quantum & (((@as(u64, 1) << pad_bits) - 1))) != 0) {
+            // Non-zero trailing pad bits are a malformed encoding.
+            return Error.BadRecord;
+        }
+        const out_bytes = width * 5 / 8;
+        var byte_index: usize = 0;
+        while (byte_index < out_bytes) : (byte_index += 1) {
+            if (written >= out.len) return Error.BadRecord;
+            out[written] = @intCast((quantum >> @intCast(32 - byte_index * 8)) & 0xff);
+            written += 1;
+        }
+        index += width;
+    }
+    return written;
+}
+
+fn base32HexValue(byte: u8) ?u5 {
+    return switch (byte) {
+        '0'...'9' => @intCast(byte - '0'),
+        'A'...'V' => @intCast(byte - 'A' + 10),
+        'a'...'v' => @intCast(byte - 'a' + 10),
+        else => null,
+    };
+}
+
 fn decodeBase64Blob(text: []const u8, out: []u8) Error!usize {
     var compact: [4096]u8 = undefined;
     var compact_len: usize = 0;
@@ -608,7 +658,7 @@ fn parseNsec3(text: []const u8) Error!dns_rdata.Unknown {
     out.data[4] = @intCast(salt_len);
     var cursor: usize = 5 + salt_len;
     var next_hash: [64]u8 = undefined;
-    const next_len = try decodeBase64Blob(next_text, &next_hash);
+    const next_len = try decodeBase32Hex(next_text, &next_hash);
     if (next_len == 0 or next_len > 255 or cursor + 1 + next_len > out.data.len) return Error.BadRecord;
     out.data[cursor] = @intCast(next_len);
     cursor += 1;
@@ -1361,7 +1411,8 @@ fn parseSoa(text: []const u8) Error!dns_rdata.Soa {
 }
 
 fn normalizeRData(allocator: std.mem.Allocator, rrtype: RecordType, origin: []const u8, text: []const u8) ![]const u8 {
-    const minimum_tokens: usize = if (rrtype.eql(.MX)) 2 else if (rrtype.eql(.SRV)) 4 else if (rrtype.eql(.SOA)) 2 else if (rrtype.eql(.SVCB) or rrtype.eql(.HTTPS)) 2 else if (rrtype.eql(.NS) or rrtype.eql(.CNAME) or rrtype.eql(.DNAME) or rrtype.eql(.PTR)) 1 else 0;
+    if (rrtype.eql(.NAPTR)) return normalizeNaptrRData(allocator, origin, text);
+    const minimum_tokens: usize = if (rrtype.eql(.MX)) 2 else if (rrtype.eql(.RT)) 2 else if (rrtype.eql(.RP)) 2 else if (rrtype.eql(.AFSDB)) 2 else if (rrtype.eql(.SRV)) 4 else if (rrtype.eql(.SOA)) 2 else if (rrtype.eql(.SVCB) or rrtype.eql(.HTTPS)) 2 else if (rrtype.eql(.NS) or rrtype.eql(.CNAME) or rrtype.eql(.DNAME) or rrtype.eql(.PTR)) 1 else 0;
     if (minimum_tokens == 0) return ZoneFile.copyText(allocator, text);
 
     var tokens = std.mem.tokenizeAny(u8, text, " \t\r\n()");
@@ -1397,10 +1448,51 @@ fn normalizeRData(allocator: std.mem.Allocator, rrtype: RecordType, origin: []co
 fn isDomainField(rrtype: RecordType, index: usize) bool {
     if (rrtype.eql(.NS) or rrtype.eql(.CNAME) or rrtype.eql(.DNAME) or rrtype.eql(.PTR)) return index == 0;
     if (rrtype.eql(.MX)) return index == 1;
+    if (rrtype.eql(.RT)) return index == 1;
+    if (rrtype.eql(.AFSDB)) return index == 1;
+    if (rrtype.eql(.RP)) return index == 0 or index == 1;
     if (rrtype.eql(.SVCB) or rrtype.eql(.HTTPS)) return index == 1;
     if (rrtype.eql(.SRV)) return index == 3;
     if (rrtype.eql(.SOA)) return index == 0 or index == 1;
     return false;
+}
+
+/// Expand only the NAPTR replacement name against the origin. The quoted
+/// flags/services/regexp fields may contain whitespace or parentheses, so the
+/// generic whitespace tokenizer cannot be used; the replacement is always the
+/// final whitespace-delimited token.
+fn normalizeNaptrRData(allocator: std.mem.Allocator, origin: []const u8, text: []const u8) ![]const u8 {
+    var end = text.len;
+    while (end > 0 and std.ascii.isWhitespace(text[end - 1])) end -= 1;
+    var start = end;
+    while (start > 0 and !std.ascii.isWhitespace(text[start - 1])) start -= 1;
+    if (start == end) return Error.BadRecord;
+    const replacement = text[start..end];
+    if (std.mem.eql(u8, replacement, "@")) {
+        const normalized = try allocator.alloc(u8, start + origin.len + (text.len - end));
+        errdefer allocator.free(normalized);
+        @memcpy(normalized[0..start], text[0..start]);
+        @memcpy(normalized[start .. start + origin.len], origin);
+        @memcpy(normalized[start + origin.len ..], text[end..]);
+        try validateName(origin);
+        return normalized;
+    }
+    if (std.mem.endsWith(u8, replacement, ".")) return ZoneFile.copyText(allocator, text);
+    const expanded_len = std.math.add(usize, replacement.len, 1) catch return error.OutOfMemory;
+    const total_len = std.math.add(usize, std.math.add(usize, start, expanded_len) catch return error.OutOfMemory, std.math.add(usize, origin.len, text.len - end) catch return error.OutOfMemory) catch return error.OutOfMemory;
+    const normalized = try allocator.alloc(u8, total_len);
+    errdefer allocator.free(normalized);
+    @memcpy(normalized[0..start], text[0..start]);
+    var offset = start;
+    @memcpy(normalized[offset .. offset + replacement.len], replacement);
+    offset += replacement.len;
+    normalized[offset] = '.';
+    offset += 1;
+    @memcpy(normalized[offset .. offset + origin.len], origin);
+    offset += origin.len;
+    @memcpy(normalized[offset..], text[end..]);
+    try validateName(normalized[offset - origin.len .. offset]);
+    return normalized;
 }
 
 fn expandedNameLength(token: []const u8, origin: []const u8) !usize {
@@ -1428,8 +1520,13 @@ fn writeExpandedName(output: []u8, offset: *usize, token: []const u8, origin: []
     validateName(output[start..offset.*]) catch return Error.BadName;
 }
 
-fn ensureTrailingDot(text: []const u8) []const u8 {
-    return text;
+fn ensureTrailingDot(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
+    if (text.len == 0) return Error.BadDirective;
+    if (std.mem.endsWith(u8, text, ".")) return text;
+    const dotted = try allocator.alloc(u8, text.len + 1);
+    @memcpy(dotted[0..text.len], text);
+    dotted[text.len] = '.';
+    return dotted;
 }
 
 test "zone parser loads opaque DNSSEC records in presentation and generic form" {
@@ -2658,4 +2755,157 @@ test "zone parser retains exact backing within its allocation budget" {
 
     try std.testing.expect(zone.storage.buffer.len < allocation_budget);
     try std.testing.expectEqual(zone.storage.buffer.len, zone.storage.end_index);
+}
+
+test "zone parser appends a missing trailing dot on $ORIGIN" {
+    var zone = try ZoneFile.parse(
+        \\$ORIGIN example
+        \\$TTL 3600
+        \\@ IN SOA ns hostmaster 1 3600 900 1209600 3600
+        \\@ IN NS ns
+        \\www IN A 192.0.2.1
+        \\
+    );
+    defer zone.deinit();
+
+    try std.testing.expectEqualStrings("example.", zone.originText());
+    try std.testing.expectEqualStrings("ns.example. hostmaster.example. 1 3600 900 1209600 3600", zone.records.items[0].rdataText());
+    try std.testing.expectEqualStrings("www.example.", zone.records.items[2].ownerText());
+}
+
+test "zone parser expands relative RP mailbox and text names against origin" {
+    var zone = try ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns hostmaster 1 3600 900 1209600 3600
+        \\@ IN NS ns
+        \\contact IN RP mbox txt
+        \\rooted IN RP . .
+        \\
+    );
+    defer zone.deinit();
+
+    try std.testing.expectEqualStrings("mbox.example. txt.example.", zone.records.items[2].rdataText());
+    const rp = try parseRData(.RP, zone.records.items[2].rdataText());
+    try std.testing.expectEqualSlices(u8, &.{ 4, 'm', 'b', 'o', 'x', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0 }, rp.RP.mbox.asWire());
+    try std.testing.expectEqualStrings(". .", zone.records.items[3].rdataText());
+
+    try std.testing.expectError(Error.BadRecord, ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns hostmaster 1 3600 900 1209600 3600
+        \\@ IN NS ns
+        \\short IN RP onlyone
+        \\
+    ));
+}
+
+test "zone parser expands relative AFSDB and RT exchange names against origin" {
+    var zone = try ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns hostmaster 1 3600 900 1209600 3600
+        \\@ IN NS ns
+        \\database IN AFSDB 1 db
+        \\route IN RT 1 gateway
+        \\
+    );
+    defer zone.deinit();
+
+    try std.testing.expectEqualStrings("1 db.example.", zone.records.items[2].rdataText());
+    const afsdb = try parseRData(.AFSDB, zone.records.items[2].rdataText());
+    try std.testing.expectEqual(@as(u16, 1), afsdb.AFSDB.preference);
+    try std.testing.expectEqualStrings("1 gateway.example.", zone.records.items[3].rdataText());
+    const rt = try parseRData(.RT, zone.records.items[3].rdataText());
+    try std.testing.expectEqual(@as(u16, 1), rt.RT.preference);
+
+    try std.testing.expectError(Error.BadRecord, ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns hostmaster 1 3600 900 1209600 3600
+        \\@ IN NS ns
+        \\database IN AFSDB 1
+        \\
+    ));
+    try std.testing.expectError(Error.BadRecord, ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns hostmaster 1 3600 900 1209600 3600
+        \\@ IN NS ns
+        \\route IN RT 1
+        \\
+    ));
+}
+
+test "zone parser expands relative NAPTR replacement names against origin" {
+    var zone = try ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns hostmaster 1 3600 900 1209600 3600
+        \\@ IN NS ns
+        \\service IN NAPTR 100 10 "u" "SIP+D2U" "" replacement
+        \\rooted IN NAPTR 100 10 "u" "SIP+D2U" "" .
+        \\
+    );
+    defer zone.deinit();
+
+    try std.testing.expectEqualStrings("100 10 \"u\" \"SIP+D2U\" \"\" replacement.example.", zone.records.items[2].rdataText());
+    const naptr = try parseRData(.NAPTR, zone.records.items[2].rdataText());
+    var replacement_text: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("replacement.example.", try naptr.NAPTR.replacement.toText(&replacement_text));
+    try std.testing.expectEqualStrings("100 10 \"u\" \"SIP+D2U\" \"\" .", zone.records.items[3].rdataText());
+
+    try std.testing.expectError(Error.BadRecord, ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns hostmaster 1 3600 900 1209600 3600
+        \\@ IN NS ns
+        \\empty IN NAPTR
+        \\
+    ));
+}
+
+test "NSEC3 zone text decodes base32hex next hashes per RFC 5155" {
+    const lower = try parseRData(.NSEC3, "1 1 10 aabbccdd 2t7b4g4vsa5smi47k61mv5bv1a22bojr A RRSIG");
+    const wire = lower.Unknown.bytes();
+    try std.testing.expectEqual(@as(u8, 1), wire[0]);
+    try std.testing.expectEqual(@as(u8, 1), wire[1]);
+    try std.testing.expectEqual(@as(u16, 10), std.mem.readInt(u16, wire[2..4], .big));
+    try std.testing.expectEqual(@as(u8, 4), wire[4]);
+    try std.testing.expectEqualSlices(u8, &.{ 0xaa, 0xbb, 0xcc, 0xdd }, wire[5..9]);
+    try std.testing.expectEqual(@as(u8, 20), wire[9]);
+    try std.testing.expectEqualSlices(u8, &.{
+        0x17, 0x4e, 0xb2, 0x40, 0x9f, 0xe2, 0x8b, 0xcb, 0x48, 0x87,
+        0xa1, 0x83, 0x6f, 0x95, 0x7f, 0x0a, 0x84, 0x25, 0xe2, 0x7b,
+    }, wire[10..30]);
+    try std.testing.expectEqual(@as(u16, 38), lower.Unknown.len);
+
+    const upper = try parseRData(.NSEC3, "1 1 10 AABBCCDD 2T7B4G4VSA5SMI47K61MV5BV1A22BOJR A RRSIG");
+    try std.testing.expectEqualSlices(u8, lower.Unknown.bytes(), upper.Unknown.bytes());
+
+    const invalid = [_][]const u8{
+        "1 1 10 aabbccdd wooooooo A",
+        "1 1 10 aabbccdd 2t7b4g4vsa5smi47k61mv5bv1a22bowz A",
+        "1 1 10 aabbccdd QUJD+/== A",
+        "1 1 10 aabbccdd ABC A",
+        "1 1 10 aabbccdd \"\" A",
+        "1 1 10 aabbccdd 2t7b4g4vsa5smi47k61mv5bv1a22bojr=",
+    };
+    for (invalid) |text| try std.testing.expectError(Error.BadRecord, parseRData(.NSEC3, text));
+}
+
+test "zone parser loads NSEC3 records with base32hex next hashes" {
+    var zone = try ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns hostmaster 1 3600 900 1209600 3600
+        \\@ IN NS ns
+        \\2t7b4g4vsa5smi47k61mv5bv1a22bojr IN NSEC3 1 1 10 aabbccdd 2t7b4g4vsa5smi47k61mv5bv1a22bojr A RRSIG
+        \\
+    );
+    defer zone.deinit();
+
+    try std.testing.expectEqual(RecordType.NSEC3, zone.records.items[2].rrtype);
+    const nsec3 = try parseRData(.NSEC3, zone.records.items[2].rdataText());
+    try std.testing.expectEqual(@as(u8, 20), nsec3.Unknown.bytes()[9]);
 }

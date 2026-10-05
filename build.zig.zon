@@ -12,6 +12,5 @@
         "docs",
         "examples",
         "test",
-        "tools",
     },
 }

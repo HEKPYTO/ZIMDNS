@@ -270,10 +270,7 @@ fn baseTransferMessage(
         .edns = mirrorEdns(request),
     };
     errdefer message.deinit();
-    appendOpt(&message) catch {
-        message.deinit();
-        return Error.BadTransferQuery;
-    };
+    appendOpt(&message) catch return Error.BadTransferQuery;
     return message;
 }
 
@@ -294,8 +291,11 @@ pub fn buildAxfrMessages(
     const count = (ordered.len + per_message - 1) / per_message;
     if (count > max_messages_per_transfer) return Error.TooManyMessages;
     var messages = allocator.alloc(dns_message.Message, count) catch return Error.BadTransferQuery;
+    // Only initialized slots own sections: later slots stay undefined until
+    // their message is stored, so cleanup must not touch them.
+    var initialized: usize = 0;
     errdefer {
-        for (messages) |*message| message.deinit();
+        for (messages[0..initialized]) |*message| message.deinit();
         allocator.free(messages);
     }
     var index: usize = 0;
@@ -305,10 +305,12 @@ pub fn buildAxfrMessages(
         const start = index * per_message;
         const end = @min(start + per_message, ordered.len);
         for (ordered[start..end]) |record| {
-            message.answers.append(try toResourceRecord(record)) catch return Error.BadTransferQuery;
+            const converted = toResourceRecord(record) catch return Error.BadTransferQuery;
+            message.answers.append(converted) catch return Error.BadTransferQuery;
         }
         try setHeaderCounts(&message);
         messages[index] = message;
+        initialized = index + 1;
     }
     return messages;
 }
@@ -323,7 +325,8 @@ pub fn buildIxfrUpToDateMessage(
     const apex_soa = zone.soa orelse return Error.MissingSoa;
     var message = try baseTransferMessage(allocator, request);
     errdefer message.deinit();
-    message.answers.append(try toResourceRecord(apex_soa)) catch return Error.BadTransferQuery;
+    const converted = toResourceRecord(apex_soa) catch return Error.BadTransferQuery;
+    message.answers.append(converted) catch return Error.BadTransferQuery;
     try setHeaderCounts(&message);
     return message;
 }
@@ -342,7 +345,8 @@ pub fn buildIxfrIncrementalMessages(
     const apex_soa = zone.soa orelse return Error.MissingSoa;
     var message = try baseTransferMessage(allocator, request);
     errdefer message.deinit();
-    message.answers.append(try toResourceRecord(apex_soa)) catch return Error.BadTransferQuery;
+    const current_soa = toResourceRecord(apex_soa) catch return Error.BadTransferQuery;
+    message.answers.append(current_soa) catch return Error.BadTransferQuery;
     const current_rdata = zone_parser.parseRData(.SOA, apex_soa.rdataText()) catch return Error.BadZoneRecord;
     var old_soa_value = current_rdata.SOA;
     old_soa_value.serial = client_serial;
@@ -355,9 +359,11 @@ pub fn buildIxfrIncrementalMessages(
     }) catch return Error.BadTransferQuery;
     for (zone.records.items[0..zone.records.len]) |record| {
         if (record.rrtype.eql(dns_types.RecordType.SOA)) continue;
-        message.answers.append(try toResourceRecord(record)) catch return Error.BadTransferQuery;
+        const converted = toResourceRecord(record) catch return Error.BadTransferQuery;
+        message.answers.append(converted) catch return Error.BadTransferQuery;
     }
-    message.answers.append(try toResourceRecord(apex_soa)) catch return Error.BadTransferQuery;
+    const closing_soa = toResourceRecord(apex_soa) catch return Error.BadTransferQuery;
+    message.answers.append(closing_soa) catch return Error.BadTransferQuery;
     try setHeaderCounts(&message);
     return message;
 }
@@ -389,10 +395,7 @@ pub fn buildNotifyResponse(
         .edns = mirrorEdns(request),
     };
     errdefer message.deinit();
-    appendOpt(&message) catch {
-        message.deinit();
-        return Error.BadTransferQuery;
-    };
+    appendOpt(&message) catch return Error.BadTransferQuery;
     try setHeaderCounts(&message);
     return message;
 }
@@ -590,6 +593,35 @@ test "transfer chunks AXFR answers into bounded standalone frames" {
         frames += 1;
     }
     try std.testing.expectEqual(messages.len, frames);
+}
+
+test "transfer AXFR cleanup releases only initialized messages on a bad record" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const request = try dns_message.Message.parseQuery(arena.allocator(), &axfr_query_bytes);
+    const soa = zone_parser.ZoneRecord{
+        .owner = "example.",
+        .ttl = 3600,
+        .rrtype = .SOA,
+        .rdata = "ns.example. hostmaster.example. 10 3600 900 1209600 3600",
+    };
+    var stored = [_]zone_parser.ZoneRecord{
+        soa,
+        .{ .owner = "www.example.", .ttl = 3600, .rrtype = .A, .rdata = "192.0.2.1" },
+        .{ .owner = "bad-owner", .ttl = 3600, .rrtype = .A, .rdata = "192.0.2.2" },
+    };
+    const zone = zone_index.Zone{
+        .backing = &.{},
+        .origin = "example.",
+        .records = .{ .items = &stored, .len = stored.len },
+        .soa = soa,
+    };
+    // One record per message puts the failing record on message index 2, so
+    // messages 0-1 own sections while slots 3+ stay undefined during cleanup.
+    try std.testing.expectError(
+        Error.BadTransferQuery,
+        buildAxfrMessages(std.testing.allocator, &request, &zone, 1),
+    );
 }
 
 test "transfer answers IXFR from the authority SOA serial" {

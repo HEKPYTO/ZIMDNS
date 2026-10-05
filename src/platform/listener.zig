@@ -51,6 +51,24 @@ pub fn readTcpFrame(reader: *std.Io.Reader, frame_buffer: []u8) ![]const u8 {
     return frame_buffer[0..request_len];
 }
 
+/// Exact-reads one length-prefixed TCP frame from a socket with a per-frame
+/// deadline: the 2-octet prefix and the payload both loop over partial reads
+/// via `tcp_deadline.readExact`, so a slow peer cannot stall the connection
+/// past the deadline. A prefix-only EOF maps to EndOfStream (clean close);
+/// a mid-payload EOF maps to BadTcpFrame.
+pub fn readTcpFrameExact(fd: std.posix.fd_t, io: std.Io, frame_buffer: []u8, frame_deadline: std.Io.Clock.Timestamp) ![]const u8 {
+    var len_bytes: [2]u8 = undefined;
+    try tcp_deadline.readExact(fd, io, &len_bytes, frame_deadline);
+    const request_len = std.mem.readInt(u16, &len_bytes, .big);
+    try validateTcpFrameLength(request_len);
+    if (request_len > frame_buffer.len) return Error.BadTcpFrame;
+    tcp_deadline.readExact(fd, io, frame_buffer[0..request_len], frame_deadline) catch |err| {
+        if (err == error.EndOfStream or err == error.Truncated) return Error.BadTcpFrame;
+        return err;
+    };
+    return frame_buffer[0..request_len];
+}
+
 fn serveUdpOnceWithTimeout(socket: *const std.Io.net.Socket, io: std.Io, runtime: *Runtime, timeout: std.Io.Timeout) !void {
     var request_buffer: [UDP_REQUEST_BUFFER_SIZE]u8 = undefined;
     const incoming = try socket.receiveTimeout(io, &request_buffer, timeout);
@@ -767,6 +785,55 @@ test "TCP framing accepts the largest u16 length-prefixed frame" {
     try std.testing.expectEqual(TCP_MAX_FRAME_SIZE, payload.len);
 }
 
+test "TCP exact frame read loops over partial writes under a deadline" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var sockets: [2]std.posix.fd_t = undefined;
+    const socket_result = std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &sockets);
+    try std.testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(socket_result));
+    defer _ = std.posix.system.close(sockets[0]);
+    defer _ = std.posix.system.close(sockets[1]);
+
+    const payload = "exact frame payload";
+    var prefix: [2]u8 = undefined;
+    std.mem.writeInt(u16, &prefix, payload.len, .big);
+    _ = std.posix.system.sendto(sockets[1], prefix[0..].ptr, prefix.len, std.posix.MSG.NOSIGNAL, null, 0);
+    _ = std.posix.system.sendto(sockets[1], payload[0..7].ptr, 7, std.posix.MSG.NOSIGNAL, null, 0);
+    _ = std.posix.system.sendto(sockets[1], payload[7..].ptr, payload.len - 7, std.posix.MSG.NOSIGNAL, null, 0);
+
+    var frame_buffer: [TCP_MAX_FRAME_SIZE]u8 = undefined;
+    const frame = try readTcpFrameExact(sockets[0], io, &frame_buffer, tcp_deadline.deadline(io, TCP_IO_TIMEOUT));
+    try std.testing.expectEqualSlices(u8, payload, frame);
+}
+
+test "TCP exact frame read rejects truncated payloads and reports clean EOF" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var truncated: [2]std.posix.fd_t = undefined;
+    var socket_result = std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &truncated);
+    try std.testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(socket_result));
+    defer _ = std.posix.system.close(truncated[0]);
+    const truncated_prefix = [_]u8{ 0, 8 };
+    _ = std.posix.system.sendto(truncated[1], truncated_prefix[0..].ptr, 2, std.posix.MSG.NOSIGNAL, null, 0);
+    _ = std.posix.system.sendto(truncated[1], "x", 1, std.posix.MSG.NOSIGNAL, null, 0);
+    _ = std.posix.system.close(truncated[1]);
+
+    var frame_buffer: [TCP_MAX_FRAME_SIZE]u8 = undefined;
+    try std.testing.expectError(
+        Error.BadTcpFrame,
+        readTcpFrameExact(truncated[0], io, &frame_buffer, tcp_deadline.deadline(io, TCP_IO_TIMEOUT)),
+    );
+
+    var clean: [2]std.posix.fd_t = undefined;
+    socket_result = std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &clean);
+    try std.testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(socket_result));
+    defer _ = std.posix.system.close(clean[0]);
+    _ = std.posix.system.close(clean[1]);
+    try std.testing.expectError(
+        error.EndOfStream,
+        readTcpFrameExact(clean[0], io, &frame_buffer, tcp_deadline.deadline(io, TCP_IO_TIMEOUT)),
+    );
+}
+
 test "TCP framing rejects zero and over-limit lengths" {
     try std.testing.expectError(Error.BadTcpFrame, validateTcpFrameLength(0));
     try std.testing.expectError(Error.BadTcpFrame, validateTcpFrameLength(TCP_MAX_FRAME_SIZE + 1));
@@ -899,11 +966,7 @@ fn buildSignedListenerQueryWithEdns(time_signed: u64, include_edns: bool) !Signe
 
 const unix_tcp_deadlines = if (TCP_DEADLINES_SUPPORTED) struct {
     fn serve(stream: std.Io.net.Stream, io: std.Io, runtime: *const Runtime, timeout: TcpIoTimeout, counters: ?*metrics.Counters) !void {
-        const posix_timeout: std.posix.timeval = .{
-            .sec = @intCast(timeout.seconds),
-            .usec = @intCast(timeout.microseconds),
-        };
-        try setSocketTimeout(stream, posix_timeout);
+        tcp_deadline.setSocketTimeout(stream.socket.handle, timeout);
 
         var request_buffer: [TCP_MAX_FRAME_SIZE]u8 = undefined;
         var response_buffer: [TCP_MAX_FRAME_SIZE]u8 = undefined;
@@ -952,23 +1015,8 @@ const unix_tcp_deadlines = if (TCP_DEADLINES_SUPPORTED) struct {
         if (counters) |value| value.responses_total += 1;
     }
 
-    fn setSocketTimeout(stream: std.Io.net.Stream, timeout: std.posix.timeval) !void {
-        const timeout_bytes = std.mem.asBytes(&timeout);
-        try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, timeout_bytes);
-        try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, timeout_bytes);
-    }
-
     fn readFrame(fd: std.posix.fd_t, io: std.Io, frame_buffer: []u8, frame_deadline: std.Io.Clock.Timestamp) ![]const u8 {
-        var len_bytes: [2]u8 = undefined;
-        try tcp_deadline.readExact(fd, io, &len_bytes, frame_deadline);
-        const request_len = std.mem.readInt(u16, &len_bytes, .big);
-        try validateTcpFrameLength(request_len);
-        if (request_len > frame_buffer.len) return Error.BadTcpFrame;
-        tcp_deadline.readExact(fd, io, frame_buffer[0..request_len], frame_deadline) catch |err| {
-            if (err == error.EndOfStream) return Error.BadTcpFrame;
-            return err;
-        };
-        return frame_buffer[0..request_len];
+        return readTcpFrameExact(fd, io, frame_buffer, frame_deadline);
     }
 } else struct {};
 

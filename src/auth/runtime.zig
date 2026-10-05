@@ -18,7 +18,6 @@ const journal_mod = @import("../zone/journal.zig");
 pub const Error = error{
     BadQuery,
     EncodeFailed,
-    UnknownZoneOrigin,
 };
 
 const TsigAuth = struct {
@@ -60,10 +59,12 @@ pub const Runtime = struct {
     resolver: ?resolver_mod.Resolver = null,
     keyring: keyring_mod.Keyring = .{},
     tsig_now: ?u64 = null,
-    /// Volatile RFC 1995 serial transitions feeding IXFR delta decisions.
-    /// Single-zone deployments stay exact; see transfer for multi-zone notes.
-    transfer_deltas: journal_mod.DeltaLog = .{},
-    // ceiling: global runtime lock serializes all zone reads/reloads; use per-zone or read/write locks if contention matters.
+    /// Volatile per-zone RFC 1995 serial transitions feeding IXFR delta
+    /// decisions. Entry i parallels `zones.items[i]`; appended best-effort so
+    /// bulk-loaded runtimes need no fallible log setup. A length mismatch
+    /// means no usable history and decideIxfr falls back to AXFR.
+    transfer_delta_logs: std.ArrayList(journal_mod.DeltaLog) = .empty,
+    // ceiling: global runtime lock serializes all zone reads; use per-zone or read/write locks if contention matters.
     mutex: std.Io.Mutex = .init,
 
     /// The returned runtime owns its authoritative zone; call deinit when done.
@@ -156,6 +157,8 @@ pub const Runtime = struct {
         for (self.zones.items) |*zone| zone.deinit();
         self.zones.deinit(self.allocator);
         self.zones = .empty;
+        self.transfer_delta_logs.deinit(self.allocator);
+        self.transfer_delta_logs = .empty;
         self.blocklist = .{};
     }
 
@@ -163,25 +166,16 @@ pub const Runtime = struct {
         self.tsig_now = now;
     }
 
-    pub fn replaceZone(self: *Runtime, replacement: zone_index.Zone) !void {
-        self.lock();
-        defer self.unlock();
-        const origin = replacement.originText();
-        for (self.zones.items) |*zone| {
+    /// Read-only per-zone log for const contexts holding the runtime lock.
+    /// Never grows: a length mismatch means no usable history, so decideIxfr
+    /// falls back to AXFR for that decision.
+    fn deltaLogForOriginConst(self: *const Runtime, origin: []const u8) ?*const journal_mod.DeltaLog {
+        if (self.transfer_delta_logs.items.len != self.zones.items.len) return null;
+        for (self.zones.items, 0..) |*zone, index| {
             if (!std.ascii.eqlIgnoreCase(zone.originText(), origin)) continue;
-            const old_serial = zoneSerial(zone.*);
-            const new_serial = zoneSerial(replacement);
-            var old_zone = zone.*;
-            zone.* = replacement;
-            old_zone.deinit();
-            if (old_serial != null and new_serial != null) {
-                self.transfer_deltas.record(old_serial.?, new_serial.?) catch {};
-            }
-            return;
+            return &self.transfer_delta_logs.items[index];
         }
-        var unowned = replacement;
-        unowned.deinit();
-        return Error.UnknownZoneOrigin;
+        return null;
     }
 
     fn zoneSerial(zone: zone_index.Zone) ?u32 {
@@ -205,8 +199,10 @@ pub const Runtime = struct {
         return @intCast(@divTrunc(timestamp, std.time.ns_per_s));
     }
 
-    fn copyMac(bytes: []const u8) tsig.Mac {
-        var mac = tsig.Mac{ .len = @intCast(bytes.len) };
+    fn copyMac(bytes: []const u8) ?tsig.Mac {
+        var mac = tsig.Mac{};
+        if (bytes.len > mac.bytes.len) return null;
+        mac.len = @intCast(bytes.len);
         @memcpy(mac.bytes[0..bytes.len], bytes);
         return mac;
     }
@@ -258,7 +254,9 @@ pub const Runtime = struct {
         if (final_record.tsig.error_code != 0) {
             return .{ .failure = .{ .code = .formerr, .final = final_record } };
         }
-        const request_mac = copyMac(final_record.tsig.macBytes());
+        const request_mac = copyMac(final_record.tsig.macBytes()) orelse {
+            return .{ .failure = .{ .code = .badsig, .final = final_record, .key = key } };
+        };
         _ = tsig.verify(packet, key.secretBytes(), null, tsig.digestLength(algorithm)) catch |err| switch (err) {
             error.BadTrunc => return .{ .failure = .{
                 .code = .badtrunc,
@@ -635,7 +633,7 @@ pub const Runtime = struct {
             },
             .ixfr => {
                 const client = transfer.clientSerialFromMessage(&query);
-                switch (transfer.decideIxfr(serial, client, &self.transfer_deltas)) {
+                switch (transfer.decideIxfr(serial, client, self.deltaLogForOriginConst(zone.originText()))) {
                     .up_to_date => {
                         single_slot = transfer.buildIxfrUpToDateMessage(scratch, &query, zone) catch
                             return Error.EncodeFailed;
@@ -827,6 +825,9 @@ pub const Runtime = struct {
         var zone = try zone_index.Zone.fromZoneFile(&zone_file);
         errdefer zone.deinit();
         try self.zones.append(self.allocator, zone);
+        // Best-effort: a length mismatch means no usable history, which
+        // decideIxfr already treats as "fall back to AXFR".
+        self.transfer_delta_logs.append(self.allocator, .{}) catch {};
     }
 
     fn selectZone(self: *const Runtime, qname: []const u8) ?*const zone_index.Zone {
@@ -1034,6 +1035,16 @@ test "runtime signs BADTIME and BADTRUNC responses" {
     try std.testing.expectEqual(@as(usize, 32), response_final.tsig.macBytes().len);
     const badtrunc_request_final = (try tsig.parseFinalAdditional(query.packet[0..query.len])).?;
     _ = try tsig.verify(response_bytes, "01234567890123456789012345678901", badtrunc_request_final.tsig.macBytes(), 32);
+}
+
+test "runtime rejects oversize MAC without overflowing copyMac" {
+    var oversize = [_]u8{0xab} ** 33;
+    try std.testing.expect(Runtime.copyMac(&oversize) == null);
+
+    var exact = [_]u8{0xcd} ** 32;
+    const mac = Runtime.copyMac(&exact).?;
+    try std.testing.expectEqual(@as(u8, 32), mac.len);
+    try std.testing.expectEqualSlices(u8, &exact, mac.slice());
 }
 
 test "runtime returns FORMERR for non-final TSIG placement" {
@@ -1397,65 +1408,6 @@ test "authoritative runtime selects longest mixed-case ancestor origin" {
     try std.testing.expect(runtime.selectZone("www.notexample.") == null);
 }
 
-test "runtime swaps a matching zone by move" {
-    var runtime = try Runtime.fromZoneText(
-        \\$ORIGIN example.
-        \\$TTL 3600
-        \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
-        \\@ IN NS ns.example.
-        \\www IN A 192.0.2.1
-        \\
-    );
-    defer runtime.deinit();
-
-    const replacement = try parseTestZone(
-        \\$ORIGIN example.
-        \\$TTL 3600
-        \\@ IN SOA ns.example. hostmaster.example. 2 3600 900 1209600 300
-        \\@ IN NS ns.example.
-        \\www IN A 192.0.2.2
-        \\
-    );
-    try runtime.replaceZone(replacement);
-
-    const selected = runtime.selectZone("www.example.") orelse return error.TestExpectedEqual;
-    var result = selected.lookup(std.testing.allocator, "www.example.", .A);
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("192.0.2.2", result.records.items[0].rdataText());
-}
-
-test "runtime rejects a replacement whose origin cannot be caller-mislabeled" {
-    var runtime = try Runtime.fromZoneText(
-        \\$ORIGIN example.
-        \\$TTL 3600
-        \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
-        \\@ IN NS ns.example.
-        \\www IN A 192.0.2.1
-        \\
-    );
-    defer runtime.deinit();
-
-    const replacement = try parseTestZone(
-        \\$ORIGIN other.
-        \\$TTL 3600
-        \\@ IN SOA ns.other. hostmaster.other. 2 3600 900 1209600 300
-        \\@ IN NS ns.other.
-        \\
-    );
-    try std.testing.expectError(Error.UnknownZoneOrigin, runtime.replaceZone(replacement));
-
-    const selected = runtime.selectZone("www.example.") orelse return error.TestExpectedEqual;
-    try std.testing.expectEqualStrings("example.", selected.originText());
-    var result = selected.lookup(std.testing.allocator, "www.example.", .A);
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("192.0.2.1", result.records.items[0].rdataText());
-}
-
-fn parseTestZone(text: []const u8) !zone_index.Zone {
-    var zone_file = try zone_parser.ZoneFile.parse(text);
-    return zone_index.Zone.fromZoneFile(&zone_file);
-}
-
 const transfer_test_axfr_query = [_]u8{
     0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x07, 'e',  'x',  'a',  'm',  'p',  'l',  'e',  0x00, 0x00, 0xfc, 0x00,
@@ -1532,31 +1484,4 @@ test "runtime serves AXFR as one bounded TCP blob opening and closing with SOA" 
     try std.testing.expect(only.answers.items[only.answers.len - 1].rrtype.eql(.SOA));
     try std.testing.expectEqual(@as(u32, 10), only.answers.items[0].rdata.SOA.serial);
     try std.testing.expectEqual(@as(u32, 10), only.answers.items[only.answers.len - 1].rdata.SOA.serial);
-}
-
-test "runtime records serial deltas across replacements for IXFR decisions" {
-    var runtime = try Runtime.fromZoneText(
-        \\$ORIGIN example.
-        \\$TTL 3600
-        \\@ IN SOA ns.example. hostmaster.example. 10 3600 900 1209600 3600
-        \\@ IN NS ns.example.
-        \\www IN A 192.0.2.1
-        \\
-    );
-    defer runtime.deinit();
-
-    const replacement = try parseTestZone(
-        \\$ORIGIN example.
-        \\$TTL 3600
-        \\@ IN SOA ns.example. hostmaster.example. 11 3600 900 1209600 3600
-        \\@ IN NS ns.example.
-        \\www IN A 192.0.2.2
-        \\
-    );
-    try runtime.replaceZone(replacement);
-
-    try std.testing.expect(runtime.transfer_deltas.hasSerial(10));
-    try std.testing.expect(runtime.transfer_deltas.hasSerial(11));
-    try std.testing.expect(runtime.transfer_deltas.canServeIncremental(10, 11));
-    try std.testing.expect(!runtime.transfer_deltas.canServeIncremental(9, 11));
 }

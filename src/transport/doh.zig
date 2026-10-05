@@ -1,9 +1,12 @@
-/// Contract: Serves the RFC 8484 DNS-over-HTTPS message mapping over an
-/// HTTP/1.1 byte channel behind TLS. GET /dns-query?dns=<base64url> and
-/// POST /dns-query with application/dns-message bodies share runtime.answer
-/// with the Do53/DoT paths. HTTP/2 framing requires the reviewed HTTP/2
-/// dependency (see docs/decisions/encrypted-transport.md), so this module is
-/// the HTTP/1.1 mapping subset, not a full RFC 8484 transport claim.
+/// Contract: Serves the RFC 8484 DNS-over-HTTPS message mapping (GET
+/// /dns-query?dns=<base64url> and POST /dns-query with application/dns-message
+/// bodies) on an already-TLS-terminated HTTP/1.1 byte channel, sharing
+/// runtime.answer with the Do53/DoT paths. ZIMDNS has no TLS server, so nothing
+/// in this repository can produce such a channel: there is deliberately no
+/// bind/accept entry point here, and the --serve-doh startup gate refuses
+/// before opening a socket (tls.zig, docs/decisions/encrypted-transport.md).
+/// HTTP/2 framing additionally needs the reviewed HTTP/2 dependency, so this
+/// module is the HTTP/1.1 mapping subset, not a full RFC 8484 transport claim.
 /// Ownership: Request/response scratch lives in caller buffers or a
 /// per-exchange arena; runtime zones stay borrowed.
 /// Errors: HTTP mapping failures map to HTTP status codes and never reach
@@ -12,6 +15,7 @@ const std = @import("std");
 const Runtime = @import("../auth/runtime.zig").Runtime;
 const metrics = @import("../metrics.zig");
 const dns_message = @import("../dns/message.zig");
+const tcp_deadline = @import("../platform/tcp_deadline.zig");
 const tls_policy = @import("tls.zig");
 
 pub const doh_path = "/dns-query";
@@ -20,6 +24,15 @@ pub const DOH_PORT = tls_policy.doh_port;
 pub const MAX_BODY_LEN: usize = 65535;
 pub const MAX_HEADER_BYTES: usize = 8192;
 pub const MAX_EXCHANGES_PER_CONNECTION: usize = 16;
+/// Five-second socket I/O budget shared with the Do53/DoT TCP paths.
+pub const DOH_IO_TIMEOUT = tcp_deadline.Timeout{ .seconds = 5 };
+/// HTTP/1.1 stream write buffering. The writer flushes incrementally, so a
+/// full 64KB DNS body never needs to sit in the stack write buffer.
+pub const DOH_WRITE_BUFFER_SIZE: usize = 8192;
+
+comptime {
+    std.debug.assert(DOH_WRITE_BUFFER_SIZE < MAX_BODY_LEN);
+}
 
 pub const Error = error{
     BadRequestLine,
@@ -267,24 +280,27 @@ pub fn serveDohExchange(
         value.doh_queries_total += 1;
     }
 
-    var dns_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer dns_arena.deinit();
-    const request_message = dns_message.Message.parseQuery(dns_arena.allocator(), query) catch {
+    // Everything below lives in the per-exchange arena: one heap allocation
+    // per exchange, freed together when the exchange ends. No 64KB stack
+    // buffers and no page_allocator arenas escape this exchange.
+    const request_message = dns_message.Message.parseQuery(arena, query) catch {
         try writeError(writer, .bad_request);
         try writer.flush();
         return true;
     };
     _ = request_message;
 
-    var response_buffer: [MAX_BODY_LEN]u8 = undefined;
+    const response_buffer = arena.alloc(u8, MAX_BODY_LEN) catch {
+        try writeError(writer, .internal_error);
+        try writer.flush();
+        return true;
+    };
     const response_bytes = if (counters) |value|
-        runtime.answerWithMetrics(query, &response_buffer, value) catch |err| return serveRuntimeError(writer, err)
+        runtime.answerWithMetrics(query, response_buffer, value) catch |err| return serveRuntimeError(writer, err)
     else
-        runtime.answer(query, &response_buffer) catch |err| return serveRuntimeError(writer, err);
+        runtime.answer(query, response_buffer) catch |err| return serveRuntimeError(writer, err);
 
-    var response_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer response_arena.deinit();
-    const response_message = dns_message.Message.parse(response_arena.allocator(), response_bytes) catch {
+    const response_message = dns_message.Message.parse(arena, response_bytes) catch {
         try writeError(writer, .internal_error);
         try writer.flush();
         return true;
@@ -323,49 +339,29 @@ pub fn serveDohStreamOnceWithMetrics(
 }
 
 fn serveDohStream(stream: std.Io.net.Stream, io: std.Io, runtime: *const Runtime, counters: ?*metrics.Counters) !void {
+    tcp_deadline.setSocketTimeout(stream.socket.handle, DOH_IO_TIMEOUT);
+
     var read_buffer: [MAX_HEADER_BYTES]u8 = undefined;
-    var write_buffer: [MAX_BODY_LEN]u8 = undefined;
+    var write_buffer: [DOH_WRITE_BUFFER_SIZE]u8 = undefined;
     var reader = stream.reader(io, &read_buffer);
     var writer = stream.writer(io, &write_buffer);
     var exchanges: usize = 0;
     while (exchanges < MAX_EXCHANGES_PER_CONNECTION) : (exchanges += 1) {
-        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        defer arena.deinit();
-        const must_close = serveDohExchange(&reader.interface, &writer.interface, arena.allocator(), runtime, counters) catch |err| {
-            if (err == error.EndOfStream or err == error.ReadFailed) {
-                if (exchanges == 0) return error.EndOfStream;
-                return;
-            }
-            return err;
+        // Block-scoped so the arena frees at the end of each exchange, not
+        // at connection close: memory stays bounded across keep-alive.
+        const must_close = blk: {
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            break :blk serveDohExchange(&reader.interface, &writer.interface, arena.allocator(), runtime, counters) catch |err| {
+                if (err == error.EndOfStream or err == error.ReadFailed) {
+                    if (exchanges == 0) return error.EndOfStream;
+                    return;
+                }
+                return err;
+            };
         };
         if (must_close) return;
     }
-}
-
-pub fn serveDohLoop(server: anytype, io: std.Io, runtime: *const Runtime, max_requests: ?usize) !void {
-    var group: std.Io.Group = .init;
-    defer group.await(io) catch unreachable;
-
-    var accepted: usize = 0;
-    while (max_requests == null or accepted < max_requests.?) {
-        const stream = try server.accept(io);
-        accepted += 1;
-        group.concurrent(io, serveDohStreamWorker, .{ stream, io, runtime }) catch |err| switch (err) {
-            error.ConcurrencyUnavailable => stream.close(io),
-        };
-    }
-}
-
-fn serveDohStreamWorker(stream: std.Io.net.Stream, io: std.Io, runtime: *const Runtime) void {
-    defer stream.close(io);
-    serveDohStreamOnce(stream, io, runtime) catch {};
-}
-
-pub fn serveDohLoopOnAddress(io: std.Io, runtime: *const Runtime, address: *const std.Io.net.IpAddress, max_requests: ?usize) !void {
-    var bind_address = address.*;
-    var server = try std.Io.net.IpAddress.listen(&bind_address, io, .{ .reuse_address = true });
-    defer server.deinit(io);
-    try serveDohLoop(&server, io, runtime, max_requests);
 }
 
 fn streamPair() ![2]std.Io.net.Stream {
@@ -498,6 +494,58 @@ test "DoH rejects wrong method, path, media type, and bad wire" {
     try std.testing.expectEqual(Status.unsupported_media_type, statusForError(Error.BadContentType));
     try std.testing.expectEqual(Status.payload_too_large, statusForError(Error.BodyTooLarge));
     try std.testing.expectEqual(Status.bad_request, statusForError(Error.BadDnsMessage));
+}
+
+test "DoH keep-alive serves pipelined exchanges with bounded per-exchange state" {
+    try std.testing.expect(DOH_WRITE_BUFFER_SIZE < MAX_BODY_LEN);
+    try std.testing.expectEqual(@as(u32, 5), DOH_IO_TIMEOUT.seconds);
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+
+    const streams = try streamPair();
+    var client_stream = streams[0];
+    defer client_stream.close(io);
+    const server_stream = streams[1];
+    defer server_stream.close(io);
+
+    var client_write_buffer: [4096]u8 = undefined;
+    var client_writer = client_stream.writer(io, &client_write_buffer);
+    for ([2]u16{ 0x1111, 0x2222 }) |id| {
+        var query_buffer: [512]u8 = undefined;
+        const query = try @import("../cli/query.zig").buildQueryPacket(&query_buffer, id, "dns.home.arpa.", .A);
+        var encoded: [1024]u8 = undefined;
+        const encoded_query = std.base64.url_safe_no_pad.Encoder.encode(&encoded, query);
+        try client_writer.interface.print("GET /dns-query?dns={s} HTTP/1.1\r\nHost: localhost\r\n\r\n", .{encoded_query});
+    }
+    try client_writer.interface.flush();
+    try client_stream.shutdown(io, .send);
+
+    try serveDohStreamOnce(server_stream, io, &runtime);
+
+    var response_buffer: [4096]u8 = undefined;
+    var client_reader = client_stream.reader(io, &response_buffer);
+    for ([2]u16{ 0x1111, 0x2222 }) |id| {
+        const status_line = try takeTestLine(&client_reader.interface);
+        try std.testing.expect(std.mem.startsWith(u8, status_line, "HTTP/1.1 200"));
+        var content_length: usize = 0;
+        while (true) {
+            const trimmed = try takeTestLine(&client_reader.interface);
+            if (trimmed.len == 0) break;
+            if (trimmed.len > 15 and std.ascii.eqlIgnoreCase(trimmed[0..14], "content-length")) {
+                content_length = try std.fmt.parseInt(usize, std.mem.trim(u8, trimmed[15..], " "), 10);
+            }
+        }
+        try std.testing.expect(content_length > 0);
+        const body = try client_reader.interface.take(content_length);
+        const response = try dns_message.Message.parse(arena.allocator(), body);
+        try std.testing.expectEqual(id, response.header.id);
+        try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+    }
 }
 
 fn takeTestLine(reader: *std.Io.Reader) ![]u8 {

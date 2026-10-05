@@ -196,6 +196,21 @@ pub const Message = struct {
         self.additionals.deinit();
     }
 
+    /// Full 12-bit extended RCODE: OPT extended-rcode byte combined with the
+    /// 4-bit header code. Messages without OPT report the bare header code,
+    /// so a header 7 alone yields 7 (reserved), never 23 (BADCOOKIE).
+    pub fn effectiveRcode(self: *const Message) u16 {
+        const extended: u8 = if (self.edns) |edns| edns.extended_rcode else 0;
+        return self.header.rcode.extendedCode(extended);
+    }
+
+    /// True only for RFC 7873 BADCOOKIE: header low bits 7 plus OPT
+    /// extended-rcode 1 (extended code 23).
+    pub fn isBadCookie(self: *const Message) bool {
+        const extended: u8 = if (self.edns) |edns| edns.extended_rcode else 0;
+        return self.header.rcode.isBadCookie(extended);
+    }
+
     pub fn encode(self: Message, writer: *Writer) !void {
         var compression = CompressionTable{};
         try self.header.encode(writer);
@@ -401,6 +416,32 @@ test "message preserves EDNS extended RCODE, DO bit, and option bytes" {
     try std.testing.expectEqual(@as(u8, 0), parsed.edns.?.version);
     try std.testing.expect(parsed.edns.?.dnssec_ok);
     try std.testing.expectEqualSlices(u8, &.{ 0xea, 0x60, 0x00, 0x03, 0x01, 0x02, 0x03, 0x00, 0x0f, 0x00, 0x00 }, parsed.additionals.items[0].rdata.OPT.bytes());
+}
+
+test "message splits bare header 7 from OPT-backed BADCOOKIE 23" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // Header RCODE 7 with no OPT: reserved, effective code 7, not BADCOOKIE.
+    const bare = [_]u8{
+        0x12, 0x34, 0x85, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        7,    'e',  'x',  'a',  'm',  'p',  'l',  'e',  3,    'c',  'o',  'm',
+        0,    0x00, 0x01, 0x00, 0x01,
+    };
+    const parsed_bare = try Message.parse(arena.allocator(), &bare);
+    try std.testing.expectEqual(@as(u16, 7), parsed_bare.effectiveRcode());
+    try std.testing.expect(!parsed_bare.isBadCookie());
+
+    // Header RCODE 7 with OPT extended-rcode 1: BADCOOKIE, effective code 23.
+    const extended = [_]u8{
+        0x12, 0x34, 0x85, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        7,    'e',  'x',  'a',  'm',  'p',  'l',  'e',  3,    'c',  'o',  'm',
+        0,    0x00, 0x01, 0x00, 0x01, 0,    0x00, 0x29, 0x04, 0xd0, 0x01, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+    };
+    const parsed_extended = try Message.parse(arena.allocator(), &extended);
+    try std.testing.expectEqual(@as(u16, 23), parsed_extended.effectiveRcode());
+    try std.testing.expect(parsed_extended.isBadCookie());
 }
 
 test "message rejects malformed OPT records" {

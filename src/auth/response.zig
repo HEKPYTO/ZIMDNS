@@ -214,6 +214,10 @@ pub fn buildResponse(request: dns_message.Message, zone: *const zone_index.Zone)
     return response;
 }
 
+/// Maximum RRSIGs attached to one response. Answers name few RRsets, so this
+/// bounds amplification from a zone packed with signatures.
+const max_covering_rrsigs: usize = 8;
+
 /// Append zone RRSIGs whose owner matches an answer record and whose
 /// type-covered field equals that record's type. Malformed candidates are
 /// skipped so one bad RRSIG cannot fail the whole response.
@@ -222,26 +226,34 @@ fn appendCoveringRrsigs(response: *dns_message.Message, zone: *const zone_index.
     // Snapshot the pre-proof length: appended RRSIGs must not be rescanned,
     // and section storage may move on append.
     const original_len = response.answers.len;
-    var answer_index: usize = 0;
-    while (answer_index < original_len) : (answer_index += 1) {
-        const answer = response.answers.items[answer_index];
-        if (answer.rrtype.eql(.RRSIG)) continue;
-        var index: usize = 0;
-        while (index < zone.records.len) : (index += 1) {
-            const candidate = zone.records.items[index];
-            if (!candidate.rrtype.eql(.RRSIG)) continue;
-            const owner = dns_name.Name.fromText(candidate.ownerText()) catch continue;
-            if (!owner.eql(&answer.owner)) continue;
-            const rr = toResourceRecord(candidate, null) catch continue;
-            const raw = switch (rr.rdata) {
-                .Unknown => |unknown| unknown.bytes(),
-                else => continue,
-            };
-            const covers = @import("../dns/dnssec.zig").rrsigCovers(raw) catch continue;
+    var appended: usize = 0;
+    var index: usize = 0;
+    // Single pass over the zone: each RRSIG candidate is decoded once and
+    // attached at most once when it covers a snapshotted answer RRset.
+    while (index < zone.records.len and appended < max_covering_rrsigs) : (index += 1) {
+        const candidate = zone.records.items[index];
+        if (!candidate.rrtype.eql(.RRSIG)) continue;
+        const rr = toResourceRecord(candidate, null) catch continue;
+        const raw = switch (rr.rdata) {
+            .Unknown => |unknown| unknown.bytes(),
+            else => continue,
+        };
+        const covers = @import("../dns/dnssec.zig").rrsigCovers(raw) catch continue;
+        const owner = dns_name.Name.fromText(candidate.ownerText()) catch continue;
+        var answer_index: usize = 0;
+        var covers_answer = false;
+        while (answer_index < original_len) : (answer_index += 1) {
+            const answer = response.answers.items[answer_index];
+            if (answer.rrtype.eql(.RRSIG)) continue;
             if (covers != answer.rrtype.code()) continue;
-            if (response.answers.len >= std.math.maxInt(u16)) return Error.TooManyRecords;
-            try response.answers.append(rr);
+            if (!owner.eql(&answer.owner)) continue;
+            covers_answer = true;
+            break;
         }
+        if (!covers_answer) continue;
+        if (response.answers.len >= std.math.maxInt(u16)) return Error.TooManyRecords;
+        try response.answers.append(rr);
+        appended += 1;
     }
 }
 
@@ -716,6 +728,43 @@ test "DO-bit query receives covering RRSIGs, plain query does not" {
     try std.testing.expectEqual(@as(u16, 2), round_trip.header.answer_count);
     try std.testing.expect(round_trip.answers.items[1].rrtype.eql(.RRSIG));
     try std.testing.expectEqual(@as(u16, 1), try @import("../dns/dnssec.zig").rrsigCovers(round_trip.answers.items[1].rdata.Unknown.bytes()));
+}
+
+test "covering RRSIGs are capped so packed zones cannot amplify" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+        \\@ IN NS ns.example.
+        \\www IN A 192.0.2.1
+        \\www IN RRSIG A 8 2 3600 2000000000 1000000000 1234 example. QUJD
+        \\www IN RRSIG A 8 2 3600 2000000000 1000000000 1235 example. QUJD
+        \\www IN RRSIG A 8 2 3600 2000000000 1000000000 1236 example. QUJD
+        \\www IN RRSIG A 8 2 3600 2000000000 1000000000 1237 example. QUJD
+        \\www IN RRSIG A 8 2 3600 2000000000 1000000000 1238 example. QUJD
+        \\www IN RRSIG A 8 2 3600 2000000000 1000000000 1239 example. QUJD
+        \\www IN RRSIG A 8 2 3600 2000000000 1000000000 1240 example. QUJD
+        \\www IN RRSIG A 8 2 3600 2000000000 1000000000 1241 example. QUJD
+        \\www IN RRSIG A 8 2 3600 2000000000 1000000000 1242 example. QUJD
+        \\www IN RRSIG A 8 2 3600 2000000000 1000000000 1243 example. QUJD
+        \\www IN RRSIG A 8 2 3600 2000000000 1000000000 1244 example. QUJD
+        \\www IN RRSIG A 8 2 3600 2000000000 1000000000 1245 example. QUJD
+        \\
+    );
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    const response = try buildResponse(try testDoQuery(arena.allocator(), 0x4410, "www.example.", .A, true), &zone);
+    try std.testing.expectEqual(@as(usize, 1 + max_covering_rrsigs), response.answers.len);
+    try std.testing.expectEqual(@as(u16, 1 + max_covering_rrsigs), response.header.answer_count);
+    try std.testing.expect(response.answers.items[0].rrtype.eql(.A));
+    for (response.answers.slice()[1..]) |answer| {
+        try std.testing.expect(answer.rrtype.eql(.RRSIG));
+        try std.testing.expectEqual(@as(u16, 1), try @import("../dns/dnssec.zig").rrsigCovers(answer.rdata.Unknown.bytes()));
+    }
 }
 
 test "explicit DNSKEY query is answered with or without DO" {

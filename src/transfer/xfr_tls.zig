@@ -1,13 +1,16 @@
-/// Contract: Serves RFC 9103 zone transfers over TLS (strict TLS use): AXFR
-/// queries and RFC 1995 IXFR-fallback queries on a TLS channel receive the
-/// axfr.zig message sequence, while ordinary queries share runtime.answer.
-/// Plaintext channels answer ordinary queries but refuse transfers instead of
-/// leaking zone contents. Multi-message TSIG chaining stays deferred per the
-/// axfr.zig policy; authentication rides the TLS session.
+/// Contract: Serves the RFC 9103 zone-transfer message sequence (AXFR queries
+/// and RFC 1995 IXFR-fallback queries answered from axfr.zig; ordinary queries
+/// share runtime.answer) on an already-TLS-terminated byte channel.
+/// ZIMDNS has no TLS server, so nothing in this repository can produce such a
+/// channel and nothing can truthfully claim a channel is TLS: there is
+/// deliberately no bind/accept entry point and no channel selector here, and
+/// the --serve-xfr startup gate refuses before opening a socket (tls.zig,
+/// docs/decisions/encrypted-transport.md). Multi-message TSIG chaining stays
+/// deferred per the axfr.zig policy.
 /// Ownership: Runtime is borrowed; streams are consumed/closed by the caller
 /// loop; wire buffers are local.
-/// Errors: DNS failures are typed; socket read/write and bind failures
-/// propagate as I/O errors.
+/// Errors: DNS failures are typed; socket read/write failures propagate as
+/// I/O errors.
 const std = @import("std");
 const Runtime = @import("../auth/runtime.zig").Runtime;
 const metrics = @import("../metrics.zig");
@@ -26,36 +29,27 @@ pub fn serveXfrStreamOnce(
     stream: std.Io.net.Stream,
     io: std.Io,
     runtime: *const Runtime,
-    channel: tls_policy.Channel,
 ) !void {
-    return serveXfrStream(stream, io, runtime, channel, null);
+    return serveXfrStream(stream, io, runtime, null);
 }
 
 pub fn serveXfrStreamOnceWithMetrics(
     stream: std.Io.net.Stream,
     io: std.Io,
     runtime: *const Runtime,
-    channel: tls_policy.Channel,
     counters: *metrics.Counters,
 ) !void {
-    return serveXfrStream(stream, io, runtime, channel, counters);
+    return serveXfrStream(stream, io, runtime, counters);
 }
 
 fn serveXfrStream(
     stream: std.Io.net.Stream,
     io: std.Io,
     runtime: *const Runtime,
-    channel: tls_policy.Channel,
     counters: ?*metrics.Counters,
 ) !void {
     if (comptime !listener.TCP_DEADLINES_SUPPORTED) return listener.Error.UnsupportedPlatform;
-    const posix_timeout: std.posix.timeval = .{
-        .sec = @intCast(IO_TIMEOUT.seconds),
-        .usec = @intCast(IO_TIMEOUT.microseconds),
-    };
-    const timeout_bytes = std.mem.asBytes(&posix_timeout);
-    try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, timeout_bytes);
-    try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, timeout_bytes);
+    tcp_deadline.setSocketTimeout(stream.socket.handle, IO_TIMEOUT);
 
     var request_buffer: [listener.TCP_MAX_FRAME_SIZE]u8 = undefined;
     var response_buffer: [listener.TCP_MAX_FRAME_SIZE]u8 = undefined;
@@ -72,7 +66,7 @@ fn serveXfrStream(
         };
         var frame_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer frame_arena.deinit();
-        if (axfr.buildTransferResponses(frame_arena.allocator(), request, runtime, channel)) |messages| {
+        if (axfr.buildTransferResponses(frame_arena.allocator(), request, runtime)) |messages| {
             var answers: usize = 0;
             for (messages) |message| {
                 answers += message.answers.len;
@@ -103,16 +97,7 @@ fn serveXfrStream(
 }
 
 fn readFrame(fd: std.posix.fd_t, io: std.Io, frame_buffer: []u8, frame_deadline: std.Io.Clock.Timestamp) ![]const u8 {
-    var len_bytes: [2]u8 = undefined;
-    try tcp_deadline.readExact(fd, io, &len_bytes, frame_deadline);
-    const request_len = std.mem.readInt(u16, &len_bytes, .big);
-    try listener.validateTcpFrameLength(request_len);
-    if (request_len > frame_buffer.len) return listener.Error.BadTcpFrame;
-    tcp_deadline.readExact(fd, io, frame_buffer[0..request_len], frame_deadline) catch |err| {
-        if (err == error.EndOfStream) return listener.Error.BadTcpFrame;
-        return err;
-    };
-    return frame_buffer[0..request_len];
+    return listener.readTcpFrameExact(fd, io, frame_buffer, frame_deadline);
 }
 
 fn writeFrame(fd: std.posix.fd_t, io: std.Io, payload: []const u8) !void {
@@ -122,38 +107,6 @@ fn writeFrame(fd: std.posix.fd_t, io: std.Io, payload: []const u8) !void {
     const write_deadline = tcp_deadline.deadline(io, IO_TIMEOUT);
     try tcp_deadline.writeExact(fd, io, &prefix, write_deadline);
     try tcp_deadline.writeExact(fd, io, payload, write_deadline);
-}
-
-fn serveXfrStreamWorker(stream: std.Io.net.Stream, io: std.Io, runtime: *const Runtime, channel: tls_policy.Channel) void {
-    defer stream.close(io);
-    serveXfrStreamOnce(stream, io, runtime, channel) catch {};
-}
-
-pub fn serveXfrLoop(server: anytype, io: std.Io, runtime: *const Runtime, channel: tls_policy.Channel, max_requests: ?usize) !void {
-    var group: std.Io.Group = .init;
-    defer group.await(io) catch unreachable;
-
-    var accepted: usize = 0;
-    while (max_requests == null or accepted < max_requests.?) {
-        const stream = try server.accept(io);
-        accepted += 1;
-        group.concurrent(io, serveXfrStreamWorker, .{ stream, io, runtime, channel }) catch |err| switch (err) {
-            error.ConcurrencyUnavailable => stream.close(io),
-        };
-    }
-}
-
-pub fn serveXfrLoopOnAddress(
-    io: std.Io,
-    runtime: *const Runtime,
-    channel: tls_policy.Channel,
-    address: *const std.Io.net.IpAddress,
-    max_requests: ?usize,
-) !void {
-    var bind_address = address.*;
-    var server = try std.Io.net.IpAddress.listen(&bind_address, io, .{ .reuse_address = true });
-    defer server.deinit(io);
-    try serveXfrLoop(&server, io, runtime, channel, max_requests);
 }
 
 fn streamPair() ![2]std.Io.net.Stream {
@@ -167,7 +120,7 @@ fn streamPair() ![2]std.Io.net.Stream {
     };
 }
 
-test "XFR-over-TLS serves a full AXFR sequence on a TLS channel" {
+test "transfer channel serves a full AXFR sequence for an already-terminated stream" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -191,7 +144,7 @@ test "XFR-over-TLS serves a full AXFR sequence on a TLS channel" {
     try client_stream.shutdown(io, .send);
 
     var counters = metrics.Counters{};
-    try serveXfrStreamOnceWithMetrics(server_stream, io, &runtime, .tls, &counters);
+    try serveXfrStreamOnceWithMetrics(server_stream, io, &runtime, &counters);
     try std.testing.expectEqual(@as(u64, 1), counters.xfr_transfers_total);
 
     var client_read_buffer: [4096]u8 = undefined;
@@ -208,7 +161,7 @@ test "XFR-over-TLS serves a full AXFR sequence on a TLS channel" {
     try std.testing.expect(response.answers.slice()[3].rrtype.eql(@import("../dns/types.zig").RecordType.SOA));
 }
 
-test "XFR-over-TLS answers ordinary queries and refuses plaintext transfers" {
+test "transfer channel answers ordinary queries without counting a transfer" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -216,65 +169,32 @@ test "XFR-over-TLS answers ordinary queries and refuses plaintext transfers" {
     var runtime = try Runtime.fromZoneText(test_zone);
     defer runtime.deinit();
 
-    // Ordinary A query on a TLS channel: answered, not counted as transfer.
-    {
-        const streams = try streamPair();
-        var client_stream = streams[0];
-        defer client_stream.close(io);
-        const server_stream = streams[1];
-        defer server_stream.close(io);
-        var client_write_buffer: [512]u8 = undefined;
-        var client_writer = client_stream.writer(io, &client_write_buffer);
-        var prefix: [2]u8 = undefined;
-        std.mem.writeInt(u16, &prefix, @intCast(simple_a_query.len), .big);
-        try client_writer.interface.writeAll(&prefix);
-        try client_writer.interface.writeAll(simple_a_query);
-        try client_writer.interface.flush();
-        try client_stream.shutdown(io, .send);
+    const streams = try streamPair();
+    var client_stream = streams[0];
+    defer client_stream.close(io);
+    const server_stream = streams[1];
+    defer server_stream.close(io);
+    var client_write_buffer: [512]u8 = undefined;
+    var client_writer = client_stream.writer(io, &client_write_buffer);
+    var prefix: [2]u8 = undefined;
+    std.mem.writeInt(u16, &prefix, @intCast(simple_a_query.len), .big);
+    try client_writer.interface.writeAll(&prefix);
+    try client_writer.interface.writeAll(simple_a_query);
+    try client_writer.interface.flush();
+    try client_stream.shutdown(io, .send);
 
-        var counters = metrics.Counters{};
-        try serveXfrStreamOnceWithMetrics(server_stream, io, &runtime, .tls, &counters);
-        try std.testing.expectEqual(@as(u64, 0), counters.xfr_transfers_total);
-        try std.testing.expectEqual(@as(u64, 1), counters.responses_total);
+    var counters = metrics.Counters{};
+    try serveXfrStreamOnceWithMetrics(server_stream, io, &runtime, &counters);
+    try std.testing.expectEqual(@as(u64, 0), counters.xfr_transfers_total);
+    try std.testing.expectEqual(@as(u64, 1), counters.responses_total);
 
-        var client_read_buffer: [512]u8 = undefined;
-        var client_reader = client_stream.reader(io, &client_read_buffer);
-        const response_len_bytes = try client_reader.interface.takeArray(2);
-        const response_len = std.mem.readInt(u16, response_len_bytes, .big);
-        const response_bytes = try client_reader.interface.take(response_len);
-        const response = try @import("../dns/message.zig").Message.parse(arena.allocator(), response_bytes);
-        try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
-    }
-
-    // AXFR on a plaintext channel: single REFUSED, never a transfer.
-    {
-        const streams = try streamPair();
-        var client_stream = streams[0];
-        defer client_stream.close(io);
-        const server_stream = streams[1];
-        defer server_stream.close(io);
-        var client_write_buffer: [512]u8 = undefined;
-        var client_writer = client_stream.writer(io, &client_write_buffer);
-        var prefix: [2]u8 = undefined;
-        std.mem.writeInt(u16, &prefix, @intCast(axfr_query.len), .big);
-        try client_writer.interface.writeAll(&prefix);
-        try client_writer.interface.writeAll(axfr_query);
-        try client_writer.interface.flush();
-        try client_stream.shutdown(io, .send);
-
-        var counters = metrics.Counters{};
-        try serveXfrStreamOnceWithMetrics(server_stream, io, &runtime, .plaintext, &counters);
-        try std.testing.expectEqual(@as(u64, 0), counters.xfr_transfers_total);
-
-        var client_read_buffer: [512]u8 = undefined;
-        var client_reader = client_stream.reader(io, &client_read_buffer);
-        const response_len_bytes = try client_reader.interface.takeArray(2);
-        const response_len = std.mem.readInt(u16, response_len_bytes, .big);
-        const response_bytes = try client_reader.interface.take(response_len);
-        const response = try @import("../dns/message.zig").Message.parse(arena.allocator(), response_bytes);
-        try std.testing.expectEqual(@import("../dns/header.zig").Rcode.refused, response.header.rcode);
-        try std.testing.expectEqual(@as(u16, 0), response.header.answer_count);
-    }
+    var client_read_buffer: [512]u8 = undefined;
+    var client_reader = client_stream.reader(io, &client_read_buffer);
+    const response_len_bytes = try client_reader.interface.takeArray(2);
+    const response_len = std.mem.readInt(u16, response_len_bytes, .big);
+    const response_bytes = try client_reader.interface.take(response_len);
+    const response = try @import("../dns/message.zig").Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
 }
 
 const test_zone =

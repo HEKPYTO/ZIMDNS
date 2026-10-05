@@ -93,18 +93,35 @@ pub const Zone = struct {
         }
 
         var result = LookupResult{ .kind = .nxdomain, .soa = self.soa };
-        if (self.findDelegation(qname)) |delegation| {
-            result.kind = .referral;
-            result.soa = null;
-            self.appendDelegation(allocator, &result, delegation) catch return failResult(&result, allocator);
-            return result;
+        // Exact authoritative data (including CNAME/DNAME chains and glue
+        // published in this zone) wins over a zone cut below it.
+        var exact_nodata = false;
+        if (self.lookupExact(allocator, qname, qtype, &result)) |exact_kind| {
+            if (exact_kind == .servfail) {
+                result.kind = .servfail;
+                return failResult(&result, allocator);
+            }
+            if (exact_kind == .answer or exact_kind == .cname or exact_kind == .dname or exact_kind == .yxdomain) {
+                result.kind = exact_kind;
+                return result;
+            }
+            exact_nodata = true;
         }
 
-        if (self.lookupExact(allocator, qname, qtype, &result)) |exact_kind| {
-            result.kind = exact_kind;
-            if (exact_kind == .servfail) return failResult(&result, allocator);
-            if (exact_kind == .answer or exact_kind == .cname or exact_kind == .dname or exact_kind == .yxdomain) return result;
-            if (exact_kind == .nodata) return result;
+        // A zone cut refers except for a DS query at the cut itself, which
+        // stays authoritative in the parent (RFC 4035 section 3.1).
+        if (self.findDelegation(qname)) |delegation| {
+            if (!(qtype.eql(.DS) and std.ascii.eqlIgnoreCase(qname, delegation))) {
+                result.kind = .referral;
+                result.soa = null;
+                self.appendDelegation(allocator, &result, delegation) catch return failResult(&result, allocator);
+                return result;
+            }
+        }
+
+        if (exact_nodata) {
+            result.kind = .nodata;
+            return result;
         }
 
         if (self.nodeExists(qname)) {
@@ -697,4 +714,96 @@ test "zone index returns SERVFAIL after the shared CNAME hop cap" {
     defer arena.deinit();
     const result = zone.lookup(arena.allocator(), "a0.example.", .A);
     try std.testing.expectEqual(LookupKind.servfail, result.kind);
+}
+
+test "zone index answers exact data before referring at a zone cut" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try parser.ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+        \\@ IN NS ns.example.
+        \\ns IN A 192.0.2.1
+        \\child IN NS ns.child.example.
+        \\child IN NS ns.external.example.
+        \\ns.child.example. IN A 192.0.2.10
+        \\ns.external.example. IN A 192.0.2.11
+        \\
+    );
+    var zone = try Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    var glue = zone.lookup(arena.allocator(), "ns.child.example.", .A);
+    defer glue.deinit(arena.allocator());
+    try std.testing.expectEqual(LookupKind.answer, glue.kind);
+    try std.testing.expectEqual(@as(usize, 1), glue.records.len);
+    try std.testing.expectEqualStrings("192.0.2.10", glue.records.items[0].rdataText());
+
+    var cut = zone.lookup(arena.allocator(), "child.example.", .NS);
+    defer cut.deinit(arena.allocator());
+    try std.testing.expectEqual(LookupKind.answer, cut.kind);
+    try std.testing.expectEqual(@as(usize, 2), cut.records.len);
+
+    var below = zone.lookup(arena.allocator(), "www.child.example.", .A);
+    defer below.deinit(arena.allocator());
+    try std.testing.expectEqual(LookupKind.referral, below.kind);
+    try std.testing.expectEqual(@as(usize, 2), below.authorities.len);
+    try std.testing.expectEqual(@as(usize, 1), below.additionals.len);
+
+    var at_cut = zone.lookup(arena.allocator(), "child.example.", .TXT);
+    defer at_cut.deinit(arena.allocator());
+    try std.testing.expectEqual(LookupKind.referral, at_cut.kind);
+}
+
+test "zone index keeps DS queries at the cut authoritative" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try parser.ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+        \\@ IN NS ns.example.
+        \\ns IN A 192.0.2.1
+        \\child IN NS ns.child.example.
+        \\ns.child.example. IN A 192.0.2.10
+        \\child IN DS 1234 8 2 DEADBEEF
+        \\
+    );
+    var zone = try Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    var ds = zone.lookup(arena.allocator(), "child.example.", .DS);
+    defer ds.deinit(arena.allocator());
+    try std.testing.expectEqual(LookupKind.answer, ds.kind);
+    try std.testing.expectEqual(@as(usize, 1), ds.records.len);
+
+    var below = zone.lookup(arena.allocator(), "www.child.example.", .DS);
+    defer below.deinit(arena.allocator());
+    try std.testing.expectEqual(LookupKind.referral, below.kind);
+}
+
+test "zone index returns nodata for a missing DS at the cut" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try parser.ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+        \\@ IN NS ns.example.
+        \\ns IN A 192.0.2.1
+        \\child IN NS ns.child.example.
+        \\ns.child.example. IN A 192.0.2.10
+        \\
+    );
+    var zone = try Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    var ds = zone.lookup(arena.allocator(), "child.example.", .DS);
+    defer ds.deinit(arena.allocator());
+    try std.testing.expectEqual(LookupKind.nodata, ds.kind);
+    try std.testing.expect(ds.soa != null);
 }

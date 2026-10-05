@@ -13,6 +13,28 @@ pub const Timeout = struct {
     microseconds: u32 = 0,
 };
 
+/// Installs SO_RCVTIMEO/SO_SNDTIMEO on `fd`, best effort.
+///
+/// darwin rejects *every* SOL_SOCKET option with EINVAL once both directions
+/// are shut down: the kernel raises SS_CANTRCVMORE when a peer FIN arrives
+/// (XNU `tcp_input`, `socantrcvmore`) and SS_CANTSENDMORE on shutdown(SHUT_WR),
+/// after which `sosetoptlock` refuses the whole level. `std.posix.setsockopt`
+/// maps that EINVAL to `unreachable`, so calling it on a half-closed connection
+/// aborts the process. Talk to the syscall directly instead: a connection that
+/// is already finished simply keeps no socket timeout, and every frame exchange
+/// stays bounded by the poll deadlines below.
+pub fn setSocketTimeout(fd: std.posix.fd_t, timeout: Timeout) void {
+    const value: std.posix.timeval = .{
+        .sec = @intCast(timeout.seconds),
+        .usec = @intCast(timeout.microseconds),
+    };
+    const bytes = std.mem.asBytes(&value);
+    for ([_]u32{ std.posix.SO.RCVTIMEO, std.posix.SO.SNDTIMEO }) |option| {
+        const result = std.posix.system.setsockopt(fd, std.posix.SOL.SOCKET, option, bytes.ptr, @intCast(bytes.len));
+        _ = std.posix.errno(result);
+    }
+}
+
 pub fn deadline(io: std.Io, timeout: Timeout) std.Io.Clock.Timestamp {
     const duration = std.Io.Clock.Duration{ .raw = .fromNanoseconds(
         @as(i96, timeout.seconds) * std.time.ns_per_s + @as(i96, timeout.microseconds) * std.time.ns_per_us,
@@ -154,4 +176,34 @@ test "writeExact loops over scripted partial writes" {
     try readExact(sockets[1], io, &received, deadline(io, .{ .seconds = 1 }));
     try std.testing.expectEqualSlices(u8, payload, &received);
     try std.testing.expectEqual(@as(usize, 3), scripted.calls);
+}
+test "socket timeout fails a stalled peer read instead of blocking forever" {
+    if (comptime !tcp_deadlines_supported) return;
+    var sockets: [2]std.posix.fd_t = undefined;
+    const socket_result = std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &sockets);
+    try std.testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(socket_result));
+    defer _ = std.posix.system.close(sockets[0]);
+    defer _ = std.posix.system.close(sockets[1]);
+
+    setSocketTimeout(sockets[0], .{ .seconds = 0, .microseconds = 50_000 });
+    var buffer: [8]u8 = undefined;
+    // The peer never writes, so the only outcome is SO_RCVTIMEO firing: without
+    // the option this read would hang until the test runner is killed.
+    try std.testing.expectError(error.WouldBlock, std.posix.read(sockets[0], &buffer));
+}
+
+test "setSocketTimeout tolerates a socket that is shut down on both sides" {
+    if (comptime !tcp_deadlines_supported) return;
+    var sockets: [2]std.posix.fd_t = undefined;
+    const socket_result = std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &sockets);
+    try std.testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(socket_result));
+    defer _ = std.posix.system.close(sockets[0]);
+    defer _ = std.posix.system.close(sockets[1]);
+
+    // SHUT_RDWR is 2 on both linux and darwin; std.posix has no shutdown wrapper.
+    for (sockets) |fd| _ = std.posix.system.shutdown(fd, @as(u32, 2));
+    // darwin's sosetoptlock answers EINVAL for every SOL_SOCKET option once
+    // SS_CANTRCVMORE|SS_CANTSENDMORE are set, which std.posix.setsockopt
+    // turns into an unreachable panic. Reaching the next line is the assertion.
+    setSocketTimeout(sockets[0], .{ .seconds = 5 });
 }

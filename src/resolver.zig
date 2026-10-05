@@ -312,14 +312,20 @@ const Cache = struct {
 
         var slot: usize = 0;
         var index: usize = 0;
+        var empty: ?usize = null;
         while (index < self.len) : (index += 1) {
-            if (self.entries[index].response == null) continue;
+            if (self.entries[index].response == null) {
+                if (empty == null) empty = index;
+                continue;
+            }
             if (self.entries[index].key.eql(&key)) {
                 slot = index;
                 break;
             }
         } else {
-            if (self.len < MAX_CACHE_ENTRIES) {
+            if (empty) |free| {
+                slot = free;
+            } else if (self.len < MAX_CACHE_ENTRIES) {
                 slot = self.len;
                 self.len += 1;
             } else {
@@ -491,8 +497,21 @@ pub const Resolver = struct {
         // DNSSEC proofs (DO) and did not disable checking (CD).
         if (wantsDnssecProofs(query)) {
             if (query.question) |question| {
-                if (self.dnssec_aggressive.deny(question.name, question.qtype)) |denial| {
-                    const bytes = try self.aggressiveAnswer(query, denial, output);
+                const denial = self.dnssec_aggressive.deny(question.name, question.qtype, now) catch {
+                    // Fail closed: an exact-owner NSEC proof is cached but its
+                    // bitmap is malformed, so no denial can be synthesized.
+                    // Answer SERVFAIL with a DNSSEC-bogus EDE (RFC 8914)
+                    // instead of forwarding as if the cache were clean.
+                    var bogus = try Resolver.buildDnssecBogusResponse(query, EDE_DNSSEC_BOGUS);
+                    defer bogus.deinit();
+                    var writer = dns_writer.Writer.init(output);
+                    bogus.encode(&writer) catch return Error.ResponseTooLarge;
+                    const bytes = writer.written();
+                    if (cookie == .valid) return self.addCachedCookie(output, query, cookie.valid);
+                    return bytes;
+                };
+                if (denial) |d| {
+                    const bytes = try self.aggressiveAnswer(query, d, output);
                     if (cookie == .valid) return self.addCachedCookie(output, query, cookie.valid);
                     return bytes;
                 }
@@ -526,7 +545,7 @@ pub const Resolver = struct {
         response.question = query.question;
         stripOptions(&response);
         self.cache.put(key, &response, now) catch {};
-        self.harvestNsecProofs(response);
+        self.harvestNsecProofs(response, now);
         if (query.edns) |edns| try appendOpt(&response, edns);
         // DNSSEC presence signals (RFC 8914 6-10) ride along as informational
         // EDE on the relayed response. They never change the RCODE here: this
@@ -549,9 +568,9 @@ pub const Resolver = struct {
         return errorResponse(query, .servfail, ede_code);
     }
 
-    fn harvestNsecProofs(self: *Resolver, response: dns_message.Message) void {
-        harvestSectionNsec(&self.dnssec_aggressive, response.answers.slice());
-        harvestSectionNsec(&self.dnssec_aggressive, response.authorities.slice());
+    fn harvestNsecProofs(self: *Resolver, response: dns_message.Message, now: i64) void {
+        harvestSectionNsec(&self.dnssec_aggressive, response.answers.slice(), now);
+        harvestSectionNsec(&self.dnssec_aggressive, response.authorities.slice(), now);
     }
 
     fn aggressiveAnswer(self: *const Resolver, query: dns_message.Message, denial: dnssec.Denial, output: []u8) ![]const u8 {
@@ -683,7 +702,7 @@ pub const Resolver = struct {
             }) catch return Error.UpstreamFailure;
         defer stream.close(self.io);
         const frame_deadline = tcp_deadline.deadlineFromTimeout(self.io, TCP_TIMEOUT) orelse return Error.UpstreamFailure;
-        setTcpIoTimeout(stream) catch return Error.UpstreamFailure;
+        setTcpIoTimeout(stream);
 
         var prefix: [2]u8 = undefined;
         if (query_bytes.len == 0 or query_bytes.len > MAX_UPSTREAM_MESSAGE) return Error.UpstreamFailure;
@@ -820,12 +839,9 @@ fn nonBlockingFlag() usize {
     return @intCast(@as(u32, @bitCast(flags)));
 }
 
-fn setTcpIoTimeout(stream: std.Io.net.Stream) !void {
+fn setTcpIoTimeout(stream: std.Io.net.Stream) void {
     if (comptime UPSTREAM_TCP_DEADLINES_SUPPORTED) {
-        const timeout: std.posix.timeval = .{ .sec = 1, .usec = 0 };
-        const timeout_bytes = std.mem.asBytes(&timeout);
-        try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, timeout_bytes);
-        try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, timeout_bytes);
+        tcp_deadline.setSocketTimeout(stream.socket.handle, .{ .seconds = 1 });
     }
 }
 
@@ -867,7 +883,7 @@ fn wantsDnssecProofs(query: dns_message.Message) bool {
     return edns.dnssec_ok;
 }
 
-fn harvestSectionNsec(cache: *dnssec.AggressiveCache, records: []const dns_record.ResourceRecord) void {
+fn harvestSectionNsec(cache: *dnssec.AggressiveCache, records: []const dns_record.ResourceRecord, now: i64) void {
     for (records) |*record| {
         if (!record.rrtype.eql(.NSEC)) continue;
         const raw = switch (record.rdata) {
@@ -875,7 +891,7 @@ fn harvestSectionNsec(cache: *dnssec.AggressiveCache, records: []const dns_recor
             else => continue,
         };
         const next = dns_name.Name.parse(raw, 0) catch continue;
-        cache.insertNsec(record.owner, next.name, raw[next.next_offset..]);
+        cache.insertNsec(record.owner, next.name, raw[next.next_offset..], now, record.ttl);
     }
 }
 
@@ -945,6 +961,18 @@ fn appendOpt(message: *dns_message.Message, edns: dns_message.EdnsState) !void {
 
 fn errorResponse(request: dns_message.Message, rcode: dns_header.Rcode, ede_code: ?u16) !dns_message.Message {
     const q = request.question orelse return Error.BadUpstreamResponse;
+    // RFC 7873 BADCOOKIE is extended RCODE 23: header low bits 7 plus an
+    // OPT record with extended-rcode 1 carrying the fresh server cookie. A
+    // bare header 7 with no OPT is reserved, so BADCOOKIE responses always
+    // synthesize EDNS even when the offending query carried none.
+    const with_opt = request.edns != null or rcode == .badcookie;
+    const fallback_edns = dns_message.EdnsState{
+        .udp_payload_size = dns_message.DEFAULT_EDNS_UDP_PAYLOAD_SIZE,
+        .extended_rcode = 0,
+        .version = dns_message.EDNS_VERSION,
+        .dnssec_ok = false,
+    };
+    const edns = request.edns orelse fallback_edns;
     var message = dns_message.Message{
         .allocator = request.allocator,
         .header = .{
@@ -960,7 +988,7 @@ fn errorResponse(request: dns_message.Message, rcode: dns_header.Rcode, ede_code
         .answers = try dns_message.RecordSection.init(request.allocator, 0),
         .authorities = try dns_message.RecordSection.init(request.allocator, 0),
         .additionals = try dns_message.RecordSection.init(request.allocator, 0),
-        .edns = if (request.edns) |edns| .{
+        .edns = if (with_opt) .{
             .udp_payload_size = @max(dns_message.CLASSIC_UDP_PAYLOAD_SIZE, @min(edns.udp_payload_size, dns_message.DEFAULT_EDNS_UDP_PAYLOAD_SIZE)),
             .extended_rcode = if (rcode == .badcookie) 1 else 0,
             .version = dns_message.EDNS_VERSION,
@@ -968,7 +996,7 @@ fn errorResponse(request: dns_message.Message, rcode: dns_header.Rcode, ede_code
         } else null,
     };
     errdefer message.deinit();
-    if (request.edns) |edns| {
+    if (with_opt) {
         try appendOpt(&message, edns);
         if (rcode == .badcookie) {
             message.edns.?.extended_rcode = 1;
@@ -1136,6 +1164,70 @@ test "cache excludes failures truncation and upstream option data" {
     try std.testing.expectEqual(@as(usize, 0), hit_message.additionals.len);
 }
 
+test "cache reuses an expired slot instead of evicting a live entry" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cache = Cache.init(std.testing.allocator);
+    defer cache.deinit();
+    var output: [2048]u8 = undefined;
+
+    var queries: [MAX_CACHE_ENTRIES]dns_message.Message = undefined;
+    var responses: [MAX_CACHE_ENTRIES]dns_message.Message = undefined;
+    defer {
+        for (&queries) |*message| message.deinit();
+        for (&responses) |*message| message.deinit();
+    }
+    var keys: [MAX_CACHE_ENTRIES]CacheKey = undefined;
+
+    var name_buffer: [32]u8 = undefined;
+    var index: usize = 0;
+    while (index < MAX_CACHE_ENTRIES) : (index += 1) {
+        const name_text = try std.fmt.bufPrint(&name_buffer, "host{d}.example.", .{index});
+        const name = try dns_name.Name.fromText(name_text);
+        queries[index] = try makeTestQuery(arena.allocator(), @intCast(0x3000 + index), name_text, false);
+        responses[index] = try makeTestQuery(arena.allocator(), @intCast(0x3000 + index), name_text, false);
+        responses[index].header.qr = true;
+        responses[index].header.recursion_available = true;
+        try responses[index].answers.append(.{
+            .owner = name,
+            .rrtype = .A,
+            .class = .IN,
+            .ttl = if (index == 5) 60 else 3600,
+            .rdata = .{ .A = .{ 192, 0, 2, 1 } },
+        });
+        responses[index].header.answer_count = 1;
+        keys[index] = try CacheKey.fromQuestion(queries[index]);
+        try cache.put(keys[index], &responses[index], 1000);
+    }
+    try std.testing.expectEqual(MAX_CACHE_ENTRIES, cache.len);
+
+    // Expire the short-lived entry; its slot must be recycled by the next put.
+    try std.testing.expect((try cache.lookup(&keys[5], queries[5], 1061, &output, false)) == null);
+
+    var newcomer = try makeTestQuery(arena.allocator(), 0x3fff, "new.example.", false);
+    defer newcomer.deinit();
+    var newcomer_response = try makeTestQuery(arena.allocator(), 0x3fff, "new.example.", false);
+    defer newcomer_response.deinit();
+    newcomer_response.header.qr = true;
+    newcomer_response.header.recursion_available = true;
+    try newcomer_response.answers.append(.{
+        .owner = try dns_name.Name.fromText("new.example."),
+        .rrtype = .A,
+        .class = .IN,
+        .ttl = 3600,
+        .rdata = .{ .A = .{ 192, 0, 2, 2 } },
+    });
+    newcomer_response.header.answer_count = 1;
+    const newcomer_key = try CacheKey.fromQuestion(newcomer);
+    try cache.put(newcomer_key, &newcomer_response, 1061);
+    try std.testing.expectEqual(MAX_CACHE_ENTRIES, cache.len);
+
+    const survivor = (try cache.lookup(&keys[0], queries[0], 1062, &output, false)).?;
+    try std.testing.expect(!survivor.stale);
+    const fresh = (try cache.lookup(&newcomer_key, newcomer, 1062, &output, false)).?;
+    try std.testing.expect(!fresh.stale);
+}
+
 test "resolver treats missing cookie normally and rejects an invalid cookie" {
     const io = std.Io.Threaded.global_single_threaded.io();
     const client = try std.Io.net.IpAddress.parse("127.0.0.1", 12346);
@@ -1163,6 +1255,25 @@ test "resolver treats missing cookie normally and rejects an invalid cookie" {
     const server_cookie = findOption(response, COOKIE_OPTION_CODE).?;
     try std.testing.expectEqual(@as(usize, 24), server_cookie.len);
     try std.testing.expectEqualSlices(u8, &client_cookie, server_cookie[0..8]);
+}
+
+test "BADCOOKIE answers carry OPT extended 23 even without request EDNS" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2401, "example.com.", false);
+    defer query.deinit();
+
+    var message = try errorResponse(query, .badcookie, null);
+    defer message.deinit();
+    try std.testing.expect(message.edns != null);
+    try std.testing.expectEqual(@as(u8, 1), message.edns.?.extended_rcode);
+    try std.testing.expect(message.isBadCookie());
+    try std.testing.expectEqual(@as(u16, dns_header.Rcode.BADCOOKIE_EXTENDED_CODE), message.effectiveRcode());
+
+    var servfail = try errorResponse(query, .servfail, null);
+    defer servfail.deinit();
+    try std.testing.expect(servfail.edns == null);
+    try std.testing.expectEqual(@as(u16, 2), servfail.effectiveRcode());
 }
 
 test "network failures add EDE only when the query has EDNS" {
@@ -1406,28 +1517,44 @@ test "dnssec bogus responses carry SERVFAIL with the EDE code and text" {
 
 test "aggressive NSEC answers denials without upstream and honors CD" {
     const io = std.Io.Threaded.global_single_threaded.io();
-    var resolver = try Resolver.init(std.testing.allocator, io, .{});
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = try std.Io.net.IpAddress.parse("127.0.0.1", 9) },
+    });
     defer resolver.deinit();
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    // Seed the aggressive cache as harvestSectionNsec would from an NSEC proof.
+    // Seed closest-encloser plus wildcard-cover proofs as harvestSectionNsec
+    // would from NSEC RRs (RFC 8198 section 5). Window 0 bitmap carries
+    // A(1) and NSEC(47); byte 5 covers 47 % 8.
+    const bitmap = [_]u8{ 0x00, 0x06, 0x40, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    const now: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
     resolver.dnssec_aggressive.insertNsec(
+        try dns_name.Name.fromText("example."),
+        try dns_name.Name.fromText("mail.example."),
+        &bitmap,
+        now,
+        3600,
+    );
+    resolver.dnssec_aggressive.insertNsec(
+        try dns_name.Name.fromText("mail.example."),
         try dns_name.Name.fromText("www.example."),
-        try dns_name.Name.fromText("zzz.example."),
-        &[_]u8{ 0x00, 0x01, 0x40 },
+        &bitmap,
+        now,
+        3600,
     );
 
-    var query = try makeTestQuery(arena.allocator(), 0x2704, "x.example.", true);
+    var query = try makeTestQuery(arena.allocator(), 0x2704, "nx.example.", true);
     defer query.deinit();
     query.edns.?.dnssec_ok = true;
     query.additionals.items[0].ttl |= 0x8000;
     try std.testing.expect(wantsDnssecProofs(query));
 
     var output: [2048]u8 = undefined;
-    const denial = resolver.dnssec_aggressive.deny(
+    const denial = try resolver.dnssec_aggressive.deny(
         (query.question orelse return error.TestUnexpectedResult).name,
         (query.question orelse return error.TestUnexpectedResult).qtype,
+        now,
     );
     try std.testing.expectEqual(dnssec.Denial.nxdomain, denial.?);
     const bytes = try resolver.aggressiveAnswer(query, denial.?, &output);
@@ -1435,11 +1562,51 @@ test "aggressive NSEC answers denials without upstream and honors CD" {
     try std.testing.expectEqual(dns_header.Rcode.nxdomain, parsed.header.rcode);
     try std.testing.expect(parsed.edns.?.dnssec_ok);
 
-    var cd_query = try makeTestQuery(arena.allocator(), 0x2705, "x.example.", true);
+    var cd_query = try makeTestQuery(arena.allocator(), 0x2705, "nx.example.", true);
     defer cd_query.deinit();
     cd_query.header.checking_disabled = true;
     cd_query.edns.?.dnssec_ok = true;
     try std.testing.expect(!wantsDnssecProofs(cd_query));
+}
+
+test "aggressive NSEC answers SERVFAIL with bogus EDE on malformed bitmap" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = try std.Io.net.IpAddress.parse("127.0.0.1", 9) },
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // Exact-owner proof whose bitmap lacks the NSEC bit: deny errors instead
+    // of synthesizing a false NODATA.
+    const now: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+    resolver.dnssec_aggressive.insertNsec(
+        try dns_name.Name.fromText("www.example."),
+        try dns_name.Name.fromText("zzz.example."),
+        &[_]u8{ 0x00, 0x01, 0x40 },
+        now,
+        3600,
+    );
+    try std.testing.expectError(
+        dnssec.Error.MalformedNsec,
+        resolver.dnssec_aggressive.deny(try dns_name.Name.fromText("www.example."), .A, now),
+    );
+
+    // The forward path maps that failure to SERVFAIL with a DNSSEC-bogus
+    // EDE (RFC 8914) before any upstream round trip.
+    var query = try makeTestQuery(arena.allocator(), 0x2706, "www.example.", true);
+    defer query.deinit();
+    query.edns.?.dnssec_ok = true;
+    query.additionals.items[0].ttl |= 0x8000;
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42602);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    const parsed = try dns_message.Message.parse(arena.allocator(), bytes);
+    try std.testing.expectEqual(dns_header.Rcode.servfail, parsed.header.rcode);
+    try expectEde(parsed, EDE_DNSSEC_BOGUS, "dnssec bogus");
 }
 
 test "error responses preserve query CD and DO policy" {

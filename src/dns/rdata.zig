@@ -9,6 +9,13 @@ const NameParseResult = @import("name.zig").ParseResult;
 const RecordType = @import("types.zig").RecordType;
 
 const max_txt_len = 255;
+
+/// RFC 1035 section 3.3.14 TXT RDATA is a sequence of character-strings whose
+/// concatenation is the logical text (long DKIM/SPF values routinely split
+/// across 255-octet chunks). The concatenated text keeps this 512-octet cap
+/// so TXT wire stays far below the 2048-octet record buffer; the 255-octet
+/// single-string bound above still applies per chunk and to X25/ISDN/NAPTR.
+const max_txt_data_len = 512;
 // Bounded opaque-RDATA profile: untyped types (DNSKEY/RRSIG and future
 // types), APL, CAA, and the NAPTR size check share this bound. 2048 covers a
 // 4096-bit RSA DNSKEY (~520 bytes) and a 4096-bit RSA RRSIG (~570 bytes with
@@ -441,8 +448,8 @@ pub const Naptr = struct {
 };
 
 pub const Txt = struct {
-    data: [max_txt_len]u8 = undefined,
-    len: u8 = 0,
+    data: [max_txt_data_len]u8 = undefined,
+    len: u16 = 0,
 
     pub fn text(self: *const Txt) []const u8 {
         return self.data[0..self.len];
@@ -659,13 +666,7 @@ pub const RData = union(enum) {
                 break :blk .{ .APL = apl };
             },
             RecordType.TXT.value => blk: {
-                if (len == 0) return Error.InvalidLength;
-                const text_len = message[offset];
-                if (text_len > max_txt_len) return Error.TextTooLong;
-                if (@as(usize, text_len) + 1 != len) return Error.InvalidLength;
-                var txt = Txt{ .len = text_len };
-                @memcpy(txt.data[0..text_len], message[offset + 1 .. end]);
-                break :blk .{ .TXT = txt };
+                break :blk .{ .TXT = try parseTxt(message, offset, end) };
             },
             RecordType.CAA.value => blk: {
                 if (len < 3 or len > max_unknown_len) return Error.InvalidLength;
@@ -787,12 +788,11 @@ pub const RData = union(enum) {
             },
             .APL => |apl| try writer.writeBytes(apl.bytes()),
             .TXT => |txt| {
-                try writer.writeU8(txt.len);
-                try writer.writeBytes(txt.text());
+                try encodeTxt(txt, writer);
             },
             .X25 => |x25| {
                 if (!validX25(x25.text())) return Error.InvalidLength;
-                try writer.writeU8(x25.len);
+                try writer.writeU8(@intCast(x25.len));
                 try writer.writeBytes(x25.text());
             },
             .ISDN => |isdn| {
@@ -879,8 +879,7 @@ pub const RData = union(enum) {
             },
             .APL => |apl| try writer.writeBytes(apl.bytes()),
             .TXT => |txt| {
-                try writer.writeU8(txt.len);
-                try writer.writeBytes(txt.text());
+                try encodeTxt(txt, writer);
             },
             .X25 => try self.encode(writer),
             .ISDN => try self.encode(writer),
@@ -1015,6 +1014,47 @@ fn parseApl(message: []const u8, offset: usize, end: usize) Error!void {
             }
         }
         cursor += afdlen;
+    }
+}
+
+/// Parse RFC 1035 section 3.3.14 TXT RDATA: one or more character-strings
+/// whose concatenation is the logical text. Each chunk holds at most 255
+/// octets; the concatenated text keeps the 512-octet cap and the wire keeps
+/// the 2048-octet record-buffer bound.
+fn parseTxt(message: []const u8, offset: usize, end: usize) Error!Txt {
+    const len = end - offset;
+    if (len == 0) return Error.InvalidLength;
+    if (len > max_unknown_len) return Error.TextTooLong;
+    var txt = Txt{};
+    var cursor = offset;
+    while (cursor < end) {
+        const chunk_len = message[cursor];
+        cursor += 1;
+        if (@as(usize, chunk_len) > end - cursor) return Error.EndOfInput;
+        if (@as(usize, txt.len) + chunk_len > max_txt_data_len) return Error.TextTooLong;
+        @memcpy(txt.data[@as(usize, txt.len) .. @as(usize, txt.len) + chunk_len], message[cursor .. cursor + chunk_len]);
+        txt.len += @as(u16, chunk_len);
+        cursor += chunk_len;
+    }
+    return txt;
+}
+
+/// Encode concatenated TXT text as RFC 1035 character-strings, splitting at
+/// 255 octets so long DKIM/SPF values round-trip. Empty text encodes as one
+/// empty string to keep the wire non-empty.
+fn encodeTxt(txt: Txt, writer: *Writer) !void {
+    if (txt.len > max_txt_data_len) return Error.TextTooLong;
+    const text = txt.text();
+    if (text.len == 0) {
+        try writer.writeU8(0);
+        return;
+    }
+    var offset: usize = 0;
+    while (offset < text.len) {
+        const chunk_len: u8 = @intCast(@min(@as(usize, max_txt_len), text.len - offset));
+        try writer.writeU8(chunk_len);
+        try writer.writeBytes(text[offset .. offset + chunk_len]);
+        offset += chunk_len;
     }
 }
 
@@ -1159,6 +1199,87 @@ test "rdata parses and encodes MX and TXT records" {
     var txt_writer = Writer.init(&txt_out);
     try txt.encode(&txt_writer);
     try std.testing.expectEqualSlices(u8, &.{ 5, 'h', 'e', 'l', 'l', 'o' }, txt_writer.written());
+}
+
+test "TXT wire concatenates multi-string character-strings for DKIM/SPF" {
+    const spf_wire = [_]u8{
+        6, 'h', 'e', 'l', 'l', 'o', ' ',
+        5, 'w', 'o', 'r', 'l', 'd',
+    };
+    const spf = try RData.parse(.TXT, &spf_wire, 0, spf_wire.len);
+    try std.testing.expectEqualStrings("hello world", spf.TXT.text());
+
+    var spf_out: [12]u8 = undefined;
+    var spf_writer = Writer.init(&spf_out);
+    try spf.encode(&spf_writer);
+    try std.testing.expectEqualSlices(u8, &.{ 11, 'h', 'e', 'l', 'l', 'o', ' ', 'w', 'o', 'r', 'l', 'd' }, spf_writer.written());
+
+    var spf_compressed_out: [12]u8 = undefined;
+    var spf_compressed_writer = Writer.init(&spf_compressed_out);
+    var spf_table = CompressionTable{};
+    try spf.encodeCompressed(&spf_compressed_writer, &spf_table);
+    try std.testing.expectEqualSlices(u8, spf_writer.written(), spf_compressed_writer.written());
+
+    const reparsed = try RData.parse(.TXT, spf_writer.written(), 0, spf_writer.len());
+    try std.testing.expectEqualStrings("hello world", reparsed.TXT.text());
+
+    var dkim_text: [300]u8 = undefined;
+    @memset(&dkim_text, 'a');
+    @memcpy(dkim_text[0..11], "v=DKIM1; p=");
+    var dkim = RData{ .TXT = .{ .len = dkim_text.len } };
+    @memcpy(dkim.TXT.data[0..dkim_text.len], &dkim_text);
+
+    var dkim_out: [302]u8 = undefined;
+    var dkim_writer = Writer.init(&dkim_out);
+    try dkim.encode(&dkim_writer);
+    try std.testing.expectEqual(@as(usize, 302), dkim_writer.len());
+    try std.testing.expectEqual(@as(u8, 255), dkim_writer.written()[0]);
+    try std.testing.expectEqual(@as(u8, 45), dkim_writer.written()[256]);
+
+    const parsed_dkim = try RData.parse(.TXT, dkim_writer.written(), 0, dkim_writer.len());
+    try std.testing.expectEqualSlices(u8, &dkim_text, parsed_dkim.TXT.text());
+
+    var dkim_round_trip: [302]u8 = undefined;
+    var dkim_round_trip_writer = Writer.init(&dkim_round_trip);
+    try parsed_dkim.encode(&dkim_round_trip_writer);
+    try std.testing.expectEqualSlices(u8, dkim_writer.written(), dkim_round_trip_writer.written());
+
+    var max_text: [512]u8 = undefined;
+    @memset(&max_text, 'b');
+    var max_txt = RData{ .TXT = .{ .len = max_text.len } };
+    @memcpy(max_txt.TXT.data[0..max_text.len], &max_text);
+    var max_out: [515]u8 = undefined;
+    var max_writer = Writer.init(&max_out);
+    try max_txt.encode(&max_writer);
+    const parsed_max = try RData.parse(.TXT, max_writer.written(), 0, max_writer.len());
+    try std.testing.expectEqualSlices(u8, &max_text, parsed_max.TXT.text());
+
+    const empty_string = [_]u8{0};
+    const parsed_empty = try RData.parse(.TXT, &empty_string, 0, empty_string.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed_empty.TXT.text().len);
+    var empty_out: [1]u8 = undefined;
+    var empty_writer = Writer.init(&empty_out);
+    try parsed_empty.encode(&empty_writer);
+    try std.testing.expectEqualSlices(u8, &empty_string, empty_writer.written());
+
+    try std.testing.expectError(Error.InvalidLength, RData.parse(.TXT, &.{}, 0, 0));
+    try std.testing.expectError(Error.EndOfInput, RData.parse(.TXT, &.{ 5, 'h', 'i' }, 0, 3));
+
+    var overlong_wire: [516]u8 = undefined;
+    overlong_wire[0] = 255;
+    @memset(overlong_wire[1..256], 'c');
+    overlong_wire[256] = 255;
+    @memset(overlong_wire[257..512], 'd');
+    overlong_wire[512] = 3;
+    @memset(overlong_wire[513..516], 'e');
+    try std.testing.expectError(Error.EndOfInput, RData.parse(.TXT, overlong_wire[0..511], 0, 511));
+    try std.testing.expectError(Error.TextTooLong, RData.parse(.TXT, &overlong_wire, 0, overlong_wire.len));
+
+    var overlong_txt = Txt{ .len = 513 };
+    @memset(overlong_txt.data[0..512], 'e');
+    var overlong_out: [516]u8 = undefined;
+    var overlong_writer = Writer.init(&overlong_out);
+    try std.testing.expectError(Error.TextTooLong, (RData{ .TXT = overlong_txt }).encode(&overlong_writer));
 }
 
 test "AFSDB wire round trips subtype boundaries with ordinary and compressed names" {

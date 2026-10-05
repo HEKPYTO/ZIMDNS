@@ -1,6 +1,6 @@
 # ZIMDNS
 
-ZIMDNS is a minimal, local-first DNS server and CLI written in Zig. The current profile is one scriptable binary with a small authoritative path, safe DNS/UDP and DNS/TCP transport, and standards evidence for every advertised behavior. There is no web UI or remote administration surface in this profile.
+ZIMDNS is a minimal, local-first DNS server and CLI written in Zig. The current profile is one scriptable binary with a small authoritative path, safe DNS/UDP and DNS/TCP transport, and a standards matrix that names the exact evidence behind every advertised behavior. There is no web UI or remote administration surface in this profile.
 
 The [RFC standards matrix](docs/standards-matrix.md) is the source of truth for what is `supported`, `partial`, `planned`, `not-applicable`, or `out of scope`. A roadmap item is not a supported feature, and a `partial` row names only its tested subset.
 
@@ -8,7 +8,7 @@ The internal quality goal is to make this declared profile explicit, test-backed
 
 ## Current status
 
-The repository contains the bounded authoritative and forwarding profile. It currently has DNS message/name/RDATA parsing, continuous authoritative UDP listeners, fail-closed authoritative TCP ingress, opt-in UDP forwarding with source/ID/question checks and TC-to-TCP upstream fallback only where upstream TCP deadlines are available (TC fails closed otherwise), bounded positive/negative caching with serve-stale, EDE diagnostics, DNS Cookie validation, a CLI query client, and strict configuration/zone/blocklist parsers. Forwarding is disabled unless both an explicit recursion ACL and a forwarder are configured; consult the matrix for each exact boundary and its evidence.
+The repository contains the bounded authoritative and forwarding profile. It currently has DNS message/name/RDATA parsing, continuous authoritative UDP listeners, fail-closed authoritative TCP ingress, opt-in UDP forwarding with source/ID/question checks and TC-to-TCP upstream fallback only where upstream TCP deadlines are available (TC fails closed otherwise), bounded positive/negative caching with serve-stale, forwarding-path-only EDE diagnostics, DNS Cookie validation, a CLI query client, and strict configuration/zone/blocklist parsers. Forwarding is disabled unless both an explicit recursion ACL and a forwarder are configured; consult the matrix for each exact boundary and its evidence.
 
 RFC 9463 DNR is `not-applicable` to this DNS-only server because it defines DHCP/Router Advertisement provisioning; no DNR parser, CLI/config surface, DHCP, RA, or output artifact is planned.
 

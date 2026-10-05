@@ -32,8 +32,28 @@ pub const Rcode = enum(u4) {
     notimp = 4,
     refused = 5,
     yxdomain = 6,
+    /// Low 4 wire bits shared by RFC 7873 BADCOOKIE. A bare 7 without an
+    /// accompanying OPT extended-rcode of 1 is reserved, not BADCOOKIE;
+    /// use `isBadCookie`/`extendedCode` to split the two cases.
     badcookie = 7,
+    nxrrset = 8,
     notauth = 9,
+    notzone = 10,
+
+    /// Full RFC 7873 extended code: OPT extended-rcode 1 + low bits 7.
+    pub const BADCOOKIE_EXTENDED_CODE: u16 = 23;
+
+    /// Combines the 4-bit header code with the OPT extended-rcode byte into
+    /// the 12-bit extended RCODE. Without OPT the extended byte is zero.
+    pub fn extendedCode(self: Rcode, extended_rcode: u8) u16 {
+        return (@as(u16, extended_rcode) << 4) | @as(u16, @intFromEnum(self));
+    }
+
+    /// True only for extended RCODE 23: header low bits 7 plus OPT
+    /// extended-rcode 1. A bare header 7 with no OPT is reserved.
+    pub fn isBadCookie(self: Rcode, extended_rcode: u8) bool {
+        return self == .badcookie and extended_rcode == 1;
+    }
 };
 
 pub const Error = error{
@@ -77,7 +97,9 @@ pub const Header = struct {
             5 => Rcode.refused,
             6 => Rcode.yxdomain,
             7 => Rcode.badcookie,
+            8 => Rcode.nxrrset,
             9 => Rcode.notauth,
+            10 => Rcode.notzone,
             else => Rcode.servfail,
         };
 
@@ -152,6 +174,32 @@ test "header rejects short input and preserves unassigned opcode" {
     var unsupported = Reader.init(&.{ 0x12, 0x34, 0x78, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 });
     const parsed = try Header.parse(&unsupported);
     try std.testing.expectEqual(Opcode.unassigned_15, parsed.opcode);
+}
+
+test "header round trips NXRRSET and NOTZONE" {
+    var output: [12]u8 = undefined;
+    var writer = Writer.init(&output);
+    try (Header{ .id = 0x1234, .rcode = .nxrrset }).encode(&writer);
+    try std.testing.expectEqual(@as(u8, 8), output[3] & 0x0f);
+    var reader = Reader.init(&output);
+    try std.testing.expectEqual(Rcode.nxrrset, (try Header.parse(&reader)).rcode);
+
+    writer = Writer.init(&output);
+    try (Header{ .id = 0x1234, .rcode = .notzone }).encode(&writer);
+    try std.testing.expectEqual(@as(u8, 10), output[3] & 0x0f);
+    reader = Reader.init(&output);
+    try std.testing.expectEqual(Rcode.notzone, (try Header.parse(&reader)).rcode);
+}
+
+test "header splits bare RCODE 7 from extended BADCOOKIE 23" {
+    try std.testing.expectEqual(@as(u16, 23), Rcode.BADCOOKIE_EXTENDED_CODE);
+    // Bare header 7 with no OPT extended byte is reserved, not BADCOOKIE.
+    try std.testing.expect(!(Rcode.badcookie.isBadCookie(0)));
+    try std.testing.expectEqual(@as(u16, 7), Rcode.badcookie.extendedCode(0));
+    // Header 7 plus OPT extended-rcode 1 is BADCOOKIE (23).
+    try std.testing.expect(Rcode.badcookie.isBadCookie(1));
+    try std.testing.expectEqual(@as(u16, 23), Rcode.badcookie.extendedCode(1));
+    try std.testing.expect(!Rcode.servfail.isBadCookie(1));
 }
 
 test "header round trips NOTAUTH" {

@@ -1,12 +1,13 @@
-/// Contract: Owns the encrypted-transport policy surface (RFC 7858/8484/9103 substrate).
-/// The Zig 0.16 standard library ships a TLS client only, so the record-layer
-/// handshake stays behind a fail-closed gate until the reviewed TLS-server
-/// dependency lands (see docs/decisions/encrypted-transport.md). All DNS-layer
-/// behavior here operates on the post-handshake byte channel; no cipher,
+/// Contract: Owns the encrypted-transport policy surface (RFC 7858/8484/9103
+/// substrate). The Zig 0.16 standard library ships a TLS client only, so ZIMDNS
+/// cannot terminate a TLS handshake and no encrypted listener may start:
+/// --serve-dot, --serve-doh, and --serve-xfr fail closed before a port is bound
+/// (see docs/decisions/encrypted-transport.md). dot.zig and doh.zig hold the
+/// DNS-layer mappings for an already-terminated byte channel; no cipher,
 /// certificate-parsing, or key-exchange code lives in this module.
 /// Ownership: Config and PEM byte slices are borrowed; nothing is allocated.
 /// Errors: Missing/disabled identity and deferred transports are typed; the
-/// handshake gate always fails closed.
+/// startup gate always fails closed.
 const std = @import("std");
 
 pub const dot_port: u16 = 853;
@@ -24,28 +25,14 @@ pub const Error = error{
     DoqDeferred,
 };
 
-/// Marks whether a byte stream already passed TLS termination. XFR-over-TLS
-/// (RFC 9103) requires .tls; plaintext channels must refuse transfers.
-pub const Channel = enum {
-    tls,
-    plaintext,
-};
-
 /// Server ALPN preference for one handshake offer list. DoT selects "dot"
-/// (RFC 7858 section 3.1); DoH prefers "h2" then "http/1.1" (RFC 8484
-/// section 5.2 prefers HTTP/2 while tolerating HTTP/1.1 mappings).
+/// (RFC 7858 section 3.1). DoH selects "http/1.1" only, because doh.zig
+/// implements the HTTP/1.1 mapping: selecting "h2" would hand the client a
+/// protocol this server cannot speak (docs/decisions/encrypted-transport.md).
 pub fn negotiateAlpn(offered: []const []const u8, want_doh: bool) ?[]const u8 {
-    if (want_doh) {
-        for (offered) |protocol| {
-            if (std.mem.eql(u8, protocol, doh_alpn_h2)) return doh_alpn_h2;
-        }
-        for (offered) |protocol| {
-            if (std.mem.eql(u8, protocol, doh_alpn_http11)) return doh_alpn_http11;
-        }
-        return null;
-    }
+    const wanted = if (want_doh) doh_alpn_http11 else dot_alpn;
     for (offered) |protocol| {
-        if (std.mem.eql(u8, protocol, dot_alpn)) return dot_alpn;
+        if (std.mem.eql(u8, protocol, wanted)) return wanted;
     }
     return null;
 }
@@ -70,10 +57,11 @@ pub fn validatePemPair(cert_bytes: []const u8, key_bytes: []const u8) Error!void
     if (key_bytes.len == 0) return Error.MissingKey;
 }
 
-/// Fail-closed handshake gate. Until the G4-reviewed TLS-server dependency
-/// lands, no handshake bytes are ever emitted or accepted here; callers must
-/// serve only externally terminated channels or return this error.
-pub fn acceptHandshake() Error!void {
+/// Startup gate for every encrypted listener. Always fails: with no reviewed
+/// TLS-server dependency ZIMDNS cannot terminate a handshake, so it must not
+/// open a socket and serve DNS in cleartext on a port the operator configured
+/// as encrypted. Callers report the refusal and exit before any bind.
+pub fn requireTlsServer() Error!void {
     return Error.TlsServerUnavailable;
 }
 
@@ -84,11 +72,12 @@ pub fn dialDoq() Error!void {
     return Error.DoqDeferred;
 }
 
-test "ALPN prefers dot for DoT and h2 for DoH" {
+test "ALPN selects dot for DoT and only http/1.1 for DoH, never unimplemented h2" {
     const offered = &.{ "h2", "dot", "http/1.1" };
     try std.testing.expectEqualStrings("dot", negotiateAlpn(offered, false).?);
-    try std.testing.expectEqualStrings("h2", negotiateAlpn(offered, true).?);
-    try std.testing.expectEqualStrings("http/1.1", negotiateAlpn(&.{"http/1.1"}, true).?);
+    try std.testing.expectEqualStrings("http/1.1", negotiateAlpn(offered, true).?);
+    // doh.zig speaks HTTP/1.1 only, so an h2-only client gets no selection.
+    try std.testing.expect(negotiateAlpn(&.{"h2"}, true) == null);
     try std.testing.expect(negotiateAlpn(&.{"h2"}, false) == null);
     try std.testing.expect(negotiateAlpn(&.{}, true) == null);
 }
@@ -111,7 +100,7 @@ test "PEM pair check rejects non-PEM certificates and empty keys" {
     try std.testing.expectError(Error.MissingKey, validatePemPair("-----BEGIN CERTIFICATE-----\nabc\n", ""));
 }
 
-test "handshake gate fails closed and DoQ is deferred" {
-    try std.testing.expectError(Error.TlsServerUnavailable, acceptHandshake());
+test "encrypted listener startup fails closed and DoQ is deferred" {
+    try std.testing.expectError(Error.TlsServerUnavailable, requireTlsServer());
     try std.testing.expectError(Error.DoqDeferred, dialDoq());
 }

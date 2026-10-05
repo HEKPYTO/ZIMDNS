@@ -1,8 +1,11 @@
 .zig-cache/
+.zig-global-cache/
 zig-out/
 .DS_Store
 .worktrees/
 *.log
 *.tmp
+tls/cert.pem
+tls/key.pem
 data/
 /config/

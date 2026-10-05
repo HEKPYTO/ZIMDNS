@@ -1,13 +1,16 @@
-/// Contract: Serves RFC 7858 DNS-over-TLS framing on the post-handshake byte
-/// channel. Wire framing is the same two-octet length-prefixed stream as DNS
-/// over TCP, so frame bounds, FIFO order, and five-second deadlines are shared
-/// with the plaintext TCP listener. TLS termination itself stays behind the
-/// fail-closed gate in tls.zig until the reviewed TLS-server dependency lands;
-/// these handlers never see handshake bytes.
+/// Contract: Serves the RFC 7858 section 3.3 DNS-over-TLS wire framing on an
+/// already-TLS-terminated byte channel. Two-octet length-prefixed stream
+/// framing is the same as DNS over TCP, so frame bounds, FIFO order, and
+/// five-second deadlines are shared with the plaintext TCP listener.
+/// ZIMDNS has no TLS server, so nothing in this repository can produce such a
+/// channel: there is deliberately no bind/accept entry point here, and the
+/// --serve-dot startup gate refuses before opening a socket (tls.zig,
+/// docs/decisions/encrypted-transport.md). Handlers below never see handshake
+/// bytes.
 /// Ownership: Runtime is borrowed; streams are consumed/closed by the caller
 /// loop; wire buffers are local.
-/// Errors: DNS failures are typed; socket read/write and bind failures
-/// propagate as I/O errors.
+/// Errors: DNS failures are typed; socket read/write failures propagate as
+/// I/O errors.
 const std = @import("std");
 const Runtime = @import("../auth/runtime.zig").Runtime;
 const metrics = @import("../metrics.zig");
@@ -35,17 +38,11 @@ pub fn serveDotStreamOnceWithMetrics(
 }
 
 /// RFC 7858 section 3.3 framing loop: two-octet length-prefixed DNS messages
-/// with the same bounds as DNS over TCP. Runs on the post-handshake channel;
-/// see tls.zig for the handshake gate.
+/// with the same bounds as DNS over TCP. Operates on an already-terminated
+/// byte stream; see tls.zig for the startup refusal.
 fn serveDotStream(stream: std.Io.net.Stream, io: std.Io, runtime: *const Runtime, counters: ?*metrics.Counters) !void {
     if (comptime !listener.TCP_DEADLINES_SUPPORTED) return listener.Error.UnsupportedPlatform;
-    const posix_timeout: std.posix.timeval = .{
-        .sec = @intCast(IO_TIMEOUT.seconds),
-        .usec = @intCast(IO_TIMEOUT.microseconds),
-    };
-    const timeout_bytes = std.mem.asBytes(&posix_timeout);
-    try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, timeout_bytes);
-    try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, timeout_bytes);
+    tcp_deadline.setSocketTimeout(stream.socket.handle, IO_TIMEOUT);
 
     var request_buffer: [listener.TCP_MAX_FRAME_SIZE]u8 = undefined;
     var response_buffer: [listener.TCP_MAX_FRAME_SIZE]u8 = undefined;
@@ -76,51 +73,7 @@ fn serveDotStream(stream: std.Io.net.Stream, io: std.Io, runtime: *const Runtime
 }
 
 fn readFrame(fd: std.posix.fd_t, io: std.Io, frame_buffer: []u8, frame_deadline: std.Io.Clock.Timestamp) ![]const u8 {
-    var len_bytes: [2]u8 = undefined;
-    try tcp_deadline.readExact(fd, io, &len_bytes, frame_deadline);
-    const request_len = std.mem.readInt(u16, &len_bytes, .big);
-    try listener.validateTcpFrameLength(request_len);
-    if (request_len > frame_buffer.len) return listener.Error.BadTcpFrame;
-    tcp_deadline.readExact(fd, io, frame_buffer[0..request_len], frame_deadline) catch |err| {
-        if (err == error.EndOfStream) return listener.Error.BadTcpFrame;
-        return err;
-    };
-    return frame_buffer[0..request_len];
-}
-
-fn serveDotStreamWorker(stream: std.Io.net.Stream, io: std.Io, runtime: *const Runtime) void {
-    defer stream.close(io);
-    serveDotStreamOnce(stream, io, runtime) catch {};
-}
-
-pub fn serveDotLoop(server: anytype, io: std.Io, runtime: *const Runtime, max_requests: ?usize) !void {
-    var group: std.Io.Group = .init;
-    defer group.await(io) catch unreachable;
-
-    var accepted: usize = 0;
-    while (max_requests == null or accepted < max_requests.?) {
-        const stream = try server.accept(io);
-        accepted += 1;
-        group.concurrent(io, serveDotStreamWorker, .{ stream, io, runtime }) catch |err| switch (err) {
-            error.ConcurrencyUnavailable => stream.close(io),
-        };
-    }
-}
-
-pub fn serveDotLoopOnAddress(io: std.Io, runtime: *const Runtime, address: *const std.Io.net.IpAddress, max_requests: ?usize) !void {
-    var bind_address = address.*;
-    var server = try std.Io.net.IpAddress.listen(&bind_address, io, .{ .reuse_address = true });
-    defer server.deinit(io);
-    try serveDotLoop(&server, io, runtime, max_requests);
-}
-
-pub fn serveDotOnceOnAddress(io: std.Io, runtime: *const Runtime, address: *const std.Io.net.IpAddress) !void {
-    var bind_address = address.*;
-    var server = try std.Io.net.IpAddress.listen(&bind_address, io, .{ .reuse_address = true });
-    defer server.deinit(io);
-    const stream = try server.accept(io);
-    defer stream.close(io);
-    try serveDotStreamOnce(stream, io, runtime);
+    return listener.readTcpFrameExact(fd, io, frame_buffer, frame_deadline);
 }
 
 fn streamPair() ![2]std.Io.net.Stream {

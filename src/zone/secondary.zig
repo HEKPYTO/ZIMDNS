@@ -1,10 +1,9 @@
 /// Contract: Minimal RFC 1996 secondary timing and refresh decisions driven by
-/// SOA refresh/retry/expire timers and received NOTIFY serials.
+/// SOA refresh/retry/expire timers.
 /// Ownership: All state is inline with no allocation; timestamps are seconds.
 /// Errors: No fallible operations; malformed input is expressed as Action.
 const std = @import("std");
 const dns_rdata = @import("../dns/rdata.zig");
-const journal_mod = @import("journal.zig");
 
 /// Refresh timing taken from the zone's SOA record. Field bounds follow the
 /// zone parser: every value is an unsigned 32-bit second count.
@@ -70,14 +69,6 @@ pub fn secondsUntilAction(state: *const State, timers: *const Timers, now: u64) 
     return @min(to_refresh, to_expire);
 }
 
-/// Reports whether a received RFC 1996 NOTIFY for `notify_serial` should
-/// trigger an immediate refresh query. A secondary with no data always
-/// refreshes; otherwise only an RFC 1982 newer serial refreshes.
-pub fn notifyTriggersRefresh(notify_serial: u32, state: *const State) bool {
-    if (!state.has_data) return true;
-    return journal_mod.compareSerial(notify_serial, state.serial) == .newer;
-}
-
 /// Records a successful refresh or transfer at `now`.
 pub fn applySuccess(state: *State, new_serial: u32, now: u64) void {
     state.serial = new_serial;
@@ -134,16 +125,6 @@ test "secondary expires the copy past the SOA expire bound" {
     applySuccess(&state, 11, 5000);
     try std.testing.expect(!state.expired);
     try std.testing.expectEqual(Action.none, nextAction(&state, &timers, 5000));
-}
-
-test "secondary refreshes on NOTIFY only for newer serials" {
-    const empty = State{};
-    try std.testing.expect(notifyTriggersRefresh(7, &empty));
-    const current = State{ .serial = 10, .has_data = true, .last_refresh = 0, .last_success = 0 };
-    try std.testing.expect(notifyTriggersRefresh(11, &current));
-    try std.testing.expect(!notifyTriggersRefresh(10, &current));
-    try std.testing.expect(!notifyTriggersRefresh(9, &current));
-    try std.testing.expect(!notifyTriggersRefresh(10 +% 0x8000_0000, &current));
 }
 
 test "secondary derives timers from the zone SOA record" {

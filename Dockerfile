@@ -27,8 +27,8 @@ FROM alpine:3.22 AS runtime
 
 RUN addgroup -S -g 10001 zimdns \
     && adduser -S -D -H -u 10001 -G zimdns zimdns \
-    && mkdir -p /etc/zimdns /var/lib/zimdns /run/zimdns \
-    && chown -R zimdns:zimdns /etc/zimdns /var/lib/zimdns /run/zimdns
+    && mkdir -p /etc/zimdns /run/zimdns \
+    && chown -R zimdns:zimdns /etc/zimdns /run/zimdns
 
 COPY --from=build /workspace/zig-out/bin/zimdns /usr/local/bin/zimdns
 COPY examples/config.gdns /etc/zimdns/config.gdns
@@ -38,10 +38,11 @@ COPY examples/zones /examples/zones
 USER 10001:10001
 WORKDIR /
 EXPOSE 1053/udp
-VOLUME ["/etc/zimdns", "/var/lib/zimdns"]
+VOLUME ["/etc/zimdns"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
     CMD ["/usr/local/bin/zimdns", "query", "@127.0.0.1", "-p", "1053", "dns.home.arpa.", "A"]
 
 ENTRYPOINT ["/usr/local/bin/zimdns"]
-CMD ["server", "run", "--config", "/etc/zimdns/config.gdns", "--serve-udp"]
+# Relative --config path: the loader confines all paths beneath the working directory and rejects absolute paths.
+CMD ["server", "run", "--config", "etc/zimdns/config.gdns", "--serve-udp"]

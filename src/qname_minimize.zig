@@ -48,8 +48,9 @@ pub fn labelCount(name: *const dns_name.Name) usize {
 /// Keeping at least the full label count returns the name unchanged.
 pub fn ancestor(full: *const dns_name.Name, keep: usize) dns_name.Name {
     const wire = full.asWire();
-    if (keep >= labelCount(full)) return full.*;
-    var drop = labelCount(full) - keep;
+    const total = labelCount(full);
+    if (keep >= total) return full.*;
+    var drop = total - keep;
     var index: usize = 0;
     while (drop > 0) : (drop -= 1) {
         index += 1 + @as(usize, wire[index]);
