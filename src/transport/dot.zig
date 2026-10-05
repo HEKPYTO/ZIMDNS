@@ -201,7 +201,7 @@ test "DoT channel records metrics for served queries" {
     try std.testing.expectEqual(@as(u64, 1), counters.dot_queries_total);
 }
 
-test "DoT defaults name the RFC 7858 port and ALPN token" {
+test "DoT defaults name the RFC 7858 port and the IANA dot ALPN token" {
     try std.testing.expectEqual(@as(u16, 853), DOT_PORT);
     try std.testing.expectEqualStrings("dot", DOT_ALPN);
     try std.testing.expectEqual(listener.TCP_MAX_FRAMES_PER_CONNECTION, MAX_FRAMES_PER_CONNECTION);

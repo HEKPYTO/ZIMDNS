@@ -10,6 +10,10 @@ The internal quality goal is to make this declared profile explicit, test-backed
 
 The repository contains the bounded authoritative and forwarding profile. It currently has DNS message/name/RDATA parsing, continuous authoritative UDP listeners, fail-closed authoritative TCP ingress, opt-in UDP forwarding with source/ID/question checks and TC-to-TCP upstream fallback only where upstream TCP deadlines are available (TC fails closed otherwise), bounded positive/negative caching with serve-stale, forwarding-path-only EDE diagnostics, DNS Cookie validation, a CLI query client, and strict configuration/zone/blocklist parsers. Forwarding is disabled unless both an explicit recursion ACL and a forwarder are configured; consult the matrix for each exact boundary and its evidence.
 
+Locally served DNS zones (RFC 6303, RFC 6761, RFC 7793, RFC 8375) are answered by this server by default, ahead of the cache and the forwarder, so a configured upstream never sees a name reserved for private, test, invalid, loopback, or home-network use. A configuration turns them off with `local-zones off`. See [`examples/local-zones.gdns`](examples/local-zones.gdns) and the matrix row for the exact zone list and treatment.
+
+A zone that carries an apex ZONEMD record (RFC 8976, type 63) is verified when it loads, and the server refuses to start if the digest does not match the zone data, naming the zone, the expected digest, and the computed one. The SIMPLE scheme with SHA384 and SHA512 is supported; see the matrix row for what is and is not implemented.
+
 RFC 9463 DNR is `not-applicable` to this DNS-only server because it defines DHCP/Router Advertisement provisioning; no DNR parser, CLI/config surface, DHCP, RA, or output artifact is planned.
 
 Key documents:

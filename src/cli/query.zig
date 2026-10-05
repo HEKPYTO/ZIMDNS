@@ -124,8 +124,10 @@ pub fn writeResponse(response: dns_message.Message, writer: *std.Io.Writer) !voi
             for (sshfp.fingerprintBytes()) |byte| try writer.print("{x:0>2}", .{byte});
         } else if (record.rrtype.eql(.TLSA)) {
             const tlsa = record.rdata.TLSA;
-            try writer.writeAll("TLSA ");
-            try writer.print("{} {} {} ", .{ tlsa.usage, tlsa.selector, tlsa.matching_type });
+            const usage = dns_rdata.tlsaUsageAcronym(tlsa.usage) orelse return Error.BadResponse;
+            const selector = dns_rdata.tlsaSelectorAcronym(tlsa.selector) orelse return Error.BadResponse;
+            const matching_type = dns_rdata.tlsaMatchingTypeAcronym(tlsa.matching_type) orelse return Error.BadResponse;
+            try writer.print("TLSA {s} {s} {s} ", .{ usage, selector, matching_type });
             for (tlsa.association[0..tlsa.association_len]) |byte| try writer.print("{x:0>2}", .{byte});
         } else if (record.rrtype.eql(.URI)) {
             const uri = record.rdata.URI;
@@ -599,25 +601,28 @@ test "query formatter prints SSHFP selectors and lowercase fingerprint" {
     );
 }
 
-test "query formatter prints TLSA selectors and lowercase association" {
+test "query formatter prints RFC 7218 TLSA acronyms and lowercase association" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
     const response = try dns_message.Message.parse(arena.allocator(), &.{
-        0x12, 0x34, 0x85, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x12, 0x34, 0x85, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
         0x04, 'h',  'o',  's',  't',  0x04, 'h',  'o',  'm',  'e',  0x04, 'a',
         'r',  'p',  'a',  0x00, 0x00, 0x34, 0x00, 0x01, 0x00, 0x00, 0x0e, 0x10,
         0x00, 0x23, 0x00, 0x00, 0x01, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
         0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12,
         0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e,
-        0x1f,
+        0x1f, 0x04, 'h',  'o',  's',  't',  0x04, 'h',  'o',  'm',  'e',  0x04,
+        'a',  'r',  'p',  'a',  0x00, 0x00, 0x34, 0x00, 0x01, 0x00, 0x00, 0x0e,
+        0x10, 0x00, 0x05, 0x03, 0x01, 0x00, 0xaa, 0xbb,
     });
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     try writeResponse(response, &output.writer);
     const text = output.written();
     try std.testing.expectEqualStrings(
-        "host.home.arpa. 3600 IN TLSA 0 0 1 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\n",
+        "host.home.arpa. 3600 IN TLSA PKIX-TA Cert SHA2-256 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\n" ++
+            "host.home.arpa. 3600 IN TLSA DANE-EE SPKI Full aabb\n",
         text,
     );
 }

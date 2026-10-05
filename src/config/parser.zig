@@ -167,6 +167,10 @@ pub const Config = struct {
     has_tls_key_file: bool = false,
     encrypted_dns: bool = false,
     has_encrypted_dns: bool = false,
+    /// RFC 6303/6761/7793/8375 locally served zones. Default on; `off` is the
+    /// RFC 6303 section 3 mechanism to disable them.
+    local_zones: bool = true,
+    has_local_zones: bool = false,
 
     pub fn tlsCertFileText(self: *const Config) ?[]const u8 {
         if (!self.has_tls_cert_file) return null;
@@ -208,6 +212,7 @@ pub const Config = struct {
         if (std.mem.eql(u8, first, "tls-cert-file")) return self.parseTlsCertFile(&tokens);
         if (std.mem.eql(u8, first, "tls-key-file")) return self.parseTlsKeyFile(&tokens);
         if (std.mem.eql(u8, first, "encrypted-dns")) return self.parseEncryptedDns(&tokens);
+        if (std.mem.eql(u8, first, "local-zones")) return self.parseLocalZones(&tokens);
         return Error.UnknownDirective;
     }
 
@@ -314,6 +319,20 @@ pub const Config = struct {
             return Error.BadDirective;
         }
         self.has_encrypted_dns = true;
+    }
+
+    fn parseLocalZones(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        if (self.has_local_zones) return Error.BadDirective;
+        const value = tokens.next() orelse return Error.BadDirective;
+        try requireNoTrailingTokens(tokens);
+        if (std.mem.eql(u8, value, "on")) {
+            self.local_zones = true;
+        } else if (std.mem.eql(u8, value, "off")) {
+            self.local_zones = false;
+        } else {
+            return Error.BadDirective;
+        }
+        self.has_local_zones = true;
     }
 };
 
@@ -455,4 +474,26 @@ test "config parser accepts one TSIG key-file path and no secret directive" {
         "tsig-key-file /etc/zimdns/a\ntsig-key-file /etc/zimdns/b\n",
     ));
     try std.testing.expectError(error.UnknownDirective, Config.parse("tsig-key secret-value\n"));
+}
+
+test "config parser keeps locally served zones on unless an operator turns them off" {
+    const implicit = try Config.parse("zone one.example primary one.zone\n");
+    try std.testing.expect(implicit.local_zones);
+    try std.testing.expect(!implicit.has_local_zones);
+
+    const on = try Config.parse("local-zones on\n");
+    try std.testing.expect(on.local_zones);
+    try std.testing.expect(on.has_local_zones);
+
+    const off = try Config.parse("local-zones off\n");
+    try std.testing.expect(!off.local_zones);
+    try std.testing.expect(off.has_local_zones);
+
+    try std.testing.expectError(error.BadDirective, Config.parse("local-zones maybe\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("local-zones\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("local-zones on extra\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse(
+        "local-zones on\nlocal-zones off\n",
+    ));
+    try std.testing.expectError(error.UnknownDirective, Config.parse("local-zone on\n"));
 }

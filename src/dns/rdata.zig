@@ -33,6 +33,9 @@ const max_tsig_mac_len = 32;
 const max_tsig_other_len = 512;
 const max_tsig_rdata_len = 512;
 const max_tsig_time: u64 = 0x0000ffffffffffff;
+pub const max_zonemd_digest_len = 64;
+/// RFC 8976 section 2.2.4: a Digest field below 12 octets is never accepted.
+pub const min_zonemd_digest_len = 12;
 
 pub const EDNS_ECS_OPTION_CODE: u16 = 8;
 pub const EDNS_PADDING_OPTION_CODE: u16 = 12;
@@ -75,6 +78,37 @@ pub fn validTlsa(usage: u8, selector: u8, matching_type: u8, association_len: us
         1 => association_len == 32,
         2 => association_len == 64,
         else => false,
+    };
+}
+
+/// RFC 7218 sections 2.1-2.3 field acronyms for the three TLSA registries,
+/// used to display a record instead of the numeric registry values. Only the
+/// values `validTlsa` accepts are listed: 255 (PrivCert, PrivSel, PrivMatch)
+/// and the unassigned ranges cannot reach a parsed record.
+pub fn tlsaUsageAcronym(usage: u8) ?[]const u8 {
+    return switch (usage) {
+        0 => "PKIX-TA",
+        1 => "PKIX-EE",
+        2 => "DANE-TA",
+        3 => "DANE-EE",
+        else => null,
+    };
+}
+
+pub fn tlsaSelectorAcronym(selector: u8) ?[]const u8 {
+    return switch (selector) {
+        0 => "Cert",
+        1 => "SPKI",
+        else => null,
+    };
+}
+
+pub fn tlsaMatchingTypeAcronym(matching_type: u8) ?[]const u8 {
+    return switch (matching_type) {
+        0 => "Full",
+        1 => "SHA2-256",
+        2 => "SHA2-512",
+        else => null,
     };
 }
 
@@ -288,6 +322,22 @@ pub const Tlsa = struct {
     matching_type: u8,
     association: [max_tlsa_association_len]u8 = undefined,
     association_len: u16 = 0,
+};
+
+/// RFC 8976 section 2.2 ZONEMD RDATA: a 32-bit serial, an 8-bit collation
+/// scheme, an 8-bit hash algorithm, then the untruncated digest. The registry
+/// only defines SHA384 (48 octets) and SHA512 (64 octets), so the digest is
+/// bounded by the larger of the two.
+pub const Zonemd = struct {
+    serial: u32,
+    scheme: u8,
+    hash: u8,
+    digest: [max_zonemd_digest_len]u8 = undefined,
+    digest_len: u8 = 0,
+
+    pub fn digestBytes(self: *const Zonemd) []const u8 {
+        return self.digest[0..self.digest_len];
+    }
 };
 
 pub const Uri = struct {
@@ -576,6 +626,7 @@ pub const RData = union(enum) {
     OPT: Opt,
     TSIG: Tsig,
     Unknown: Unknown,
+    ZONEMD: Zonemd,
 
     pub fn parse(rrtype: RecordType, message: []const u8, offset: usize, len: usize) Error!RData {
         if (offset > message.len or message.len - offset < len) return Error.EndOfInput;
@@ -734,6 +785,19 @@ pub const RData = union(enum) {
                 break :blk .{ .OPT = opt };
             },
             RecordType.TSIG.value => .{ .TSIG = try parseTsig(message, offset, end) },
+            RecordType.ZONEMD.value => blk: {
+                if (len < 6 + min_zonemd_digest_len) return Error.InvalidLength;
+                const digest_len = len - 6;
+                if (digest_len > max_zonemd_digest_len) return Error.InvalidLength;
+                var zonemd = Zonemd{
+                    .serial = std.mem.readInt(u32, message[offset..][0..4], .big),
+                    .scheme = message[offset + 4],
+                    .hash = message[offset + 5],
+                    .digest_len = @intCast(digest_len),
+                };
+                @memcpy(zonemd.digest[0..digest_len], message[offset + 6 .. end]);
+                break :blk .{ .ZONEMD = zonemd };
+            },
             else => blk: {
                 if (len > max_unknown_len) return Error.UnknownTooLong;
                 var unknown = Unknown{ .len = @intCast(len) };
@@ -830,6 +894,13 @@ pub const RData = union(enum) {
             .OPT => |opt| try writer.writeBytes(opt.bytes()),
             .TSIG => |tsig| try tsig.encode(writer),
             .Unknown => |unknown| try writer.writeBytes(unknown.bytes()),
+            .ZONEMD => |zonemd| {
+                if (zonemd.digest_len < min_zonemd_digest_len or zonemd.digest_len > max_zonemd_digest_len) return Error.InvalidLength;
+                try writer.writeU32(zonemd.serial);
+                try writer.writeU8(zonemd.scheme);
+                try writer.writeU8(zonemd.hash);
+                try writer.writeBytes(zonemd.digestBytes());
+            },
         }
     }
 
@@ -911,6 +982,7 @@ pub const RData = union(enum) {
             .OPT => |opt| try writer.writeBytes(opt.bytes()),
             .TSIG => |tsig| try tsig.encode(writer),
             .Unknown => |unknown| try writer.writeBytes(unknown.bytes()),
+            .ZONEMD => try self.encode(writer),
         }
     }
 };
@@ -1889,6 +1961,36 @@ test "SSHFP wire rejects truncation, unsupported selectors, and wrong lengths" {
     try std.testing.expectError(Error.InvalidLength, RData.parse(.SSHFP, &unsupported_algorithm_seven, 0, 34));
     try std.testing.expectError(Error.InvalidLength, RData.parse(.SSHFP, &unsupported_type_zero, 0, 34));
     try std.testing.expectError(Error.InvalidLength, RData.parse(.SSHFP, &unsupported_type_three, 0, 34));
+}
+
+test "ZONEMD wire round trips serial, scheme, hash, and digest" {
+    // RFC 8976 section 2.4 example record: serial 2018031500, SIMPLE scheme,
+    // SHA384 hash, and an untruncated 48-octet digest.
+    var wire: [6 + 48]u8 = undefined;
+    std.mem.writeInt(u32, wire[0..4], 2018031500, .big);
+    wire[4] = 1;
+    wire[5] = 1;
+    for (wire[6..], 0..) |*byte, index| byte.* = @intCast(index);
+
+    const parsed = try RData.parse(.ZONEMD, &wire, 0, wire.len);
+    try std.testing.expectEqual(@as(u32, 2018031500), parsed.ZONEMD.serial);
+    try std.testing.expectEqual(@as(u8, 1), parsed.ZONEMD.scheme);
+    try std.testing.expectEqual(@as(u8, 1), parsed.ZONEMD.hash);
+    try std.testing.expectEqual(@as(usize, 48), parsed.ZONEMD.digest_len);
+    try std.testing.expectEqualSlices(u8, wire[6..], parsed.ZONEMD.digestBytes());
+
+    var output: [64]u8 = undefined;
+    var writer = Writer.init(&output);
+    try parsed.encode(&writer);
+    try std.testing.expectEqualSlices(u8, &wire, writer.written());
+}
+
+test "ZONEMD wire rejects a digest below the 12-octet floor" {
+    // RFC 8976 section 2.2.4.
+    const short_wire = [_]u8{0} ** (6 + 11);
+    try std.testing.expectError(Error.InvalidLength, RData.parse(.ZONEMD, &short_wire, 0, short_wire.len));
+    const oversized_wire = [_]u8{0} ** (6 + 65);
+    try std.testing.expectError(Error.InvalidLength, RData.parse(.ZONEMD, &oversized_wire, 0, oversized_wire.len));
 }
 
 test "TLSA wire parses and encodes exact selector and association bytes" {

@@ -881,6 +881,75 @@ test "CLI TCP exchange uses the bounded connection path" {
     try expectAResponse(response);
 }
 
+test "TCP AXFR carries a length-framed SOA-bounded transfer sequence" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(transfer_zone);
+    defer runtime.deinit();
+
+    var listen_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try std.Io.net.IpAddress.listen(&listen_addr, io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    var client_stream = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer client_stream.close(io);
+
+    var query_buffer: [512]u8 = undefined;
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4a01, "home.arpa.", axfr_type);
+    try cli_query.sendTcpQuery(client_stream, io, query);
+    try client_stream.shutdown(io, .send);
+
+    var args = CliTcpArgs{ .io = io, .server = &server, .runtime = &runtime };
+    const thread = try std.Thread.spawn(.{}, serveCliTcp, .{&args});
+
+    // Reading to end of stream is deterministic: the server writes the whole
+    // sequence and closes the connection, so no assertion waits on a clock.
+    var read_buffer: [4096]u8 = undefined;
+    var reader = client_stream.reader(io, &read_buffer);
+    const frames = try readTransferSequence(arena.allocator(), &reader.interface);
+    thread.join();
+
+    try std.testing.expect(args.ok);
+    try expectTransferSequence(frames, 0x4a01);
+}
+
+test "TCP IXFR from a stale serial falls back to a full AXFR sequence" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(transfer_zone);
+    defer runtime.deinit();
+
+    var listen_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try std.Io.net.IpAddress.listen(&listen_addr, io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    var client_stream = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer client_stream.close(io);
+
+    // The zone has never been reloaded under this runtime, so it holds no
+    // delta chain from the client's serial. RFC 1995 answers that request with
+    // a full transfer instead of a delta.
+    var query_buffer: [512]u8 = undefined;
+    const query = try buildIxfrQuery(&query_buffer, 0x4a02, transfer_zone_serial - 1);
+    try cli_query.sendTcpQuery(client_stream, io, query);
+    try client_stream.shutdown(io, .send);
+
+    var args = CliTcpArgs{ .io = io, .server = &server, .runtime = &runtime };
+    const thread = try std.Thread.spawn(.{}, serveCliTcp, .{&args});
+
+    var read_buffer: [4096]u8 = undefined;
+    var reader = client_stream.reader(io, &read_buffer);
+    const frames = try readTransferSequence(arena.allocator(), &reader.interface);
+    thread.join();
+
+    try std.testing.expect(args.ok);
+    try expectTransferSequence(frames, 0x4a02);
+}
+
 test "configured two-zone UDP loop dispatches by longest origin" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1033,6 +1102,76 @@ test "authoritative TCP loop caps active connections at eight" {
     try std.testing.expect(args.ok);
 }
 
+test "concurrent TCP connections each answer every pipelined frame while workers are occupied" {
+    const stalled_connections = 2;
+    const query_connections = listener.TCP_MAX_CONNECTION_WORKERS - stalled_connections;
+
+    var io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{
+        .concurrent_limit = .limited(listener.TCP_MAX_CONNECTION_WORKERS),
+    });
+    defer io_backend.deinit();
+    const io = io_backend.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(fixture_zone);
+    defer runtime.deinit();
+
+    var listen_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try std.Io.net.IpAddress.listen(&listen_addr, io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    // Two connections park mid-frame, so every worker slot is busy for the
+    // whole exchange. A server that handled one connection at a time could
+    // not answer the query connections inside their read deadline.
+    const stalled_frame = [_]u8{ 0x00, 0x40, 1, 2, 3, 4, 5, 6, 7, 8 };
+    var stalled = [_]?std.Io.net.Stream{null} ** stalled_connections;
+    var stalled_write_buffer: [64]u8 = undefined;
+    for (&stalled) |*stream| {
+        stream.* = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+        var writer = stream.*.?.writer(io, &stalled_write_buffer);
+        try writer.interface.writeAll(&stalled_frame);
+        try writer.interface.flush();
+    }
+
+    var clients = [_]?std.Io.net.Stream{null} ** query_connections;
+    for (&clients) |*client| {
+        client.* = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    }
+
+    // All 96 frames (6 connections x the documented 16-frame cap) are written
+    // before the server starts, so every request is already buffered when the
+    // workers begin: no query can win a race and no assertion waits on a clock.
+    var query_buffer: [512]u8 = undefined;
+    for (&clients, 0..) |client, connection_index| {
+        for (0..listener.TCP_MAX_FRAMES_PER_CONNECTION) |frame_index| {
+            try cli_query.sendTcpQuery(client.?, io, try buildConcurrentQuery(&query_buffer, connection_index, frame_index));
+        }
+    }
+
+    var args = BoundedTcpArgs{ .io = io, .server = &server, .runtime = &runtime, .max_requests = listener.TCP_MAX_CONNECTION_WORKERS };
+    const server_thread = try std.Thread.spawn(.{}, serveBoundedTcp, .{&args});
+    var joined = false;
+    defer if (!joined) server_thread.join();
+    defer closeStreams(&clients, io);
+    defer closeStreams(&stalled, io);
+
+    var response_buffer: [512]u8 = undefined;
+    for (&clients, 0..) |client, connection_index| {
+        for (0..listener.TCP_MAX_FRAMES_PER_CONNECTION) |frame_index| {
+            const query = try buildConcurrentQuery(&query_buffer, connection_index, frame_index);
+            const response = try cli_query.receiveTcpResponse(arena.allocator(), client.?, io, &response_buffer, query);
+            try expectAddress(response, concurrentQueryFixture(connection_index, frame_index).address);
+        }
+    }
+
+    closeStreams(&stalled, io);
+    closeStreams(&clients, io);
+    server_thread.join();
+    joined = true;
+    try std.testing.expect(args.ok);
+}
+
 test "resolver accepts only an exact UDP upstream response" {
     try expectForwarderExchange(.valid);
     try expectForwarderExchange(.wrong_source);
@@ -1165,6 +1304,186 @@ test "authorized UDP listener request reaches a local upstream" {
     try expectForwardedAResponse(response, 0x7003);
 }
 
+test "locally served zones win over a configured forwarder and never reach it" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    // A live upstream that answers this exact name with 192.0.2.1.
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+    var upstream_args = UpstreamArgs{ .io = io, .udp = &upstream_socket, .mode = .valid };
+    const upstream_thread = try std.Thread.spawn(.{}, serveUpstream, .{&upstream_args});
+
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 41031);
+    var query_buffer: [512]u8 = undefined;
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x7a11, "1.2.3.10.in-addr.arpa.", .A);
+
+    // Control: with locally served zones off the question reaches the
+    // forwarder and is answered positively, so the upstream really does answer
+    // this name and the counter below is a real reachability signal.
+    var open_zones = std.ArrayList(zimdns.zone_index.Zone).empty;
+    var open_policy = resolver.Policy{ .forwarder = .{ .address = upstream_socket.address } };
+    open_policy.recursion_allow[0] = try zimdns.config_parser.Cidr.parse("127.0.0.0/8");
+    open_policy.recursion_allow_len = 1;
+    var open_runtime = try Runtime.fromZonesWithPolicy(std.testing.allocator, &open_zones, .{}, io, open_policy);
+    defer open_runtime.deinit();
+    open_runtime.local_zones = false;
+    var open_output: [resolver.MAX_UPSTREAM_MESSAGE]u8 = undefined;
+    const open_bytes = try open_runtime.answerFrom(query, &open_output, &client);
+    upstream_thread.join();
+    try std.testing.expect(upstream_args.ok);
+    try std.testing.expectEqual(@as(usize, 1), upstream_args.requests);
+
+    var open_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer open_arena.deinit();
+    const open_response = try dns_message.Message.parse(open_arena.allocator(), open_bytes);
+    try expectForwardedAResponse(open_response, 0x7a11);
+
+    // Same question on a default runtime: an authoritative NXDOMAIN carrying the
+    // RFC 6303 section 3 empty-zone SOA, and the upstream counter is unchanged
+    // because the cache and the forwarder are both consulted after the local
+    // zone and neither ever saw this question.
+    var default_zones = std.ArrayList(zimdns.zone_index.Zone).empty;
+    var default_policy = resolver.Policy{ .forwarder = .{ .address = upstream_socket.address } };
+    default_policy.recursion_allow[0] = try zimdns.config_parser.Cidr.parse("127.0.0.0/8");
+    default_policy.recursion_allow_len = 1;
+    var default_runtime = try Runtime.fromZonesWithPolicy(std.testing.allocator, &default_zones, .{}, io, default_policy);
+    defer default_runtime.deinit();
+    try std.testing.expect(default_runtime.local_zones);
+
+    // Fill the cache with a positive answer from the forwarder for a name it
+    // owns, then repeat it from the cache. The cache sits after the local
+    // zone, so a cached positive must not change the answer for a locally
+    // served name either.
+    var warm_args = UpstreamArgs{ .io = io, .udp = &upstream_socket, .mode = .valid };
+    const warm_thread = try std.Thread.spawn(.{}, serveUpstream, .{&warm_args});
+    var cached_buffer: [512]u8 = undefined;
+    const cached_query = try cli_query.buildQueryPacket(&cached_buffer, 0x7a12, "host.in-addr.arpa.", .A);
+    var cached_output: [resolver.MAX_UPSTREAM_MESSAGE]u8 = undefined;
+    const cached_bytes = try default_runtime.answerFrom(cached_query, &cached_output, &client);
+    warm_thread.join();
+    try std.testing.expect(warm_args.ok);
+    try std.testing.expectEqual(@as(usize, 1), warm_args.requests);
+
+    var warm_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer warm_arena.deinit();
+    const warm_response = try dns_message.Message.parse(warm_arena.allocator(), cached_bytes);
+    try expectForwardedAResponse(warm_response, 0x7a12);
+
+    var repeat_output: [resolver.MAX_UPSTREAM_MESSAGE]u8 = undefined;
+    _ = try default_runtime.answerFrom(cached_query, &repeat_output, &client);
+    try std.testing.expectEqual(@as(usize, 1), warm_args.requests);
+
+    var default_output: [resolver.MAX_UPSTREAM_MESSAGE]u8 = undefined;
+    const default_bytes = try default_runtime.answerFrom(query, &default_output, &client);
+    try std.testing.expectEqual(@as(usize, 1), warm_args.requests);
+
+    var default_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer default_arena.deinit();
+    const default_response = try dns_message.Message.parse(default_arena.allocator(), default_bytes);
+    try expectLocalNxdomain(default_response, 0x7a11, "10.in-addr.arpa.");
+}
+
+test "locally served zone answers over UDP from a config with no forwarder" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.writeFile(io, .{ .sub_path = "one.zone", .data =
+        \\$ORIGIN one.example.
+        \\$TTL 3600
+        \\@ IN SOA ns.one.example. hostmaster.one.example. 1 3600 900 1209600 3600
+        \\@ IN NS ns.one.example.
+        \\www IN A 192.0.2.1
+        \\
+    });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone one.example primary one.zone\n" });
+
+    var context = try zimdns.config_loader.ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+    defer context.deinit();
+    var runtime = try context.takeRuntime(io);
+    defer runtime.deinit();
+    // No forwarder, no recursion ACL, so no resolver exists at all. The local
+    // zone must still answer, which is the operator-reachable path.
+    try std.testing.expect(runtime.resolver == null);
+
+    var server_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server_socket = try std.Io.net.IpAddress.bind(&server_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer server_socket.close(io);
+    var client_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var client_socket = try std.Io.net.IpAddress.bind(&client_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer client_socket.close(io);
+
+    var query_buffer: [512]u8 = undefined;
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x7a21, "1.0.0.127.in-addr.arpa.", .PTR);
+    try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, query);
+    try listener.serveUdpOnce(&server_socket, io, &runtime);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var response_buffer: [512]u8 = undefined;
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    try expectLocalNxdomain(response, 0x7a21, "127.in-addr.arpa.");
+
+    // The operator's own zone is untouched by the local-zone table.
+    const zone_query = try cli_query.buildQueryPacket(&query_buffer, 0x7a22, "www.one.example.", .A);
+    try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, zone_query);
+    try listener.serveUdpOnce(&server_socket, io, &runtime);
+    var zone_response_buffer: [512]u8 = undefined;
+    const zone_response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &zone_response_buffer, &server_socket.address, zone_query);
+    try expectAddress(zone_response, .{ 192, 0, 2, 1 });
+}
+
+test "the shipped --config invocation loads through the cwd Dir and answers a query" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    // Exactly what `zimdns server run --config examples/config.gdns` passes:
+    // Dir.cwd() carries the AT_FDCWD sentinel, so no hand-built Dir reproduces
+    // the failure the shipped command had.
+    var context = try zimdns.config_loader.ServerContext.load(std.Io.Dir.cwd(), io, "examples/config.gdns", std.testing.allocator);
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 1), context.zones.items.len);
+    try std.testing.expectEqualStrings("home.arpa.", context.zones.items[0].originText());
+
+    var runtime = try context.takeRuntime(io);
+    defer runtime.deinit();
+
+    var server_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server_socket = try std.Io.net.IpAddress.bind(&server_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer server_socket.close(io);
+    var client_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var client_socket = try std.Io.net.IpAddress.bind(&client_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer client_socket.close(io);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query_buffer: [512]u8 = undefined;
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x5a11, "dns.home.arpa.", .A);
+    try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, query);
+    try listener.serveUdpOnce(&server_socket, io, &runtime);
+
+    var response_buffer: [512]u8 = undefined;
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    try expectAddress(response, .{ 192, 168, 1, 1 });
+}
+
+fn expectLocalNxdomain(response: dns_message.Message, expected_id: u16, apex: []const u8) !void {
+    try std.testing.expect(response.header.qr);
+    try std.testing.expectEqual(expected_id, response.header.id);
+    try std.testing.expect(response.header.authoritative);
+    try std.testing.expectEqual(@as(@TypeOf(response.header.rcode), .nxdomain), response.header.rcode);
+    try std.testing.expectEqual(@as(u16, 0), response.header.answer_count);
+    try std.testing.expectEqual(@as(u16, 1), response.header.authority_count);
+
+    const soa = response.authorities.items[0];
+    try std.testing.expect(soa.rrtype.eql(.SOA));
+    try std.testing.expectEqual(zimdns.local_zone.RECORD_TTL, soa.ttl);
+    try std.testing.expectEqual(zimdns.local_zone.RECORD_TTL, soa.rdata.SOA.minimum);
+    var owner_buffer: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(apex, try soa.owner.toText(&owner_buffer));
+    var mname_buffer: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(apex, try soa.rdata.SOA.mname.toText(&mname_buffer));
+    var rname_buffer: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("nobody.invalid.", try soa.rdata.SOA.rname.toText(&rname_buffer));
+}
+
 test "resolver caches a live upstream NXDOMAIN response" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
@@ -1265,6 +1584,72 @@ fn expectForwarderExchange(mode: UpstreamMode) !void {
     try expectForwardedAResponse(response, 0x7000);
 }
 
+test "upstream UDP attempts each bind a fresh ephemeral source port" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var udp = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer udp.close(io);
+    var capture = PortCaptureArgs{ .io = io, .udp = &udp };
+    const capture_thread = try std.Thread.spawn(.{}, servePortCapture, .{&capture});
+
+    const policy = resolver.Policy{ .forwarder = .{ .address = udp.address } };
+    var upstream = try Resolver.init(std.testing.allocator, io, policy);
+    defer upstream.deinit();
+    var query_buffer: [512]u8 = undefined;
+    const query_bytes = try cli_query.buildQueryPacket(&query_buffer, 0x7020, "example.com.", .A);
+    var query_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer query_arena.deinit();
+    const query = try dns_message.Message.parseQuery(query_arena.allocator(), query_bytes);
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 41020);
+    var output: [resolver.MAX_UPSTREAM_MESSAGE]u8 = undefined;
+    const response_bytes = try upstream.answer(query_bytes, query, &client, &output);
+    capture_thread.join();
+    try std.testing.expect(capture.ok);
+    try std.testing.expectEqual(@as(usize, 2), capture.requests);
+
+    // RFC 5452 §9.2: a blind spoof has to guess the per-attempt randomized
+    // query ID *and* the ephemeral source port, so the two attempts must not
+    // share a port. `incoming.from` is the address the kernel stamped on each
+    // datagram, i.e. the port the resolver's per-attempt socket actually used.
+    const first_port = capture.first_from.getPort();
+    const second_port = capture.second_from.getPort();
+    try std.testing.expect(first_port != 0);
+    try std.testing.expect(second_port != 0);
+    if (first_port == second_port) {
+        std.debug.print("both upstream UDP attempts left the same ephemeral source port: {d}\n", .{first_port});
+        return error.SameUpstreamSourcePort;
+    }
+
+    const response = try dns_message.Message.parse(query_arena.allocator(), response_bytes);
+    try expectForwardedAResponse(response, 0x7020);
+}
+
+const PortCaptureArgs = struct {
+    io: std.Io,
+    udp: *const std.Io.net.Socket,
+    first_from: std.Io.net.IpAddress = undefined,
+    second_from: std.Io.net.IpAddress = undefined,
+    requests: usize = 0,
+    ok: bool = false,
+};
+
+/// Leaves the first attempt unanswered on purpose. The resolver's own
+/// `UDP_TIMEOUT` then expires, it closes that socket, and only afterwards does
+/// the second attempt reach the wire — so this thread observes both datagrams
+/// and both source ports with no sleep, no retry, and no timing threshold.
+fn servePortCapture(args: *PortCaptureArgs) void {
+    var request_buffer: [resolver.MAX_UPSTREAM_MESSAGE]u8 = undefined;
+    const first = args.udp.receiveTimeout(args.io, &request_buffer, TestTimeout) catch return;
+    args.requests = 1;
+    args.first_from = first.from;
+    const second = args.udp.receiveTimeout(args.io, &request_buffer, TestTimeout) catch return;
+    args.requests = 2;
+    args.second_from = second.from;
+    const valid = makeAResponse(second.data, false, false, false);
+    args.udp.send(args.io, &second.from, valid.bytes[0..valid.len]) catch return;
+    args.ok = true;
+}
+
 test "forwarder preserves full QNAME upstream with QMIN enabled" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
@@ -1358,6 +1743,58 @@ fn serveCliTcp(args: *CliTcpArgs) void {
 fn serveBoundedTcp(args: *BoundedTcpArgs) void {
     listener.serveTcpLoop(args.server, args.io, args.runtime, args.max_requests) catch return;
     args.ok = true;
+}
+
+fn closeStreams(streams: []?std.Io.net.Stream, io: std.Io) void {
+    for (streams) |*stream| {
+        if (stream.*) |value| {
+            value.close(io);
+            stream.* = null;
+        }
+    }
+}
+
+const ConcurrentQueryFixture = struct { name: []const u8, address: [4]u8 };
+
+/// Alternates qnames so a response swapped between connections or frames
+/// carries the wrong answer, not just a wrong id.
+fn concurrentQueryFixture(connection_index: usize, frame_index: usize) ConcurrentQueryFixture {
+    const fixtures = [_]ConcurrentQueryFixture{
+        .{ .name = "dns.home.arpa.", .address = .{ 192, 168, 1, 1 } },
+        .{ .name = "target.home.arpa.", .address = .{ 192, 0, 2, 21 } },
+    };
+    return fixtures[(connection_index + frame_index) % fixtures.len];
+}
+
+fn buildConcurrentQuery(buffer: []u8, connection_index: usize, frame_index: usize) ![]const u8 {
+    const fixture = concurrentQueryFixture(connection_index, frame_index);
+    const id = @as(u16, @intCast(0x5400 + connection_index * listener.TCP_MAX_FRAMES_PER_CONNECTION + frame_index));
+    return cli_query.buildQueryPacket(buffer, id, fixture.name, .A);
+}
+
+/// RFC 1995 IXFR request: the question plus the client's serial in an
+/// authority SOA owned by the question name.
+fn buildIxfrQuery(buffer: []u8, id: u16, client_serial: u32) ![]const u8 {
+    const base = try cli_query.buildQueryPacket(buffer, id, "home.arpa.", ixfr_type);
+    std.mem.writeInt(u16, buffer[8..10], 1, .big);
+    const client_soa = dns_record.ResourceRecord{
+        .owner = try dns_name.Name.fromText("home.arpa."),
+        .rrtype = .SOA,
+        .class = .IN,
+        .ttl = 3600,
+        .rdata = .{ .SOA = .{
+            .mname = try dns_name.Name.fromText("ns1.home.arpa."),
+            .rname = try dns_name.Name.fromText("hostmaster.home.arpa."),
+            .serial = client_serial,
+            .refresh = 3600,
+            .retry = 900,
+            .expire = 1209600,
+            .minimum = 3600,
+        } },
+    };
+    var writer = dns_writer.Writer.init(buffer[base.len..]);
+    try client_soa.encode(&writer);
+    return buffer[0 .. base.len + writer.len()];
 }
 
 const IntegrationSignedQuery = struct {
@@ -1717,6 +2154,71 @@ fn expectAddress(response: anytype, expected: [4]u8) !void {
     try std.testing.expectEqualSlices(u8, &expected, &response.answers.items[0].rdata.A);
 }
 
+/// Reads a Do53 transfer sequence: a two-octet length prefix per RFC 1035
+/// section 4.2.2 followed by that many octets of DNS message, until the server
+/// closes the connection. A prefix that disagrees with the octets that follow
+/// it fails here: a short frame parses as a truncated message, a long one
+/// never delivers `length` octets, and a missing prefix is read as a length of
+/// the query id.
+fn readTransferSequence(allocator: std.mem.Allocator, reader: *std.Io.Reader) ![]dns_message.Message {
+    var frames: std.ArrayList(dns_message.Message) = .empty;
+    while (true) {
+        const len_bytes = reader.takeArray(2) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        const length = std.mem.readInt(u16, len_bytes, .big);
+        // RFC 1035 section 4.2.2: zero is not a legal message length.
+        try std.testing.expect(length > 0);
+        try frames.append(allocator, try dns_message.Message.parse(allocator, try reader.take(length)));
+    }
+    // Anything still buffered would be an octet the frame lengths never
+    // accounted for, so the sequence would not be framed end to end.
+    try std.testing.expectEqual(@as(usize, 0), reader.bufferedLen());
+    try std.testing.expect(frames.items.len > 0);
+    return frames.toOwnedSlice(allocator);
+}
+
+/// Every frame of a transfer sequence is a standalone authoritative response,
+/// and the concatenated answers are exactly the loaded zone's records in
+/// RFC 5936 order: apex SOA first, apex SOA last, nothing else in between.
+fn expectTransferSequence(frames: []dns_message.Message, expected_id: u16) !void {
+    var name_buffer: [256]u8 = undefined;
+    var index: usize = 0;
+    var first_soa: ?u32 = null;
+    var last_soa: ?u32 = null;
+    for (frames) |frame| {
+        try std.testing.expect(frame.header.qr);
+        try std.testing.expectEqual(expected_id, frame.header.id);
+        try std.testing.expectEqual(@as(@TypeOf(frame.header.rcode), .no_error), frame.header.rcode);
+        // AA: the zone that owns the transfer answers it.
+        try std.testing.expect(frame.header.authoritative);
+        // Each frame echoes the question so it parses standalone.
+        try std.testing.expectEqual(@as(u16, 1), frame.header.question_count);
+        const question = frame.question orelse return error.MissingQuestion;
+        try std.testing.expectEqualStrings("home.arpa.", try question.name.toText(&name_buffer));
+        try std.testing.expectEqual(@as(u16, 0), frame.header.authority_count);
+        try std.testing.expectEqual(@as(u16, 0), frame.header.additional_count);
+        try std.testing.expectEqual(@as(u16, @intCast(frame.answers.len)), frame.header.answer_count);
+        for (frame.answers.slice()) |record| {
+            if (index >= expected_transfer_records.len) return error.TooManyAnswers;
+            const expected = expected_transfer_records[index];
+            try std.testing.expect(record.rrtype.eql(expected.rrtype));
+            try std.testing.expectEqualStrings(expected.owner, try record.owner.toText(&name_buffer));
+            if (record.rrtype.eql(.SOA)) {
+                if (first_soa == null) first_soa = record.rdata.SOA.serial;
+                last_soa = record.rdata.SOA.serial;
+            }
+            index += 1;
+        }
+    }
+    try std.testing.expectEqual(expected_transfer_records.len, index);
+    // SOA-framed: the apex SOA of the loaded zone opens and closes the
+    // sequence, and it is the same record at both ends.
+    try std.testing.expectEqual(transfer_zone_serial, first_soa orelse return error.MissingSoa);
+    try std.testing.expectEqual(first_soa, last_soa);
+}
+
 fn loadConfiguredRuntime(io: std.Io, tmp: *std.testing.TmpDir) !Runtime {
     try tmp.dir.writeFile(io, .{ .sub_path = "parent.zone", .data = parent_zone });
     try tmp.dir.writeFile(io, .{ .sub_path = "child.zone", .data = child_zone });
@@ -1758,6 +2260,35 @@ const fixture_zone =
     \\target IN ISDN 1234 "aBf"
     \\
 ;
+
+const TransferRecord = struct {
+    owner: []const u8,
+    rrtype: @FieldType(dns_record.ResourceRecord, "rrtype"),
+};
+
+const axfr_type: @FieldType(TransferRecord, "rrtype") = .AXFR;
+const ixfr_type: @FieldType(TransferRecord, "rrtype") = .IXFR;
+const transfer_zone_serial: u32 = 2026053001;
+
+const transfer_zone =
+    \\$ORIGIN home.arpa.
+    \\$TTL 3600
+    \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 2026053001 3600 900 1209600 3600
+    \\@ IN NS ns1.home.arpa.
+    \\ns1 IN A 192.168.1.1
+    \\dns IN A 192.168.1.1
+    \\
+;
+
+/// The records `transfer_zone` must put on the wire: apex SOA, the zone's own
+/// records in zone order, apex SOA again.
+const expected_transfer_records = [_]TransferRecord{
+    .{ .owner = "home.arpa.", .rrtype = .SOA },
+    .{ .owner = "home.arpa.", .rrtype = .NS },
+    .{ .owner = "ns1.home.arpa.", .rrtype = .A },
+    .{ .owner = "dns.home.arpa.", .rrtype = .A },
+    .{ .owner = "home.arpa.", .rrtype = .SOA },
+};
 
 const tlsa_association = [_]u8{
     0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,

@@ -341,6 +341,7 @@ fn parseRecordType(text: []const u8) ?RecordType {
     if (std.mem.eql(u8, text, "DNSKEY")) return .DNSKEY;
     if (std.mem.eql(u8, text, "NSEC3")) return .NSEC3;
     if (std.mem.eql(u8, text, "NSEC3PARAM")) return .NSEC3PARAM;
+    if (std.mem.eql(u8, text, "ZONEMD")) return .ZONEMD;
     if (text.len > 4 and std.ascii.eqlIgnoreCase(text[0..4], "TYPE")) {
         const code = std.fmt.parseInt(u16, text[4..], 10) catch return null;
         return RecordType.fromCode(code);
@@ -384,6 +385,7 @@ pub fn parseRData(rrtype: RecordType, text: []const u8) Error!dns_rdata.RData {
     if (rrtype.eql(.NSEC)) return .{ .Unknown = try parseNsec(text) };
     if (rrtype.eql(.NSEC3)) return .{ .Unknown = try parseNsec3(text) };
     if (rrtype.eql(.NSEC3PARAM)) return .{ .Unknown = try parseNsec3Param(text) };
+    if (rrtype.eql(.ZONEMD)) return .{ .ZONEMD = try parseZonemd(text) };
     return Error.BadRecord;
 }
 
@@ -401,7 +403,10 @@ fn decodeHexBlob(hex: []const u8) Error!dns_rdata.Unknown {
     var compact: [4096]u8 = undefined;
     var compact_len: usize = 0;
     for (hex) |byte| {
-        if (std.ascii.isWhitespace(byte)) continue;
+        // Presentation hex blobs allow embedded whitespace and the zone-file
+        // grammar wraps long values in parentheses, which survive mid-string
+        // because Tokenizer.rest only trims them at the ends.
+        if (std.ascii.isWhitespace(byte) or byte == '(' or byte == ')') continue;
         if (compact_len >= compact.len) return Error.BadRecord;
         compact[compact_len] = byte;
         compact_len += 1;
@@ -525,6 +530,28 @@ fn parseDs(text: []const u8) Error!dns_rdata.Unknown {
 fn parseTypeCovered(text: []const u8) Error!u16 {
     if (parseRecordType(text)) |rrtype| return rrtype.code();
     return Error.BadRecord;
+}
+
+/// RFC 8976 section 2.3 presentation format: serial, scheme, and hash are
+/// unsigned decimal integers; the digest is case-insensitive hexadecimal
+/// whose whitespace the zone parser has already folded out of parenthetical
+/// continuations. decodeHexBlob accepts the embedded whitespace as well.
+fn parseZonemd(text: []const u8) Error!dns_rdata.Zonemd {
+    var tokens = std.mem.tokenizeAny(u8, text, " \t\r\n");
+    const serial = parseStrictDecimal(u32, tokens.next() orelse return Error.BadRecord) orelse return Error.BadRecord;
+    const scheme = parseStrictDecimal(u8, tokens.next() orelse return Error.BadRecord) orelse return Error.BadRecord;
+    const hash = parseStrictDecimal(u8, tokens.next() orelse return Error.BadRecord) orelse return Error.BadRecord;
+    const digest = try decodeHexBlob(tokens.rest());
+    const bytes = digest.bytes();
+    if (bytes.len < dns_rdata.min_zonemd_digest_len or bytes.len > dns_rdata.max_zonemd_digest_len) return Error.BadRecord;
+    var zonemd = dns_rdata.Zonemd{
+        .serial = serial,
+        .scheme = scheme,
+        .hash = hash,
+        .digest_len = @intCast(bytes.len),
+    };
+    @memcpy(zonemd.digest[0..bytes.len], bytes);
+    return zonemd;
 }
 
 fn parseRrsig(text: []const u8) Error!dns_rdata.Unknown {

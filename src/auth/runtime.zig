@@ -10,6 +10,7 @@ const zone_index = @import("../zone/index.zig");
 const metrics = @import("../metrics.zig");
 const blocklist_mod = @import("../blocklist.zig");
 const resolver_mod = @import("../resolver.zig");
+const local_zone = @import("../local_zone.zig");
 const keyring_mod = @import("keyring.zig");
 const tsig = @import("../dns/tsig.zig");
 const transfer = @import("../zone/transfer.zig");
@@ -57,6 +58,11 @@ pub const Runtime = struct {
     zones: std.ArrayList(zone_index.Zone) = .empty,
     blocklist: blocklist_mod.Blocklist = .{},
     resolver: ?resolver_mod.Resolver = null,
+    /// RFC 6303/6761/7793/8375 locally served zones, on by default so a
+    /// configured forwarder can never leak one of these names upstream
+    /// (RFC 7793 section 2, RFC 6598 section 3). `local-zones off` is the
+    /// RFC 6303 section 3 mechanism to disable it.
+    local_zones: bool = true,
     keyring: keyring_mod.Keyring = .{},
     tsig_now: ?u64 = null,
     /// Volatile per-zone RFC 1995 serial transitions feeding IXFR delta
@@ -500,6 +506,7 @@ pub const Runtime = struct {
                 if (incoming.auth) |auth| {
                     return self.encodeSignedMessage(try self.buildMessage(incoming.query), output, auth, 0, &.{}, null);
                 }
+                if (try self.localZoneAnswer(incoming.query)) |local| return self.encodeMessage(local, output);
                 return self.encodeMessage(try self.buildMessage(incoming.query), output);
             },
         }
@@ -728,6 +735,7 @@ pub const Runtime = struct {
             }
             return self.encodeMessage(try self.buildMessage(query), output);
         }
+        if (try self.localZoneAnswer(query)) |local| return self.encodeMessage(local, output);
         if (self.blocklist.blocks(qname_text)) return self.encodeMessage(try response.buildRefusedResponse(query), output);
         if (!q.qclass.eql(@import("../dns/types.zig").Class.IN) or !query.header.recursion_desired) {
             return self.encodeMessage(try response.buildRefusedResponse(query), output);
@@ -745,6 +753,30 @@ pub const Runtime = struct {
             };
         }
         return self.encodeMessage(try response.buildRefusedResponse(query), output);
+    }
+
+    /// Answers the locally served zones of RFC 6303, RFC 7793, RFC 6761, and
+    /// RFC 8375 from one static table. Consulted before the blocklist, the
+    /// cache, and the forwarding policy, so these names never reach an
+    /// upstream. An operator's own primary zone wins, which is the RFC 6303
+    /// section 2 "configured otherwise" case. Returns null when the question
+    /// is outside every locally served zone.
+    fn localZoneAnswer(self: *const Runtime, query: dns_message.Message) !?dns_message.Message {
+        if (!self.local_zones) return null;
+        const q = query.question orelse return null;
+        // AXFR/IXFR has no zone file to transfer from a synthesized zone and is
+        // refused exactly as the authoritative path refuses a transfer.
+        if (transfer.classify(q.qtype, q.qclass) != .none) return null;
+        var qname_buffer: [256]u8 = undefined;
+        const qname_text = q.name.toText(&qname_buffer) catch return null;
+        // This profile answers class IN only; every other class keeps the
+        // existing out-of-zone behaviour, which is NOTIMP for TCP ingress.
+        if (!q.qclass.eql(@import("../dns/types.zig").Class.IN)) return null;
+        if (self.selectZone(qname_text) != null) return null;
+        const zone = local_zone.match(qname_text) orelse return null;
+        const dnssec_ok = if (query.edns) |edns| edns.dnssec_ok else false;
+        if (local_zone.forwardsUpstream(zone, q.qtype, dnssec_ok)) return null;
+        return try local_zone.build(query, zone);
     }
 
     pub fn answerFromWithMetrics(self: *Runtime, query_bytes: []const u8, output: []u8, client: *const std.Io.net.IpAddress, counters: *metrics.Counters) ![]const u8 {

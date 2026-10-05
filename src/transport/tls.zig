@@ -25,10 +25,14 @@ pub const Error = error{
     DoqDeferred,
 };
 
-/// Server ALPN preference for one handshake offer list. DoT selects "dot"
-/// (RFC 7858 section 3.1). DoH selects "http/1.1" only, because doh.zig
-/// implements the HTTP/1.1 mapping: selecting "h2" would hand the client a
-/// protocol this server cannot speak (docs/decisions/encrypted-transport.md).
+/// Server ALPN preference for one handshake offer list. DoT selects "dot",
+/// the IANA ALPN protocol ID whose registry reference is RFC 7858; RFC 7858
+/// section 3.1 fixes the DoT port and never mentions ALPN. RFC 9103 section
+/// 7.1 additionally requires "dot" for zone transfer over TLS. DoH selects
+/// "http/1.1" only, because doh.zig implements the HTTP/1.1 mapping:
+/// selecting "h2" would hand the client a protocol this server cannot speak
+/// (docs/decisions/encrypted-transport.md,
+/// docs/decisions/tls-server-dependency.md).
 pub fn negotiateAlpn(offered: []const []const u8, want_doh: bool) ?[]const u8 {
     const wanted = if (want_doh) doh_alpn_http11 else dot_alpn;
     for (offered) |protocol| {

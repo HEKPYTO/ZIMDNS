@@ -4,11 +4,12 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const app_module = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    // Single source of truth for `zimdns --version`; override with -Dversion=x.y.z.
+    const version = b.option([]const u8, "version", "Version string reported by --version") orelse "0.1.0";
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", version);
+
+    const app_module = mainModule(b, target, optimize, build_options);
 
     const exe = b.addExecutable(.{
         .name = "zimdns",
@@ -23,11 +24,7 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run zimdns");
     run_step.dependOn(&run_cmd.step);
 
-    const unit_test_module = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    const unit_test_module = mainModule(b, target, optimize, build_options);
     const unit_tests = b.addTest(.{
         .root_module = unit_test_module,
     });
@@ -41,11 +38,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    golden_test_module.addImport("zimdns", b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-    }));
+    golden_test_module.addImport("zimdns", mainModule(b, target, optimize, build_options));
     const golden_tests = b.addTest(.{
         .root_module = golden_test_module,
     });
@@ -59,11 +52,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    config_test_module.addImport("zimdns", b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-    }));
+    config_test_module.addImport("zimdns", mainModule(b, target, optimize, build_options));
     const config_tests = b.addTest(.{
         .root_module = config_test_module,
     });
@@ -84,11 +73,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     fuzz_test_module.addOptions("fuzz_options", fuzz_options);
-    fuzz_test_module.addImport("zimdns", b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-    }));
+    fuzz_test_module.addImport("zimdns", mainModule(b, target, optimize, build_options));
     const fuzz_tests = b.addTest(.{
         .root_module = fuzz_test_module,
     });
@@ -102,11 +87,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    integration_test_module.addImport("zimdns", b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-    }));
+    integration_test_module.addImport("zimdns", mainModule(b, target, optimize, build_options));
     const integration_tests = b.addTest(.{
         .root_module = integration_test_module,
     });
@@ -114,4 +95,16 @@ pub fn build(b: *std.Build) void {
 
     const integration_step = b.step("test-integration", "Run loopback DNS pipeline integration tests");
     integration_step.dependOn(&run_integration_tests.step);
+}
+
+/// Every artifact above compiles `src/main.zig`, so the build options it reads
+/// are attached here once instead of at six call sites.
+fn mainModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, build_options: *std.Build.Step.Options) *std.Build.Module {
+    const module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    module.addOptions("build_options", build_options);
+    return module;
 }

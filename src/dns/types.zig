@@ -57,6 +57,7 @@ pub const RecordType = struct {
     pub const NSEC = RecordType{ .value = 47 };
     pub const DNSKEY = RecordType{ .value = 48 };
     pub const NSEC3 = RecordType{ .value = 50 };
+    pub const ZONEMD = RecordType{ .value = 63 };
     pub const NSEC3PARAM = RecordType{ .value = 51 };
 
     pub fn fromCode(value: u16) RecordType {
@@ -163,4 +164,9 @@ test "SVCB and HTTPS record types use RFC 9460 wire codes" {
     try std.testing.expectEqual(RecordType.SVCB, RecordType.fromCode(64));
     try std.testing.expectEqual(@as(u16, 65), RecordType.HTTPS.code());
     try std.testing.expectEqual(RecordType.HTTPS, RecordType.fromCode(65));
+}
+
+test "ZONEMD record type uses RFC 8976 wire code 63" {
+    try std.testing.expectEqual(@as(u16, 63), RecordType.ZONEMD.code());
+    try std.testing.expectEqual(RecordType.ZONEMD, RecordType.fromCode(63));
 }

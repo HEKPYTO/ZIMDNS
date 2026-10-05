@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 
 pub const golden_fixture = @import("golden_fixture.zig");
 pub const dns_message = @import("dns/message.zig");
@@ -29,9 +30,10 @@ pub const transfer_xfr_tls = @import("transfer/xfr_tls.zig");
 pub const blocklist = @import("blocklist.zig");
 pub const resolver = @import("resolver.zig");
 pub const qname_minimize = @import("qname_minimize.zig");
+pub const local_zone = @import("local_zone.zig");
+pub const zone_zonemd = @import("zone/zonemd.zig");
 
 const ServerRunMode = enum { none, udp_once, tcp_once, udp_loop, tcp_loop, dot_loop, doh_loop, xfr_loop };
-const version_text = "0.0.0";
 
 test {
     _ = @import("dns/reader.zig");
@@ -49,6 +51,7 @@ test {
     _ = @import("zone/journal.zig");
     _ = zone_parser;
     _ = zone_index;
+    _ = zone_zonemd;
     _ = @import("zone/transfer.zig");
     _ = @import("zone/secondary.zig");
     _ = auth_response;
@@ -67,6 +70,7 @@ test {
     _ = blocklist;
     _ = resolver;
     _ = qname_minimize;
+    _ = local_zone;
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -90,7 +94,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, command, "--version")) {
-        try stdout.print("zimdns {s}\n", .{version_text});
+        try printVersion(stdout);
         return;
     }
 
@@ -109,6 +113,17 @@ pub fn main(init: std.process.Init) !void {
     try exitUsage(stdout);
 }
 
+fn printVersion(writer: *std.Io.Writer) !void {
+    try writer.print("zimdns {s}\n", .{build_options.version});
+}
+
+test "--version prints the build version, not a placeholder" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try printVersion(&output.writer);
+    try std.testing.expectEqualStrings("zimdns " ++ build_options.version ++ "\n", output.written());
+}
+
 fn printHelp(writer: *std.Io.Writer) !void {
     try writer.writeAll(
         \\zimdns - Zig DNS server platform
@@ -124,6 +139,12 @@ fn printHelp(writer: *std.Io.Writer) !void {
         \\  zimdns server run --config examples/config.gdns --serve-udp --max-requests 2
         \\  zimdns server run --zone-file examples/zones/home.arpa.zone --serve-tcp
         \\  zimdns query @127.0.0.1 -p 1053 example.com A
+        \\  zimdns query @127.0.0.1 -p 1054 10.in-addr.arpa. SOA
+        \\
+        \\  RFC 6303/6761/7793/8375 locally served zones are on by default and
+        \\  are answered ahead of the cache and the forwarder. A configuration
+        \\  turns them off with 'local-zones off'; examples/local-zones.gdns
+        \\  is a worked configuration.
         \\
         \\  --serve-dot, --serve-doh, and --serve-xfr are accepted but always
         \\  refuse to start: this build links no TLS server, so it cannot

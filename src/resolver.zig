@@ -649,18 +649,18 @@ pub const Resolver = struct {
         const upstream = self.upstream orelse return Error.NoForwarder;
         var query_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
         if (query_bytes.len < 2 or query_bytes.len > query_buffer.len) return Error.UpstreamFailure;
-        // One socket for the whole exchange: retries reuse it and late
-        // duplicates from an earlier attempt are rejected by the per-attempt
-        // randomized query ID check below.
-        var local = switch (upstream) {
-            .ip4 => std.Io.net.IpAddress{ .ip4 = .unspecified(0) },
-            .ip6 => std.Io.net.IpAddress{ .ip6 = .unspecified(0) },
-        };
-        var socket = std.Io.net.IpAddress.bind(&local, self.io, .{ .mode = .dgram, .protocol = .udp }) catch return Error.UpstreamFailure;
-        defer socket.close(self.io);
+        // RFC 5452 §9.2: each attempt binds its own socket so the
+        // OS-assigned ephemeral source port differs per attempt, widening the
+        // Q-ID space with the per-attempt randomized ID below.
         var response_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
         var attempt: usize = 0;
         while (attempt < UDP_ATTEMPTS) : (attempt += 1) {
+            var local = switch (upstream) {
+                .ip4 => std.Io.net.IpAddress{ .ip4 = .unspecified(0) },
+                .ip6 => std.Io.net.IpAddress{ .ip6 = .unspecified(0) },
+            };
+            var socket = std.Io.net.IpAddress.bind(&local, self.io, .{ .mode = .dgram, .protocol = .udp }) catch return Error.UpstreamFailure;
+            defer socket.close(self.io);
             var randomized_id: [2]u8 = undefined;
             self.io.randomSecure(&randomized_id) catch return Error.UpstreamFailure;
             const upstream_query = try buildUpstreamQuery(query_bytes, query, &query_buffer);

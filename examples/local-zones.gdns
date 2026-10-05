@@ -1,0 +1,26 @@
+# ZIMDNS example configuration: locally served DNS zones.
+#
+# RFC 6303, RFC 6761, RFC 7793, and RFC 8375 local zones are ON by default.
+# This config states it explicitly and also configures a forwarder, so the
+# ordering is observable: a name inside a locally served zone is answered from
+# this host and is never forwarded, while any other name is forwarded.
+#
+#   zimdns query @127.0.0.1 -p 1054 10.in-addr.arpa. SOA     # RFC 6303 section 3 empty zone
+#   zimdns query @127.0.0.1 -p 1054 1.2.3.10.in-addr.arpa. PTR
+#   zimdns query @127.0.0.1 -p 1054 127.100.in-addr.arpa. PTR   # RFC 7793 shared address space
+#   zimdns query @127.0.0.1 -p 1054 x.d.f.ip6.arpa. PTR        # RFC 4193 unique local
+#   zimdns query @127.0.0.1 -p 1054 printer.home.arpa. A        # RFC 8375
+#   zimdns query @127.0.0.1 -p 1054 thing.invalid. A           # RFC 6761 section 6.4
+#   zimdns query @127.0.0.1 -p 1054 localhost. A               # RFC 6761 section 6.3
+#   zimdns query @127.0.0.1 -p 1054 www.one.example. A         # your own zone, not a local zone
+
+listen dns udp 127.0.0.1:1054
+
+zone one.example primary examples/zones/one.example.zone
+
+local-zones on
+
+# Forwarding policy covers every other name. Point it at any upstream; the
+# locally served zones are answered here regardless of what it answers.
+recursion allow 127.0.0.0/8
+forwarder 127.0.0.1:15353

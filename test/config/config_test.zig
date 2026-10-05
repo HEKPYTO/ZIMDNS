@@ -133,6 +133,48 @@ test "server context wires the strict forwarding policy into Runtime" {
     try std.testing.expect(policy.cookies.enabled());
 }
 
+test "server context keeps locally served zones on by default and honours local-zones off" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{ .sub_path = "one.zone", .data = zone_one });
+    try dir.dir.writeFile(io, .{ .sub_path = "default.gdns", .data = "zone one.example primary one.zone\n" });
+    try dir.dir.writeFile(io, .{ .sub_path = "off.gdns", .data =
+        \\zone one.example primary one.zone
+        \\local-zones off
+        \\
+    });
+
+    var implicit = try ServerContext.load(dir.dir, io, "default.gdns", std.testing.allocator);
+    defer implicit.deinit();
+    var implicit_runtime = try implicit.takeRuntime(io);
+    defer implicit_runtime.deinit();
+    try std.testing.expect(implicit_runtime.local_zones);
+
+    var off = try ServerContext.load(dir.dir, io, "off.gdns", std.testing.allocator);
+    defer off.deinit();
+    var off_runtime = try off.takeRuntime(io);
+    defer off_runtime.deinit();
+    try std.testing.expect(!off_runtime.local_zones);
+}
+
+test "the shipped local-zones example configuration loads with its zone and forwarder" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var context = try ServerContext.load(std.Io.Dir.cwd(), io, "examples/local-zones.gdns", std.testing.allocator);
+    defer context.deinit();
+    var runtime = try context.takeRuntime(io);
+    defer runtime.deinit();
+
+    // The example is operator-reachable documentation, so it is loaded through
+    // the real loader rather than duplicated as a fixture.
+    try std.testing.expect(runtime.local_zones);
+    try std.testing.expectEqual(@as(usize, 1), runtime.zones.items.len);
+    try std.testing.expectEqualStrings("one.example.", runtime.zones.items[0].originText());
+    try std.testing.expect(runtime.resolver != null);
+    try std.testing.expect(runtime.resolver.?.policy.forwarder != null);
+}
+
 test "server context maps missing referenced blocklist" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var dir = std.testing.tmpDir(.{});
@@ -142,5 +184,31 @@ test "server context maps missing referenced blocklist" {
     try std.testing.expectError(
         error.MissingReferencedFile,
         ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator),
+    );
+}
+
+test "server context rejects a referenced zone that escapes the base directory" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var root = std.testing.tmpDir(.{});
+    defer root.cleanup();
+
+    // "base-evil" is a sibling of "base" whose name starts with the base's own
+    // name, so a containment check that forgets the path-component boundary
+    // would accept a target that is not inside the base at all.
+    try root.dir.createDir(io, "base", .default_dir);
+    try root.dir.createDir(io, "base-evil", .default_dir);
+    try root.dir.writeFile(io, .{ .sub_path = "base-evil/outside.zone", .data = zone_one });
+    var outside_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const outside_len = try root.dir.realPathFile(io, "base-evil/outside.zone", &outside_buffer);
+    const outside = outside_buffer[0..outside_len];
+
+    var base = try root.dir.openDir(io, "base", .{});
+    defer base.close(io);
+    try base.symLink(io, outside, "escape.zone", .{});
+    try base.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone one.example primary escape.zone\n" });
+
+    try std.testing.expectError(
+        error.InvalidReferencedPath,
+        ServerContext.load(base, io, "config.gdns", std.testing.allocator),
     );
 }

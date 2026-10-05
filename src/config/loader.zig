@@ -11,6 +11,7 @@ const parser = @import("parser.zig");
 const zone_index = @import("../zone/index.zig");
 const zone_parser = @import("../zone/parser.zig");
 const resolver_mod = @import("../resolver.zig");
+const zonemd = @import("../zone/zonemd.zig");
 
 pub const Error = error{
     MissingReferencedFile,
@@ -18,6 +19,7 @@ pub const Error = error{
     NoPrimaryZone,
     BadConfiguration,
     ZoneNameMismatch,
+    ZonemdMismatch,
 };
 
 pub const ServerContext = struct {
@@ -57,6 +59,19 @@ pub const ServerContext = struct {
             }
             var zone = try zone_index.Zone.fromZoneFile(&zone_file);
             errdefer zone.deinit();
+            // RFC 8976 section 4: refuse to serve a zone whose apex ZONEMD
+            // record does not match the loaded data, so a corrupted or
+            // tampered zone file fails closed at startup instead of answering
+            // queries. The report names the zone and both digests.
+            var zonemd_report: [zonemd.report_max_len]u8 = undefined;
+            _ = zonemd.verify(&zone, allocator, &zonemd_report) catch {
+                const written = std.mem.indexOfScalar(u8, &zonemd_report, 0) orelse zonemd_report.len;
+                var stderr_buffer: [256]u8 = undefined;
+                var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buffer);
+                stderr_writer.interface.print("error: {s}\n", .{zonemd_report[0..written]}) catch {};
+                stderr_writer.interface.flush() catch {};
+                return Error.ZonemdMismatch;
+            };
             try context.zones.append(allocator, zone);
         }
 
@@ -75,10 +90,11 @@ pub const ServerContext = struct {
     pub fn takeRuntime(self: *ServerContext, io: std.Io) Error!auth_runtime.Runtime {
         if (self.zones.items.len == 0) return Error.NoPrimaryZone;
         const policy = resolver_mod.Policy.fromConfig(&self.config) catch return error.BadConfiguration;
-        const runtime = if (self.config.forwarder != null or self.config.recursion_allow.len != 0 or self.config.cookies.enabled)
+        var runtime = if (self.config.forwarder != null or self.config.recursion_allow.len != 0 or self.config.cookies.enabled)
             try auth_runtime.Runtime.fromZonesWithPolicyAndKeyring(self.allocator, &self.zones, self.blocklist, io, policy, &self.keyring)
         else
             auth_runtime.Runtime.fromZonesWithKeyring(self.allocator, &self.zones, self.blocklist, &self.keyring);
+        runtime.local_zones = self.config.local_zones;
         self.blocklist = .{};
         self.config = .{};
         return runtime;
@@ -107,8 +123,15 @@ fn readReferencedFile(dir: std.Io.Dir, io: std.Io, sub_path: []const u8, allocat
 
 fn ensureConfined(dir: std.Io.Dir, io: std.Io, sub_path: []const u8) !void {
     if (!isConfinedPath(sub_path)) return Error.InvalidReferencedPath;
+    // The confinement base is resolved through "." rather than Dir.realPath.
+    // Dir.realPath issues fcntl(handle, F_GETPATH) on the handle itself, and the
+    // handle of Dir.cwd() is AT_FDCWD, which fcntl rejects with EBADF; every
+    // caller that passes a cwd-relative Dir therefore failed to load at all.
+    // realPathFile opens "." to obtain a real descriptor first, then reports the
+    // same fully canonicalised base path that realPath reports for a real
+    // descriptor, so the comparison below stays byte-for-byte as strict.
     var base_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const base_len = try dir.realPath(io, &base_buffer);
+    const base_len = try dir.realPathFile(io, ".", &base_buffer);
     const base = base_buffer[0..base_len];
     var target_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const target_len = dir.realPathFile(io, sub_path, &target_buffer) catch |err| switch (err) {
@@ -287,4 +310,70 @@ test "server context canonicalizes redundant components inside the base director
     var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
     defer context.deinit();
     try std.testing.expectEqual(@as(usize, 1), context.zones.items.len);
+}
+
+/// RFC 8976 Appendix A.1 zone carrying the digest the RFC itself publishes.
+const zonemd_verified_zone_text =
+    \\$ORIGIN example.
+    \\$TTL 86400
+    \\@ IN SOA ns1 admin 2018031900 1800 900 604800 86400
+    \\@ IN NS ns1
+    \\@ IN NS ns2
+    \\@ IN ZONEMD 2018031900 1 1 (
+    \\    c68090d90a7aed71
+    \\    6bc459f9340e3d7c
+    \\    1370d4d24b7e2fc3
+    \\    a1ddc0b9a87153b9
+    \\    a9713b3c9ae5cc27
+    \\    777f98b8e730044c )
+    \\ns1 3600 IN A 203.0.113.63
+    \\ns2 3600 IN AAAA 2001:db8::63
+    \\
+;
+
+/// The same zone with every digest digit changed to zero, so the zone loads
+/// but no longer matches its ZONEMD record.
+const zonemd_zone_text =
+    \\$ORIGIN example.
+    \\$TTL 86400
+    \\@ IN SOA ns1 admin 2018031900 1800 900 604800 86400
+    \\@ IN NS ns1
+    \\@ IN NS ns2
+    \\@ IN ZONEMD 2018031900 1 1 (
+    \\    0000000000000000
+    \\    0000000000000000
+    \\    0000000000000000
+    \\    0000000000000000
+    \\    0000000000000000
+    \\    0000000000000000 )
+    \\ns1 3600 IN A 203.0.113.63
+    \\ns2 3600 IN AAAA 2001:db8::63
+    \\
+;
+
+test "server context loads a zone whose ZONEMD digest matches" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{ .sub_path = "one.zone", .data = zonemd_verified_zone_text });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone example. primary one.zone\n" });
+
+    var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 1), context.zones.items.len);
+}
+
+test "server context refuses to start on a ZONEMD digest mismatch" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{ .sub_path = "one.zone", .data = zonemd_zone_text });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone example. primary one.zone\n" });
+
+    try std.testing.expectError(
+        Error.ZonemdMismatch,
+        ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator),
+    );
 }

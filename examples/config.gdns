@@ -13,3 +13,9 @@ zone home.arpa primary examples/zones/home.arpa.zone
 # recursion allow 127.0.0.0/8
 # forwarder 127.0.0.1:5353
 # cookies validate current-secret previous-secret
+#
+# RFC 6303/6761/7793/8375 locally served zones are answered from this host by
+# default, ahead of the cache and the forwarder above. 'local-zones off' is the
+# RFC 6303 section 3 mechanism to disable them; examples/local-zones.gdns is a
+# worked configuration for them.
+# local-zones on
