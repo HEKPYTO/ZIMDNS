@@ -231,6 +231,16 @@ pub const Runtime = struct {
                     // RFC 9619 section 4: QDCOUNT > 1 is FORMERR for any
                     // OPCODE (Message.parse returns TooManyQuestions).
                     error.TooManyQuestions => return .{ .failure = .{ .code = .formerr } },
+                    // RFC 6891 section 6.1.1: a query carrying more than one
+                    // OPT RR is answered FORMERR. Section 6.1.2 requires the
+                    // OPT owner to be the root and its option framing to be
+                    // well formed, so a malformed OPT record is a format
+                    // error (RFC 1035 section 4.1.1) answered FORMERR
+                    // instead of being dropped without an answer.
+                    error.MultipleOptRecords,
+                    error.InvalidOptOwner,
+                    error.MalformedEdnsOption,
+                    => return .{ .failure = .{ .code = .formerr } },
                     error.OutOfMemory => return parse_err,
                     else => {
                         if (parseTransferFallback(allocator, packet)) |fallback| {
@@ -248,6 +258,12 @@ pub const Runtime = struct {
                 // RFC 9619 section 4: QDCOUNT > 1 is FORMERR for any OPCODE
                 // (Message.parse returns TooManyQuestions uniformly).
                 error.TooManyQuestions => return .{ .failure = .{ .code = .formerr } },
+                // RFC 6891 section 6.1.1/6.1.2: a malformed OPT record is a
+                // format error answered FORMERR rather than dropped.
+                error.MultipleOptRecords,
+                error.InvalidOptOwner,
+                error.MalformedEdnsOption,
+                => return .{ .failure = .{ .code = .formerr } },
                 error.OutOfMemory => return err,
                 else => {
                     if (parseTransferFallback(allocator, packet)) |fallback| {
@@ -1200,6 +1216,38 @@ test "runtime returns bare FORMERR for malformed ECS with a valid question" {
     const client = try std.Io.net.IpAddress.parse("127.0.0.1", 53003);
     var output: [512]u8 = undefined;
     const response_bytes = try runtime.answerFrom(&malformed_ecs_query, &output, &client);
+
+    var arena_ecs = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_ecs.deinit();
+    const parsed_ecs = try dns_message.Message.parse(arena_ecs.allocator(), response_bytes);
+    try std.testing.expect(parsed_ecs.header.qr);
+    try std.testing.expectEqual(@as(@TypeOf(parsed_ecs.header.rcode), .formerr), parsed_ecs.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), parsed_ecs.header.question_count);
+    try std.testing.expectEqual(@as(u16, 0), parsed_ecs.header.additional_count);
+    try std.testing.expect(parsed_ecs.edns == null);
+}
+
+
+test "RFC 6891: a query carrying two OPT records is answered FORMERR" {
+    var runtime = try Runtime.fromZoneText(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\
+    );
+    defer runtime.deinit();
+
+    const multiple_opts_query = [_]u8{
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
+        7,    'e',  'x',  'a',  'm',  'p',  'l',  'e',  3,    'c',  'o',  'm',
+        0,    0x00, 0x01, 0x00, 0x01, 0,    0x00, 0x29, 0x04, 0xd0, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0,    0x00, 0x29, 0x04, 0xd0, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00,
+    };
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 53113);
+    var output: [512]u8 = undefined;
+    const response_bytes = try runtime.answerFrom(&multiple_opts_query, &output, &client);
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

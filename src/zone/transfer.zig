@@ -259,6 +259,7 @@ fn baseTransferMessage(
             .opcode = request.header.opcode,
             .authoritative = true,
             .recursion_desired = request.header.recursion_desired,
+            .checking_disabled = request.header.checking_disabled,
             .recursion_available = false,
             .rcode = .no_error,
             .question_count = 1,
@@ -384,6 +385,7 @@ pub fn buildNotifyResponse(
             .opcode = .notify,
             .authoritative = true,
             .recursion_desired = request.header.recursion_desired,
+            .checking_disabled = request.header.checking_disabled,
             .recursion_available = false,
             .rcode = .no_error,
             .question_count = 1,
@@ -594,6 +596,27 @@ test "transfer chunks AXFR answers into bounded standalone frames" {
     }
     try std.testing.expectEqual(messages.len, frames);
 }
+test "transfer AXFR answers echo the query CD bit" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cd_query = axfr_query_bytes;
+    cd_query[3] |= 0x10;
+    const request = try dns_message.Message.parseQuery(arena.allocator(), &cd_query);
+    try std.testing.expect(request.header.checking_disabled);
+    var zone = try loadTransferTestZone();
+    defer zone.deinit();
+    const messages = try buildAxfrMessages(arena.allocator(), &request, &zone, 2);
+    defer {
+        for (messages) |*message| message.deinit();
+        arena.allocator().free(messages);
+    }
+    try std.testing.expect(messages.len > 0);
+    for (messages) |message| {
+        try std.testing.expect(message.header.checking_disabled);
+        try std.testing.expect(message.header.authoritative);
+        try std.testing.expect(!message.header.recursion_available);
+    }
+}
 
 test "transfer AXFR cleanup releases only initialized messages on a bad record" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -685,7 +708,7 @@ test "transfer builds NOTIFY responses that mirror the query" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const notify_query = [_]u8{
-        0x43, 0x21, 0x20, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x43, 0x21, 0x21, 0x11, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x07, 'e',  'x',  'a',  'm',  'p',  'l',  'e',  0x00, 0x00, 0x06, 0x00,
         0x01,
     };
@@ -699,6 +722,7 @@ test "transfer builds NOTIFY responses that mirror the query" {
     try std.testing.expectEqual(@as(u16, 0x4321), response.header.id);
     try std.testing.expect(response.header.authoritative);
     try std.testing.expectEqual(@as(u16, 1), response.header.question_count);
+    try std.testing.expect(response.header.checking_disabled);
 }
 
 test "transfer chains one TSIG per message through the chainedMac primitive" {

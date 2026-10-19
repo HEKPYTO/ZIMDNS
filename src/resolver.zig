@@ -372,6 +372,7 @@ const Cache = struct {
             message.header.recursion_available = true;
             message.header.checking_disabled = query.header.checking_disabled;
             message.question = query.question;
+            stripProofsForClient(&message, query);
             if (query.edns != null) try appendOpt(&message, query.edns.?);
             if (!fresh) try appendEde(&message, if (entry.nxdomain) EDE_STALE_NXDOMAIN else EDE_STALE_ANSWER);
             var writer = dns_writer.Writer.init(output);
@@ -565,7 +566,15 @@ pub const Resolver = struct {
             }
         }
         self.cache.put(key, &response, now) catch {};
+        // RFC 8198 section 3: the NSEC proofs in the upstream answer feed the
+        // aggressive cache, so a later denial query is answered without an
+        // upstream round trip. The harvest runs before the client copy is
+        // stripped, so it still sees the full proofs.
         self.harvestNsecProofs(response, now);
+        // RFC 3225 section 3: a query with the DO bit clear must not be answered
+        // with DNSSEC security RRs. The cached copy keeps them, so the removal
+        // happens on the way out only.
+        stripProofsForClient(&response, query);
         if (query.edns) |edns| try appendOpt(&response, edns);
         // DNSSEC presence signals (RFC 8914 6-10) ride along as informational
         // EDE on a relayed response this server did NOT validate. Once the
@@ -812,8 +821,14 @@ fn buildUpstreamQuery(
         .authorities = try dns_message.RecordSection.init(query.allocator, 0),
         .additionals = try dns_message.RecordSection.init(query.allocator, 0),
     };
-    errdefer sanitized.deinit();
-    try appendOpt(&sanitized, query.edns.?);
+    // RFC 3225 section 3: a DNSSEC-aware server sets the DO bit on its
+    // recursive requests regardless of the query's own DO bit, so the
+    // response carries the records this server validates and feeds (RFC 8198)
+    // proofs from. A client that did not ask for them gets them stripped on
+    // the way out instead.
+    var upstream_edns = query.edns.?;
+    upstream_edns.dnssec_ok = true;
+    try appendOpt(&sanitized, upstream_edns);
     appendKeyTags(&sanitized, query, anchors);
     var writer = dns_writer.Writer.init(output);
     sanitized.encode(&writer) catch return Error.UpstreamFailure;
@@ -948,6 +963,15 @@ test "upstream TCP connector rejects an unbounded timeout" {
     }));
 }
 
+/// RFC 3225 section 3: a query with the DO bit clear must not be answered
+/// with DNSSEC security RRs. The cached copy keeps them, so the removal
+/// happens on the way out only.
+fn stripProofsForClient(message: *dns_message.Message, query: dns_message.Message) void {
+    const dnssec_ok = if (query.edns) |edns| edns.dnssec_ok else false;
+    if (dnssec_ok) return;
+    const q = query.question orelse return;
+    dnssec.stripProofRecords(message, q.qtype);
+}
 fn wantsDnssecProofs(query: dns_message.Message) bool {
     if (query.header.checking_disabled) return false;
     const edns = query.edns orelse return false;
@@ -1436,6 +1460,74 @@ test "buildUpstreamQuery strips client EDNS options but preserves payload size a
     try std.testing.expect(findOption(upstream, dns_rdata.EDNS_ECS_OPTION_CODE) == null);
     try std.testing.expect(findOption(upstream, COOKIE_OPTION_CODE) == null);
     try std.testing.expect(findOption(upstream, 65000) == null);
+}
+
+test "RFC 3225: buildUpstreamQuery sets DO=1 when the client cleared DO" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var query = try makeTestQuery(arena.allocator(), 0x2710, "example.com.", true);
+    defer query.deinit();
+    query.edns.?.dnssec_ok = false;
+    query.edns.?.udp_payload_size = 1200;
+    query.additionals.items[0].class = dns_types.Class.fromCode(1200);
+    query.additionals.items[0].ttl = 0;
+
+    var output: [512]u8 = undefined;
+    const encoded = try buildUpstreamQuery(&.{ 0xde, 0xad }, query, &output, &.{});
+
+    var parsed_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer parsed_arena.deinit();
+    const upstream = try dns_message.Message.parse(parsed_arena.allocator(), encoded);
+    try std.testing.expect(upstream.edns.?.dnssec_ok);
+}
+
+test "RFC 3225: stripProofsForClient drops RRSIG unless the query named it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var message = try makeTestQuery(arena.allocator(), 0x2711, "example.com.", true);
+    defer message.deinit();
+    message.answers.append(.{
+        .owner = try dns_name.Name.fromText("example.com."),
+        .rrtype = .A,
+        .class = .IN,
+        .ttl = 60,
+        .rdata = .{ .A = .{ 192, 0, 2, 7 } },
+    }) catch unreachable;
+    var rrsig_rdata = dns_rdata.Unknown{};
+    rrsig_rdata.len = 1;
+    rrsig_rdata.data[0] = 0;
+    message.answers.append(.{
+        .owner = try dns_name.Name.fromText("example.com."),
+        .rrtype = .{ .value = 46 },
+        .class = .IN,
+        .ttl = 60,
+        .rdata = .{ .Unknown = rrsig_rdata },
+    }) catch unreachable;
+    message.header.answer_count = @intCast(message.answers.len);
+
+    var query = try makeTestQuery(arena.allocator(), 0x2712, "example.com.", false);
+    defer query.deinit();
+    stripProofsForClient(&message, query);
+    try std.testing.expectEqual(@as(u16, 1), message.header.answer_count);
+
+    // Explicit RRSIG query keeps the proof record.
+    var rrsig_query = try makeTestQuery(arena.allocator(), 0x2713, "example.com.", false);
+    defer rrsig_query.deinit();
+    rrsig_query.question.?.qtype.value = 46;
+    var message2 = try makeTestQuery(arena.allocator(), 0x2714, "example.com.", true);
+    defer message2.deinit();
+    message2.answers.append(.{
+        .owner = try dns_name.Name.fromText("example.com."),
+        .rrtype = .{ .value = 46 },
+        .class = .IN,
+        .ttl = 60,
+        .rdata = .{ .Unknown = rrsig_rdata },
+    }) catch unreachable;
+    message2.header.answer_count = @intCast(message2.answers.len);
+    stripProofsForClient(&message2, rrsig_query);
+    try std.testing.expectEqual(@as(u16, 1), message2.header.answer_count);
 }
 
 test "RFC 8145: an upstream DNSKEY query carries the anchors' key tags and nothing else does" {

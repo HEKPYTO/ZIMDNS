@@ -223,6 +223,24 @@ pub const ZoneFile = struct {
 
         try self.records.append(allocator, record);
 
+        // RFC 2181 section 5.2: all RRs in an RRSet share one TTL, so
+        // same-owner, same-type records normalize to the lowest TTL listed.
+        // RRSIG records are exempt (RFC 4034 section 2.3: an RRSIG's TTL is
+        // the TTL of the RRSet it covers).
+        if (!record.rrtype.eql(.RRSIG)) {
+            var lowest = record.ttl;
+            for (self.records.items[0..self.records.len]) |existing| {
+                if (!std.ascii.eqlIgnoreCase(existing.ownerText(), record.ownerText())) continue;
+                if (!existing.rrtype.eql(record.rrtype)) continue;
+                lowest = @min(lowest, existing.ttl);
+            }
+            for (self.records.items[0..self.records.len]) |*existing| {
+                if (!std.ascii.eqlIgnoreCase(existing.ownerText(), record.ownerText())) continue;
+                if (!existing.rrtype.eql(record.rrtype)) continue;
+                existing.ttl = lowest;
+            }
+        }
+
         if (record.rrtype.eql(.NS) and std.ascii.eqlIgnoreCase(record.ownerText(), self.originText())) saw_apex_ns.* = true;
     }
 
@@ -1607,6 +1625,66 @@ test "zone parser loads origin ttl and basic records" {
     try std.testing.expect(zone.records.items[0].rrtype.eql(.SOA));
     try std.testing.expectEqualStrings("dns.home.arpa.", zone.records.items[3].ownerText());
     try std.testing.expectEqual(@as(u32, 300), zone.records.items[3].ttl);
+}
+
+test "zone parser serves one RRSet at its lowest TTL (RFC 2181 section 5.2)" {
+    // RFC 2181 section 5.2: the TTLs of all RRs in an RRSet must be the same,
+    // and in no case may a server send an RRSet with TTLs not all equal. The
+    // zone gives one A RRSet two TTLs, so the RRSet is served at the lowest of
+    // them, the value a client is told to assume.
+    var zone = try ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns hostmaster 1 3600 900 1209600 300
+        \\@ IN NS ns
+        \\ns IN A 192.0.2.1
+        \\www 300 IN A 192.0.2.2
+        \\www 600 IN A 192.0.2.3
+        \\www 900 IN AAAA 2001:db8::1
+        \\
+    );
+    defer zone.deinit();
+
+    var a_records: usize = 0;
+    var aaaa_records: usize = 0;
+    for (zone.records.items) |record| {
+        if (!std.mem.eql(u8, record.ownerText(), "www.example.")) continue;
+        if (record.rrtype.eql(.A)) {
+            try std.testing.expectEqual(@as(u32, 300), record.ttl);
+            a_records += 1;
+        }
+        if (record.rrtype.eql(.AAAA)) {
+            try std.testing.expectEqual(@as(u32, 900), record.ttl);
+            aaaa_records += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), a_records);
+    try std.testing.expectEqual(@as(usize, 1), aaaa_records);
+}
+
+test "zone parser gives an RRSIG the TTL of the RRSet it covers (RFC 4034 section 2.3)" {
+    // RFC 4034 section 2.3: the TTL value of an RRSIG RR must match the TTL
+    // value of the RRSet it covers, and that exemption is what lets RRSIGs at
+    // one owner carry different TTLs.
+    var zone = try ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns hostmaster 1 3600 900 1209600 300
+        \\@ IN NS ns
+        \\www 300 IN A 192.0.2.2
+        \\www 600 IN A 192.0.2.3
+        \\www 300 IN RRSIG A 8 2 300 2000000000 1000000000 1234 example. QUJD
+        \\
+    );
+    defer zone.deinit();
+
+    var rrsig_records: usize = 0;
+    for (zone.records.items) |record| {
+        if (!record.rrtype.eql(.RRSIG)) continue;
+        try std.testing.expectEqual(@as(u32, 300), record.ttl);
+        rrsig_records += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), rrsig_records);
 }
 
 test "zone parser rejects missing SOA or missing apex NS" {

@@ -165,6 +165,7 @@ pub fn build(request: dns_message.Message, zone: Zone) !dns_message.Message {
             .authoritative = true,
             .recursion_desired = request.header.recursion_desired,
             .recursion_available = false,
+            .checking_disabled = request.header.checking_disabled,
             .rcode = .no_error,
             .question_count = 1,
         },

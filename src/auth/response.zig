@@ -13,6 +13,7 @@ const zone_parser = @import("../zone/parser.zig");
 const zone_index = @import("../zone/index.zig");
 const zone_signer = @import("../zone/signer.zig");
 const dns_validate = @import("../dns/validate.zig");
+const dns_dnssec = @import("../dns/dnssec.zig");
 
 pub const CLASSIC_UDP_MESSAGE_SIZE: usize = 512;
 pub const DEFAULT_EDNS_UDP_PAYLOAD_SIZE: u16 = 1232;
@@ -167,6 +168,9 @@ pub fn buildResponseWithEdns(request: dns_message.Message, zone: *const zone_ind
             .authoritative = lookup.kind != .not_authoritative and lookup.kind != .referral and lookup.kind != .servfail,
             .recursion_desired = request.header.recursion_desired,
             .recursion_available = false,
+            // RFC 4035 section 3.2: the CD bit of the query is copied into
+            // the response.
+            .checking_disabled = request.header.checking_disabled,
             .rcode = switch (lookup.kind) {
                 .nxdomain => .nxdomain,
                 .yxdomain => .yxdomain,
@@ -256,7 +260,7 @@ pub fn buildResponseWithEdns(request: dns_message.Message, zone: *const zone_ind
             appendDenialProofs(&response, zone, qname_text, q.qtype) catch {};
         }
     } else {
-        stripProofRecords(&response, q.qtype);
+        dns_dnssec.stripProofRecords(&response, q.qtype);
     }
 
     try setHeaderCounts(&response);
@@ -378,27 +382,8 @@ fn appendDenialProofs(response: *dns_message.Message, zone: *const zone_index.Zo
         attached += 1;
     }
 }
-
-/// Drop proof RRsets (RRSIG/NSEC/NSEC3/NSEC3PARAM) from every section unless
-/// the QTYPE named them explicitly. DNSKEY/DS answers are ordinary data and
-/// are always kept.
-fn stripProofRecords(response: *dns_message.Message, qtype: dns_types.RecordType) void {
-    stripProofSection(&response.answers, qtype);
-    stripProofSection(&response.authorities, qtype);
-    stripProofSection(&response.additionals, qtype);
-}
-
-fn stripProofSection(section: *dns_message.RecordSection, qtype: dns_types.RecordType) void {
-    var write_index: usize = 0;
-    var read_index: usize = 0;
-    while (read_index < section.len) : (read_index += 1) {
-        const record = section.items[read_index];
-        if (!@import("../dns/dnssec.zig").shouldInclude(record.rrtype, qtype, false)) continue;
-        section.items[write_index] = record;
-        write_index += 1;
-    }
-    section.len = write_index;
-}
+// The proof-record strip moved to src/dns/dnssec.zig (RFC 3225/RFC 3597);
+// the authoritative path calls dns_dnssec.stripProofRecords below.
 
 pub fn buildRefusedResponse(request: dns_message.Message) !dns_message.Message {
     const q = request.question orelse return Error.MissingQuestion;
@@ -429,8 +414,9 @@ fn buildEmptyResponse(request: dns_message.Message, q: ?question.Question, rcode
             .opcode = request.header.opcode,
             .recursion_desired = request.header.recursion_desired,
             .recursion_available = false,
-            .rcode = rcode,
+            .checking_disabled = request.header.checking_disabled,
             .question_count = if (q == null) 0 else 1,
+            .rcode = rcode,
         },
         .question = q,
         .answers = try dns_message.RecordSection.init(request.allocator, 0),
@@ -463,6 +449,7 @@ pub fn buildBadVersionResponse(request: dns_message.Message, q: question.Questio
             .qr = true,
             .recursion_desired = request.header.recursion_desired,
             .recursion_available = false,
+            .checking_disabled = request.header.checking_disabled,
             .rcode = .no_error,
             .question_count = 1,
         },
@@ -1617,4 +1604,49 @@ test "an authoritative answer to a signed and valid zone never sets AD" {
     // a file on local disk, so AD stays clear.
     try std.testing.expect(!answer.header.authenticated_data);
     try std.testing.expect(!query.header.authenticated_data);
+}
+
+// RFC 4035 section 3.2: the CD bit of the query is copied into the response.
+test "the CD bit is copied from the query into the authoritative response" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 3600
+        \\@ IN NS ns.example.
+        \\www IN A 192.0.2.2
+        \\
+    );
+    defer zone_file.deinit();
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    // A query received on the wire with CD set (flags 0x0110: RD and CD).
+    const cd_query = try dns_message.Message.parseQuery(arena.allocator(), &.{
+        0x12, 0x34, 0x01, 0x10, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        3,    'w',  'w',  'w',  7,    'e',  'x',  'a',  'm',  'p',  'l',  'e',
+        0,    0x00, 0x01, 0x00, 0x01,
+    });
+    try std.testing.expect(cd_query.header.checking_disabled);
+
+    const cd_answer = try buildResponse(cd_query, &zone);
+    try std.testing.expect(cd_answer.header.checking_disabled);
+
+    var encoded: [512]u8 = undefined;
+    var writer = @import("../dns/writer.zig").Writer.init(&encoded);
+    try cd_answer.encode(&writer);
+    const round_trip = try dns_message.Message.parse(arena.allocator(), writer.written());
+    try std.testing.expect(round_trip.header.checking_disabled);
+
+    // The error answers carry it too.
+    try std.testing.expect((try buildFormerrResponse(cd_query)).header.checking_disabled);
+    try std.testing.expect((try buildRefusedResponse(cd_query)).header.checking_disabled);
+
+    // A query without CD keeps it clear.
+    const plain_query = try testQuery(arena.allocator(), "www.example.", .A);
+    const plain_answer = try buildResponse(plain_query, &zone);
+    try std.testing.expect(!plain_answer.header.checking_disabled);
+    try std.testing.expect(!(try buildFormerrResponse(plain_query)).header.checking_disabled);
 }

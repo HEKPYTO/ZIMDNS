@@ -17,6 +17,7 @@
 const std = @import("std");
 const RecordType = @import("types.zig").RecordType;
 const Name = @import("name.zig").Name;
+const dns_message = @import("message.zig");
 
 pub const EDE_DNSSEC_BOGUS: u16 = 6;
 pub const EDE_SIGNATURE_EXPIRED: u16 = 7;
@@ -75,6 +76,31 @@ pub fn shouldInclude(rrtype: RecordType, qtype: RecordType, dnssec_ok: bool) boo
         code != RecordType.NSEC.code() and
         code != RecordType.NSEC3.code() and
         code != RecordType.NSEC3PARAM.code();
+}
+/// Drop proof RRsets (RRSIG/NSEC/NSEC3/NSEC3PARAM) from every section unless
+/// the QTYPE named them explicitly, updating the section counts. DNSKEY/DS
+/// answers are ordinary data and are always kept. Shared by the authoritative
+/// builder (RFC 3597) and the validating forwarder (RFC 3225 section 3): a
+/// query with the DO bit clear must not be answered with security RRs.
+pub fn stripProofRecords(message: *dns_message.Message, qtype: RecordType) void {
+    stripProofSection(&message.answers, qtype);
+    stripProofSection(&message.authorities, qtype);
+    stripProofSection(&message.additionals, qtype);
+    message.header.answer_count = @intCast(message.answers.len);
+    message.header.authority_count = @intCast(message.authorities.len);
+    message.header.additional_count = @intCast(message.additionals.len);
+}
+
+fn stripProofSection(section: *dns_message.RecordSection, qtype: RecordType) void {
+    var write_index: usize = 0;
+    var read_index: usize = 0;
+    while (read_index < section.len) : (read_index += 1) {
+        const record = section.items[read_index];
+        if (!shouldInclude(record.rrtype, qtype, false)) continue;
+        section.items[write_index] = record;
+        write_index += 1;
+    }
+    section.len = write_index;
 }
 
 pub const RrsigTimeStatus = enum {

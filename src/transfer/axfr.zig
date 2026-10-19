@@ -51,6 +51,7 @@ fn transferShell(allocator: std.mem.Allocator, query: dns_message.Message) !dns_
             .qr = true,
             .authoritative = true,
             .recursion_desired = query.header.recursion_desired,
+            .checking_disabled = query.header.checking_disabled,
             .rcode = .no_error,
             .question_count = 1,
         },
