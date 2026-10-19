@@ -9,6 +9,10 @@ const dns_rdata = @import("../dns/rdata.zig");
 /// Maximum temporary parser-owned backing used while loading one zone.
 pub const max_zone_allocation_bytes: usize = 16 * 1024 * 1024;
 
+/// RFC 2181 section 8: a TTL is an unsigned value of at most 2^31-1, so a
+/// larger value has no legal wire encoding and is refused.
+const max_ttl: u32 = 0x7fff_ffff;
+
 pub const Error = error{
     MissingOrigin,
     MissingTtl,
@@ -172,7 +176,9 @@ pub const ZoneFile = struct {
         if (std.mem.eql(u8, first, "$TTL")) {
             const ttl_text = tokens.next() orelse return Error.BadDirective;
             if (tokens.next() != null) return Error.BadDirective;
-            self.default_ttl = std.fmt.parseInt(u32, ttl_text, 10) catch return Error.BadTtl;
+            const parsed_default_ttl = std.fmt.parseInt(u32, ttl_text, 10) catch return Error.BadTtl;
+            if (parsed_default_ttl > max_ttl) return Error.BadTtl;
+            self.default_ttl = parsed_default_ttl;
             return;
         }
 
@@ -185,6 +191,7 @@ pub const ZoneFile = struct {
 
         var token = tokens.next() orelse return Error.BadRecord;
         if (parseOptionalTtl(token)) |parsed_ttl| {
+            if (parsed_ttl > max_ttl) return Error.BadTtl;
             ttl = parsed_ttl;
             token = tokens.next() orelse return Error.BadRecord;
         }

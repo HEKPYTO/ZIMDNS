@@ -150,6 +150,27 @@ pub const ServerContext = struct {
             decodeNsid(self.allocator, text) catch return error.BadConfiguration
         else
             null;
+        // Per-zone override apexes outlive the config text: lowercased with a
+        // trailing dot, owned by the runtime. Decoded before the runtime
+        // exists, so a failure here leaves the context whole.
+        var except_owned = if (self.config.local_zones_except.len != 0)
+            blk: {
+                const list = self.allocator.alloc([]const u8, self.config.local_zones_except.len) catch return error.BadConfiguration;
+                errdefer self.allocator.free(list);
+                for (self.config.local_zones_except.items[0..self.config.local_zones_except.len], 0..) |slot, i| {
+                    list[i] = lowerDot(self.allocator, slot.text()) catch {
+                        for (list[0..i]) |done| self.allocator.free(done);
+                        return error.BadConfiguration;
+                    };
+                }
+                break :blk list;
+            }
+        else
+            null;
+        errdefer if (except_owned) |l| {
+            for (l) |apex| self.allocator.free(apex);
+            self.allocator.free(l);
+        };
         var policy = resolver_mod.Policy.fromConfig(&self.config) catch return error.BadConfiguration;
         // The anchors move into the policy the resolver keeps, so exactly one
         // owner frees them and no reload path exists to double-free.
@@ -160,20 +181,9 @@ pub const ServerContext = struct {
         else
             auth_runtime.Runtime.fromZonesWithKeyring(self.allocator, &self.zones, self.blocklist, &self.keyring);
         runtime.local_zones = self.config.local_zones;
-        // Per-zone override apexes outlive the config text: lowercased with a
-        // trailing dot, owned by the runtime. Decoded before anything moves
-        // out, so a failure here leaves the context whole.
-        if (self.config.local_zones_except.len != 0) {
-            const list = self.allocator.alloc([]const u8, self.config.local_zones_except.len) catch return error.BadConfiguration;
-            errdefer self.allocator.free(list);
-            for (self.config.local_zones_except.items[0..self.config.local_zones_except.len], 0..) |slot, i| {
-                list[i] = lowerDot(self.allocator, slot.text()) catch {
-                    for (list[0..i]) |done| self.allocator.free(done);
-                    self.allocator.free(list);
-                    return error.BadConfiguration;
-                };
-            }
-            runtime.local_zones_except = list;
+        if (except_owned) |l| {
+            runtime.local_zones_except = l;
+            except_owned = null;
         }
         runtime.edns.nsid = nsid;
         runtime.edns.zoneversion = self.config.zoneversion;

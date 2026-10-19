@@ -37,7 +37,8 @@ pub const ResourceRecord = struct {
         var reader = Reader.init(message[owner_result.next_offset..]);
         const rrtype_code = reader.readU16() catch return Error.EndOfInput;
         const class_code = reader.readU16() catch return Error.EndOfInput;
-        const ttl = reader.readU32() catch return Error.EndOfInput;
+        const raw_ttl = reader.readU32() catch return Error.EndOfInput;
+        const ttl = normalizeTtl(rrtype_code, raw_ttl);
         const rdlength = reader.readU16() catch return Error.EndOfInput;
 
         const rdata_offset = owner_result.next_offset + reader.position();
@@ -86,6 +87,13 @@ pub const ResourceRecord = struct {
         try writer.patchU16(length_offset, @intCast(writer.len() - rdata_start));
     }
 };
+/// RFC 2181 section 8: a TTL is an unsigned value of at most 2^31-1, so a
+/// received TTL with the sign bit set counts as the whole value zero. The OPT
+/// pseudo-record carries EDNS metadata in its TTL field, not a TTL.
+fn normalizeTtl(rrtype_code: u16, ttl: u32) u32 {
+    if (rrtype_code == RecordType.OPT.code()) return ttl;
+    return if (ttl & 0x8000_0000 != 0) 0 else ttl;
+}
 
 test "resource record parses and encodes A answer" {
     const bytes = [_]u8{
@@ -119,4 +127,35 @@ test "resource record parses compressed owner and compressed RDATA name" {
     var target_text: [64]u8 = undefined;
     try std.testing.expectEqualStrings("www.example.com.", try parsed.record.owner.toText(&owner_text));
     try std.testing.expectEqualStrings("example.com.", try parsed.record.rdata.CNAME.toText(&target_text));
+}
+
+test "received TTL with the sign bit set counts as zero" {
+    // RFC 2181 section 8: a TTL is an unsigned value of at most 2^31-1, and a
+    // received value with the sign bit set is treated as if the whole value
+    // received was zero.
+    const sign_bit = [_]u8{
+        7,    'e',  'x',  'a',  'm',  'p',  'l',  'e',  3,    'c',  'o', 'm', 0,
+        0x00, 0x01, 0x00, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x04, 192, 0,   2,
+        1,
+    };
+    const parsed = try ResourceRecord.parse(&sign_bit, 0);
+    try std.testing.expectEqual(@as(u32, 0), parsed.record.ttl);
+
+    const maximum = [_]u8{
+        7,    'e',  'x',  'a',  'm',  'p',  'l',  'e',  3,    'c',  'o', 'm', 0,
+        0x00, 0x01, 0x00, 0x01, 0x7f, 0xff, 0xff, 0xff, 0x00, 0x04, 192, 0,   2,
+        1,
+    };
+    const parsed_maximum = try ResourceRecord.parse(&maximum, 0);
+    try std.testing.expectEqual(@as(u32, 0x7fff_ffff), parsed_maximum.record.ttl);
+}
+
+test "OPT record keeps its EDNS TTL field" {
+    // The OPT pseudo-record's TTL field carries the extended RCODE, version,
+    // and flags, so RFC 2181 section 8 does not apply to it.
+    const bytes = [_]u8{
+        0, 0x00, 0x29, 0x04, 0xd0, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+    };
+    const parsed = try ResourceRecord.parse(&bytes, 0);
+    try std.testing.expectEqual(@as(u32, 0x8000_0000), parsed.record.ttl);
 }

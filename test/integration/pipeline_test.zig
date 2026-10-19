@@ -153,6 +153,81 @@ test "TCP request pipeline answers A query and records metrics" {
     try expectMetrics(counters);
 }
 
+// RFC 7766 section 8 and RFC 6891 section 4.3: an answer that does not fit
+// the negotiated datagram payload is truncated with TC=1 so the client
+// retries over TCP, where the same answer arrives whole.
+test "oversized answer is truncated over UDP and served whole over TCP" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // A round-robin A RRset whose wire form is well past the 1232-octet
+    // EDNS payload cap, so one zone exercises both transports.
+    var zone_text: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer zone_text.deinit();
+    try zone_text.writer.writeAll(
+        "$ORIGIN example.\n" ++
+        "$TTL 3600\n" ++
+        "@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300\n" ++
+        "@ IN NS ns.example.\n",
+    );
+    var address_index: usize = 1;
+    while (address_index <= 100) : (address_index += 1) {
+        try zone_text.writer.print("many IN A 192.0.2.{d}\n", .{address_index});
+    }
+    var runtime = try Runtime.fromZoneText(zone_text.written());
+    defer runtime.deinit();
+
+    var query_buffer: [512]u8 = undefined;
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4a58, "many.example.", .A, true);
+
+    // The datagram answer does not fit 1232 octets, so the server truncates
+    // it and sets TC for the client to retry over TCP.
+    var server_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server_socket = try std.Io.net.IpAddress.bind(&server_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer server_socket.close(io);
+    var client_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var client_socket = try std.Io.net.IpAddress.bind(&client_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer client_socket.close(io);
+
+    try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, query);
+    try listener.serveUdpOnce(&server_socket, io, &runtime);
+
+    var datagram_buffer: [4096]u8 = undefined;
+    const datagram = try client_socket.receiveTimeout(io, &datagram_buffer, TestTimeout);
+    const datagram_response = try dns_message.Message.parse(arena.allocator(), datagram.data);
+    try std.testing.expect(datagram.data.len <= 1232);
+    try std.testing.expect(datagram_response.header.truncated);
+    try std.testing.expectEqual(@as(u16, 0), datagram_response.header.answer_count);
+    try std.testing.expect(datagram_response.edns != null);
+
+    // The same query over TCP gets the whole answer, untruncated.
+    var listen_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try std.Io.net.IpAddress.listen(&listen_addr, io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    var client_stream = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer client_stream.close(io);
+    const server_stream = try server.accept(io);
+    defer server_stream.close(io);
+
+    try cli_query.sendTcpQuery(client_stream, io, query);
+    try client_stream.shutdown(io, .send);
+    try listener.serveTcpStreamOnce(server_stream, io, &runtime);
+
+    var response_read_buffer: [4096]u8 = undefined;
+    var response_reader = client_stream.reader(io, &response_read_buffer);
+    const response_len_bytes = try response_reader.interface.takeArray(2);
+    const response_len = std.mem.readInt(u16, response_len_bytes, .big);
+    const response_bytes = try response_reader.interface.take(response_len);
+    const response = try dns_message.Message.parse(arena.allocator(), response_bytes);
+
+    try std.testing.expect(response_len > 1232);
+    try std.testing.expect(!response.header.truncated);
+    try std.testing.expectEqual(@as(u16, 100), response.header.answer_count);
+    try std.testing.expectEqualSlices(u8, &.{ 192, 0, 2, 1 }, &response.answers.items[0].rdata.A);
+    try std.testing.expectEqualSlices(u8, &.{ 192, 0, 2, 100 }, &response.answers.items[99].rdata.A);
+}
+
 test "UDP request pipeline answers SSHFP query" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
