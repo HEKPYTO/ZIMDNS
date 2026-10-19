@@ -27,6 +27,17 @@ pub const TCP_DEADLINES_SUPPORTED = switch (builtin.os.tag) {
     else => false,
 };
 
+/// The EDNS(0) options a query asks for.
+pub const EdnsRequest = struct {
+    /// RFC 6891 section 6.1.1 DO bit: the server returns its RRSIG and NSEC
+    /// records. Without it the server strips them, so an operator could never
+    /// ask for the proofs this server signs.
+    dnssec_ok: bool = false,
+    /// RFC 9660 section 3.1: an empty ZONEVERSION option asks an
+    /// authoritative server for the version of the zone it answered from.
+    zoneversion: bool = false,
+};
+
 /// Builds the query packet. `dnssec_ok` sets the RFC 6891 section 6.1.1 DO
 /// bit: one OPT pseudo-record in the additional section whose CLASS carries
 /// the requestor's UDP payload size and whose TTL carries DO, version, and
@@ -39,14 +50,29 @@ pub fn buildQueryPacket(
     qtype: dns_types.RecordType,
     dnssec_ok: bool,
 ) ![]const u8 {
+    return buildQueryPacketWithEdns(buffer, id, name_text, qtype, .{ .dnssec_ok = dnssec_ok });
+}
+
+/// The same packet, with the EDNS(0) options the operator asked for. The OPT
+/// pseudo-record carries them: CLASS is the requestor's UDP payload size,
+/// TTL carries extended RCODE, version, and DO, and RDLENGTH covers the
+/// RFC 6891 section 6.1.2 option framing that follows.
+pub fn buildQueryPacketWithEdns(
+    buffer: []u8,
+    id: u16,
+    name_text: []const u8,
+    qtype: dns_types.RecordType,
+    edns: EdnsRequest,
+) ![]const u8 {
     var writer = dns_writer.Writer.init(buffer);
     const qname = dns_name.Name.fromText(name_text) catch return Error.BadName;
+    const want_opt = edns.dnssec_ok or edns.zoneversion;
     const message = dns_message.Message{
         .header = dns_header.Header{
             .id = id,
             .recursion_desired = true,
             .question_count = 1,
-            .additional_count = @intFromBool(dnssec_ok),
+            .additional_count = @intFromBool(want_opt),
         },
         .question = dns_question.Question{
             .name = qname,
@@ -55,29 +81,43 @@ pub fn buildQueryPacket(
         },
     };
     try message.encode(&writer);
-    if (dnssec_ok) {
+    if (want_opt) {
+        var options: [4]u8 = undefined;
+        var options_len: usize = 0;
+        if (edns.zoneversion) {
+            // RFC 9660 section 3.1: the query's ZONEVERSION option is empty,
+            // and a query carries it at most once.
+            std.mem.writeInt(u16, options[0..2], dns_rdata.EDNS_ZONEVERSION_OPTION_CODE, .big);
+            std.mem.writeInt(u16, options[2..4], 0, .big);
+            options_len = 4;
+        }
         // owner is root, type OPT, CLASS is the payload size, TTL carries
-        // extended RCODE (high byte), version, and DO (0x8000); RDLENGTH 0.
+        // extended RCODE (high byte), version, and DO (0x8000).
         try writer.writeU8(0);
         try writer.writeU16(dns_types.RecordType.OPT.code());
         try writer.writeU16(dns_message.DEFAULT_EDNS_UDP_PAYLOAD_SIZE);
-        try writer.writeU32(0x8000);
-        try writer.writeU16(0);
+        try writer.writeU32(if (edns.dnssec_ok) 0x8000 else 0);
+        try writer.writeU16(@intCast(options_len));
+        try writer.writeBytes(options[0..options_len]);
     }
     return writer.written();
 }
 
 pub fn writeResponse(response: dns_message.Message, writer: *std.Io.Writer) !void {
+    // RFC 6891 section 6.1.3: the OPT record is an EDNS(0) pseudo-record with
+    // its own presentation, so it gets a pseudosection instead of being shown
+    // as an RRset (which is why writeSection skips it).
+    try writeOptPseudoSection(response, writer);
+
     // Proof and glue records are rendered by the same per-type renderer the
     // answer section uses, so one format covers every record in a response.
-
     if (response.answers.len == 0) {
         if (response.header.rcode != .no_error) {
             try writer.writeAll("rcode ");
             try writer.writeAll(rcodeName(response.header.rcode));
             try writer.writeAll("\n");
         }
-        if (response.authorities.len == 0 and response.additionals.len == 0) {
+        if (response.authorities.len == 0 and !hasRecordAdditionals(response)) {
             try writer.writeAll("no answers\n");
             return;
         }
@@ -92,6 +132,123 @@ pub fn writeResponse(response: dns_message.Message, writer: *std.Io.Writer) !voi
     // record a DO=1 client asked for.
     try writeSection(writer, "AUTHORITY", response.authorities.slice());
     try writeSection(writer, "ADDITIONAL", response.additionals.slice());
+}
+/// Render the response's EDNS(0) pseudo-record as a separate pseudosection.
+/// RFC 6891 section 6.1.3 makes OPT a pseudo-record, so printing it as an
+/// ordinary RR would show a meaningless TYPE41 with no owner name.
+fn writeOptPseudoSection(response: dns_message.Message, writer: *std.Io.Writer) !void {
+    const edns = response.edns orelse return;
+    try writer.writeAll(";; OPT PSEUDOSECTION:\n");
+    try writer.print("; EDNS: version: {d}, flags:{s} udp: {d}", .{
+        edns.version,
+        if (edns.dnssec_ok) "do" else "",
+        edns.udp_payload_size,
+    });
+    if (edns.extended_rcode != 0) {
+        try writer.print(", ext-rcode: {d}", .{edns.extended_rcode});
+    }
+    try writer.writeAll("\n");
+    const options = optOptions(response) orelse return;
+    var offset: usize = 0;
+    while (offset + 4 <= options.len) {
+        const code = std.mem.readInt(u16, options[offset..][0..2], .big);
+        const length = std.mem.readInt(u16, options[offset + 2 ..][0..2], .big);
+        offset += 4;
+        if (length > options.len - offset) break;
+        try writeEdnsOption(code, options[offset..][0..length], response.question, writer);
+        offset += length;
+    }
+}
+
+fn optOptions(response: dns_message.Message) ?[]const u8 {
+    for (response.additionals.slice()) |record| {
+        if (!record.rrtype.eql(.OPT)) continue;
+        return switch (record.rdata) {
+            .OPT => |opt| opt.bytes(),
+            else => unreachable,
+        };
+    }
+    return null;
+}
+
+/// The OPT pseudo-record does not count as an RRset, so the answerless path
+/// ignores it.
+fn hasRecordAdditionals(response: dns_message.Message) bool {
+    for (response.additionals.slice()) |record| {
+        if (record.rrtype.eql(.OPT)) continue;
+        return true;
+    }
+    return false;
+}
+
+fn writeEdnsOption(code: u16, data: []const u8, question: ?dns_question.Question, writer: *std.Io.Writer) !void {
+    switch (code) {
+        dns_rdata.EDNS_ZONEVERSION_OPTION_CODE => try writeZoneversion(data, question, writer),
+        dns_rdata.EDNS_NSID_OPTION_CODE => {
+            // RFC 5001 section 2.4: a user interface reads the payload as a
+            // sequence of hexadecimal digits, two per octet.
+            try writer.writeAll("; NSID: ");
+            for (data) |byte| try writer.print("{x:0>2}", .{byte});
+            try writer.writeAll("\n");
+        },
+        else => try writer.print("; EDNS-OPTION: {d} ({d} octets)\n", .{ code, data.len }),
+    }
+}
+
+fn writeZoneversion(data: []const u8, question: ?dns_question.Question, writer: *std.Io.Writer) !void {
+    try writer.writeAll("; ZONEVERSION: ");
+    // RFC 9660 section 2.1: LABELCOUNT, TYPE, then the opaque VERSION.
+    if (data.len < 6) {
+        try writer.writeAll("(malformed option data)\n");
+        return;
+    }
+    const label_count = data[0];
+    const version_type = data[1];
+    if (version_type == 0) {
+        // RFC 9660 section 4.1: TYPE is the mnemonic "SOA-SERIAL", and
+        // VERSION is the zone's SOA serial as an unsigned decimal integer.
+        try writer.print("SOA-SERIAL {d}", .{std.mem.readInt(u32, data[2..6], .big)});
+    } else {
+        try writer.print("TYPE {d} ", .{version_type});
+        for (data[2..]) |byte| try writer.print("{x:0>2}", .{byte});
+    }
+    if (question) |q| {
+        var name_buffer: [512]u8 = undefined;
+        if (zoneNameFromLabelCount(q.name, label_count, &name_buffer)) |zone| {
+            try writer.print(" ({s})", .{zone});
+        }
+    }
+    try writer.writeAll("\n");
+}
+
+fn zoneNameFromLabelCount(name: dns_name.Name, label_count: u8, buffer: []u8) ?[]const u8 {
+    // RFC 9660 section 2.1: the zone name is the last LABELCOUNT labels of the
+    // original QNAME, with LABELCOUNT 0 naming the root.
+    const wire = name.asWire();
+    var total: usize = 0;
+    var cursor: usize = 0;
+    while (cursor < wire.len) {
+        const len = wire[cursor];
+        if (len == 0) break;
+        total += 1;
+        cursor += 1 + len;
+    }
+    if (label_count > total) return null;
+    if (label_count == 0) {
+        if (buffer.len < 1) return null;
+        buffer[0] = '.';
+        return buffer[0..1];
+    }
+    const skip = total - label_count;
+    cursor = 0;
+    var index: usize = 0;
+    while (index < skip) : (index += 1) {
+        const len = wire[cursor];
+        if (len == 0) return null;
+        cursor += 1 + len;
+    }
+    const parsed = dns_name.Name.parse(wire, cursor) catch return null;
+    return parsed.name.toText(buffer) catch null;
 }
 
 fn writeSection(writer: *std.Io.Writer, label: []const u8, records: []const dns_record.ResourceRecord) !void {
@@ -1059,7 +1216,9 @@ test "query formatter prints the authority section a signature proof lives in" {
     defer output.deinit();
     try writeResponse(response, &output.writer);
     try std.testing.expectEqualStrings(
-        "www.example. 3600 IN A 192.0.2.80\n" ++
+        ";; OPT PSEUDOSECTION:\n" ++
+            "; EDNS: version: 0, flags:do udp: 1232\n" ++
+            "www.example. 3600 IN A 192.0.2.80\n" ++
             ";; AUTHORITY SECTION:\n" ++
             "example. 3600 IN TYPE47 \\# 03777777076578616d706c650000060000000000c0\n",
         output.written(),
@@ -1134,3 +1293,35 @@ const test_zone =
     \\dns IN A 192.168.1.1
     \\
 ;
+
+test "the query packet carries an empty ZONEVERSION option when the operator asks" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buffer: [512]u8 = undefined;
+    const packet = try buildQueryPacketWithEdns(&buffer, 0x1234, "target.home.arpa.", .A, .{ .zoneversion = true });
+    const parsed = try dns_message.Message.parseQuery(arena.allocator(), packet);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.additional_count);
+    try std.testing.expect(parsed.edns != null);
+    try std.testing.expectEqual(@as(u16, dns_message.DEFAULT_EDNS_UDP_PAYLOAD_SIZE), parsed.edns.?.udp_payload_size);
+    const options = optOptions(parsed) orelse return error.NoEdnsOptions;
+    const opt_data = dns_rdata.findOption(options, dns_rdata.EDNS_ZONEVERSION_OPTION_CODE) orelse return error.ZoneversionMissing;
+    try std.testing.expectEqual(@as(usize, 0), opt_data.len);
+}
+test "query formatter prints the OPT pseudosection with the RFC 9660 zone version" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const response = try dns_message.Message.parse(arena.allocator(), &.{
+        0x12, 0x34, 0x85, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        0x03, 'w', 'w', 'w', 0x07, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0x03, 'c', 'o', 'm', 0x00,
+        0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x29, 0x05, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x0a, 0x00, 0x13, 0x00, 0x06, 0x02, 0x00, 0x78, 0x95, 0xa4, 0xe9,
+    });
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try writeResponse(response, &output.writer);
+    const text = output.written();
+    try std.testing.expect(std.mem.indexOf(u8, text, ";; OPT PSEUDOSECTION:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "; ZONEVERSION: SOA-SERIAL 2023073001 (example.com.)") != null);
+}
+

@@ -1450,6 +1450,7 @@ fn parseSoa(text: []const u8) Error!dns_rdata.Soa {
     const retry = std.fmt.parseInt(u32, tokens.next() orelse return Error.BadRecord, 10) catch return Error.BadRecord;
     const expire = std.fmt.parseInt(u32, tokens.next() orelse return Error.BadRecord, 10) catch return Error.BadRecord;
     const minimum = std.fmt.parseInt(u32, tokens.next() orelse return Error.BadRecord, 10) catch return Error.BadRecord;
+    if (minimum > max_ttl) return Error.BadTtl;
     if (tokens.next() != null) return Error.BadRecord;
     return .{
         .mname = try parseRdataName(mname),
@@ -1686,6 +1687,46 @@ test "zone parser gives an RRSIG the TTL of the RRSet it covers (RFC 4034 sectio
     }
     try std.testing.expectEqual(@as(usize, 1), rrsig_records);
 }
+test "zone parser refuses TTLs above 2^31-1, including SOA MINIMUM (RFC 2181 §8)" {
+    // A per-record TTL with the sign bit set has no legal wire encoding.
+    try std.testing.expectError(error.BadTtl, ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns hostmaster 1 3600 900 1209600 300
+        \\@ IN NS ns
+        \\www 2147483648 IN A 192.0.2.2
+        \\
+    ));
+    // The $TTL default is bounded the same way.
+    try std.testing.expectError(error.BadTtl, ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 2147483648
+        \\@ IN SOA ns hostmaster 1 3600 900 1209600 300
+        \\@ IN NS ns
+        \\
+    ));
+    // SOA MINIMUM feeds signer TTLs for DNSKEY/DS/NSEC/RRSIGs, so an
+    // out-of-range MINIMUM would put sign-bit TTLs on the wire.
+    try std.testing.expectError(error.BadTtl, ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns hostmaster 1 3600 900 1209600 2147483648
+        \\@ IN NS ns
+        \\
+    ));
+    // The maximum stays legal: 2^31-1 parses.
+    var zone = try ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns hostmaster 1 3600 900 1209600 2147483647
+        \\@ IN NS ns
+        \\www 2147483647 IN A 192.0.2.2
+        \\
+    );
+    defer zone.deinit();
+    try std.testing.expectEqual(@as(u32, 2147483647), zone.records.items[2].ttl);
+}
+
 
 test "zone parser rejects missing SOA or missing apex NS" {
     try std.testing.expectError(error.MissingSoa, ZoneFile.parse(

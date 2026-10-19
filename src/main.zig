@@ -138,9 +138,8 @@ fn printHelp(writer: *std.Io.Writer) !void {
         \\  zimdns server run --zone-file examples/zones/home.arpa.zone --once-tcp 1053
         \\  zimdns server run --config examples/config.gdns --serve-udp --max-requests 2
         \\  zimdns server run --zone-file examples/zones/home.arpa.zone --serve-tcp
-        \\  zimdns query @127.0.0.1 -p 1053 example.com A
-        \\  zimdns query @127.0.0.1 -p 1054 10.in-addr.arpa. SOA
         \\  zimdns query @127.0.0.1 -p 1055 --dnssec signed.example. A
+        \\  zimdns query @127.0.0.1 -p 1055 --zoneversion example.com A
         \\
         \\  RFC 6303/6761/7793/8375 locally served zones are on by default and
         \\  are answered ahead of the cache and the forwarder. A configuration
@@ -167,6 +166,7 @@ fn printHelp(writer: *std.Io.Writer) !void {
 fn handleQuery(args: []const []const u8, io: std.Io, allocator: std.mem.Allocator, writer: *std.Io.Writer) !void {
     var server_text: []const u8 = "127.0.0.1";
     var use_dnssec = false;
+    var use_zoneversion = false;
     var port: u16 = 1053;
     var use_tcp = false;
     var name: ?[]const u8 = null;
@@ -191,6 +191,8 @@ fn handleQuery(args: []const []const u8, io: std.Io, allocator: std.mem.Allocato
             use_tcp = true;
         } else if (std.mem.eql(u8, arg, "--dnssec")) {
             use_dnssec = true;
+        } else if (std.mem.eql(u8, arg, "--zoneversion")) {
+            use_zoneversion = true;
         } else if (name == null) {
             name = arg;
         } else {
@@ -213,7 +215,7 @@ fn handleQuery(args: []const []const u8, io: std.Io, allocator: std.mem.Allocato
     io.random(&query_id_bytes);
     const query_id = std.mem.readInt(u16, &query_id_bytes, .big);
     var packet_buffer: [512]u8 = undefined;
-    const query = try cli_query.buildQueryPacket(&packet_buffer, query_id, absolute_name, qtype, use_dnssec);
+    const query = try cli_query.buildQueryPacketWithEdns(&packet_buffer, query_id, absolute_name, qtype, .{ .dnssec_ok = use_dnssec, .zoneversion = use_zoneversion });
     const server = std.Io.net.IpAddress.parse(server_text, port) catch {
         try writer.writeAll("error: query server must be an IP address for now\n");
         try exitUsage(writer);

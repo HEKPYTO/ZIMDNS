@@ -258,7 +258,7 @@ pub fn buildResponseWithPolicy(request: dns_message.Message, zone: *const zone_i
     // forwarding path in `src/dns/validate.zig`).
     const dnssec_ok = if (request.edns) |edns| edns.dnssec_ok else false;
     if (dnssec_ok) {
-        appendCoveringRrsigs(&response, zone, q.qtype) catch {};
+        appendCoveringRrsigs(&response, zone, q.qtype, lookup.answer_owner) catch {};
         if (lookup.kind == .nodata or lookup.kind == .nxdomain) {
             appendDenialProofs(&response, zone, qname_text, q.qtype) catch {};
         }
@@ -307,7 +307,21 @@ const max_covering_rrsigs: usize = 8;
 /// Append zone RRSIGs whose owner matches an answer record and whose
 /// type-covered field equals that record's type. Malformed candidates are
 /// skipped so one bad RRSIG cannot fail the whole response.
-fn appendCoveringRrsigs(response: *dns_message.Message, zone: *const zone_index.Zone, qtype: dns_types.RecordType) !void {
+/// An RRSIG at `rrsig_owner` covers an answer owned by `answer_owner` when
+/// the owners match, or when the RRSIG sits at a wildcard (`*.example.`)
+/// whose parent suffix-matches the answer owner.
+fn coversOwner(rrsig_owner: []const u8, answer_owner: dns_name.Name) bool {
+    var answer_text: [256]u8 = undefined;
+    const answer = answer_owner.toText(&answer_text) catch return false;
+    if (std.ascii.eqlIgnoreCase(rrsig_owner, answer)) return true;
+    if (rrsig_owner.len < 3 or rrsig_owner[0] != '*' or rrsig_owner[1] != '.') return false;
+    const parent = rrsig_owner[2..];
+    if (answer.len <= parent.len) return false;
+    if (!std.ascii.eqlIgnoreCase(answer[answer.len - parent.len ..], parent)) return false;
+    return answer[answer.len - parent.len - 1] == '.';
+}
+
+fn appendCoveringRrsigs(response: *dns_message.Message, zone: *const zone_index.Zone, qtype: dns_types.RecordType, answer_owner: ?[]const u8) !void {
     _ = qtype;
     // Snapshot the pre-proof length: appended RRSIGs must not be rescanned,
     // and section storage may move on append.
@@ -319,30 +333,26 @@ fn appendCoveringRrsigs(response: *dns_message.Message, zone: *const zone_index.
     while (index < zone.records.len and appended < max_covering_rrsigs) : (index += 1) {
         const candidate = zone.records.items[index];
         if (!candidate.rrtype.eql(.RRSIG)) continue;
-        const rr = toResourceRecord(candidate, null) catch continue;
+        const is_wildcard = candidate.ownerText().len > 2 and candidate.ownerText()[0] == '*' and candidate.ownerText()[1] == '.';
+        // A wildcard RRSIG is emitted under the expanded answer owner (RFC
+        // 4035 §3.1.3.3), never as `*.example.`. Only a wildcard expansion
+        // sets answer_owner, so an exact answer never matches a wildcard
+        // RRSIG here — even if the zone holds one for the same type.
+        if (is_wildcard and answer_owner == null) continue;
+        const owner_override = if (is_wildcard) answer_owner else null;
+        const rr = toResourceRecord(candidate, owner_override) catch continue;
         const raw = switch (rr.rdata) {
             .Unknown => |unknown| unknown.bytes(),
             else => continue,
         };
         const covers = @import("../dns/dnssec.zig").rrsigCovers(raw) catch continue;
-        const owner = dns_name.Name.fromText(candidate.ownerText()) catch continue;
         var answer_index: usize = 0;
         var covers_answer = false;
         while (answer_index < original_len) : (answer_index += 1) {
             const answer = response.answers.items[answer_index];
             if (answer.rrtype.eql(.RRSIG)) continue;
             if (covers != answer.rrtype.code()) continue;
-        var owners_match = owner.eql(&answer.owner);
-        if (!owners_match) {
-            const candidate_wire = owner.asWire();
-            const answer_wire = answer.owner.asWire();
-            if (candidate_wire.len >= 3 and candidate_wire[0] == 1 and candidate_wire[1] == 0x2a and answer_wire.len >= 2) {
-                const first_label_len: usize = answer_wire[0];
-                const tail = candidate_wire[2..];
-                if (first_label_len + 1 <= answer_wire.len and answer_wire[first_label_len + 1 ..].len == tail.len and std.mem.eql(u8, tail, answer_wire[first_label_len + 1 ..])) owners_match = true;
-            }
-        }
-        if (!owners_match) continue;
+            if (!coversOwner(candidate.ownerText(), answer.owner)) continue;
             covers_answer = true;
             break;
         }
@@ -894,6 +904,37 @@ test "DO-bit query receives covering RRSIGs, plain query does not" {
     try std.testing.expectEqual(@as(u16, 2), round_trip.header.answer_count);
     try std.testing.expect(round_trip.answers.items[1].rrtype.eql(.RRSIG));
     try std.testing.expectEqual(@as(u16, 1), try @import("../dns/dnssec.zig").rrsigCovers(round_trip.answers.items[1].rdata.Unknown.bytes()));
+}
+test "wildcard RRSIGs are emitted under the expanded owner, never as wildcard" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+        \\@ IN NS ns.example.
+        \\* IN A 192.0.2.9
+        \\* IN RRSIG A 8 2 3600 2000000000 1000000000 1234 example. QUJD
+        \\www IN A 192.0.2.1
+        \\www IN RRSIG A 8 2 3600 2000000000 1000000000 1235 example. QUJD
+        \\
+    );
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    // Wildcard expansion: the RRSIG rides under the QNAME, not `*.example.`.
+    const expanded = try buildResponse(try testDoQuery(arena.allocator(), 0x4450, "other.example.", .A, true), &zone);
+    var expanded_text: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("other.example.", try expanded.answers.items[0].owner.toText(&expanded_text));
+    var rrsig_text: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("other.example.", try expanded.answers.items[1].owner.toText(&rrsig_text));
+
+    // Exact answer: the wildcard RRSIG never attaches, only the exact one.
+    const exact = try buildResponse(try testDoQuery(arena.allocator(), 0x4451, "www.example.", .A, true), &zone);
+    try std.testing.expectEqual(@as(u16, 2), exact.header.answer_count);
+    var exact_rrsig: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("www.example.", try exact.answers.items[1].owner.toText(&exact_rrsig));
 }
 
 test "covering RRSIGs are capped so packed zones cannot amplify" {

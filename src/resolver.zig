@@ -36,7 +36,10 @@ pub const UPSTREAM_TCP_DEADLINES_SUPPORTED = switch (builtin.os.tag) {
 pub const COOKIE_OPTION_CODE: u16 = 10;
 pub const EDE_OPTION_CODE: u16 = 15;
 pub const EDE_STALE_ANSWER: u16 = 3;
-pub const EDE_STALE_NXDOMAIN: u16 = 22;
+/// RFC 8914 section 4.20 assigns 19 to "Stale NXDOMAIN Answer". 22 is
+/// "No Reachable Authority" (section 4.23), which is a different condition:
+/// the upstream was unreachable, not the answer served from cache.
+pub const EDE_STALE_NXDOMAIN: u16 = 19;
 pub const EDE_NETWORK_ERROR: u16 = 23;
 /// RFC 8914 DNSSEC-bogus INFO-CODEs (see dns/dnssec.zig for purpose text).
 pub const EDE_DNSSEC_BOGUS: u16 = dnssec.EDE_DNSSEC_BOGUS;
@@ -810,6 +813,11 @@ fn buildUpstreamQuery(
     if (query.edns == null) {
         if (original.len > output.len) return Error.UpstreamFailure;
         @memcpy(output[0..original.len], original);
+        // RFC 4035 section 4.6: a security-aware resolver MUST clear the AD
+        // bit when composing a query message, so a client's claim that an
+        // answer was authenticated never reaches the upstream. The bit is
+        // 0x0020 in the header flags word, whose low octet is octet 3.
+        if (original.len >= 4) output[3] &= ~@as(u8, 0x20);
         return output[0..original.len];
     }
 
@@ -821,6 +829,9 @@ fn buildUpstreamQuery(
         .authorities = try dns_message.RecordSection.init(query.allocator, 0),
         .additionals = try dns_message.RecordSection.init(query.allocator, 0),
     };
+    // RFC 4035 section 4.6: as in the verbatim path above, the client's AD
+    // claim does not travel with the composed upstream query.
+    sanitized.header.authenticated_data = false;
     // RFC 3225 section 3: a DNSSEC-aware server sets the DO bit on its
     // recursive requests regardless of the query's own DO bit, so the
     // response carries the records this server validates and feeds (RFC 8198)
@@ -1482,6 +1493,46 @@ test "RFC 3225: buildUpstreamQuery sets DO=1 when the client cleared DO" {
     try std.testing.expect(upstream.edns.?.dnssec_ok);
 }
 
+test "RFC 4035 section 4.6: buildUpstreamQuery clears the client's AD bit" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var plain = try makeTestQuery(arena.allocator(), 0x2714, "example.com.", false);
+    defer plain.deinit();
+    plain.header.authenticated_data = true;
+
+    var original_bytes: [512]u8 = undefined;
+    const original = try encodeTestMessage(plain, &original_bytes);
+
+    var output: [512]u8 = undefined;
+    const composed = try buildUpstreamQuery(original, plain, &output, &.{});
+
+    // Byte for byte with the client's query, except that the AD bit is cleared.
+    var expected = try std.testing.allocator.dupe(u8, original);
+    defer std.testing.allocator.free(expected);
+    expected[3] &= ~@as(u8, 0x20);
+    try std.testing.expectEqualSlices(u8, expected, composed);
+
+    // The EDNS-aware path re-encodes the message; the AD claim must not
+    // travel there either, and the upstream query semantics stay intact.
+    var dnssec_query = try makeTestQuery(arena.allocator(), 0x2715, "example.com.", true);
+    defer dnssec_query.deinit();
+    dnssec_query.header.authenticated_data = true;
+    dnssec_query.edns.?.dnssec_ok = true;
+    dnssec_query.edns.?.udp_payload_size = 1200;
+    dnssec_query.additionals.items[0].class = dns_types.Class.fromCode(1200);
+    dnssec_query.additionals.items[0].ttl = 0x8000;
+
+    var edns_output: [512]u8 = undefined;
+    const composed_edns = try buildUpstreamQuery(&.{ 0xde, 0xad }, dnssec_query, &edns_output, &.{});
+    var parsed_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer parsed_arena.deinit();
+    const upstream = try dns_message.Message.parse(parsed_arena.allocator(), composed_edns);
+    try std.testing.expect(!upstream.header.authenticated_data);
+    try std.testing.expect(upstream.edns.?.dnssec_ok);
+    try std.testing.expectEqual(@as(u16, 1200), upstream.edns.?.udp_payload_size);
+}
+
 test "RFC 3225: stripProofsForClient drops RRSIG unless the query named it" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1622,6 +1673,10 @@ fn expectEde(message: dns_message.Message, code: u16, text: []const u8) !void {
     try std.testing.expectEqual(@as(usize, 2 + text.len), option.len);
     try std.testing.expectEqual(code, std.mem.readInt(u16, option[0..2], .big));
     try std.testing.expectEqualSlices(u8, text, option[2..]);
+}
+
+test "stale nxdomain ede wire code is 19 not 22" {
+    try std.testing.expectEqual(@as(u16, 19), EDE_STALE_NXDOMAIN);
 }
 
 test "ede purpose text covers emitted codes" {
