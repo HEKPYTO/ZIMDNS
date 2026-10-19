@@ -4,7 +4,7 @@
 /// runtime.answer with the Do53/DoT paths. ZIMDNS has no TLS server, so nothing
 /// in this repository can produce such a channel: there is deliberately no
 /// bind/accept entry point here, and the --serve-doh startup gate refuses
-/// before opening a socket (tls.zig, docs/decisions/encrypted-transport.md).
+/// before opening a socket (tls.zig; see src/transport/README.md).
 /// HTTP/2 framing additionally needs the reviewed HTTP/2 dependency, so this
 /// module is the HTTP/1.1 mapping subset, not a full RFC 8484 transport claim.
 /// Ownership: Request/response scratch lives in caller buffers or a
@@ -20,7 +20,6 @@ const tls_policy = @import("tls.zig");
 
 pub const doh_path = "/dns-query";
 pub const dns_message_media_type = "application/dns-message";
-pub const DOH_PORT = tls_policy.doh_port;
 pub const MAX_BODY_LEN: usize = 65535;
 pub const MAX_HEADER_BYTES: usize = 8192;
 pub const MAX_EXCHANGES_PER_CONNECTION: usize = 16;
@@ -242,7 +241,7 @@ fn minTtl(message: *const dns_message.Message) u32 {
 
 fn writeError(writer: *std.Io.Writer, status: Status) !void {
     try writer.print("HTTP/1.1 {d} {s}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n", .{
-        @intFromEnum(status),
+        @backingInt(status),
         status.reason(),
     });
 }
@@ -329,14 +328,6 @@ pub fn serveDohStreamOnce(stream: std.Io.net.Stream, io: std.Io, runtime: *const
     return serveDohStream(stream, io, runtime, null);
 }
 
-pub fn serveDohStreamOnceWithMetrics(
-    stream: std.Io.net.Stream,
-    io: std.Io,
-    runtime: *const Runtime,
-    counters: *metrics.Counters,
-) !void {
-    return serveDohStream(stream, io, runtime, counters);
-}
 
 fn serveDohStream(stream: std.Io.net.Stream, io: std.Io, runtime: *const Runtime, counters: ?*metrics.Counters) !void {
     tcp_deadline.setSocketTimeout(stream.socket.handle, DOH_IO_TIMEOUT);

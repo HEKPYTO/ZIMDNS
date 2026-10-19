@@ -1597,7 +1597,7 @@ const h_w = "k8udemvp1j2f7eg6jebps17vp3n8i58h";
 /// real owner from a delegation (RFC 5155 section 8.9): the pairing matters,
 /// not just the presence of the bit.
 fn typeBitmap(codes: []const RecordType) [2 + 32]u8 {
-    var bitmap = [_]u8{0} ** (2 + 32);
+    var bitmap = @as([(2 + 32)]u8, @splat(@as(u8, 0)));
     bitmap[0] = 0;
     bitmap[1] = 32;
     for (codes) |code| {
@@ -1825,7 +1825,7 @@ test "the anchor file takes DS and DNSKEY lines and rejects every other shape" {
     try std.testing.expectError(Error.BadAnchorFile, Anchors.parse(std.testing.allocator, "example. DS 1 15 2 aabbc\n"));
     try std.testing.expectError(Error.BadAnchorFile, Anchors.parse(std.testing.allocator, "example. DS 1 15 2 aabb extra\n"));
     try std.testing.expectError(Error.BadAnchorFile, Anchors.parse(std.testing.allocator, "example. DNSKEY 257 3\n"));
-    try std.testing.expectError(Error.BadAnchorFile, Anchors.parse(std.testing.allocator, "example. DS 1 15 2 " ++ "ab" ** 65 ++ "\n"));
+    try std.testing.expectError(Error.BadAnchorFile, Anchors.parse(std.testing.allocator, "example. DS 1 15 2 " ++ "ababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab" ++ "\n"));
 }
 
 test "the anchor file is bounded and an empty file is an empty store" {

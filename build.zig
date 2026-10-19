@@ -18,9 +18,8 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    // Zig 0.17 removed `b.args`; `zig build run` takes no extra args.
+    // Invoke the binary directly for CLI arguments.
     const run_step = b.step("run", "Run zimdns");
     run_step.dependOn(&run_cmd.step);
 

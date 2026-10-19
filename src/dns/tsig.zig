@@ -491,8 +491,8 @@ test "tsig raw parser rejects a MAC larger than HMAC-SHA256" {
     const algorithm = try Name.fromText("hmac-sha256.");
     var raw: [62]u8 = undefined;
     var writer = Writer.init(&raw);
-    var time_signed = [_]u8{0} ** 6;
-    var mac = [_]u8{0} ** 33;
+    var time_signed = @as([6]u8, @splat(@as(u8, 0)));
+    var mac = @as([33]u8, @splat(@as(u8, 0)));
     try algorithm.encode(&writer);
     try writer.writeBytes(&time_signed);
     try writer.writeU16(0);
@@ -508,8 +508,8 @@ test "tsig raw parser rejects a MAC larger than HMAC-SHA256" {
 
 test "tsig RDATA stays within the common record encoder boundary" {
     const algorithm = try Name.fromText("hmac-sha256.");
-    var mac = [_]u8{0} ** 32;
-    var max_other = [_]u8{0} ** 451;
+    var mac = @as([32]u8, @splat(@as(u8, 0)));
+    var max_other = @as([451]u8, @splat(@as(u8, 0)));
     const maximum = try Tsig.init(algorithm, 0, 0, &mac, 0, 0, &max_other);
 
     var output: [1024]u8 = undefined;
@@ -522,7 +522,7 @@ test "tsig RDATA stays within the common record encoder boundary" {
         .rdata = .{ .TSIG = maximum },
     }).encode(&writer);
 
-    var one_over = [_]u8{0} ** 452;
+    var one_over = @as([452]u8, @splat(@as(u8, 0)));
     try std.testing.expectError(
         rdata.Error.InvalidLength,
         Tsig.init(algorithm, 0, 0, &mac, 0, 0, &one_over),
@@ -530,7 +530,7 @@ test "tsig RDATA stays within the common record encoder boundary" {
 }
 
 // Fixed SHA-256, chained, and altered-intermediary-ID values are reproduced independently in
-// docs/decisions/tsig-vectors.md.
+// src/dns/README.md and the tests below.
 test "tsig SHA-256 known-answer vector verifies the received raw wire message" {
     const packet = [_]u8{
         0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x07, 0x65, 0x78, 0x61,
@@ -735,7 +735,7 @@ test "tsig SHA-256 known-answer vector verifies the received raw wire message" {
     ));
 }
 
-// Fixed SHA-1 value is reproduced independently in docs/decisions/tsig-vectors.md.
+// Fixed SHA-1 value is reproduced independently in the test below.
 test "tsig SHA-1 known-answer vector verifies the received raw wire message" {
     const packet = [_]u8{
         0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x07, 0x65, 0x78, 0x61,

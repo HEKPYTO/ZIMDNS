@@ -1552,7 +1552,7 @@ test "X25 wire round trips the minimum and maximum decimal addresses" {
     try parsed_minimum.encodeCompressed(&minimum_compressed_writer, &minimum_compression_table);
     try std.testing.expectEqualSlices(u8, &minimum, minimum_compressed_writer.written());
 
-    var maximum = [_]u8{0} ** 256;
+    var maximum = @as([256]u8, @splat(@as(u8, 0)));
     maximum[0] = 255;
     @memset(maximum[1..], '9');
     const parsed_maximum = try RData.parse(.X25, &maximum, 0, maximum.len);
@@ -2051,14 +2051,14 @@ test "SSHFP wire parses and encodes exact selector and fingerprint bytes" {
 }
 
 test "SSHFP wire rejects truncation, unsupported selectors, and wrong lengths" {
-    const short_sha1 = [_]u8{ 4, 2 } ++ [_]u8{0} ** 19;
-    const wrong_type_sha1 = [_]u8{ 4, 1 } ++ [_]u8{0} ** 19;
-    const short_sha256 = [_]u8{ 4, 2 } ++ [_]u8{0} ** 31;
-    const unsupported_algorithm_zero = [_]u8{ 0, 2 } ++ [_]u8{0} ** 32;
-    const unsupported_algorithm_five = [_]u8{ 5, 2 } ++ [_]u8{0} ** 32;
-    const unsupported_algorithm_seven = [_]u8{ 7, 2 } ++ [_]u8{0} ** 32;
-    const unsupported_type_zero = [_]u8{ 4, 0 } ++ [_]u8{0} ** 32;
-    const unsupported_type_three = [_]u8{ 4, 3 } ++ [_]u8{0} ** 32;
+    const short_sha1 = [_]u8{ 4, 2 } ++ @as([19]u8, @splat(@as(u8, 0)));
+    const wrong_type_sha1 = [_]u8{ 4, 1 } ++ @as([19]u8, @splat(@as(u8, 0)));
+    const short_sha256 = [_]u8{ 4, 2 } ++ @as([31]u8, @splat(@as(u8, 0)));
+    const unsupported_algorithm_zero = [_]u8{ 0, 2 } ++ @as([32]u8, @splat(@as(u8, 0)));
+    const unsupported_algorithm_five = [_]u8{ 5, 2 } ++ @as([32]u8, @splat(@as(u8, 0)));
+    const unsupported_algorithm_seven = [_]u8{ 7, 2 } ++ @as([32]u8, @splat(@as(u8, 0)));
+    const unsupported_type_zero = [_]u8{ 4, 0 } ++ @as([32]u8, @splat(@as(u8, 0)));
+    const unsupported_type_three = [_]u8{ 4, 3 } ++ @as([32]u8, @splat(@as(u8, 0)));
     try std.testing.expectError(Error.EndOfInput, RData.parse(.SSHFP, &.{4}, 0, 2));
     try std.testing.expectError(Error.InvalidLength, RData.parse(.SSHFP, &short_sha1, 0, 21));
     try std.testing.expectError(Error.InvalidLength, RData.parse(.SSHFP, &wrong_type_sha1, 0, 21));
@@ -2094,9 +2094,9 @@ test "ZONEMD wire round trips serial, scheme, hash, and digest" {
 
 test "ZONEMD wire rejects a digest below the 12-octet floor" {
     // RFC 8976 section 2.2.4.
-    const short_wire = [_]u8{0} ** (6 + 11);
+    const short_wire = @as([(6 + 11)]u8, @splat(@as(u8, 0)));
     try std.testing.expectError(Error.InvalidLength, RData.parse(.ZONEMD, &short_wire, 0, short_wire.len));
-    const oversized_wire = [_]u8{0} ** (6 + 65);
+    const oversized_wire = @as([(6 + 65)]u8, @splat(@as(u8, 0)));
     try std.testing.expectError(Error.InvalidLength, RData.parse(.ZONEMD, &oversized_wire, 0, oversized_wire.len));
 }
 

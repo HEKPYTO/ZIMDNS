@@ -5,11 +5,10 @@
 ///   NSEC3 (SHA-1, RFC 5155) hash and denial.
 /// - A bounded aggressive-NSEC cache (RFC 8198 sections 4-5) for validators.
 /// - EDE DNSSEC-bogus INFO-CODEs (RFC 8914 codes 6-10) for validation failures.
-/// What this module does NOT do (each deferred behind a typed error below;
-/// see docs/decisions/dnssec-deferral.md): zone signing (this profile serves
-/// pre-signed zone text only), cryptographic validation (no RSA/ECDSA chain
-/// building and no trust-anchor management), authoritative NSEC3 denial
-/// serving, and NSEC3 closest-encloser/opt-out proofs. A full-validating
+/// What this module does NOT do: zone signing, cryptographic validation (no
+/// RSA/ECDSA chain building and no trust-anchor management), and
+/// authoritative NSEC3 denial serving with closest-encloser/opt-out proofs
+/// (deferred behind the typed error below). A full-validating
 /// resolver MUST NOT claim `secure` from this module alone. Presence,
 /// time-window, and denial checks report `bogus`/`insecure` only; `secure`
 /// requires an external cryptographic verifier over the same opaque RDATA.
@@ -42,42 +41,16 @@ pub const Error = error{
     MalformedNsec,
     MalformedNsec3,
     NameTooLong,
-    /// Zone signing is deferred: this profile serves pre-signed zone text only.
-    DnssecSigningDeferred,
-    /// Cryptographic validation is deferred: presence and time-window checks
-    /// report bogus through the RFC 8914 EDE codes above, never `secure`.
-    DnssecValidationDeferred,
     /// Authoritative NSEC3 denial serving is deferred: no closest-encloser or
     /// opt-out proofs are synthesized for authoritative answers.
     Nsec3DenialDeferred,
-    /// Trust-anchor management is deferred: there is no anchor store and no
-    /// RFC 5011-style rollover in this profile.
-    TrustAnchorDeferred,
 };
 
-/// Deferred DNSSEC operations. Each fails with its typed error instead of a
-/// silent fallback or an unsigned answer, mirroring dialDoq (RFC 9250
-/// DoqDeferred) in src/transport/tls.zig. See
-/// docs/decisions/dnssec-deferral.md for the out-of-scope rationale.
-pub fn signZoneDeferred() Error!void {
-    return Error.DnssecSigningDeferred;
-}
-
-/// Cryptographic chain validation is deferred; callers map failures to the
-/// bogus EDE codes above rather than claiming `secure`.
-pub fn validateChainDeferred() Error!void {
-    return Error.DnssecValidationDeferred;
-}
-
 /// Authoritative NSEC3 denial serving is deferred; the aggressive cache below
-/// consumes NSEC proofs only and never synthesizes an NSEC3 denial.
+/// consumes NSEC proofs only and never synthesizes an NSEC3 denial. Fails with
+/// its typed error instead of a silent fallback or an unsigned answer.
 pub fn serveNsec3DenialDeferred() Error!void {
     return Error.Nsec3DenialDeferred;
-}
-
-/// Trust-anchor loading is deferred; no anchors are configured or rolled over.
-pub fn loadTrustAnchorDeferred() Error!void {
-    return Error.TrustAnchorDeferred;
 }
 
 /// True for the proof/key RRsets this minimum serves (RFC 4034 + RFC 5155).
@@ -371,16 +344,16 @@ pub const AggressiveCache = struct {
         valid: bool = false,
         owner: Name = Name.root(),
         next: Name = Name.root(),
-        bitmap: [64]u8 = [_]u8{0} ** 64,
+        bitmap: [64]u8 = @as([64]u8, @as([64]u8, @splat(@as(u8, 0)))),
         bitmap_len: u8 = 0,
-        hashed_owner: [20]u8 = [_]u8{0} ** 20,
+        hashed_owner: [20]u8 = @as([20]u8, @as([20]u8, @splat(@as(u8, 0)))),
         is_nsec3: bool = false,
         /// Unix seconds after which the proof must no longer deny (RFC 8198
         /// section 4). Always derived as now + min(ttl, cap) at insert.
         expires_at: i64 = 0,
     };
 
-    entries: [capacity]Entry = [_]Entry{.{}} ** capacity,
+    entries: [capacity]Entry = @splat(Entry{}),
     next_slot: usize = 0,
 
     pub fn insertNsec(self: *AggressiveCache, owner: Name, next: Name, bitmap: []const u8, now: i64, ttl: u32) void {
@@ -513,11 +486,8 @@ test "EDE DNSSEC-bogus codes use RFC 8914 INFO-CODEs 6 through 10" {
     try std.testing.expectEqualStrings("", edeText(99));
 }
 
-test "deferred DNSSEC operations fail with typed errors" {
-    try std.testing.expectError(Error.DnssecSigningDeferred, signZoneDeferred());
-    try std.testing.expectError(Error.DnssecValidationDeferred, validateChainDeferred());
+test "deferred NSEC3 denial fails with a typed error" {
     try std.testing.expectError(Error.Nsec3DenialDeferred, serveNsec3DenialDeferred());
-    try std.testing.expectError(Error.TrustAnchorDeferred, loadTrustAnchorDeferred());
 }
 
 test "DO-bit inclusion keeps explicit queries and gates proof RRsets" {
@@ -696,12 +666,12 @@ test "exact deny requires the NSEC bit and a well-formed bitmap" {
 test "aggressive NSEC3 cache denies only types missing from the bitmap" {
     const now: i64 = 1_000_000;
     var cache = AggressiveCache{};
-    const hashed = [_]u8{0xab} ** 20;
+    const hashed = @as([20]u8, @splat(@as(u8, 0xab)));
     // Window 0 bitmap with A(1) only.
     cache.insertNsec3Hash(hashed, &[_]u8{ 0x00, 0x01, 0x40 }, now, 3600);
     try std.testing.expectEqual(Denial.nodata, (try cache.denyNsec3(hashed, 16, now)).?);
     try std.testing.expect((try cache.denyNsec3(hashed, 1, now)) == null);
-    try std.testing.expect((try cache.denyNsec3([_]u8{0xcd} ** 20, 16, now)) == null);
+    try std.testing.expect((try cache.denyNsec3(@as([20]u8, @splat(@as(u8, 0xcd))), 16, now)) == null);
 }
 
 test "NSEC3 hash matches an independent SHA-1 recomputation (RFC 5155 7.1)" {
@@ -798,7 +768,7 @@ test "nsecDeniesType fails closed on trailing garbage (no false denial)" {
 
 test "denyNsec3 fails closed without a well-formed bitmap proof" {
     const now: i64 = 1_000_000;
-    const hashed = [_]u8{0xab} ** 20;
+    const hashed = @as([20]u8, @splat(@as(u8, 0xab)));
     // Empty bitmap on a matching hash: no proof, so error (never NODATA).
     var empty = AggressiveCache{};
     empty.insertNsec3Hash(hashed, &[_]u8{}, now, 3600);
@@ -814,7 +784,7 @@ test "denyNsec3 fails closed without a well-formed bitmap proof" {
         bad.insertNsec3Hash(hashed, bitmap, now, 3600);
         try std.testing.expectError(Error.MalformedNsec, bad.denyNsec3(hashed, 16, now));
         // Unknown hashes still prove nothing either way: null, not error.
-        try std.testing.expect((try bad.denyNsec3([_]u8{0xcd} ** 20, 16, now)) == null);
+        try std.testing.expect((try bad.denyNsec3(@as([20]u8, @splat(@as(u8, 0xcd))), 16, now)) == null);
     }
 }
 
@@ -852,7 +822,7 @@ test "aggressive cache proofs expire, cap, and refresh (RFC 8198 4)" {
 
     // NSEC3 proofs expire the same way: evicted entries return null.
     var nsec3 = AggressiveCache{};
-    const hashed = [_]u8{0xab} ** 20;
+    const hashed = @as([20]u8, @splat(@as(u8, 0xab)));
     nsec3.insertNsec3Hash(hashed, &[_]u8{ 0x00, 0x01, 0x40 }, 1_000, 60);
     try std.testing.expectEqual(Denial.nodata, (try nsec3.denyNsec3(hashed, 16, 1_059)).?);
     try std.testing.expect((try nsec3.denyNsec3(hashed, 16, 1_060)) == null);

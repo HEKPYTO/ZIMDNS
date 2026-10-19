@@ -179,6 +179,10 @@ pub const Config = struct {
     /// RFC 6303 section 3 mechanism to disable them.
     local_zones: bool = true,
     has_local_zones: bool = false,
+    /// Per-zone override: `local-zones except <apex>` excludes one locally
+    /// served apex (repeatable, up to max_items). Matching is case-insensitive
+    /// on the enclosing apex.
+    local_zones_except: List(Text) = .{},
     /// RFC 5001 section 2.4 presentation format: the NSID payload is written
     /// as hexadecimal digits, two per octet. There is no default, so an
     /// unconfigured server answers no NSID at all.
@@ -376,8 +380,16 @@ pub const Config = struct {
     }
 
     fn parseLocalZones(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
-        if (self.has_local_zones) return Error.BadDirective;
         const value = tokens.next() orelse return Error.BadDirective;
+        if (std.mem.eql(u8, value, "except")) {
+            const apex = tokens.next() orelse return Error.BadDirective;
+            try requireNoTrailingTokens(tokens);
+            var slot = Text{};
+            try slot.set(apex);
+            try self.local_zones_except.append(slot);
+            return;
+        }
+        if (self.has_local_zones) return Error.BadDirective;
         try requireNoTrailingTokens(tokens);
         if (std.mem.eql(u8, value, "on")) {
             self.local_zones = true;
@@ -606,6 +618,17 @@ test "config parser keeps locally served zones on unless an operator turns them 
     ));
     try std.testing.expectError(error.UnknownDirective, Config.parse("local-zone on\n"));
 }
+test "config parser collects local-zones except apexes" {
+    const config = try Config.parse("local-zones except 10.in-addr.arpa.\nlocal-zones except EXAMPLE.\n");
+    try std.testing.expect(config.local_zones);
+    try std.testing.expectEqual(@as(usize, 2), config.local_zones_except.len);
+    try std.testing.expectEqualStrings("10.in-addr.arpa.", config.local_zones_except.items[0].text());
+    try std.testing.expectEqualStrings("EXAMPLE.", config.local_zones_except.items[1].text());
+
+    try std.testing.expectError(error.BadDirective, Config.parse("local-zones except\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("local-zones except a. b.\n"));
+}
+
 
 test "config parser takes one RFC 5001 NSID as hex and rejects every other shape" {
     const config = try Config.parse("nsid 6e73312e6578616d706c652e\n");

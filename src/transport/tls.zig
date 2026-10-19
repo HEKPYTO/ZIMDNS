@@ -2,7 +2,7 @@
 /// substrate). The Zig 0.16 standard library ships a TLS client only, so ZIMDNS
 /// cannot terminate a TLS handshake and no encrypted listener may start:
 /// --serve-dot, --serve-doh, and --serve-xfr fail closed before a port is bound
-/// (see docs/decisions/encrypted-transport.md). dot.zig and doh.zig hold the
+/// (see src/transport/README.md). dot.zig and doh.zig hold the
 /// DNS-layer mappings for an already-terminated byte channel; no cipher,
 /// certificate-parsing, or key-exchange code lives in this module.
 /// Ownership: Config and PEM byte slices are borrowed; nothing is allocated.
@@ -13,7 +13,6 @@ const std = @import("std");
 pub const dot_port: u16 = 853;
 pub const doh_port: u16 = 443;
 pub const dot_alpn = "dot";
-pub const doh_alpn_h2 = "h2";
 pub const doh_alpn_http11 = "http/1.1";
 
 pub const Error = error{
@@ -31,8 +30,7 @@ pub const Error = error{
 /// 7.1 additionally requires "dot" for zone transfer over TLS. DoH selects
 /// "http/1.1" only, because doh.zig implements the HTTP/1.1 mapping:
 /// selecting "h2" would hand the client a protocol this server cannot speak
-/// (docs/decisions/encrypted-transport.md,
-/// docs/decisions/tls-server-dependency.md).
+/// (see src/transport/README.md).
 pub fn negotiateAlpn(offered: []const []const u8, want_doh: bool) ?[]const u8 {
     const wanted = if (want_doh) doh_alpn_http11 else dot_alpn;
     for (offered) |protocol| {

@@ -63,6 +63,9 @@ pub const Runtime = struct {
     /// (RFC 7793 section 2, RFC 6598 section 3). `local-zones off` is the
     /// RFC 6303 section 3 mechanism to disable it.
     local_zones: bool = true,
+    /// Per-zone override apexes (`local-zones except`), lowercase with
+    /// trailing dot, heap-owned. Empty unless configured.
+    local_zones_except: []const []const u8 = &.{},
     /// What an authoritative answer may carry back in its OPT record, from the
     /// `nsid` and `zoneversion` directives. `nsid` is heap-owned so it outlives
     /// the config text it was decoded from.
@@ -172,6 +175,9 @@ pub const Runtime = struct {
         self.blocklist = .{};
         if (self.edns.nsid) |nsid| self.allocator.free(nsid);
         self.edns = .{};
+        for (self.local_zones_except) |apex| self.allocator.free(apex);
+        if (self.local_zones_except.len != 0) self.allocator.free(self.local_zones_except);
+        self.local_zones_except = &.{};
     }
 
     pub fn setTsigNow(self: *Runtime, now: u64) void {
@@ -191,7 +197,7 @@ pub const Runtime = struct {
     }
 
     fn lock(self: *const Runtime) void {
-        std.Io.Threaded.mutexLock(@constCast(&self.mutex));
+        std.Io.Threaded.mutexLockUncancelable(@constCast(&self.mutex));
     }
 
     fn unlock(self: *const Runtime) void {
@@ -222,8 +228,8 @@ pub const Runtime = struct {
             else => {
                 const query = dns_message.Message.parseQuery(allocator, packet) catch |parse_err| switch (parse_err) {
                     error.MalformedEcsOption => return .{ .failure = .{ .code = .formerr } },
-                    // RFC 9619 section 4: OPCODE 0 with QDCOUNT > 1 is
-                    // incorrectly formatted, so the answer is FORMERR.
+                    // RFC 9619 section 4: QDCOUNT > 1 is FORMERR for any
+                    // OPCODE (Message.parse returns TooManyQuestions).
                     error.TooManyQuestions => return .{ .failure = .{ .code = .formerr } },
                     error.OutOfMemory => return parse_err,
                     else => {
@@ -239,8 +245,8 @@ pub const Runtime = struct {
         const final_record = final orelse {
             const query = dns_message.Message.parseQuery(allocator, packet) catch |err| switch (err) {
                 error.MalformedEcsOption => return .{ .failure = .{ .code = .formerr } },
-                // RFC 9619 section 4: OPCODE 0 with QDCOUNT > 1 is
-                // incorrectly formatted, so the answer is FORMERR.
+                // RFC 9619 section 4: QDCOUNT > 1 is FORMERR for any OPCODE
+                // (Message.parse returns TooManyQuestions uniformly).
                 error.TooManyQuestions => return .{ .failure = .{ .code = .formerr } },
                 error.OutOfMemory => return err,
                 else => {
@@ -779,6 +785,11 @@ pub const Runtime = struct {
         if (!q.qclass.eql(@import("../dns/types.zig").Class.IN)) return null;
         if (self.selectZone(qname_text) != null) return null;
         const zone = local_zone.match(qname_text) orelse return null;
+        // Per-zone override: an excluded apex falls through to the cache,
+        // forwarder, or REFUSED exactly as a non-local name would.
+        for (self.local_zones_except) |apex| {
+            if (std.ascii.eqlIgnoreCase(zone.apex, apex)) return null;
+        }
         const dnssec_ok = if (query.edns) |edns| edns.dnssec_ok else false;
         if (local_zone.forwardsUpstream(zone, q.qtype, dnssec_ok)) return null;
         return try local_zone.build(query, zone);
@@ -1080,10 +1091,10 @@ test "runtime signs BADTIME and BADTRUNC responses" {
 }
 
 test "runtime rejects oversize MAC without overflowing copyMac" {
-    var oversize = [_]u8{0xab} ** 33;
+    var oversize = @as([33]u8, @splat(@as(u8, 0xab)));
     try std.testing.expect(Runtime.copyMac(&oversize) == null);
 
-    var exact = [_]u8{0xcd} ** 32;
+    var exact = @as([32]u8, @splat(@as(u8, 0xcd)));
     const mac = Runtime.copyMac(&exact).?;
     try std.testing.expectEqual(@as(u8, 32), mac.len);
     try std.testing.expectEqualSlices(u8, &exact, mac.slice());
@@ -1234,6 +1245,37 @@ test "RFC 9619: an OPCODE 0 query with QDCOUNT 2 is answered FORMERR" {
     try std.testing.expectEqual(@as(u16, 0), parsed.header.answer_count);
     var text: [64]u8 = undefined;
     try std.testing.expectEqualStrings("dns.home.arpa.", try parsed.question.?.name.toText(&text));
+}
+test "RFC 9619: a non-query OPCODE with QDCOUNT 2 is answered FORMERR" {
+    var runtime = try Runtime.fromZoneText(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
+        \\
+    );
+    defer runtime.deinit();
+
+    // OPCODE 15 (unassigned) with QDCOUNT 2: Message.parse reports
+    // TooManyQuestions for any OPCODE, so the answer is FORMERR rather
+    // than a silent drop.
+    const two_question_query = [_]u8{
+        0x12, 0x34, 0x79, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        3,    'd',  'n',  's',  4,    'h',  'o',  'm',  'e',  4,    'a',  'r',
+        'p',  'a',  0,    0x00, 0x01, 0x00, 0x01, 5,    'a',  'l',  'i',  'a',
+        's',  4,    'h',  'o',  'm',  'e',  4,    'a',  'r',  'p',  'a',  0,
+        0x00, 0x01, 0x00, 0x01,
+    };
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 53005);
+    var output: [512]u8 = undefined;
+    const response_bytes = try runtime.answerFrom(&two_question_query, &output, &client);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expect(parsed.header.qr);
+    try std.testing.expectEqual(@as(@TypeOf(parsed.header.rcode), .formerr), parsed.header.rcode);
 }
 
 test "RFC 9619: an OPCODE 0 query with QDCOUNT 0 is never answered FORMERR" {

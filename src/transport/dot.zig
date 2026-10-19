@@ -4,8 +4,8 @@
 /// five-second deadlines are shared with the plaintext TCP listener.
 /// ZIMDNS has no TLS server, so nothing in this repository can produce such a
 /// channel: there is deliberately no bind/accept entry point here, and the
-/// --serve-dot startup gate refuses before opening a socket (tls.zig,
-/// docs/decisions/encrypted-transport.md). Handlers below never see handshake
+/// --serve-dot startup gate refuses before opening a socket (tls.zig; see
+/// src/transport/README.md). Handlers below never see handshake
 /// bytes.
 /// Ownership: Runtime is borrowed; streams are consumed/closed by the caller
 /// loop; wire buffers are local.

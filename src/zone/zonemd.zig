@@ -68,15 +68,15 @@ pub const report_max_len = 1024;
 /// verifiable here.
 fn schemeFromCode(code: u8) ?Scheme {
     return switch (code) {
-        @intFromEnum(Scheme.simple) => Scheme.simple,
+        @backingInt(Scheme.simple) => Scheme.simple,
         else => null,
     };
 }
 
 fn hashFromCode(code: u8) ?Hash {
     return switch (code) {
-        @intFromEnum(Hash.sha384) => Hash.sha384,
-        @intFromEnum(Hash.sha512) => Hash.sha512,
+        @backingInt(Hash.sha384) => Hash.sha384,
+        @backingInt(Hash.sha512) => Hash.sha512,
         else => null,
     };
 }
@@ -668,7 +668,7 @@ test "verify reports zone, expected and computed digests on mismatch" {
         return error.TestUnexpectedResult;
     } else |err| try std.testing.expectEqual(Error.DigestMismatch, err);
     const expected_report = "zone example.: ZONEMD SIMPLE SHA384 serial 2018031900 mismatch, expected " ++
-        "0" ** 96 ++ ", computed " ++
+        "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" ++ ", computed " ++
         "c68090d90a7aed716bc459f9340e3d7c1370d4d24b7e2fc3a1ddc0b9a87153b9a9713b3c9ae5cc27777f98b8e730044c";
     if (!std.mem.startsWith(u8, report[0..], expected_report)) {
         const written = std.mem.indexOfScalar(u8, report[0..], 0) orelse report.len;

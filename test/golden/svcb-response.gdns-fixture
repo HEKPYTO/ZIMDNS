@@ -1,0 +1,22 @@
+name: svcb-response
+rfc: RFC 9460 section 2
+phase: 3
+description: Exact authoritative SVCB response with an uncompressed target and alpn and port SvcParams.
+input_hex:
+  53 56 01 00 00 01 00 00 00 00 00 00
+  03 73 76 63 04 68 6f 6d 65 04 61 72
+  70 61 00 00 40 00 01
+response_hex:
+  53 56 85 00 00 01 00 01 00 00 00 00
+  03 73 76 63 04 68 6f 6d 65 04 61 72
+  70 61 00 00 40 00 01 c0 0c 00 40 00
+  01 00 00 0e 10 00 21 00 01 06 74 61
+  72 67 65 74 04 68 6f 6d 65 04 61 72
+  70 61 00 00 01 00 03 02 68 32 00 03
+  00 02 01 bb
+expect:
+  parse_ok: true
+  id: 0x5356
+  qname: svc.home.arpa.
+  qtype: SVCB
+  qclass: IN

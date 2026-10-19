@@ -46,7 +46,7 @@ pub const Rcode = enum(u4) {
     /// Combines the 4-bit header code with the OPT extended-rcode byte into
     /// the 12-bit extended RCODE. Without OPT the extended byte is zero.
     pub fn extendedCode(self: Rcode, extended_rcode: u8) u16 {
-        return (@as(u16, extended_rcode) << 4) | @as(u16, @intFromEnum(self));
+        return (@as(u16, extended_rcode) << 4) | @as(u16, @backingInt(self));
     }
 
     /// True only for extended RCODE 23: header low bits 7 plus OPT
@@ -85,7 +85,7 @@ pub const Header = struct {
         const ar = reader.readU16() catch return Error.EndOfInput;
 
         const opcode_code: u4 = @intCast((flags >> 11) & 0x0f);
-        const opcode: Opcode = @enumFromInt(opcode_code);
+        const opcode: Opcode = @fromBackingInt(@intCast(opcode_code));
 
         const rcode_code: u4 = @intCast(flags & 0x0f);
         const rcode = switch (rcode_code) {
@@ -124,14 +124,14 @@ pub const Header = struct {
     pub fn encode(self: Header, writer: *Writer) !void {
         var flags: u16 = 0;
         if (self.qr) flags |= 0x8000;
-        flags |= (@as(u16, @intFromEnum(self.opcode)) & 0x0f) << 11;
+        flags |= (@as(u16, @backingInt(self.opcode)) & 0x0f) << 11;
         if (self.authoritative) flags |= 0x0400;
         if (self.truncated) flags |= 0x0200;
         if (self.recursion_desired) flags |= 0x0100;
         if (self.recursion_available) flags |= 0x0080;
         if (self.authenticated_data) flags |= 0x0020;
         if (self.checking_disabled) flags |= 0x0010;
-        flags |= @as(u16, @intFromEnum(self.rcode)) & 0x0f;
+        flags |= @as(u16, @backingInt(self.rcode)) & 0x0f;
 
         try writer.writeU16(self.id);
         try writer.writeU16(flags);

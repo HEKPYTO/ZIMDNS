@@ -9,11 +9,11 @@ pub const dns_writer = @import("dns/writer.zig");
 pub const dns_rdata = @import("dns/rdata.zig");
 pub const dns_record = @import("dns/record.zig");
 pub const dns_dnssec = @import("dns/dnssec.zig");
+pub const dns_validate = @import("dns/validate.zig");
 pub const zone_parser = @import("zone/parser.zig");
 pub const zone_index = @import("zone/index.zig");
 pub const zone_journal = @import("zone/journal.zig");
 pub const zone_transfer = @import("zone/transfer.zig");
-pub const zone_secondary = @import("zone/secondary.zig");
 pub const auth_response = @import("auth/response.zig");
 pub const auth_runtime = @import("auth/runtime.zig");
 pub const auth_keyring = @import("auth/keyring.zig");
@@ -29,7 +29,6 @@ pub const transfer_axfr = @import("transfer/axfr.zig");
 pub const transfer_xfr_tls = @import("transfer/xfr_tls.zig");
 pub const blocklist = @import("blocklist.zig");
 pub const resolver = @import("resolver.zig");
-pub const qname_minimize = @import("qname_minimize.zig");
 pub const local_zone = @import("local_zone.zig");
 pub const zone_zonemd = @import("zone/zonemd.zig");
 pub const zone_signer = @import("zone/signer.zig");
@@ -56,7 +55,6 @@ test {
     _ = zone_zonemd;
     _ = zone_signer;
     _ = @import("zone/transfer.zig");
-    _ = @import("zone/secondary.zig");
     _ = auth_response;
     _ = auth_runtime;
     _ = auth_keyring;
@@ -72,7 +70,6 @@ test {
     _ = metrics;
     _ = blocklist;
     _ = resolver;
-    _ = qname_minimize;
     _ = local_zone;
 }
 
@@ -159,7 +156,7 @@ fn printHelp(writer: *std.Io.Writer) !void {
         \\  --serve-dot, --serve-doh, and --serve-xfr are accepted but always
         \\  refuse to start: this build links no TLS server, so it cannot
         \\  terminate a handshake and will not serve cleartext on an encrypted
-        \\  port (see docs/decisions/encrypted-transport.md).
+        \\  port (see src/transport/README.md).
         \\
         \\Implemented now:
         \\  --help, --version, server run, query
@@ -461,7 +458,7 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
             try writer.writeAll(
                 "error: --serve-dot, --serve-doh, and --serve-xfr require TLS termination, " ++
                     "which this build cannot provide: no TLS-server dependency is linked " ++
-                    "(see docs/decisions/encrypted-transport.md). The listener was not started " ++
+                    "(see src/transport/README.md). The listener was not started " ++
                     "and the port was not bound.\n",
             );
             try exitUsage(writer);

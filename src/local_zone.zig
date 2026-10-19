@@ -373,8 +373,8 @@ test "RFC 6303 section 4.3 zones hold exactly the 32 nibbles of :: and ::1" {
     // zone table, which is the only place a wrong count could hide.
     var unspecified_buffer: [128]u8 = undefined;
     var loopback_buffer: [128]u8 = undefined;
-    const unspecified = try std.fmt.bufPrint(&unspecified_buffer, "0{s}.ip6.arpa.", .{".0" ** 31});
-    const loopback = try std.fmt.bufPrint(&loopback_buffer, "1{s}.ip6.arpa.", .{".0" ** 31});
+    const unspecified = try std.fmt.bufPrint(&unspecified_buffer, "0{s}.ip6.arpa.", .{".0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0"});
+    const loopback = try std.fmt.bufPrint(&loopback_buffer, "1{s}.ip6.arpa.", .{".0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0"});
     for ([_][]const u8{ unspecified, loopback }) |name| {
         const zone = match(name) orelse return error.MissingZone;
         try std.testing.expectEqualStrings(name, zone.apex);
@@ -384,7 +384,7 @@ test "RFC 6303 section 4.3 zones hold exactly the 32 nibbles of :: and ::1" {
     }
     // A 31-nibble name is a different, unregistered name and must not match.
     var short_buffer: [128]u8 = undefined;
-    const short = try std.fmt.bufPrint(&short_buffer, "1{s}.ip6.arpa.", .{".0" ** 30});
+    const short = try std.fmt.bufPrint(&short_buffer, "1{s}.ip6.arpa.", .{".0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0"});
     try std.testing.expect(match(short) == null);
 }
 
@@ -419,7 +419,7 @@ test "matching walks label boundaries and reports the enclosing apex" {
 
     // The 32-nibble reverse name of fd00::3, which sits below d.f.ip6.arpa.
     var unique_buffer: [128]u8 = undefined;
-    const unique_name = try std.fmt.bufPrint(&unique_buffer, "3{s}.d.f.ip6.arpa.", .{".0" ** 29});
+    const unique_name = try std.fmt.bufPrint(&unique_buffer, "3{s}.d.f.ip6.arpa.", .{".0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0"});
     const unique_local = match(unique_name) orelse return error.MissingZone;
     try std.testing.expectEqualStrings("d.f.ip6.arpa.", unique_local.apex);
     try std.testing.expectEqual(@as(usize, 32), std.mem.count(u8, unique_name, ".") - 2);

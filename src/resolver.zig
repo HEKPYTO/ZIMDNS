@@ -16,7 +16,6 @@ const dns_types = @import("dns/types.zig");
 const dns_writer = @import("dns/writer.zig");
 const dnssec = @import("dns/dnssec.zig");
 const validate = @import("dns/validate.zig");
-const qname_minimize = @import("qname_minimize.zig");
 const tcp_deadline = @import("platform/tcp_deadline.zig");
 
 pub const MAX_CACHE_ENTRIES = 64;
@@ -83,9 +82,6 @@ pub const Policy = struct {
     recursion_allow_len: usize = 0,
     forwarder: ?Endpoint = null,
     cookies: CookiePolicy = .{},
-    /// RFC 9156 minimization mode for the future iterative path. A forwarder
-    /// always sends the full QNAME upstream; see the hook in `answer`.
-    qmin_mode: qname_minimize.Mode = .disabled,
 
     /// RFC 4035 section 5.2 trust anchors. Empty unless `trust-anchor-file`
     /// named one, so a forwarder with no configured anchor validates nothing
@@ -204,12 +200,12 @@ pub const CookiePolicy = struct {
 pub const CookieReplayDb = struct {
     const Entry = struct {
         ip_tag: u8 = 0,
-        ip: [16]u8 = [_]u8{0} ** 16,
-        cookie: [40]u8 = [_]u8{0} ** 40,
+        ip: [16]u8 = @as([16]u8, @as([16]u8, @splat(@as(u8, 0)))),
+        cookie: [40]u8 = @as([40]u8, @as([40]u8, @splat(@as(u8, 0)))),
         cookie_len: u8 = 0,
     };
 
-    entries: [MAX_COOKIE_REPLAY_ENTRIES]Entry = [_]Entry{.{}} ** MAX_COOKIE_REPLAY_ENTRIES,
+    entries: [MAX_COOKIE_REPLAY_ENTRIES]Entry = @splat(Entry{}),
     next: usize = 0,
 
     pub fn contains(self: *const CookieReplayDb, client: *const std.Io.net.IpAddress, cookie: []const u8) bool {
@@ -244,7 +240,7 @@ pub const CookieReplayDb = struct {
     fn clientIdentity(client: *const std.Io.net.IpAddress) ClientIdentity {
         return switch (client.*) {
             .ip4 => |ip4| blk: {
-                var bytes = [_]u8{0} ** 16;
+                var bytes = @as([16]u8, @splat(@as(u8, 0)));
                 @memcpy(bytes[0..4], &ip4.bytes);
                 break :blk .{ .tag = 4, .bytes = bytes };
             },
@@ -291,7 +287,7 @@ const CacheEntry = struct {
 
 const Cache = struct {
     allocator: std.mem.Allocator,
-    entries: [MAX_CACHE_ENTRIES]CacheEntry = [_]CacheEntry{.{}} ** MAX_CACHE_ENTRIES,
+    entries: [MAX_CACHE_ENTRIES]CacheEntry = @splat(CacheEntry{}),
     len: usize = 0,
     replacement: usize = 0,
 
@@ -524,13 +520,6 @@ pub const Resolver = struct {
                     return bytes;
                 }
             }
-        }
-        if (query.question) |question| {
-            // Forwarder QMIN hook (RFC 9156): minimization is an iterative-query
-            // policy, so a forwarder always sends the full QNAME to its recursive
-            // upstream. Keep the decision explicit for the future iterative path.
-            const upstream_name = qname_minimize.forwarderQueryName(&question.name, self.policy.qmin_mode);
-            std.debug.assert(upstream_name.eql(&question.name));
         }
         var response = self.queryUdp(query_bytes, query) catch |err| switch (err) {
             Error.UpstreamFailure,

@@ -171,6 +171,9 @@ fn parseU16(text: []const u8) !u16 {
 
 fn parseRecordType(text: []const u8) RecordType {
     if (std.mem.eql(u8, text, "A")) return .A;
+    if (std.mem.eql(u8, text, "DNAME")) return .DNAME;
+    if (std.mem.eql(u8, text, "SVCB")) return .SVCB;
+    if (std.mem.eql(u8, text, "HTTPS")) return .HTTPS;
     if (std.mem.eql(u8, text, "AAAA")) return .AAAA;
     if (std.mem.eql(u8, text, "NS")) return .NS;
     if (std.mem.eql(u8, text, "CNAME")) return .CNAME;

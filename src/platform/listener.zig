@@ -769,7 +769,7 @@ test "TCP framing accepts the largest u16 length-prefixed frame" {
     const server_stream = try server.accept(io);
     defer server_stream.close(io);
 
-    var frame = [_]u8{0} ** TCP_MAX_FRAME_SIZE;
+    var frame = @as([TCP_MAX_FRAME_SIZE]u8, @splat(@as(u8, 0)));
     var client_write_buffer: [1024]u8 = undefined;
     var client_writer = client_stream.writer(io, &client_write_buffer);
     var prefix: [2]u8 = undefined;

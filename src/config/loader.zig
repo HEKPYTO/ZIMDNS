@@ -4,6 +4,7 @@
 /// Paths: every loader path (config plus referenced zone/blocklist/TSIG files) must be relative,
 /// NUL-free, and without `..` components; symlink-resolved canonical targets must stay beneath `dir`.
 const std = @import("std");
+const builtin = @import("builtin");
 const auth_runtime = @import("../auth/runtime.zig");
 const keyring_mod = @import("../auth/keyring.zig");
 const blocklist_mod = @import("../blocklist.zig");
@@ -103,11 +104,17 @@ pub const ServerContext = struct {
             // queries. The report names the zone and both digests.
             var zonemd_report: [zonemd.report_max_len]u8 = undefined;
             _ = zonemd.verify(&zone, allocator, &zonemd_report) catch {
-                const written = std.mem.indexOfScalar(u8, &zonemd_report, 0) orelse zonemd_report.len;
-                var stderr_buffer: [256]u8 = undefined;
-                var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buffer);
-                stderr_writer.interface.print("error: {s}\n", .{zonemd_report[0..written]}) catch {};
-                stderr_writer.interface.flush() catch {};
+                // The report names the zone and both digests for the operator
+                // who starts the server. A test build has no operator and the
+                // test runner fails on any stderr write, so the line is
+                // printed by the server build only.
+                if (!builtin.is_test) {
+                    const written = std.mem.indexOfScalar(u8, &zonemd_report, 0) orelse zonemd_report.len;
+                    var stderr_buffer: [256]u8 = undefined;
+                    var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buffer);
+                    stderr_writer.interface.print("error: {s}\n", .{zonemd_report[0..written]}) catch {};
+                    stderr_writer.interface.flush() catch {};
+                }
                 return Error.ZonemdMismatch;
             };
             // RFC 4035 section 2.3: signing adds DNSKEY, DS, RRSIG, and NSEC to
@@ -153,6 +160,21 @@ pub const ServerContext = struct {
         else
             auth_runtime.Runtime.fromZonesWithKeyring(self.allocator, &self.zones, self.blocklist, &self.keyring);
         runtime.local_zones = self.config.local_zones;
+        // Per-zone override apexes outlive the config text: lowercased with a
+        // trailing dot, owned by the runtime. Decoded before anything moves
+        // out, so a failure here leaves the context whole.
+        if (self.config.local_zones_except.len != 0) {
+            const list = self.allocator.alloc([]const u8, self.config.local_zones_except.len) catch return error.BadConfiguration;
+            errdefer self.allocator.free(list);
+            for (self.config.local_zones_except.items[0..self.config.local_zones_except.len], 0..) |slot, i| {
+                list[i] = lowerDot(self.allocator, slot.text()) catch {
+                    for (list[0..i]) |done| self.allocator.free(done);
+                    self.allocator.free(list);
+                    return error.BadConfiguration;
+                };
+            }
+            runtime.local_zones_except = list;
+        }
         runtime.edns.nsid = nsid;
         runtime.edns.zoneversion = self.config.zoneversion;
         self.blocklist = .{};
@@ -194,6 +216,18 @@ fn decodeNsid(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     _ = std.fmt.hexToBytes(bytes, text) catch return error.BadConfiguration;
     return bytes;
 }
+/// Lowercase an override apex with its trailing dot, for comparison against
+/// `local_zone.Zone.apex`. The parser stores raw text; the runtime compares
+/// case-insensitively, but canonicalizing here keeps one comparison path.
+fn lowerDot(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    const dotted = text.len != 0 and text[text.len - 1] == '.';
+    const out = try allocator.alloc(u8, text.len + @intFromBool(!dotted));
+    errdefer allocator.free(out);
+    for (text, 0..) |byte, i| out[i] = std.ascii.toLower(byte);
+    if (!dotted) out[out.len - 1] = '.';
+    return out;
+}
+
 
 fn ensureConfined(dir: std.Io.Dir, io: std.Io, sub_path: []const u8) !void {
     if (!isConfinedPath(sub_path)) return Error.InvalidReferencedPath;

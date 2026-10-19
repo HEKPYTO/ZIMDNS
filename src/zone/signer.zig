@@ -7,8 +7,8 @@
 /// allocated from `allocator`, which the caller keeps alive for as long as it
 /// keeps the signed zone. `Key` owns private key material; call `Key.deinit`.
 /// Errors: key-file, RDATA, and capacity failures are typed; no file or socket
-/// I/O occurs here. This module signs only: validation, chain building, and
-/// trust anchors stay deferred per docs/decisions/dnssec-deferral.md.
+/// I/O occurs here. This module signs only: validation lives in
+/// `src/dns/validate.zig`, served over the forwarding path.
 const std = @import("std");
 const Name = @import("../dns/name.zig").Name;
 const dns_dnssec = @import("../dns/dnssec.zig");
@@ -128,7 +128,7 @@ pub const Key = struct {
         var buffer: [max_rdata_len]u8 = undefined;
         std.mem.writeInt(u16, buffer[0..2], dnskey_flags, .big);
         buffer[2] = dnskey_protocol;
-        buffer[3] = @intFromEnum(self.algorithm());
+        buffer[3] = @backingInt(self.algorithm());
         var len: usize = 4;
         switch (self.material) {
             .ecdsa_p256_sha256 => |key_pair| {
@@ -183,8 +183,8 @@ pub const Key = struct {
 
         var buffer: [4 + digest.len]u8 = undefined;
         std.mem.writeInt(u16, buffer[0..2], dns_dnssec.keyTag(dnskey_rdata), .big);
-        buffer[2] = @intFromEnum(self.algorithm());
-        buffer[3] = @intFromEnum(DigestType.forAlgorithm(self.algorithm()));
+        buffer[2] = @backingInt(self.algorithm());
+        buffer[3] = @backingInt(DigestType.forAlgorithm(self.algorithm()));
         @memcpy(buffer[4..][0..digest_len], digest[0..digest_len]);
         return allocator.dupe(u8, buffer[0 .. 4 + digest_len]);
     }
@@ -536,7 +536,7 @@ fn typeBitmap(allocator: std.mem.Allocator, codes: []u16) Error![]const u8 {
     var index: usize = 0;
     while (index < codes.len) {
         const window: u8 = @intCast(codes[index] / 256);
-        var bits = [_]u8{0} ** 32;
+        var bits = @as([32]u8, @splat(@as(u8, 0)));
         var last: usize = 0;
         while (index < codes.len and codes[index] / 256 == window) : (index += 1) {
             const bit: u16 = codes[index] % 256;
@@ -613,7 +613,7 @@ fn rrsigHeader(
     out: []u8,
 ) Error!usize {
     std.mem.writeInt(u16, out[0..2], rrset.rrtype, .big);
-    out[2] = @intFromEnum(algorithm);
+    out[2] = @backingInt(algorithm);
     out[3] = labelCount(rrset.owner_wire);
     std.mem.writeInt(u32, out[4..8], rrset.ttl, .big);
     std.mem.writeInt(u32, out[8..12], options.expiration, .big);

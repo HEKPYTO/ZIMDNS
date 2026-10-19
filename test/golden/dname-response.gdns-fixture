@@ -1,0 +1,25 @@
+name: dname-response
+rfc: RFC 6672 section 3
+phase: 3
+description: Exact authoritative DNAME substitution response with an uncompressed DNAME target and the synthesized CNAME.
+input_hex:
+  4d 4e 01 00 00 01 00 00 00 00 00 00
+  03 77 77 77 06 6c 65 67 61 63 79 04
+  68 6f 6d 65 04 61 72 70 61 00 00 01
+  00 01
+response_hex:
+  4d 4e 85 00 00 01 00 02 00 00 00 00
+  03 77 77 77 06 6c 65 67 61 63 79 04
+  68 6f 6d 65 04 61 72 70 61 00 00 01
+  00 01 c0 10 00 27 00 01 00 00 0e 10
+  00 10 06 74 61 72 67 65 74 07 65 78
+  61 6d 70 6c 65 00 c0 0c 00 05 00 01
+  00 00 0e 10 00 14 03 77 77 77 06 74
+  61 72 67 65 74 07 65 78 61 6d 70 6c
+  65 00
+expect:
+  parse_ok: true
+  id: 0x4d4e
+  qname: www.legacy.home.arpa.
+  qtype: A
+  qclass: IN

@@ -158,6 +158,29 @@ test "server context keeps locally served zones on by default and honours local-
     defer off_runtime.deinit();
     try std.testing.expect(!off_runtime.local_zones);
 }
+test "server context decodes local-zones except apexes into the runtime" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{ .sub_path = "one.zone", .data = zone_one });
+    try dir.dir.writeFile(io, .{ .sub_path = "except.gdns", .data =
+        \\zone one.example primary one.zone
+        \\local-zones except 10.in-addr.arpa.
+        \\local-zones except EXAMPLE
+        \\
+    });
+
+    var context = try ServerContext.load(dir.dir, io, "except.gdns", std.testing.allocator);
+    defer context.deinit();
+    var runtime = try context.takeRuntime(io);
+    defer runtime.deinit();
+    try std.testing.expect(runtime.local_zones);
+    try std.testing.expectEqual(@as(usize, 2), runtime.local_zones_except.len);
+    try std.testing.expectEqualStrings("10.in-addr.arpa.", runtime.local_zones_except[0]);
+    try std.testing.expectEqualStrings("example.", runtime.local_zones_except[1]);
+}
+
 
 test "server context decodes the nsid hex and the zoneversion switch into the runtime EDNS policy" {
     const io = std.Io.Threaded.global_single_threaded.io();

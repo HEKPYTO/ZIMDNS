@@ -90,8 +90,12 @@ pub const Message = struct {
     pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !Message {
         var reader = Reader.init(bytes);
         const header = header_mod.Header.parse(&reader) catch return Error.EndOfInput;
+        // RFC 9619 section 4: QDCOUNT > 1 is malformed for any OPCODE here.
+        // UPDATE/NOTIFY/transfer layouts are recovered downstream by
+        // parseTransferFallback, which needs this error (not
+        // UnsupportedQuestionCount) to reach FORMERR instead of silent drop.
         if (header.question_count > 1) {
-            return if (header.opcode == .query) Error.TooManyQuestions else Error.UnsupportedQuestionCount;
+            return Error.TooManyQuestions;
         }
 
         var message = Message{ .allocator = allocator, .header = header };

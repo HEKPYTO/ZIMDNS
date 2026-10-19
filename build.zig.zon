@@ -2,7 +2,7 @@
     .name = .zimdns,
     .version = "0.0.0",
     .fingerprint = 0x3bb9b0b5ba8c89dd,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{},
     .paths = .{
         "README.md",

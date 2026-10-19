@@ -639,3 +639,123 @@ const rp_fixture_zone =
     \\txt-dname IN TXT "target text"
     \\
 ;
+
+test "DNAME query golden fixture" {
+    const text = @embedFile("dname-response.gdns-fixture");
+    const fixture = try Fixture.parse(text);
+    try fixture.run();
+
+    var runtime = try zimdns.auth_runtime.Runtime.fromZoneText(dname_fixture_zone);
+    defer runtime.deinit();
+    var output: [512]u8 = undefined;
+    const actual = try runtime.answer(fixture.inputBytes(), &output);
+    try std.testing.expectEqualSlices(u8, fixture.responseBytes(), actual);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try zimdns.dns_message.Message.parse(arena.allocator(), actual);
+    const answer = parsed.answers.items[1];
+    try std.testing.expect(answer.rrtype.eql(.CNAME));
+    var target: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("www.target.example.", try answer.rdata.CNAME.toText(&target));
+}
+
+const dname_fixture_zone =
+    \\$ORIGIN home.arpa.
+    \\$TTL 3600
+    \\@ IN SOA ns.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 300
+    \\@ IN NS ns.home.arpa.
+    \\legacy IN DNAME target.example.
+    \\target IN A 192.0.2.21
+    \\
+;
+
+test "SVCB query golden fixture" {
+    const text = @embedFile("svcb-response.gdns-fixture");
+    const fixture = try Fixture.parse(text);
+    try fixture.run();
+
+    var runtime = try zimdns.auth_runtime.Runtime.fromZoneText(svcb_fixture_zone);
+    defer runtime.deinit();
+    var output: [512]u8 = undefined;
+    const actual = try runtime.answer(fixture.inputBytes(), &output);
+    try std.testing.expectEqualSlices(u8, fixture.responseBytes(), actual);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try zimdns.dns_message.Message.parse(arena.allocator(), actual);
+    const answer = parsed.answers.items[0];
+    try std.testing.expect(answer.rrtype.eql(.SVCB));
+    try std.testing.expectEqual(@as(u16, 1), answer.rdata.SVCB.priority);
+    var target: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("target.home.arpa.", try answer.rdata.SVCB.target.toText(&target));
+}
+
+const svcb_fixture_zone =
+    \\$ORIGIN home.arpa.
+    \\$TTL 3600
+    \\@ IN SOA ns.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 300
+    \\@ IN NS ns.home.arpa.
+    \\svc IN SVCB 1 target.home.arpa. alpn=h2 port=443
+    \\target IN A 192.0.2.21
+    \\
+;
+test "HTTPS query golden fixture" {
+    const text = @embedFile("https-response.gdns-fixture");
+    const fixture = try Fixture.parse(text);
+    try fixture.run();
+
+    var runtime = try zimdns.auth_runtime.Runtime.fromZoneText(https_fixture_zone);
+    defer runtime.deinit();
+    var output: [512]u8 = undefined;
+    const actual = try runtime.answer(fixture.inputBytes(), &output);
+    try std.testing.expectEqualSlices(u8, fixture.responseBytes(), actual);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try zimdns.dns_message.Message.parse(arena.allocator(), actual);
+    const answer = parsed.answers.items[0];
+    try std.testing.expect(answer.rrtype.eql(.HTTPS));
+    try std.testing.expectEqual(@as(u16, 0), answer.rdata.HTTPS.priority);
+    var target: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("target.home.arpa.", try answer.rdata.HTTPS.target.toText(&target));
+    try std.testing.expectEqual(@as(u16, 0), answer.rdata.HTTPS.params_len);
+}
+
+const https_fixture_zone =
+    \\$ORIGIN home.arpa.
+    \\$TTL 3600
+    \\@ IN SOA ns.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 300
+    \\@ IN NS ns.home.arpa.
+    \\alias IN HTTPS 0 target
+    \\target IN A 192.0.2.21
+    \\
+;
+
+test "AAAA query golden fixture" {
+    const text = @embedFile("aaaa-response.gdns-fixture");
+    const fixture = try Fixture.parse(text);
+    try fixture.run();
+
+    var runtime = try zimdns.auth_runtime.Runtime.fromZoneText(aaaa_fixture_zone);
+    defer runtime.deinit();
+    var output: [512]u8 = undefined;
+    const actual = try runtime.answer(fixture.inputBytes(), &output);
+    try std.testing.expectEqualSlices(u8, fixture.responseBytes(), actual);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try zimdns.dns_message.Message.parse(arena.allocator(), actual);
+    const answer = parsed.answers.items[0];
+    try std.testing.expect(answer.rrtype.eql(.AAAA));
+    try std.testing.expectEqualSlices(u8, &.{ 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x21 }, &answer.rdata.AAAA);
+}
+
+const aaaa_fixture_zone =
+    \\$ORIGIN home.arpa.
+    \\$TTL 3600
+    \\@ IN SOA ns.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 300
+    \\@ IN NS ns.home.arpa.
+    \\target IN AAAA 2001:db8::21
+    \\
+;

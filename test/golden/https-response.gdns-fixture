@@ -1,0 +1,21 @@
+name: https-response
+rfc: RFC 9460 section 2
+phase: 3
+description: Exact authoritative HTTPS alias-mode response with priority 0 and empty params.
+input_hex:
+  53 57 01 00 00 01 00 00 00 00 00 00
+  05 61 6c 69 61 73 04 68 6f 6d 65 04
+  61 72 70 61 00 00 41 00 01
+response_hex:
+  53 57 85 00 00 01 00 01 00 00 00 00
+  05 61 6c 69 61 73 04 68 6f 6d 65 04
+  61 72 70 61 00 00 41 00 01 c0 0c 00
+  41 00 01 00 00 0e 10 00 14 00 00 06
+  74 61 72 67 65 74 04 68 6f 6d 65 04
+  61 72 70 61 00
+expect:
+  parse_ok: true
+  id: 0x5357
+  qname: alias.home.arpa.
+  qtype: HTTPS
+  qclass: IN

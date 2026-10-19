@@ -76,7 +76,7 @@ pub const Name = struct {
         var next_offset = offset;
         var jumped = false;
         var jumps: u8 = 0;
-        var seen_offsets = [_]usize{0} ** max_jumps;
+        var seen_offsets = @as([max_jumps]usize, @splat(@as(usize, 0)));
 
         while (true) {
             if (current >= message.len) return Error.EndOfInput;

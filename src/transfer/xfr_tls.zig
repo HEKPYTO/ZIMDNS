@@ -5,7 +5,7 @@
 /// channel and nothing can truthfully claim a channel is TLS: there is
 /// deliberately no bind/accept entry point and no channel selector here, and
 /// the --serve-xfr startup gate refuses before opening a socket (tls.zig,
-/// docs/decisions/encrypted-transport.md). Multi-message TSIG chaining stays
+/// src/transport/README.md). Multi-message TSIG chaining stays
 /// deferred per the axfr.zig policy.
 /// Ownership: Runtime is borrowed; streams are consumed/closed by the caller
 /// loop; wire buffers are local.
@@ -20,18 +20,10 @@ const tcp_deadline = @import("../platform/tcp_deadline.zig");
 const tls_policy = @import("../transport/tls.zig");
 const axfr = @import("axfr.zig");
 
-pub const XFR_TLS_PORT = tls_policy.dot_port;
 pub const MAX_FRAMES_PER_CONNECTION = listener.TCP_MAX_FRAMES_PER_CONNECTION;
 pub const MAX_CONNECTION_WORKERS = listener.TCP_MAX_CONNECTION_WORKERS;
 const IO_TIMEOUT = listener.TCP_IO_TIMEOUT;
 
-pub fn serveXfrStreamOnce(
-    stream: std.Io.net.Stream,
-    io: std.Io,
-    runtime: *const Runtime,
-) !void {
-    return serveXfrStream(stream, io, runtime, null);
-}
 
 pub fn serveXfrStreamOnceWithMetrics(
     stream: std.Io.net.Stream,

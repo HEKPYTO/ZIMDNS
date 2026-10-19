@@ -606,7 +606,7 @@ fn buildTypeBitmap(tokens: *std.mem.TokenIterator(u8, .any), out: []u8) Error!us
     var index: usize = 0;
     while (index < count) {
         const window: u8 = @intCast(codes[index] / 256);
-        var bits: [32]u8 = [_]u8{0} ** 32;
+        var bits: [32]u8 = @as([32]u8, @as([32]u8, @splat(@as(u8, 0))));
         var max_byte: usize = 0;
         while (index < count and codes[index] / 256 == window) : (index += 1) {
             const bit: u16 = codes[index] % 256;
@@ -1795,7 +1795,7 @@ test "zone RDATA parser rejects malformed text for every supported type" {
     };
     for (cases) |case| try std.testing.expectError(Error.BadRecord, parseRData(case.rrtype, case.text));
 
-    const overlong_txt = [_]u8{'x'} ** 256;
+    const overlong_txt = @as([256]u8, @splat(@as(u8, 'x')));
     try std.testing.expectError(Error.BadRecord, parseRData(.TXT, &overlong_txt));
 }
 
@@ -2652,7 +2652,7 @@ test "NAPTR zone text rejects non-UTF8 and oversized wire data" {
         text[index] = ' ';
         index += 1;
     }
-    @memcpy(text[index .. index + 256], "a" ** 256);
+    @memset(text[index .. index + 256], 'a');
     index += 256;
     text[index] = '.';
     index += 1;
@@ -2712,7 +2712,7 @@ test "parses a large zone without arbitrary limits" {
             "@ IN NS ns1.home.arpa.\n",
     );
     try input.writer.writeAll("long IN TXT \"");
-    const long_text = [_]u8{'x'} ** 255;
+    const long_text = @as([255]u8, @splat(@as(u8, 'x')));
     try input.writer.writeAll(&long_text);
     try input.writer.writeAll("\"\n");
     var index: usize = 0;

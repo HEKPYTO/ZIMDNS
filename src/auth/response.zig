@@ -246,8 +246,9 @@ pub fn buildResponseWithEdns(request: dns_message.Message, zone: *const zone_ind
     // DNSSEC minimum (RFC 4035 section 3.1, RFC 5155): RRSIGs covering the
     // answer RRsets and NSEC/NSEC3 denial proofs ride along only when the
     // query set DO=1; without DO, proof RRsets are stripped unless the
-    // QTYPE asked for them explicitly. The AD bit is never set: this server
-    // does not perform cryptographic validation.
+    // QTYPE asked for them explicitly. The AD bit is never set here: the
+    // authoritative path does not validate (validation lives on the
+    // forwarding path in `src/dns/validate.zig`).
     const dnssec_ok = if (request.edns) |edns| edns.dnssec_ok else false;
     if (dnssec_ok) {
         appendCoveringRrsigs(&response, zone, q.qtype) catch {};

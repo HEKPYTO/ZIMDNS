@@ -441,7 +441,7 @@ pub fn appendTsigStub(
     now: u64,
 ) Error!void {
     const digest_len: usize = dns_tsig.digestLength(algorithm);
-    var zero_mac: [32]u8 = .{0} ** 32;
+    var zero_mac: [32]u8 = @splat(0);
     const value = dns_rdata.Tsig.init(
         algorithmName(algorithm),
         now,
@@ -707,7 +707,7 @@ test "transfer chains one TSIG per message through the chainedMac primitive" {
     defer arena.deinit();
     const secret = "01234567890123456789012345678901";
     const key_owner = try dns_name.Name.fromText("key.");
-    const request_mac = [_]u8{0x5a} ** 32;
+    const request_mac = @as([32]u8, @splat(@as(u8, 0x5a)));
     const now = 1_700_000_000;
 
     var zone = try loadTransferTestZone();

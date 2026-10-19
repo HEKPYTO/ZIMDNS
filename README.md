@@ -20,12 +20,6 @@ Two EDNS(0) options that identify *this* server are configuration directives, an
 
 RFC 9463 DNR is `not-applicable` to this DNS-only server because it defines DHCP/Router Advertisement provisioning; no DNR parser, CLI/config surface, DHCP, RA, or output artifact is planned.
 
-Key documents:
-
-- [DNS RFC parity roadmap](docs/plans/2026-08-12-dns-rfc-parity-roadmap.md)
-- [Master specification](docs/specs/zimdns-master-spec.md)
-- [Historical revision findings](docs/notes/specs/2026-08-10-zimdns-revision-findings.md)
-
 ## Development
 
 ```sh
