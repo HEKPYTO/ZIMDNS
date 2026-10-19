@@ -153,20 +153,17 @@ pub const ServerContext = struct {
         // Per-zone override apexes outlive the config text: lowercased with a
         // trailing dot, owned by the runtime. Decoded before the runtime
         // exists, so a failure here leaves the context whole.
-        var except_owned = if (self.config.local_zones_except.len != 0)
-            blk: {
-                const list = self.allocator.alloc([]const u8, self.config.local_zones_except.len) catch return error.BadConfiguration;
-                errdefer self.allocator.free(list);
-                for (self.config.local_zones_except.items[0..self.config.local_zones_except.len], 0..) |slot, i| {
-                    list[i] = lowerDot(self.allocator, slot.text()) catch {
-                        for (list[0..i]) |done| self.allocator.free(done);
-                        return error.BadConfiguration;
-                    };
-                }
-                break :blk list;
+        var except_owned = if (self.config.local_zones_except.len != 0) blk: {
+            const list = self.allocator.alloc([]const u8, self.config.local_zones_except.len) catch return error.BadConfiguration;
+            errdefer self.allocator.free(list);
+            for (self.config.local_zones_except.items[0..self.config.local_zones_except.len], 0..) |slot, i| {
+                list[i] = lowerDot(self.allocator, slot.text()) catch {
+                    for (list[0..i]) |done| self.allocator.free(done);
+                    return error.BadConfiguration;
+                };
             }
-        else
-            null;
+            break :blk list;
+        } else null;
         errdefer if (except_owned) |l| {
             for (l) |apex| self.allocator.free(apex);
             self.allocator.free(l);
@@ -185,8 +182,9 @@ pub const ServerContext = struct {
             runtime.local_zones_except = l;
             except_owned = null;
         }
-        runtime.edns.nsid = nsid;
-        runtime.edns.zoneversion = self.config.zoneversion;
+        runtime.answer_policy.nsid = nsid;
+        runtime.answer_policy.zoneversion = self.config.zoneversion;
+        if (self.config.minimal_any_ttl) |ttl| runtime.answer_policy.minimal_any_ttl = ttl;
         self.blocklist = .{};
         self.config = .{};
         return runtime;
@@ -237,7 +235,6 @@ fn lowerDot(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     if (!dotted) out[out.len - 1] = '.';
     return out;
 }
-
 
 fn ensureConfined(dir: std.Io.Dir, io: std.Io, sub_path: []const u8) !void {
     if (!isConfinedPath(sub_path)) return Error.InvalidReferencedPath;

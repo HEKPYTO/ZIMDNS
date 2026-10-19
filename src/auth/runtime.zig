@@ -69,7 +69,7 @@ pub const Runtime = struct {
     /// What an authoritative answer may carry back in its OPT record, from the
     /// `nsid` and `zoneversion` directives. `nsid` is heap-owned so it outlives
     /// the config text it was decoded from.
-    edns: response.EdnsPolicy = .{},
+    answer_policy: response.AnswerPolicy = .{},
     keyring: keyring_mod.Keyring = .{},
     tsig_now: ?u64 = null,
     /// Volatile per-zone RFC 1995 serial transitions feeding IXFR delta
@@ -173,8 +173,8 @@ pub const Runtime = struct {
         self.transfer_delta_logs.deinit(self.allocator);
         self.transfer_delta_logs = .empty;
         self.blocklist = .{};
-        if (self.edns.nsid) |nsid| self.allocator.free(nsid);
-        self.edns = .{};
+        if (self.answer_policy.nsid) |nsid| self.allocator.free(nsid);
+        self.answer_policy = .{};
         for (self.local_zones_except) |apex| self.allocator.free(apex);
         if (self.local_zones_except.len != 0) self.allocator.free(self.local_zones_except);
         self.local_zones_except = &.{};
@@ -885,7 +885,7 @@ pub const Runtime = struct {
         // partial zone can never leak through one datagram or frame.
         if (transfer.classify(q.qtype, q.qclass) != .none) return response.buildRefusedResponse(query);
         const selected = self.selectZone(qname_text) orelse return response.buildRefusedResponse(query);
-        return response.buildResponseWithEdns(query, selected, self.edns);
+        return response.buildResponseWithPolicy(query, selected, self.answer_policy);
     }
 
     fn appendZoneText(self: *Runtime, text: []const u8) !void {
@@ -1226,7 +1226,6 @@ test "runtime returns bare FORMERR for malformed ECS with a valid question" {
     try std.testing.expectEqual(@as(u16, 0), parsed_ecs.header.additional_count);
     try std.testing.expect(parsed_ecs.edns == null);
 }
-
 
 test "RFC 6891: a query carrying two OPT records is answered FORMERR" {
     var runtime = try Runtime.fromZoneText(

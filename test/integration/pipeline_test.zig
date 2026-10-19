@@ -167,9 +167,9 @@ test "oversized answer is truncated over UDP and served whole over TCP" {
     defer zone_text.deinit();
     try zone_text.writer.writeAll(
         "$ORIGIN example.\n" ++
-        "$TTL 3600\n" ++
-        "@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300\n" ++
-        "@ IN NS ns.example.\n",
+            "$TTL 3600\n" ++
+            "@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300\n" ++
+            "@ IN NS ns.example.\n",
     );
     var address_index: usize = 1;
     while (address_index <= 100) : (address_index += 1) {
@@ -1127,10 +1127,10 @@ test "UDP request pipeline answers ZONEVERSION with SOA serial" {
     // root + OPT(41) + CLASS(udp size) + TTL(0) + RDLEN(4) + opt(19,0).
     const query = &[_]u8{
         0x42, 0xE1, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
-        0x06, 't', 'a', 'r', 'g', 'e', 't', 0x04, 'h', 'o', 'm', 'e', 0x04, 'a', 'r', 'p', 'a', 0x00,
-        0x00, 0x01, 0x00, 0x01,
-        0x00, 0x00, 0x29, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04,
-        0x00, 0x13, 0x00, 0x00,
+        0x06, 't',  'a',  'r',  'g',  'e',  't',  0x04, 'h',  'o',  'm',  'e',
+        0x04, 'a',  'r',  'p',  'a',  0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
+        0x29, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x13, 0x00,
+        0x00,
     };
     try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, query);
     try listener.serveUdpOnce(&server_socket, io, &runtime);
@@ -1170,10 +1170,10 @@ test "TCP request pipeline answers ZONEVERSION with SOA serial" {
 
     const query = &[_]u8{
         0x42, 0xE2, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
-        0x06, 't', 'a', 'r', 'g', 'e', 't', 0x04, 'h', 'o', 'm', 'e', 0x04, 'a', 'r', 'p', 'a', 0x00,
-        0x00, 0x01, 0x00, 0x01,
-        0x00, 0x00, 0x29, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04,
-        0x00, 0x13, 0x00, 0x00,
+        0x06, 't',  'a',  'r',  'g',  'e',  't',  0x04, 'h',  'o',  'm',  'e',
+        0x04, 'a',  'r',  'p',  'a',  0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
+        0x29, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x13, 0x00,
+        0x00,
     };
     try cli_query.sendTcpQuery(client_stream, io, query);
     try client_stream.shutdown(io, .send);
@@ -1201,7 +1201,7 @@ test "UDP request pipeline answers NSID with configured payload" {
     var runtime = try Runtime.fromZoneText(fixture_zone);
     defer runtime.deinit();
     // Operator identifier "ns1.example." — heap-owned like loader output.
-    runtime.edns.nsid = try std.heap.page_allocator.dupe(u8, "ns1.example.");
+    runtime.answer_policy.nsid = try std.heap.page_allocator.dupe(u8, "ns1.example.");
 
     var server_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     var server_socket = try std.Io.net.IpAddress.bind(&server_addr, io, .{ .mode = .dgram, .protocol = .udp });
@@ -1215,10 +1215,10 @@ test "UDP request pipeline answers NSID with configured payload" {
     // NSID option (code 3, len 0); query payload is never read.
     const query = &[_]u8{
         0x42, 0xF1, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
-        0x06, 't', 'a', 'r', 'g', 'e', 't', 0x04, 'h', 'o', 'm', 'e', 0x04, 'a', 'r', 'p', 'a', 0x00,
-        0x00, 0x01, 0x00, 0x01,
-        0x00, 0x00, 0x29, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04,
-        0x00, 0x03, 0x00, 0x00,
+        0x06, 't',  'a',  'r',  'g',  'e',  't',  0x04, 'h',  'o',  'm',  'e',
+        0x04, 'a',  'r',  'p',  'a',  0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
+        0x29, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x03, 0x00,
+        0x00,
     };
     try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, query);
     try listener.serveUdpOnce(&server_socket, io, &runtime);
@@ -1243,7 +1243,7 @@ test "TCP request pipeline answers NSID with configured payload" {
 
     var runtime = try Runtime.fromZoneText(fixture_zone);
     defer runtime.deinit();
-    runtime.edns.nsid = try std.heap.page_allocator.dupe(u8, "ns1.example.");
+    runtime.answer_policy.nsid = try std.heap.page_allocator.dupe(u8, "ns1.example.");
 
     var listen_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     var server = try std.Io.net.IpAddress.listen(&listen_addr, io, .{ .reuse_address = true });
@@ -1256,10 +1256,10 @@ test "TCP request pipeline answers NSID with configured payload" {
 
     const query = &[_]u8{
         0x42, 0xF2, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
-        0x06, 't', 'a', 'r', 'g', 'e', 't', 0x04, 'h', 'o', 'm', 'e', 0x04, 'a', 'r', 'p', 'a', 0x00,
-        0x00, 0x01, 0x00, 0x01,
-        0x00, 0x00, 0x29, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04,
-        0x00, 0x03, 0x00, 0x00,
+        0x06, 't',  'a',  'r',  'g',  'e',  't',  0x04, 'h',  'o',  'm',  'e',
+        0x04, 'a',  'r',  'p',  'a',  0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
+        0x29, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x03, 0x00,
+        0x00,
     };
     try cli_query.sendTcpQuery(client_stream, io, query);
     try client_stream.shutdown(io, .send);
@@ -1278,8 +1278,6 @@ test "TCP request pipeline answers NSID with configured payload" {
     }
     try std.testing.expect(found);
 }
-
-
 
 test "TCP request pipeline preserves FIFO responses for pipelined queries" {
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -1950,7 +1948,6 @@ test "local-zones except falls through to refused without a forwarder" {
     try expectLocalNxdomain(kept, 0x7a32, "10.in-addr.arpa.");
 }
 
-
 test "the shipped --config invocation loads through the cwd Dir and answers a query" {
     const io = std.Io.Threaded.global_single_threaded.io();
     // Exactly what `zimdns server run --config examples/config.gdns` passes:
@@ -2261,7 +2258,6 @@ test "forwarder signals anchor key tags on upstream DNSKEY query" {
     // 0x888f is the RFC 4034 Appendix B checksum of RDATA 01 01 03 08 41 42 43 44.
     try std.testing.expectEqualSlices(u8, &.{ 0x88, 0x8f }, capture.tags[0..capture.tags_len]);
 }
-
 
 const QminCaptureArgs = struct {
     io: std.Io,
@@ -3153,4 +3149,38 @@ fn serveAdUpstream(args: *AdUpstreamArgs) void {
     valid.bytes[3] |= 0x20;
     args.udp.send(args.io, &incoming.from, valid.bytes[0..valid.len]) catch return;
     args.ok = true;
+}
+
+test "UDP request pipeline ANY answers one synthesized HINFO at the operator TTL" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(fixture_zone);
+    defer runtime.deinit();
+    runtime.answer_policy.minimal_any_ttl = 300;
+
+    var server_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server_socket = try std.Io.net.IpAddress.bind(&server_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer server_socket.close(io);
+
+    var client_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var client_socket = try std.Io.net.IpAddress.bind(&client_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer client_socket.close(io);
+
+    const query = &[_]u8{
+        0x42, 0xE3, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x03, 'd',  'n',  's',  0x04, 'h',  'o',  'm',  'e',  0x04, 'a',  'r',
+        'p',  'a',  0x00, 0x00, 0xff, 0x00, 0x01,
+    };
+    try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, query);
+    try listener.serveUdpOnce(&server_socket, io, &runtime);
+
+    var response_buffer: [512]u8 = undefined;
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    try std.testing.expect(response.header.qr);
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+    try std.testing.expect(response.answers.items[0].rrtype.eql(.{ .value = 13 }));
+    try std.testing.expectEqual(@as(u32, 300), response.answers.items[0].ttl);
+    try std.testing.expectEqualSlices(u8, &.{ 0x07, 'R', 'F', 'C', '8', '4', '8', '2', 0x00 }, response.answers.items[0].rdata.Unknown.bytes());
 }

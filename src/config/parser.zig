@@ -193,6 +193,11 @@ pub const Config = struct {
     zoneversion: bool = true,
     has_zoneversion: bool = false,
 
+    /// RFC 8482 section 4.2: the operator-chosen TTL of the synthesized HINFO
+    /// in a minimal ANY answer. Null means "use the RFC's day-long default"
+    /// (see AnswerPolicy.minimal_any_ttl); set via `minimal-any-ttl <seconds>`.
+    minimal_any_ttl: ?u32 = null,
+
     pub fn tlsCertFileText(self: *const Config) ?[]const u8 {
         if (!self.has_tls_cert_file) return null;
         return self.tls_cert_file.text();
@@ -253,6 +258,7 @@ pub const Config = struct {
         if (std.mem.eql(u8, first, "local-zones")) return self.parseLocalZones(&tokens);
         if (std.mem.eql(u8, first, "nsid")) return self.parseNsid(&tokens);
         if (std.mem.eql(u8, first, "zoneversion")) return self.parseZoneversion(&tokens);
+        if (std.mem.eql(u8, first, "minimal-any-ttl")) return self.parseMinimalAnyTtl(&tokens);
         return Error.UnknownDirective;
     }
 
@@ -428,6 +434,15 @@ pub const Config = struct {
             return Error.BadDirective;
         }
         self.has_zoneversion = true;
+    }
+
+    fn parseMinimalAnyTtl(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        if (self.minimal_any_ttl != null) return Error.BadDirective;
+        const value = tokens.next() orelse return Error.BadDirective;
+        try requireNoTrailingTokens(tokens);
+        const parsed = std.fmt.parseInt(u32, value, 10) catch return Error.BadDirective;
+        if (parsed > 0x7fffffff) return Error.BadDirective;
+        self.minimal_any_ttl = parsed;
     }
 };
 
@@ -629,7 +644,6 @@ test "config parser collects local-zones except apexes" {
     try std.testing.expectError(error.BadDirective, Config.parse("local-zones except a. b.\n"));
 }
 
-
 test "config parser takes one RFC 5001 NSID as hex and rejects every other shape" {
     const config = try Config.parse("nsid 6e73312e6578616d706c652e\n");
     try std.testing.expectEqualStrings("6e73312e6578616d706c652e", config.nsidText().?);
@@ -675,4 +689,33 @@ test "config parser keeps ZONEVERSION answers on unless an operator turns them o
         "zoneversion on\nzoneversion off\n",
     ));
     try std.testing.expectError(error.UnknownDirective, Config.parse("zoneversions on\n"));
+}
+
+test "config parser accepts minimal-any-ttl as a guarded unsigned TTL" {
+    const implicit = try Config.parse("zone one.example primary one.zone\n");
+    try std.testing.expect(implicit.minimal_any_ttl == null);
+
+    const configured = try Config.parse("minimal-any-ttl 300\n");
+    try std.testing.expectEqual(@as(u32, 300), configured.minimal_any_ttl.?);
+
+    const zero = try Config.parse("minimal-any-ttl 0\n");
+    try std.testing.expectEqual(@as(u32, 0), zero.minimal_any_ttl.?);
+
+    for ([_][]const u8{
+        "minimal-any-ttl\n",
+        "minimal-any-ttl 300 extra\n",
+        "minimal-any-ttl abc\n",
+        "minimal-any-ttl -1\n",
+        "minimal-any-ttl 2147483648\n",
+        "minimal-any-ttl 4294967295\n",
+        "minimal-any-ttl 0x12\n",
+    }) |text| {
+        try std.testing.expectError(error.BadDirective, Config.parse(text));
+    }
+    try std.testing.expectError(error.BadDirective, Config.parse(
+        "minimal-any-ttl 300\nminimal-any-ttl 600\n",
+    ));
+    // Typical zone config plus the new directive survives parsing.
+    const config = try Config.parse("zone one.example primary one.zone\nminimal-any-ttl 7200\n");
+    try std.testing.expectEqual(@as(u32, 7200), config.minimal_any_ttl.?);
 }

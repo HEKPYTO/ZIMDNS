@@ -181,7 +181,6 @@ test "server context decodes local-zones except apexes into the runtime" {
     try std.testing.expectEqualStrings("example.", runtime.local_zones_except[1]);
 }
 
-
 test "server context decodes the nsid hex and the zoneversion switch into the runtime EDNS policy" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var dir = std.testing.tmpDir(.{});
@@ -193,6 +192,7 @@ test "server context decodes the nsid hex and the zoneversion switch into the ru
         \\zone one.example primary one.zone
         \\nsid 6e73312e6578616d706c652e
         \\zoneversion off
+        \\minimal-any-ttl 300
         \\
     });
 
@@ -200,8 +200,9 @@ test "server context decodes the nsid hex and the zoneversion switch into the ru
     defer plain.deinit();
     var plain_runtime = try plain.takeRuntime(io);
     defer plain_runtime.deinit();
-    try std.testing.expect(plain_runtime.edns.nsid == null);
-    try std.testing.expect(plain_runtime.edns.zoneversion);
+    try std.testing.expect(plain_runtime.answer_policy.nsid == null);
+    try std.testing.expect(plain_runtime.answer_policy.zoneversion);
+    try std.testing.expectEqual(@as(u32, 86400), plain_runtime.answer_policy.minimal_any_ttl);
 
     var configured = try ServerContext.load(dir.dir, io, "edns.gdns", std.testing.allocator);
     defer configured.deinit();
@@ -209,8 +210,9 @@ test "server context decodes the nsid hex and the zoneversion switch into the ru
     defer configured_runtime.deinit();
     // RFC 5001 section 2.4: the hex an operator writes is the presentation
     // format for the OPTION-DATA octets, so the payload is the decoded text.
-    try std.testing.expectEqualSlices(u8, "ns1.example.", configured_runtime.edns.nsid.?);
-    try std.testing.expect(!configured_runtime.edns.zoneversion);
+    try std.testing.expectEqualSlices(u8, "ns1.example.", configured_runtime.answer_policy.nsid.?);
+    try std.testing.expect(!configured_runtime.answer_policy.zoneversion);
+    try std.testing.expectEqual(@as(u32, 300), configured_runtime.answer_policy.minimal_any_ttl);
 }
 
 test "the shipped local-zones example configuration loads with its zone and forwarder" {

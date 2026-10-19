@@ -759,6 +759,30 @@ const Validator = struct {
         return keys.items;
     }
 
+    fn dsAnchorFor(self: *const Validator, signer: Name) bool {
+        var index: usize = 0;
+        while (index < self.anchors.len) : (index += 1) {
+            const anchor = &self.anchors.items[index];
+            if (!anchor.rrtype.eql(.DS)) continue;
+            if (!anchor.owner.eql(&signer)) continue;
+            return true;
+        }
+        return false;
+    }
+
+    fn hasDnskey(self: *const Validator, signer: Name) bool {
+        var index: usize = 0;
+        while (index < self.anchors.len) : (index += 1) {
+            const anchor = &self.anchors.items[index];
+            if (anchor.rrtype.eql(.DNSKEY) and anchor.owner.eql(&signer)) return true;
+        }
+        for (self.rrsets.items) |*rrset| {
+            if (rrset.rrtype != RecordType.DNSKEY.code()) continue;
+            if (rrset.owner.eql(&signer)) return true;
+        }
+        return false;
+    }
+
     fn keysFromDs(self: *Validator, keys: *std.ArrayList([]const u8), signer: Name) Error!void {
         for (self.anchors.items[0..self.anchors.len]) |anchor| {
             if (!anchor.rrtype.eql(.DS) or !anchor.owner.eql(&signer)) continue;
@@ -811,7 +835,14 @@ const Validator = struct {
             // name vouched for nothing here, whatever the signature says.
             if (!isSuffix(rrsig.signer, rrset.owner)) return self.fail(dnssec.EDE_DNSSEC_BOGUS);
             const keys = try self.keySet(rrsig.signer);
-            if (keys.len == 0) continue;
+            if (keys.len == 0) {
+                // RFC 8914 section 4.10: a DS existed at a parent, but no
+                // supported matching DNSKEY could be found for the child.
+                if (self.dsAnchorFor(rrsig.signer) and !self.hasDnskey(rrsig.signer)) {
+                    return self.fail(dnssec.EDE_DNSKEY_MISSING);
+                }
+                continue;
+            }
             has_keys = true;
             const status = dnssec.rrsigTimeStatus(rrsig.raw, self.now) catch return self.fail(dnssec.EDE_DNSSEC_BOGUS);
             if (status != .valid) return self.fail(dnssec.rrsigTimeEde(status).?);
@@ -1454,6 +1485,26 @@ test "a DS whose digest does not match the DNSKEY leaves the answer insecure" {
     // Not bogus: RFC 4035 section 5.2 makes a DS that matches no DNSKEY an
     // absent authentication path, which is insecure, not a forged answer.
     try expectStatus(.insecure, try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds));
+}
+
+test "a DS anchor whose child publishes no DNSKEY is bogus with the DNSKEY Missing EDE (RFC 8914 4.10)" {
+    var signed = try signZoneText(std.testing.allocator, child_zone_text, p256_secret);
+    defer signed.deinit(std.testing.allocator);
+    var anchors = try dsAnchor(std.testing.allocator, "example.com.", signed.dnskey, false);
+    defer anchors.deinit(std.testing.allocator);
+
+    // The answer still carries the A RRset and its RRSIG, but the authority
+    // section (and the answer) contain no DNSKEY RRset for the apex, mirroring
+    // a forwarder that returns the answer alone: a DS anchor names the signer
+    // and no matching key material is reachable.
+    var empty_owners: [0][]const u8 = .{};
+    var pair = try exchange(std.testing.allocator, &signed.zone, "www.example.com.", .A, .no_error, "www.example.com.", empty_owners[0..]);
+    defer pair.query.deinit();
+    defer pair.response.deinit();
+
+    const result = try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds);
+    try expectStatus(.bogus, result);
+    try std.testing.expectEqual(dnssec.EDE_DNSKEY_MISSING, result.ede);
 }
 
 test "a DNSKEY fetched out of band authenticates the answer as a DS chain does" {

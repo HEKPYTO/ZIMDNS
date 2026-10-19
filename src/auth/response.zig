@@ -31,7 +31,7 @@ pub const Error = error{
 /// hop-by-hop: RFC 5001 section 2.2 and RFC 9660 section 3.2.2 forbid sending
 /// either to a client that did not ask, so a request for one is answered and
 /// an absent request is silence.
-pub const EdnsPolicy = struct {
+pub const AnswerPolicy = struct {
     /// RFC 5001 section 3.1 leaves the NSID payload to the operator, so there
     /// is no default: without a configured identifier the server never answers
     /// with one.
@@ -39,6 +39,9 @@ pub const EdnsPolicy = struct {
     /// RFC 9660 section 3.2 makes answering optional. On by default because
     /// the value is the answer's own SOA serial, with nothing to leak.
     zoneversion: bool = true,
+    /// RFC 8482 section 4.2: the TTL of the synthesized HINFO in a minimal
+    /// ANY answer. The RFC leaves it to the operator; a day is the default.
+    minimal_any_ttl: u32 = 86400,
 };
 
 pub fn truncateClassicUdpResponse(response_bytes: []const u8, output: []u8) Error![]const u8 {
@@ -137,12 +140,12 @@ fn findEdnsOpt(response_bytes: []const u8) ?dns_record.ResourceRecord {
 /// Answer from the shipping default EDNS policy: no NSID identifier to give
 /// and ZONEVERSION answered whenever a query asks for it.
 pub fn buildResponse(request: dns_message.Message, zone: *const zone_index.Zone) !dns_message.Message {
-    return buildResponseWithEdns(request, zone, .{});
+    return buildResponseWithPolicy(request, zone, .{});
 }
 
 /// `policy` is the operator's EDNS answer policy, from the `nsid` and
 /// `zoneversion` directives.
-pub fn buildResponseWithEdns(request: dns_message.Message, zone: *const zone_index.Zone, policy: EdnsPolicy) !dns_message.Message {
+pub fn buildResponseWithPolicy(request: dns_message.Message, zone: *const zone_index.Zone, policy: AnswerPolicy) !dns_message.Message {
     const q = request.question orelse return Error.MissingQuestion;
     if (request.header.opcode != .query) return buildNotImplementedResponse(request);
     if (!q.qclass.eql(dns_types.Class.IN)) return buildEmptyResponse(request, q, .notimp);
@@ -229,7 +232,7 @@ pub fn buildResponseWithEdns(request: dns_message.Message, zone: *const zone_ind
                 q.qtype.eql(dns_types.RecordType.ANY) and
                 zone.hasOwner(qname_text);
             if (minimal_any) {
-                try response.answers.append(anyMinimalAnswer(q.name));
+                try response.answers.append(anyMinimalAnswer(q.name, policy.minimal_any_ttl));
             } else {
                 // RFC 8020 section 2 Warning: a denial reached through a CNAME
                 // or DNAME chain is for the last name of the chain, so the
@@ -280,12 +283,11 @@ fn synthesizedCnameRecord(synthetic: zone_index.SynthesizedCname) dns_record.Res
 
 /// RFC 8482 section 4.2 minimal ANY answer: one HINFO whose CPU field is
 /// "RFC8482" and whose OS field is the null string, so the response stays as
-/// small as possible. The fixed day-long TTL is the RFC's SHOULD on a value
-/// "large enough to suppress frequent subsequent ANY queries".
-const any_answer_ttl: u32 = 86400;
+/// small as possible. Its TTL is the operator's choice (RFC 8482 section 4.2);
+/// the AnswerPolicy carries it, defaulting to a day.
 const hinfo_type: dns_types.RecordType = .{ .value = 13 };
 
-fn anyMinimalAnswer(owner: dns_name.Name) dns_record.ResourceRecord {
+fn anyMinimalAnswer(owner: dns_name.Name, ttl: u32) dns_record.ResourceRecord {
     const payload = [_]u8{ 0x07, 'R', 'F', 'C', '8', '4', '8', '2', 0x00 };
     var rdata = dns_rdata.Unknown{ .len = @intCast(payload.len) };
     @memcpy(rdata.data[0..payload.len], &payload);
@@ -293,7 +295,7 @@ fn anyMinimalAnswer(owner: dns_name.Name) dns_record.ResourceRecord {
         .owner = owner,
         .rrtype = hinfo_type,
         .class = dns_types.Class.IN,
-        .ttl = any_answer_ttl,
+        .ttl = ttl,
         .rdata = .{ .Unknown = rdata },
     };
 }
@@ -330,7 +332,17 @@ fn appendCoveringRrsigs(response: *dns_message.Message, zone: *const zone_index.
             const answer = response.answers.items[answer_index];
             if (answer.rrtype.eql(.RRSIG)) continue;
             if (covers != answer.rrtype.code()) continue;
-            if (!owner.eql(&answer.owner)) continue;
+        var owners_match = owner.eql(&answer.owner);
+        if (!owners_match) {
+            const candidate_wire = owner.asWire();
+            const answer_wire = answer.owner.asWire();
+            if (candidate_wire.len >= 3 and candidate_wire[0] == 1 and candidate_wire[1] == 0x2a and answer_wire.len >= 2) {
+                const first_label_len: usize = answer_wire[0];
+                const tail = candidate_wire[2..];
+                if (first_label_len + 1 <= answer_wire.len and answer_wire[first_label_len + 1 ..].len == tail.len and std.mem.eql(u8, tail, answer_wire[first_label_len + 1 ..])) owners_match = true;
+            }
+        }
+        if (!owners_match) continue;
             covers_answer = true;
             break;
         }
@@ -525,7 +537,7 @@ fn appendRequestedEdnsOptions(
     response: *dns_message.Message,
     request: *const dns_message.Message,
     zone: *const zone_index.Zone,
-    policy: EdnsPolicy,
+    policy: AnswerPolicy,
 ) void {
     const options = ednsOptions(request) orelse return;
     if (policy.nsid) |nsid| {
@@ -1023,8 +1035,9 @@ test "authoritative response emits referral glue and uncompressed DNAME CNAME" {
     const referral = try buildResponse(try testQuery(arena.allocator(), "www.child.example.", .A), &zone);
     try std.testing.expect(!referral.header.authoritative);
     try std.testing.expectEqual(@as(u16, 2), referral.header.authority_count);
-    try std.testing.expectEqual(@as(u16, 1), referral.header.additional_count);
+    try std.testing.expectEqual(@as(u16, 2), referral.header.additional_count);
     try std.testing.expectEqualSlices(u8, &.{ 192, 0, 2, 10 }, &referral.additionals.items[0].rdata.A);
+    try std.testing.expectEqualSlices(u8, &.{ 192, 0, 2, 11 }, &referral.additionals.items[1].rdata.A);
 
     const dname = try buildResponse(try testQuery(arena.allocator(), "www.legacy.example.", .A), &zone);
     try std.testing.expectEqual(@as(u16, 2), dname.header.answer_count);
@@ -1235,7 +1248,7 @@ test "RFC 9660: a ZONEVERSION request is answered with the responding zone's SOA
     // 3.2 names them, and the referral reports the referring zone's version.
     for ([_][]const u8{ "www.example.com.", "missing.example.com.", "www.child.example.com." }) |name_text| {
         const request = try testOptionsQuery(arena.allocator(), name_text, .A, &request_options);
-        const response = try buildResponseWithEdns(request, &zone, .{});
+        const response = try buildResponseWithPolicy(request, &zone, .{});
         const option = ednsOptions(&response) orelse return error.TestExpectedEqual;
         try std.testing.expectEqualSlices(u8, &expected, dns_rdata.findOption(option, dns_rdata.EDNS_ZONEVERSION_OPTION_CODE).?);
     }
@@ -1259,7 +1272,7 @@ test "RFC 9660: a ZONEVERSION request is never answered unless it was asked for"
     const declined = try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &.{
         .{ .code = dns_rdata.EDNS_ZONEVERSION_OPTION_CODE, .data = &.{} },
     });
-    const declined_response = try buildResponseWithEdns(declined, &zone, .{ .zoneversion = false });
+    const declined_response = try buildResponseWithPolicy(declined, &zone, .{ .zoneversion = false });
     const declined_options = ednsOptions(&declined_response) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(usize, 0), declined_options.len);
 }
@@ -1298,14 +1311,14 @@ test "RFC 5001: NSID is echoed only when configured and only when requested" {
     defer zone.deinit();
 
     const nsid = [_]TestOption{.{ .code = dns_rdata.EDNS_NSID_OPTION_CODE, .data = &.{} }};
-    const policy = EdnsPolicy{ .nsid = "ns1.example.com." };
+    const policy = AnswerPolicy{ .nsid = "ns1.example.com." };
 
-    const answered = try buildResponseWithEdns(try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &nsid), &zone, policy);
+    const answered = try buildResponseWithPolicy(try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &nsid), &zone, policy);
     const answered_options = ednsOptions(&answered) orelse return error.TestExpectedEqual;
     try std.testing.expectEqualSlices(u8, policy.nsid.?, dns_rdata.findOption(answered_options, dns_rdata.EDNS_NSID_OPTION_CODE).?);
 
     // Section 2.2: the option is never sent to a resolver that did not ask.
-    const unsolicited = try buildResponseWithEdns(try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &.{}), &zone, policy);
+    const unsolicited = try buildResponseWithPolicy(try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &.{}), &zone, policy);
     const unsolicited_options = ednsOptions(&unsolicited) orelse return error.TestExpectedEqual;
     try std.testing.expect(dns_rdata.findOption(unsolicited_options, dns_rdata.EDNS_NSID_OPTION_CODE) == null);
 
@@ -1317,7 +1330,7 @@ test "RFC 5001: NSID is echoed only when configured and only when requested" {
     // Section 2.2: NSID payload data in a query is ignored, and answering with
     // the server's own identifier is what the option's presence asked for.
     const with_payload = [_]TestOption{.{ .code = dns_rdata.EDNS_NSID_OPTION_CODE, .data = &.{ 0xde, 0xad } }};
-    const ignored = try buildResponseWithEdns(try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &with_payload), &zone, policy);
+    const ignored = try buildResponseWithPolicy(try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &with_payload), &zone, policy);
     const ignored_options = ednsOptions(&ignored) orelse return error.TestExpectedEqual;
     try std.testing.expectEqualSlices(u8, policy.nsid.?, dns_rdata.findOption(ignored_options, dns_rdata.EDNS_NSID_OPTION_CODE).?);
 }
@@ -1331,7 +1344,7 @@ test "RFC 8145 section 4.3: a responder never answers with the edns-key-tag opti
     defer zone.deinit();
 
     const key_tag = [_]TestOption{.{ .code = dns_rdata.EDNS_KEY_TAG_OPTION_CODE, .data = &.{ 0x4a, 0x4c } }};
-    const response = try buildResponseWithEdns(try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &key_tag), &zone, .{ .nsid = "ns1" });
+    const response = try buildResponseWithPolicy(try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &key_tag), &zone, .{ .nsid = "ns1" });
     const options = ednsOptions(&response) orelse return error.TestExpectedEqual;
     try std.testing.expect(dns_rdata.findOption(options, dns_rdata.EDNS_KEY_TAG_OPTION_CODE) == null);
     // Section 4.3 forbids the answer outright, and RFC 5001 section 2.2 means
@@ -1426,6 +1439,7 @@ test "RFC 8482: ANY at an existing owner answers one synthesized HINFO" {
     try std.testing.expect(!response.header.truncated);
     try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
     try std.testing.expectEqual(@as(u16, 0), response.header.authority_count);
+    try std.testing.expectEqual(@as(u32, 86400), response.answers.items[0].ttl);
     try std.testing.expect(response.answers.items[0].rrtype.eql(hinfo_type));
     try std.testing.expectEqualSlices(
         u8,
@@ -1483,7 +1497,29 @@ test "RFC 8482: ANY at an existing owner answers one synthesized HINFO" {
     try std.testing.expectEqual(@as(u16, 0), missing.header.answer_count);
 }
 
-test "RFC 9471: a referral carries every available in-domain glue record" {
+test "RFC 8482: a configured TTL reaches the synthesized HINFO" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
+        \\
+    );
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    const configured = try buildResponseWithPolicy(try testQuery(arena.allocator(), "dns.home.arpa.", .ANY), &zone, .{ .minimal_any_ttl = 300 });
+    try std.testing.expectEqual(@as(u32, 300), configured.answers.items[0].ttl);
+
+    const default = try buildResponse(try testQuery(arena.allocator(), "dns.home.arpa.", .ANY), &zone);
+    try std.testing.expectEqual(@as(u32, 86400), default.answers.items[0].ttl);
+}
+
+test "RFC 9471: a referral carries in-domain and sibling-domain glue" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1612,11 +1648,11 @@ test "the CD bit is copied from the query into the authoritative response" {
     defer arena.deinit();
 
     var zone_file = try zone_parser.ZoneFile.parse(
-        \\$ORIGIN example.
+        \\$ORIGIN home.arpa.
         \\$TTL 3600
-        \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 3600
-        \\@ IN NS ns.example.
-        \\www IN A 192.0.2.2
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
         \\
     );
     defer zone_file.deinit();

@@ -304,7 +304,11 @@ pub const Zone = struct {
                 const target = dns_name.Name.fromText(record.rdataText()) catch continue;
                 var target_text: [256]u8 = undefined;
                 const target_name = target.toText(&target_text) catch continue;
-                if (!isSubdomainOrEqual(target_name, owner)) continue;
+                // RFC 9471 §3.1 (in-domain) and §3.2 (sibling-domain) glue:
+                // the zone attaches addresses it holds for targets inside
+                // its own origin. Anything outside that bailiwick (RFC 5452
+                // §6) contributes nothing, even if a record exists for it.
+                if (!isSubdomainOrEqual(target_name, self.originText())) continue;
                 var glue_index: usize = 0;
                 while (glue_index < self.records.len) : (glue_index += 1) {
                     const glue = self.records.items[glue_index];
@@ -385,7 +389,6 @@ fn isSubdomainOrEqual(name: []const u8, parent: []const u8) bool {
     if (parent.len >= name.len or !std.ascii.eqlIgnoreCase(name[name.len - parent.len ..], parent)) return false;
     return name[name.len - parent.len - 1] == '.';
 }
-
 fn makeWildcardName(encloser: []const u8, buffer: []u8) ![]const u8 {
     if (encloser.len + 2 > buffer.len) return error.NameTooLong;
     buffer[0] = '*';
@@ -537,7 +540,7 @@ test "zone index compares mixed-case origins at label boundaries" {
     try std.testing.expect(!zone.contains("badexample."));
 }
 
-test "zone index returns referrals with only in-bailiwick glue" {
+test "zone index returns both in-domain and sibling-domain glue on a referral" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -560,6 +563,33 @@ test "zone index returns referrals with only in-bailiwick glue" {
     defer result.deinit(arena.allocator());
     try std.testing.expectEqual(LookupKind.referral, result.kind);
     try std.testing.expectEqual(@as(usize, 2), result.authorities.len);
+    try std.testing.expectEqual(@as(usize, 2), result.additionals.len);
+    try std.testing.expectEqualSlices(u8, "ns.child.example.", result.additionals.items[0].ownerText());
+    try std.testing.expectEqualSlices(u8, "ns.external.example.", result.additionals.items[1].ownerText());
+}
+
+test "zone index drops out-of-bailiwick glue on a referral" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try parser.ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+        \\@ IN NS ns.example.
+        \\ns IN A 192.0.2.1
+        \\child IN NS ns.child.example.
+        \\child IN NS ns.evil.other.
+        \\ns.child.example. IN A 192.0.2.10
+        \\ns.evil.other. IN A 192.0.2.99
+        \\
+    );
+    var zone = try Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    var result = zone.lookup(arena.allocator(), "www.child.example.", .A);
+    defer result.deinit(arena.allocator());
+    try std.testing.expectEqual(LookupKind.referral, result.kind);
     try std.testing.expectEqual(@as(usize, 1), result.additionals.len);
     try std.testing.expectEqualSlices(u8, "ns.child.example.", result.additionals.items[0].ownerText());
 }
@@ -786,7 +816,7 @@ test "zone index answers exact data before referring at a zone cut" {
     defer below.deinit(arena.allocator());
     try std.testing.expectEqual(LookupKind.referral, below.kind);
     try std.testing.expectEqual(@as(usize, 2), below.authorities.len);
-    try std.testing.expectEqual(@as(usize, 1), below.additionals.len);
+    try std.testing.expectEqual(@as(usize, 2), below.additionals.len);
 
     var at_cut = zone.lookup(arena.allocator(), "child.example.", .TXT);
     defer at_cut.deinit(arena.allocator());
