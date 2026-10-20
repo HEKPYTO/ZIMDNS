@@ -685,11 +685,13 @@ pub const Runtime = struct {
         query_bytes: []const u8,
         output: []u8,
         client: ?*const std.Io.net.IpAddress,
+        counters: ?*metrics.Counters,
     ) ![]const u8 {
         const parsed = try self.parseIncoming(allocator, query_bytes);
         switch (parsed) {
             .failure => |failure| return self.encodeFailure(allocator, query_bytes, output, failure),
             .incoming => |incoming| {
+                if (counters) |value| countInboundBits(value, incoming.query);
                 if (incoming.auth) |auth| {
                     return self.encodeSignedMessage(try self.buildMessage(incoming.query), output, auth, 0, &.{}, null);
                 }
@@ -722,7 +724,7 @@ pub const Runtime = struct {
         defer arena.deinit();
         self.lock();
         defer self.unlock();
-        return self.answerIncoming(arena.allocator(), query_bytes, output, client);
+        return self.answerIncoming(arena.allocator(), query_bytes, output, client, null);
     }
 
     pub fn truncateUdpResponse(self: *Runtime, query_bytes: []const u8, response_bytes: []const u8, output: []u8) ![]const u8 {
@@ -989,13 +991,22 @@ pub const Runtime = struct {
         return try local_zone.build(query, zone);
     }
 
+    /// Counts the query header bits the RFCs require to be zero: the reserved
+    /// Z bit (RFC 1035 section 4.1.1) and the AD bit of a query (RFC 4035
+    /// section 3: a name server must ignore the setting of the AD bit in
+    /// queries).
+    fn countInboundBits(counters: *metrics.Counters, query: dns_message.Message) void {
+        if (query.header.reserved) counters.reserved_bit_queries_total += 1;
+        if (query.header.authenticated_data) counters.ad_bit_queries_total += 1;
+    }
+
     pub fn answerFromWithMetrics(self: *Runtime, query_bytes: []const u8, output: []u8, client: *const std.Io.net.IpAddress, counters: *metrics.Counters) ![]const u8 {
         counters.queries_total += 1;
         self.lock();
         defer self.unlock();
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
-        const result = self.answerIncoming(arena.allocator(), query_bytes, output, client) catch |err| {
+        const result = self.answerIncoming(arena.allocator(), query_bytes, output, client, counters) catch |err| {
             if (err == Error.BadQuery) counters.bad_queries_total += 1;
             if (err == Error.EncodeFailed) counters.encode_failures_total += 1;
             return err;
@@ -1016,10 +1027,13 @@ pub const Runtime = struct {
         };
         const result = switch (parsed) {
             .failure => |failure| self.encodeFailure(arena.allocator(), query_bytes, output, failure),
-            .incoming => |incoming| if (incoming.auth) |auth|
-                self.encodeSignedMessage(try self.buildMessage(incoming.query), output, auth, 0, &.{}, null)
-            else
-                self.encodeMessage(try self.buildMessage(incoming.query), output),
+            .incoming => |incoming| answer: {
+                countInboundBits(counters, incoming.query);
+                break :answer if (incoming.auth) |auth|
+                    self.encodeSignedMessage(try self.buildMessage(incoming.query), output, auth, 0, &.{}, null)
+                else
+                    self.encodeMessage(try self.buildMessage(incoming.query), output);
+            },
         } catch |err| {
             if (err == Error.BadQuery) counters.bad_queries_total += 1;
             if (err == Error.EncodeFailed) counters.encode_failures_total += 1;
@@ -1744,7 +1758,7 @@ test "RFC 9619: an OPCODE 0 query with QDCOUNT 0 is never answered FORMERR" {
     try std.testing.expectError(Error.BadQuery, runtime.answerFrom(&zero_question_query, &output, &client));
 }
 
-test "authoritative runtime records metrics for successful and bad queries" {
+test "authoritative runtime records metrics for successful, bad, and bit-flagged queries" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1771,6 +1785,35 @@ test "authoritative runtime records metrics for successful and bad queries" {
     try std.testing.expectEqual(@as(u64, 1), counters.responses_total);
     try std.testing.expectEqual(@as(u64, 1), counters.bad_queries_total);
     try std.testing.expectEqual(@as(u64, 0), counters.encode_failures_total);
+    // A query that carries neither bit leaves the inbound-bit counters alone.
+    try std.testing.expectEqual(@as(u64, 0), counters.reserved_bit_queries_total);
+    try std.testing.expectEqual(@as(u64, 0), counters.ad_bit_queries_total);
+
+    // RFC 1035 section 4.1.1: the reserved Z bit must be zero in a query, so
+    // a query that carries it is counted on the network answer path.
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 53005);
+    _ = try runtime.answerFromWithMetrics(&.{
+        0x12, 0x34, 0x01, 0x40, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        3,    'd',  'n',  's',  4,    'h',  'o',  'm',  'e',  4,    'a',  'r',
+        'p',  'a',  0,    0x00, 0x01, 0x00, 0x01,
+    }, &output, &client, &counters);
+    // RFC 4035 section 3: the AD bit of a query must be ignored, so a query
+    // that carries it is counted on the stream answer path.
+    _ = try runtime.answerWithMetrics(&.{
+        0x12, 0x34, 0x01, 0x20, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        3,    'd',  'n',  's',  4,    'h',  'o',  'm',  'e',  4,    'a',  'r',
+        'p',  'a',  0,    0x00, 0x01, 0x00, 0x01,
+    }, &output, &counters);
+
+    try std.testing.expectEqual(@as(u64, 1), counters.reserved_bit_queries_total);
+    try std.testing.expectEqual(@as(u64, 1), counters.ad_bit_queries_total);
+
+    var metrics_output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer metrics_output.deinit();
+    try @import("../metrics.zig").formatPrometheus(counters, &metrics_output.writer);
+    const text = metrics_output.written();
+    try std.testing.expect(std.mem.indexOf(u8, text, "zimdns_reserved_bit_queries_total 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zimdns_ad_bit_queries_total 1\n") != null);
 }
 
 test "authoritative runtime refuses exact blocklisted names" {

@@ -19,6 +19,13 @@ const validate = @import("dns/validate.zig");
 const tcp_deadline = @import("platform/tcp_deadline.zig");
 
 pub const MAX_CACHE_ENTRIES = 64;
+/// RFC 9520 section 3.2: the resolution-failure cache is bounded too, so a
+/// flood of failing names cannot grow it without limit.
+pub const MAX_FAILURE_CACHE_ENTRIES = 64;
+/// RFC 9520 section 3.2: a resolution failure is cached for at least one
+/// second and never longer than five minutes. The operator sets the time
+/// with `minimum-failure-cache-time`, inside those bounds.
+pub const DEFAULT_FAILURE_CACHE_SECONDS: u32 = 5;
 pub const STALE_WINDOW_SECONDS: i64 = 24 * 60 * 60;
 pub const STALE_TTL: u32 = 30;
 pub const UDP_ATTEMPTS = 2;
@@ -94,6 +101,10 @@ pub const Policy = struct {
     /// operator gets without a `nat64-prefix` directive.
     nat64_prefix: ?config.Nat64Prefix = null,
 
+    /// RFC 9520 section 3.2: the time a resolution failure stays cached, in
+    /// seconds. The operator sets it with `minimum-failure-cache-time`.
+    failure_cache_seconds: u32 = DEFAULT_FAILURE_CACHE_SECONDS,
+
     /// RFC 4035 section 5.2 trust anchors. Empty unless `trust-anchor-file`
     /// named one, so a forwarder with no configured anchor validates nothing
     /// and never sets AD. Owned here because the Policy is copied into the
@@ -117,6 +128,7 @@ pub const Policy = struct {
             policy.cookies = CookiePolicy.init(value.cookies.currentText(), value.cookies.previousText());
         }
         policy.nat64_prefix = value.nat64_prefix;
+        if (value.minimum_failure_cache_time) |seconds| policy.failure_cache_seconds = seconds;
         return policy;
     }
 
@@ -289,6 +301,13 @@ const CacheKey = struct {
             self.checking_disabled == other.checking_disabled and self.dnssec_ok == other.dnssec_ok and
             std.ascii.eqlIgnoreCase(self.name[0..self.name_len], other.name[0..other.name_len]);
     }
+
+    /// True when two keys ask the same question. The CD and DO flags are
+    /// left out: a resolution failure does not depend on them.
+    fn sameQuestion(self: *const CacheKey, other: *const CacheKey) bool {
+        return self.qtype == other.qtype and self.qclass == other.qclass and
+            std.ascii.eqlIgnoreCase(self.name[0..self.name_len], other.name[0..other.name_len]);
+    }
 };
 
 const CacheEntry = struct {
@@ -300,14 +319,98 @@ const CacheEntry = struct {
     nxdomain: bool = false,
 };
 
+/// RFC 9520 section 3.2: a resolution failure, kept so the next client for
+/// the same question is answered without a new upstream query. The RCODE is
+/// the one the client would have seen; the EDE is the local one the fresh
+/// failure carried, if any.
+const Failure = struct {
+    rcode: dns_header.Rcode = .servfail,
+    ede: ?u16 = null,
+};
+
+const FailureEntry = struct {
+    key: CacheKey = .{},
+    expires_at: i64 = 0,
+    failure: Failure = .{},
+};
+
+/// RFC 9520 section 3.2: the cache of resolution failures. It is a table of
+/// its own, so a failure never evicts a good answer and the answer cache
+/// keeps its own bounds. Every entry expires on its own.
+const FailureCache = struct {
+    entries: [MAX_FAILURE_CACHE_ENTRIES]FailureEntry = @splat(FailureEntry{}),
+    len: usize = 0,
+    replacement: usize = 0,
+    /// The time a failure stays cached, in seconds.
+    ttl: u32 = DEFAULT_FAILURE_CACHE_SECONDS,
+
+    fn init(ttl: u32) FailureCache {
+        // RFC 9520 section 3.2: a failure is cached for at least one second
+        // and never for longer than five minutes.
+        return .{ .ttl = @min(@max(ttl, config.FAILURE_CACHE_MIN_SECONDS), config.FAILURE_CACHE_MAX_SECONDS) };
+    }
+
+    /// Records the failure of one question. A failure for the same question
+    /// is replaced, and a full table recycles its oldest slot.
+    fn put(self: *FailureCache, key: CacheKey, failure: Failure, now: i64) void {
+        var slot: usize = 0;
+        var index: usize = 0;
+        var empty: ?usize = null;
+        while (index < self.len) : (index += 1) {
+            if (self.entries[index].key.name_len == 0) {
+                if (empty == null) empty = index;
+                continue;
+            }
+            if (self.entries[index].key.sameQuestion(&key)) {
+                slot = index;
+                break;
+            }
+        } else {
+            if (empty) |free| {
+                slot = free;
+            } else if (self.len < MAX_FAILURE_CACHE_ENTRIES) {
+                slot = self.len;
+                self.len += 1;
+            } else {
+                slot = self.replacement;
+                self.replacement = (self.replacement + 1) % MAX_FAILURE_CACHE_ENTRIES;
+            }
+        }
+        self.entries[slot] = .{
+            .key = key,
+            .expires_at = now + @as(i64, self.ttl),
+            .failure = failure,
+        };
+    }
+
+    /// The failure of this question, or null when it has no live failure.
+    /// An expired entry is dropped where it is found.
+    fn lookup(self: *FailureCache, key: *const CacheKey, now: i64) ?Failure {
+        var index: usize = 0;
+        while (index < self.len) : (index += 1) {
+            const entry = &self.entries[index];
+            if (entry.key.name_len == 0) continue;
+            if (!entry.key.sameQuestion(key)) continue;
+            if (now >= entry.expires_at) {
+                entry.* = .{};
+                return null;
+            }
+            return entry.failure;
+        }
+        return null;
+    }
+};
+
 const Cache = struct {
     allocator: std.mem.Allocator,
     entries: [MAX_CACHE_ENTRIES]CacheEntry = @splat(CacheEntry{}),
     len: usize = 0,
     replacement: usize = 0,
+    /// RFC 9520 section 3.2: the resolution failures this resolver holds.
+    failures: FailureCache = .{},
 
-    fn init(allocator: std.mem.Allocator) Cache {
-        return .{ .allocator = allocator };
+    fn init(allocator: std.mem.Allocator, failure_ttl: u32) Cache {
+        return .{ .allocator = allocator, .failures = FailureCache.init(failure_ttl) };
     }
 
     fn deinit(self: *Cache) void {
@@ -459,9 +562,11 @@ fn applyNegativeTtl(message: *dns_message.Message, ttl: u32) void {
 
 /// True when `name` sits strictly below `ancestor` in the DNS tree. Both
 /// are wire names, so the label structure decides where the ancestor starts.
+/// The suffix is compared without regard to case: all comparisons between
+/// character strings are case-insensitive (RFC 1035 section 2.3.3).
 fn isDescendant(name: []const u8, ancestor: []const u8) bool {
     if (ancestor.len >= name.len) return false;
-    if (!std.mem.endsWith(u8, name, ancestor)) return false;
+    if (!endsWithIgnoreCase(name, ancestor)) return false;
     // The root sits above every other name.
     if (ancestor.len == 1 and ancestor[0] == 0) return true;
     const offset = name.len - ancestor.len;
@@ -479,6 +584,12 @@ const LookupResult = struct {
     stale: bool,
     bytes: []const u8,
 };
+
+/// True when `name` ends with `suffix`, comparing ASCII case-insensitively.
+fn endsWithIgnoreCase(name: []const u8, suffix: []const u8) bool {
+    if (suffix.len > name.len) return false;
+    return std.ascii.eqlIgnoreCase(name[name.len - suffix.len ..], suffix);
+}
 
 const TtlInfo = struct { ttl: u32, negative: bool, nxdomain: bool };
 
@@ -549,7 +660,7 @@ pub const Resolver = struct {
             .io = io,
             .policy = policy,
             .upstream = if (policy.forwarder) |forwarder| forwarder.address else null,
-            .cache = Cache.init(allocator),
+            .cache = Cache.init(allocator, policy.failure_cache_seconds),
         };
     }
 
@@ -618,10 +729,27 @@ pub const Resolver = struct {
                 }
             }
         }
+        // RFC 9520 section 3.2: a cached resolution failure answers the next
+        // client for the same question, and no outgoing query is sent for it.
+        if (self.cache.failures.lookup(&key, now)) |failure| {
+            // A stale answer is still better than a failure, and it needs no
+            // outgoing query either.
+            if (try self.cache.lookup(&key, query, now, output, true)) |stale| {
+                if (cookie == .valid) return self.addCachedCookie(output, query, cookie.valid);
+                return stale.bytes;
+            }
+            const bytes = try self.failureResponse(query, failure, output);
+            if (cookie == .valid) return self.addCachedCookie(output, query, cookie.valid);
+            return bytes;
+        }
         var response = self.queryUdp(query_bytes, query) catch |err| switch (err) {
             Error.UpstreamFailure,
             Error.BadUpstreamResponse,
             => {
+                // RFC 9520 section 3.2: an upstream that sends no usable
+                // answer is a resolution failure, and the next client for the
+                // same question is answered from the cache.
+                self.cache.failures.put(key, .{ .rcode = .servfail, .ede = EDE_NETWORK_ERROR }, now);
                 if (try self.cache.lookup(&key, query, now, output, true)) |stale| {
                     if (cookie == .valid) return self.addCachedCookie(output, query, cookie.valid);
                     return stale.bytes;
@@ -660,6 +788,18 @@ pub const Resolver = struct {
                 .bogus => return self.relayBogus(query, cookie, result.ede, output),
                 .insecure => {},
             }
+        }
+        // RFC 9520 sections 2.1, 2.2, 2.7 and 3.2: an upstream SERVFAIL,
+        // REFUSED, or FORMERR says nothing about the name, so it is a
+        // resolution failure. The next client for the same question is
+        // answered from the failure cache instead of a new upstream query. A
+        // DNSSEC validation failure never reaches this point: it returned
+        // above with its own RFC 8914 code.
+        switch (response.header.rcode) {
+            .servfail => self.cache.failures.put(key, .{ .rcode = .servfail }, now),
+            .refused => self.cache.failures.put(key, .{ .rcode = .refused }, now),
+            .formerr => self.cache.failures.put(key, .{ .rcode = .formerr }, now),
+            else => {},
         }
         // RFC 8198 sections 5 and 9: only a proof that DNSSEC validation
         // has made trustworthy may be used aggressively. AD is set above
@@ -717,6 +857,18 @@ pub const Resolver = struct {
         var message = try Resolver.buildDnssecBogusResponse(query, ede_code);
         defer message.deinit();
         if (cookie == .valid) try appendCookie(&message, cookie.valid);
+        var writer = dns_writer.Writer.init(output);
+        message.encode(&writer) catch return Error.ResponseTooLarge;
+        return writer.written();
+    }
+
+    /// RFC 9520 section 3.2: the cached failure is answered with the RCODE
+    /// the client would have seen, so a cached SERVFAIL stays a SERVFAIL and
+    /// is never an NXDOMAIN, a NODATA, or an authenticated answer.
+    fn failureResponse(self: *Resolver, query: dns_message.Message, failure: Failure, output: []u8) ![]const u8 {
+        _ = self;
+        var message = try errorResponse(query, failure.rcode, failure.ede);
+        defer message.deinit();
         var writer = dns_writer.Writer.init(output);
         message.encode(&writer) catch return Error.ResponseTooLarge;
         return writer.written();
@@ -1057,9 +1209,11 @@ fn buildUpstreamQuery(
         @memcpy(output[0..original.len], original);
         // RFC 4035 section 4.6: a security-aware resolver MUST clear the AD
         // bit when composing a query message, so a client's claim that an
-        // answer was authenticated never reaches the upstream. The bit is
-        // 0x0020 in the header flags word, whose low octet is octet 3.
-        output[3] &= ~@as(u8, 0x20);
+        // answer was authenticated never reaches the upstream. RFC 1035
+        // section 4.1.1 reserves the Z bit, which must be zero in every
+        // query. Both bits sit in the header flags word, whose low octet is
+        // octet 3.
+        output[3] &= ~@as(u8, 0x60);
         const additional_count = std.mem.readInt(u16, output[10..12], .big);
         if (additional_count == std.math.maxInt(u16)) return Error.UpstreamFailure;
         std.mem.writeInt(u16, output[10..12], additional_count + 1, .big);
@@ -1309,7 +1463,7 @@ fn errorResponse(request: dns_message.Message, rcode: dns_header.Rcode, ede_code
     const q = request.question orelse return Error.BadUpstreamResponse;
     // RFC 7873 BADCOOKIE is extended RCODE 23: header low bits 7 plus an
     // OPT record with extended-rcode 1 carrying the fresh server cookie. A
-    // bare header 7 with no OPT is reserved, so BADCOOKIE responses always
+    // bare header 7 with no OPT is YXRRSET, so BADCOOKIE responses always
     // synthesize EDNS even when the offending query carried none.
     const with_opt = request.edns != null or rcode == .badcookie;
     const fallback_edns = dns_message.EdnsState{
@@ -1421,7 +1575,7 @@ test "cache ages positive and negative responses and emits stale EDE" {
     var query = try makeTestQuery(arena.allocator(), 0x2200, "example.com.", true);
     defer query.deinit();
     const key = try CacheKey.fromQuestion(query);
-    var cache = Cache.init(std.testing.allocator);
+    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
     defer cache.deinit();
 
     var positive = try makePositiveResponse(arena.allocator(), 60);
@@ -1462,13 +1616,13 @@ test "cache ages positive and negative responses and emits stale EDE" {
     try expectEde(nodata_message, EDE_STALE_ANSWER, "stale answer");
 }
 
-test "cache excludes failures truncation and upstream option data" {
+test "the answer cache excludes failures truncation and upstream option data" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var query = try makeTestQuery(arena.allocator(), 0x2300, "example.com.", false);
     defer query.deinit();
     const key = try CacheKey.fromQuestion(query);
-    var cache = Cache.init(std.testing.allocator);
+    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
     defer cache.deinit();
     var output: [2048]u8 = undefined;
 
@@ -1505,7 +1659,7 @@ test "cache excludes failures truncation and upstream option data" {
 test "cache reuses an expired slot instead of evicting a live entry" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var cache = Cache.init(std.testing.allocator);
+    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
     defer cache.deinit();
     var output: [2048]u8 = undefined;
 
@@ -1569,7 +1723,7 @@ test "cache reuses an expired slot instead of evicting a live entry" {
 test "RFC 8020 section 2: a cached NXDOMAIN cuts the names below it" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var cache = Cache.init(std.testing.allocator);
+    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
     defer cache.deinit();
     var output: [2048]u8 = undefined;
 
@@ -1617,7 +1771,7 @@ test "RFC 8020 section 2: a cached NXDOMAIN cuts the names below it" {
 test "RFC 8020 section 2: a cached answer below a cut name still wins" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var cache = Cache.init(std.testing.allocator);
+    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
     defer cache.deinit();
     var output: [2048]u8 = undefined;
 
@@ -1645,7 +1799,7 @@ test "RFC 8020 section 2: a cached answer below a cut name still wins" {
 test "RFC 8020 section 2: the cut expires with the cached entry" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var cache = Cache.init(std.testing.allocator);
+    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
     defer cache.deinit();
     var output: [2048]u8 = undefined;
 
@@ -1668,7 +1822,7 @@ test "RFC 8020 section 2: the cut expires with the cached entry" {
 test "RFC 2308 section 5: the negative TTL is the smaller of the SOA TTL and the SOA MINIMUM" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var cache = Cache.init(std.testing.allocator);
+    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
     defer cache.deinit();
     var output: [2048]u8 = undefined;
 
@@ -1763,6 +1917,10 @@ test "resolver treats missing cookie normally and rejects an invalid cookie" {
     try std.testing.expectEqual(@as(@TypeOf(response.header.rcode), .badcookie), response.header.rcode);
     try std.testing.expect(response.edns != null);
     try std.testing.expectEqual(@as(u8, 1), response.edns.?.extended_rcode);
+    // RFC 7873 section 8: the OPT extended-rcode of 1 is what makes the low
+    // bits 7 the extended code 23 rather than YXRRSET.
+    try std.testing.expectEqual(@as(u16, dns_header.Rcode.BADCOOKIE_EXTENDED_CODE), response.effectiveRcode());
+    try std.testing.expect(response.isBadCookie());
     const server_cookie = findOption(response, COOKIE_OPTION_CODE).?;
     try std.testing.expectEqual(@as(usize, 24), server_cookie.len);
     try std.testing.expectEqualSlices(u8, &client_cookie, server_cookie[0..8]);
@@ -2133,7 +2291,7 @@ test "cache separates CD and EDNS DO variants" {
 
     var response = try makePositiveResponse(arena.allocator(), 60);
     defer response.deinit();
-    var cache = Cache.init(std.testing.allocator);
+    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
     defer cache.deinit();
     try cache.put(try CacheKey.fromQuestion(base), &response, 4000);
 
@@ -2799,6 +2957,224 @@ fn dns64TestSoaRecord(name_text: []const u8) dns_record.ResourceRecord {
             .minimum = 600,
         } },
     };
+}
+
+/// The fake upstream a failure-cache test forwards to. It answers every
+/// query with the same failure and counts the queries it received.
+const FailingUpstream = struct {
+    io: std.Io,
+    udp: *const std.Io.net.Socket,
+    rcode: dns_header.Rcode,
+    requests: usize = 0,
+};
+
+/// Long enough for a second upstream query to arrive, short enough that the
+/// test does not wait for one when the cache answers instead.
+const FailingUpstreamTimeout: std.Io.Timeout = .{ .duration = .{
+    .raw = .fromMilliseconds(500),
+    .clock = .awake,
+} };
+
+fn serveFailingUpstream(args: *FailingUpstream) void {
+    var request_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
+    var index: usize = 0;
+    while (index < 2) : (index += 1) {
+        const incoming = args.udp.receiveTimeout(args.io, &request_buffer, FailingUpstreamTimeout) catch return;
+        args.requests += 1;
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const query = dns_message.Message.parseQuery(arena.allocator(), incoming.data) catch return;
+        var response_buffer: [512]u8 = undefined;
+        const bytes = buildFailingUpstreamAnswer(&response_buffer, query, args.rcode) catch return;
+        args.udp.send(args.io, &incoming.from, bytes) catch return;
+    }
+}
+
+/// A response that fails the question the upstream was asked.
+fn buildFailingUpstreamAnswer(buffer: []u8, query: dns_message.Message, rcode: dns_header.Rcode) ![]const u8 {
+    var message = dns_message.Message{
+        .allocator = query.allocator,
+        .header = .{
+            .id = query.header.id,
+            .qr = true,
+            .recursion_desired = true,
+            .recursion_available = true,
+            .rcode = rcode,
+            .question_count = 1,
+        },
+        .question = query.question,
+        .answers = try dns_message.RecordSection.init(query.allocator, 0),
+        .authorities = try dns_message.RecordSection.init(query.allocator, 0),
+        .additionals = try dns_message.RecordSection.init(query.allocator, 0),
+    };
+    defer message.deinit();
+    var writer = dns_writer.Writer.init(buffer);
+    try message.encode(&writer);
+    return writer.written();
+}
+
+test "RFC 9520 section 3.2: a SERVFAIL is answered from the cache without a second upstream query" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    var upstream = FailingUpstream{ .io = io, .udp = &upstream_socket, .rcode = .servfail };
+    const thread = try std.Thread.spawn(.{}, serveFailingUpstream, .{&upstream});
+
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = upstream_socket.address },
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2910, "fail.example.", true);
+    defer query.deinit();
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42710);
+
+    const first = try resolver.answer(encoded, query, &client, &output);
+    const first_message = try dns_message.Message.parse(arena.allocator(), first);
+    try std.testing.expectEqual(dns_header.Rcode.servfail, first_message.header.rcode);
+
+    // The same question again: the failure is in the cache, so no second
+    // query goes upstream.
+    const second = try resolver.answer(encoded, query, &client, &output);
+    const second_message = try dns_message.Message.parse(arena.allocator(), second);
+    try std.testing.expectEqual(dns_header.Rcode.servfail, second_message.header.rcode);
+    try std.testing.expectEqual(@as(u16, 0), second_message.header.answer_count);
+    try std.testing.expect(!second_message.header.authenticated_data);
+
+    thread.join();
+    try std.testing.expectEqual(@as(usize, 1), upstream.requests);
+}
+
+test "RFC 9520 section 3.2: a cached failure is answered as the failure it is" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var resolver = try Resolver.init(std.testing.allocator, io, .{});
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2911, "fail.example.", true);
+    defer query.deinit();
+    const key = try CacheKey.fromQuestion(query);
+    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    defer cache.deinit();
+    var output: [2048]u8 = undefined;
+
+    // Every failure keeps its own RCODE: a failure is a failure, never an
+    // NXDOMAIN, never a NODATA, and never an authenticated answer.
+    for ([_]dns_header.Rcode{ .servfail, .refused, .formerr }) |rcode| {
+        cache.failures.put(key, .{ .rcode = rcode, .ede = EDE_NETWORK_ERROR }, 1000);
+        const failure = cache.failures.lookup(&key, 1001).?;
+        const bytes = try resolver.failureResponse(query, failure, &output);
+        const message = try dns_message.Message.parse(arena.allocator(), bytes);
+        try std.testing.expectEqual(rcode, message.header.rcode);
+        try std.testing.expectEqual(@as(u16, 0), message.header.answer_count);
+        try std.testing.expectEqual(@as(u16, 0), message.header.authority_count);
+        try std.testing.expect(!message.header.authenticated_data);
+        // The RFC 8914 code the fresh failure carried rides along as well.
+        try expectEde(message, EDE_NETWORK_ERROR, "network error");
+    }
+}
+
+test "RFC 9520 section 3.2: a cached failure expires at the maximum cache time" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2912, "fail.example.", false);
+    defer query.deinit();
+    const key = try CacheKey.fromQuestion(query);
+    var cache = Cache.init(std.testing.allocator, config.FAILURE_CACHE_MAX_SECONDS);
+    defer cache.deinit();
+    cache.failures.put(key, .{ .rcode = .servfail }, 1000);
+
+    // The failure lives exactly as long as the RFC's five minutes allow.
+    try std.testing.expect(cache.failures.lookup(&key, 1000 + config.FAILURE_CACHE_MAX_SECONDS - 1) != null);
+    try std.testing.expect(cache.failures.lookup(&key, 1000 + config.FAILURE_CACHE_MAX_SECONDS) == null);
+}
+
+test "RFC 9520 section 3.2: the failure cache keeps the answer cache's own bounds" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    defer cache.deinit();
+    var output: [2048]u8 = undefined;
+
+    var query = try makeTestQuery(arena.allocator(), 0x2913, "answer.example.", false);
+    defer query.deinit();
+    var response = try makePositiveResponse(arena.allocator(), 60);
+    defer response.deinit();
+    const key = try CacheKey.fromQuestion(query);
+    try cache.put(key, &response, 1000);
+
+    // A full table of failures leaves the answer cache alone.
+    var name_buffer: [32]u8 = undefined;
+    var index: usize = 0;
+    while (index < MAX_FAILURE_CACHE_ENTRIES) : (index += 1) {
+        const name_text = try std.fmt.bufPrint(&name_buffer, "fail{d}.example.", .{index});
+        var failure_query = try makeTestQuery(arena.allocator(), @intCast(0x2920 + index), name_text, false);
+        defer failure_query.deinit();
+        const failure_key = try CacheKey.fromQuestion(failure_query);
+        cache.failures.put(failure_key, .{ .rcode = .servfail }, 1000);
+    }
+    try std.testing.expectEqual(MAX_FAILURE_CACHE_ENTRIES, cache.failures.len);
+    try std.testing.expectEqual(@as(usize, 1), cache.len);
+    const hit = (try cache.lookup(&key, query, 1001, &output, false)).?;
+    try std.testing.expect(!hit.stale);
+}
+
+test "RFC 1035 section 4.1.1: the upstream query never carries the reserved Z bit" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var query = try makeTestQuery(arena.allocator(), 0x2718, "example.com.", false);
+    defer query.deinit();
+
+    var original_bytes: [512]u8 = undefined;
+    const original = try encodeTestMessage(query, &original_bytes);
+    // A client that sets the reserved Z bit in its own header.
+    var raw: [512]u8 = undefined;
+    @memcpy(raw[0..original.len], original);
+    raw[3] |= 0x40;
+    try std.testing.expectEqual(@as(u8, 0x40), raw[3] & 0x40);
+
+    var output: [512]u8 = undefined;
+    const composed = try buildUpstreamQuery(raw[0..original.len], query, &output, &.{});
+    // RFC 1035 section 4.1.1: the Z bit must be zero in all queries.
+    try std.testing.expectEqual(@as(u8, 0), composed[3] & 0x40);
+}
+
+test "RFC 1035 section 2.3.3: the NXDOMAIN cut ignores the case of the ancestor" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    defer cache.deinit();
+    var output: [2048]u8 = undefined;
+
+    var denied = try makeTestQuery(arena.allocator(), 0x2850, "a.example.", false);
+    defer denied.deinit();
+    var denial = try makeNxdomainResponse(arena.allocator(), "a.example.", 60, 30);
+    defer denial.deinit();
+    const denied_key = try CacheKey.fromQuestion(denied);
+    try cache.put(denied_key, &denial, 1000);
+
+    // The descendant spells the ancestor in another case, which names the
+    // same node: the cut applies.
+    var child = try makeTestQuery(arena.allocator(), 0x2851, "b.a.example.", false);
+    defer child.deinit();
+    child.question.?.name = (try dns_name.Name.parsePreservingCase(
+        &.{ 1, 'b', 1, 'A', 7, 'E', 'x', 'a', 'm', 'p', 'l', 'e', 0 },
+        0,
+    )).name;
+    const child_key = try CacheKey.fromQuestion(child);
+    const cut = (try cache.lookup(&child_key, child, 1000, &output, false)).?;
+    const cut_message = try dns_message.Message.parse(arena.allocator(), cut.bytes);
+    try std.testing.expectEqual(dns_header.Rcode.nxdomain, cut_message.header.rcode);
+    try std.testing.expectEqual(@as(u16, 0), cut_message.header.answer_count);
 }
 
 fn makeTestQuery(allocator: std.mem.Allocator, id: u16, name_text: []const u8, with_edns: bool) !dns_message.Message {

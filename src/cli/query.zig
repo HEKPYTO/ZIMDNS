@@ -67,8 +67,21 @@ pub fn buildQueryPacketWithEdns(
     qtype: dns_types.RecordType,
     edns: EdnsRequest,
 ) ![]const u8 {
-    var writer = dns_writer.Writer.init(buffer);
     const qname = dns_name.Name.fromText(name_text) catch return Error.BadName;
+    return buildQueryPacketForName(buffer, id, qname, qtype, edns);
+}
+
+/// The same packet, with the question name the caller built. The 0x20
+/// mechanism randomizes the name's label-first letters before this call, so
+/// the packet carries the case the client chose.
+pub fn buildQueryPacketForName(
+    buffer: []u8,
+    id: u16,
+    qname: dns_name.Name,
+    qtype: dns_types.RecordType,
+    edns: EdnsRequest,
+) ![]const u8 {
+    var writer = dns_writer.Writer.init(buffer);
     const want_opt = edns.dnssec_ok or edns.zoneversion or edns.nsid;
     const message = dns_message.Message{
         .header = dns_header.Header{
@@ -108,6 +121,18 @@ pub fn buildQueryPacketWithEdns(
         try writer.writeBytes(opt.bytes());
     }
     return writer.written();
+}
+
+/// Prints the question the server echoed. The 0x20 mechanism puts its random
+/// case in the question name, and RFC 4343 section 4.1 has the server copy
+/// that name into the response, so the echoed name is what shows the client
+/// what went on the wire.
+pub fn writeQuestion(response: dns_message.Message, writer: *std.Io.Writer) !void {
+    const question = response.question orelse return;
+    var name_buffer: [256]u8 = undefined;
+    const name = question.name.toText(&name_buffer) catch return Error.BadResponse;
+    try writer.writeAll(";; QUESTION SECTION:\n");
+    try writer.print("{s}\n", .{name});
 }
 
 pub fn writeResponse(response: dns_message.Message, writer: *std.Io.Writer) !void {
@@ -596,6 +621,7 @@ fn rcodeName(rcode: dns_header.Rcode) []const u8 {
         .notimp => "NOTIMP",
         .refused => "REFUSED",
         .yxdomain => "YXDOMAIN",
+        .yxrrset => "YXRRSET",
         .badcookie => "BADCOOKIE",
         .nxrrset => "NXRRSET",
         .notauth => "NOTAUTH",
@@ -739,6 +765,85 @@ test "the query packet carries the RFC 6891 DO bit only when the operator asks" 
     try std.testing.expectEqual(@as(u8, 0), parsed.edns.?.version);
     try std.testing.expectEqual(@as(u16, dns_message.DEFAULT_EDNS_UDP_PAYLOAD_SIZE), parsed.edns.?.udp_payload_size);
     try std.testing.expect(parsed.additionals.items[0].rrtype.eql(.OPT));
+}
+
+/// The question name the packet carries: the header is 12 octets and the
+/// name comes first in the question section.
+fn qnameWire(packet: []const u8) []const u8 {
+    var index: usize = 12;
+    while (index < packet.len) {
+        const len = packet[index];
+        if (len == 0) return packet[12 .. index + 1];
+        index += 1 + @as(usize, len);
+    }
+    return packet[12..];
+}
+
+test "the query packet carries the question name as typed" {
+    var buffer: [512]u8 = undefined;
+    const packet = try buildQueryPacket(&buffer, 0x1234, "www.example.com.", .A, false);
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{ 3, 'w', 'w', 'w', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0 },
+        qnameWire(packet),
+    );
+}
+
+test "0x20: the question name on the wire varies only in the case of the label-first letters" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var random_source = std.Random.IoSource{ .io = io };
+    const random = random_source.interface();
+    const base = try dns_name.Name.fromText("www.example.com.");
+
+    var previous: [64]u8 = undefined;
+    var differs = false;
+    for (0..32) |_| {
+        var buffer: [512]u8 = undefined;
+        const randomized = base.withRandomizedLabelFirstCase(random);
+        const packet = try buildQueryPacketForName(&buffer, 0x1234, randomized, .A, .{});
+        const wire = qnameWire(packet);
+
+        // RFC 1035 section 2.3.3: the name still compares equal to the typed
+        // one, whatever case the labels carry.
+        try std.testing.expect(randomized.eql(&base));
+
+        // Only the first letter of a label moves, and only in case.
+        var index: usize = 0;
+        while (index < base.asWire().len) {
+            const len: usize = base.asWire()[index];
+            if (len == 0) break;
+            try std.testing.expectEqual(
+                std.ascii.toLower(base.asWire()[index + 1]),
+                std.ascii.toLower(wire[index + 1]),
+            );
+            try std.testing.expectEqualSlices(
+                u8,
+                base.asWire()[index + 2 .. index + 1 + len],
+                wire[index + 2 .. index + 1 + len],
+            );
+            index += 1 + len;
+        }
+
+        if (!std.mem.eql(u8, previous[0..wire.len], wire)) differs = true;
+        @memcpy(previous[0..wire.len], wire);
+    }
+    // The case is drawn, so the name on the wire is not the same every time.
+    try std.testing.expect(differs);
+}
+
+test "the question the server echoed is printed with the case it carries" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const response = try dns_message.Message.parse(arena.allocator(), &.{
+        0x12, 0x34, 0x85, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        3,    'W',  'w',  'w',  7,    'E',  'x',  'a',  'm',  'p',  'l',  'e',
+        0,    0x00, 0x01, 0x00, 0x01,
+    });
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try writeQuestion(response, &output.writer);
+    try std.testing.expectEqualStrings(";; QUESTION SECTION:\nWww.Example.\n", output.written());
 }
 
 test "response validation requires QR and the exact question" {
@@ -1229,6 +1334,41 @@ test "query formatter prints response code when there are no answers" {
     try writeResponse(response, &output.writer);
     const text = output.written();
     try std.testing.expectEqualStrings("rcode REFUSED\nno answers\n", text);
+}
+
+test "query formatter prints YXRRSET and BADCOOKIE for the shared low nibble" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // RFC 2136 section 1.3: a bare low nibble 7 is YXRRSET.
+    const yxrrset = try dns_message.Message.parse(arena.allocator(), &.{
+        0x12, 0x34, 0x81, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        3,    'a',  'd',  's',  4,    'h',  'o',  'm',  'e',  4,    'a',  'r',
+        'p',  'a',  0,    0x00, 0x01, 0x00, 0x01,
+    });
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try writeResponse(yxrrset, &output.writer);
+    try std.testing.expectEqualStrings("rcode YXRRSET\nno answers\n", output.written());
+
+    // RFC 7873 section 8: the same low nibble with an OPT extended-rcode of 1
+    // is BADCOOKIE.
+    const badcookie = try dns_message.Message.parse(arena.allocator(), &.{
+        0x12, 0x34, 0x81, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        3,    'a',  'd',  's',  4,    'h',  'o',  'm',  'e',  4,    'a',  'r',
+        'p',  'a',  0,    0x00, 0x01, 0x00, 0x01, 0,    0x00, 0x29, 0x04, 0xd0,
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+    });
+    var extended_output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer extended_output.deinit();
+    try writeResponse(badcookie, &extended_output.writer);
+    try std.testing.expectEqualStrings(
+        ";; OPT PSEUDOSECTION:\n" ++
+            "; EDNS: version: 0, flags: udp: 1232, ext-rcode: 1\n" ++
+            "rcode BADCOOKIE\n" ++
+            "no answers\n",
+        extended_output.written(),
+    );
 }
 
 test "query formatter prints the authority section a signature proof lives in" {

@@ -115,6 +115,14 @@ pub const Message = struct {
         try parseSection(allocator, bytes, &reader, header.authority_count, &message.authorities);
         try parseAdditionalSection(allocator, bytes, &reader, header.additional_count, &message);
 
+        // RFC 7873 section 8: BADCOOKIE is the extended code 23, the header's
+        // low bits 7 plus an OPT extended-rcode of 1 (RFC 6891 section 6.1.3).
+        // The header field alone cannot tell it from YXRRSET, so the OPT byte
+        // decides; this is the one place that decides it.
+        if (message.edns) |edns| {
+            if (message.header.rcode.isBadCookie(edns.extended_rcode)) message.header.rcode = .badcookie;
+        }
+
         if (reader.position() != bytes.len) return Error.TrailingData;
         return message;
     }
@@ -216,7 +224,7 @@ pub const Message = struct {
 
     /// Full 12-bit extended RCODE: OPT extended-rcode byte combined with the
     /// 4-bit header code. Messages without OPT report the bare header code,
-    /// so a header 7 alone yields 7 (reserved), never 23 (BADCOOKIE).
+    /// so a header 7 alone yields 7 (YXRRSET), never 23 (BADCOOKIE).
     pub fn effectiveRcode(self: *const Message) u16 {
         const extended: u8 = if (self.edns) |edns| edns.extended_rcode else 0;
         return self.header.rcode.extendedCode(extended);
@@ -464,17 +472,18 @@ test "message preserves EDNS extended RCODE, DO bit, and option bytes" {
     try std.testing.expectEqualSlices(u8, &.{ 0xea, 0x60, 0x00, 0x03, 0x01, 0x02, 0x03, 0x00, 0x0f, 0x00, 0x00 }, parsed.additionals.items[0].rdata.OPT.bytes());
 }
 
-test "message splits bare header 7 from OPT-backed BADCOOKIE 23" {
+test "message splits YXRRSET 7 from OPT-backed BADCOOKIE 23" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    // Header RCODE 7 with no OPT: reserved, effective code 7, not BADCOOKIE.
+    // Header RCODE 7 with no OPT: YXRRSET, effective code 7, not BADCOOKIE.
     const bare = [_]u8{
         0x12, 0x34, 0x85, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         7,    'e',  'x',  'a',  'm',  'p',  'l',  'e',  3,    'c',  'o',  'm',
         0,    0x00, 0x01, 0x00, 0x01,
     };
     const parsed_bare = try Message.parse(arena.allocator(), &bare);
+    try std.testing.expectEqual(header_mod.Rcode.yxrrset, parsed_bare.header.rcode);
     try std.testing.expectEqual(@as(u16, 7), parsed_bare.effectiveRcode());
     try std.testing.expect(!parsed_bare.isBadCookie());
 
@@ -486,6 +495,7 @@ test "message splits bare header 7 from OPT-backed BADCOOKIE 23" {
         0x00, 0x00, 0x00, 0x00,
     };
     const parsed_extended = try Message.parse(arena.allocator(), &extended);
+    try std.testing.expectEqual(header_mod.Rcode.badcookie, parsed_extended.header.rcode);
     try std.testing.expectEqual(@as(u16, 23), parsed_extended.effectiveRcode());
     try std.testing.expect(parsed_extended.isBadCookie());
 }

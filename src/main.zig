@@ -19,6 +19,7 @@ pub const auth_runtime = @import("auth/runtime.zig");
 pub const auth_keyring = @import("auth/keyring.zig");
 pub const listener = @import("platform/listener.zig");
 pub const cli_query = @import("cli/query.zig");
+pub const cli_zonemd = @import("cli/zonemd.zig");
 pub const config_parser = @import("config/parser.zig");
 pub const config_loader = @import("config/loader.zig");
 pub const metrics = @import("metrics.zig");
@@ -128,6 +129,11 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, command, "zonemd")) {
+        try handleZonemd(args, io, arena, stdout);
+        return;
+    }
+
     try stdout.print("error: command '{s}' is not implemented yet\n\n", .{command});
     try printHelp(stdout);
     try exitUsage(stdout);
@@ -161,6 +167,8 @@ fn printHelp(writer: *std.Io.Writer) !void {
         \\  zimdns query @127.0.0.1 -p 1055 --dnssec signed.example. A
         \\  zimdns query @127.0.0.1 -p 1055 --zoneversion example.com A
         \\  zimdns query @127.0.0.1 -p 1055 --nsid example.com A
+        \\  zimdns query @127.0.0.1 -p 1055 --0x20 example.com A
+        \\  zimdns zonemd publish --zone-file examples/zones/home.arpa.zone
         \\
         \\  RFC 6303/6761/7793/8375 locally served zones are on by default and
         \\  are answered ahead of the cache and the forwarder. A configuration
@@ -182,15 +190,41 @@ fn printHelp(writer: *std.Io.Writer) !void {
         \\  hexadecimal, two digits per octet. A server with no 'nsid'
         \\  directive answers no identifier at all.
         \\
+        \\  --0x20 randomizes the case of the first letter of every label of
+        \\  the question name, so a forged answer has to carry the exact case
+        \\  to be accepted. The name still compares equal (RFC 1035 section
+        \\  2.3.3) and the server copies the question into its answer, so the
+        \\  CLI prints the question it asked, with the case it used. The
+        \\  mechanism comes from the expired Internet-Draft
+        \\  draft-vixie-dnsext-dns0x20 and is no RFC requirement, so it is
+        \\  off unless the operator asks for it.
+        \\
+        \\  zonemd publish computes the RFC 8976 zone digest of a zone file
+        \\  and prints the ZONEMD record in zone text, ready to paste into
+        \\  the zone. The digest is computed over the zone as published: the
+        \\  apex ZONEMD RRset and the RRSIG covering it stay outside it (RFC
+        \\  8976 section 3.3.1.1), and the record carries the zone's SOA
+        \\  serial (section 3.1). '--scheme' and '--hash' take the RFC 8976
+        \\  registry codes: scheme 1 is SIMPLE, hash 1 is SHA384 and hash 2
+        \\  is SHA512. A signed zone needs its ZONEMD RRset signed again
+        \\  after the record is published (section 3.4).
+        \\
         \\  --serve-dot, --serve-doh, and --serve-xfr are accepted but always
         \\  refuse to start: this build links no TLS server, so it cannot
         \\  terminate a handshake and will not serve cleartext on an encrypted
         \\  port (see src/transport/README.md).
         \\
         \\Implemented now:
-        \\  --help, --version, server run, query
+        \\  --help, --version, server run, query, zonemd publish
         \\
     );
+}
+
+test "the help text documents the zonemd publish command" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try printHelp(&output.writer);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "zimdns zonemd publish --zone-file") != null);
 }
 
 fn handleQuery(args: []const []const u8, io: std.Io, allocator: std.mem.Allocator, writer: *std.Io.Writer) !void {
@@ -198,6 +232,7 @@ fn handleQuery(args: []const []const u8, io: std.Io, allocator: std.mem.Allocato
     var use_dnssec = false;
     var use_zoneversion = false;
     var use_nsid = false;
+    var use_case_randomization = false;
     var port: u16 = 1053;
     var use_tcp = false;
     var name: ?[]const u8 = null;
@@ -226,6 +261,8 @@ fn handleQuery(args: []const []const u8, io: std.Io, allocator: std.mem.Allocato
             use_zoneversion = true;
         } else if (std.mem.eql(u8, arg, "--nsid")) {
             use_nsid = true;
+        } else if (std.mem.eql(u8, arg, "--0x20")) {
+            use_case_randomization = true;
         } else if (name == null) {
             name = arg;
         } else {
@@ -247,8 +284,19 @@ fn handleQuery(args: []const []const u8, io: std.Io, allocator: std.mem.Allocato
     var query_id_bytes: [2]u8 = undefined;
     io.random(&query_id_bytes);
     const query_id = std.mem.readInt(u16, &query_id_bytes, .big);
+
+    const qname = dns_name.Name.fromText(absolute_name) catch return cli_query.Error.BadName;
+    // The 0x20 mechanism draws the case of the first letter of every label
+    // from the system CSPRNG, so a forged answer has to match the exact case
+    // to be accepted.
+    var random_source = std.Random.IoSource{ .io = io };
+    const question_name = if (use_case_randomization)
+        qname.withRandomizedLabelFirstCase(random_source.interface())
+    else
+        qname;
+
     var packet_buffer: [512]u8 = undefined;
-    const query = try cli_query.buildQueryPacketWithEdns(&packet_buffer, query_id, absolute_name, qtype, .{ .dnssec_ok = use_dnssec, .zoneversion = use_zoneversion, .nsid = use_nsid });
+    const query = try cli_query.buildQueryPacketForName(&packet_buffer, query_id, question_name, qtype, .{ .dnssec_ok = use_dnssec, .zoneversion = use_zoneversion, .nsid = use_nsid });
     const server = std.Io.net.IpAddress.parse(server_text, port) catch {
         try writer.writeAll("error: query server must be an IP address for now\n");
         try exitUsage(writer);
@@ -260,7 +308,74 @@ fn handleQuery(args: []const []const u8, io: std.Io, allocator: std.mem.Allocato
     else
         try queryUdp(allocator, io, &server, query, &response_buffer);
     defer response.deinit();
+    // The question the server echoed is what shows the case that went on the
+    // wire, so it is printed only when the case was randomized.
+    if (use_case_randomization) try cli_query.writeQuestion(response, writer);
     try cli_query.writeResponse(response, writer);
+}
+
+fn handleZonemd(args: []const []const u8, io: std.Io, allocator: std.mem.Allocator, writer: *std.Io.Writer) !void {
+    if (args.len < 3 or !std.mem.eql(u8, args[2], "publish")) {
+        try writer.writeAll("error: expected 'zonemd publish'\n");
+        try exitUsage(writer);
+    }
+
+    var zone_path: ?[]const u8 = null;
+    var scheme: u8 = 1;
+    var hash: u8 = 1;
+
+    var index: usize = 3;
+    while (index < args.len) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--zone-file")) {
+            index += 1;
+            if (index >= args.len) {
+                try writer.writeAll("error: --zone-file requires a path\n");
+                try exitUsage(writer);
+            }
+            zone_path = args[index];
+        } else if (std.mem.eql(u8, arg, "--scheme")) {
+            index += 1;
+            if (index >= args.len) {
+                try writer.writeAll("error: --scheme requires a code\n");
+                try exitUsage(writer);
+            }
+            scheme = std.fmt.parseInt(u8, args[index], 10) catch {
+                try writer.writeAll("error: invalid scheme code\n");
+                try exitUsage(writer);
+            };
+        } else if (std.mem.eql(u8, arg, "--hash")) {
+            index += 1;
+            if (index >= args.len) {
+                try writer.writeAll("error: --hash requires a code\n");
+                try exitUsage(writer);
+            }
+            hash = std.fmt.parseInt(u8, args[index], 10) catch {
+                try writer.writeAll("error: invalid hash code\n");
+                try exitUsage(writer);
+            };
+        } else {
+            try writer.print("error: unknown zonemd option '{s}'\n", .{arg});
+            try exitUsage(writer);
+        }
+        index += 1;
+    }
+
+    const path = zone_path orelse {
+        try writer.writeAll("error: zonemd publish requires --zone-file\n");
+        try exitUsage(writer);
+    };
+    const zone_text = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024)) catch {
+        try writer.writeAll("error: cannot read the zone file\n");
+        try exitFailure(writer);
+    };
+
+    // The publisher prints its own refusal line; the exit code says the
+    // digest was not published.
+    cli_zonemd.publish(zone_text, scheme, hash, allocator, writer) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => try exitFailure(writer),
+    };
 }
 
 fn parseQueryType(text: []const u8) !@import("dns/types.zig").RecordType {
@@ -629,9 +744,7 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
     }
 
     if (print_metrics) {
-        var metrics_buffer: [512]u8 = undefined;
-        const text = try metrics.formatPrometheus(counters, &metrics_buffer);
-        try writer.writeAll(text);
+        try metrics.formatPrometheus(counters, writer);
     }
 }
 
@@ -836,6 +949,154 @@ test "query parser matches named types case-insensitively" {
     try std.testing.expectEqual(RecordType.A, try parseQueryType("a"));
     try std.testing.expectEqual(RecordType.AAAA, try parseQueryType("aaaa"));
     try std.testing.expectEqual(RecordType.SRV, try parseQueryType("srv"));
+}
+
+test "the 0x20 query asks a randomized name and prints the question the server echoed" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var runtime = try auth_runtime.Runtime.fromZoneText(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\a.b.c.d.e.f.g.h IN A 192.0.2.1
+        \\
+    );
+    defer runtime.deinit();
+
+    // Many labels: the chance that every run draws the same case is
+    // negligible.
+    const typed = "a.b.c.d.e.f.g.h.home.arpa.";
+
+    // One query against a one-shot server, and the CLI's output.
+    const Query = struct {
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        runtime: *auth_runtime.Runtime,
+        typed: []const u8,
+        randomized: bool,
+
+        fn run(self: *@This()) ![]const u8 {
+            var server_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+            var server_socket = try std.Io.net.IpAddress.bind(&server_addr, self.io, .{ .mode = .dgram, .protocol = .udp });
+            defer server_socket.close(self.io);
+
+            const Server = struct {
+                io: std.Io,
+                socket: *const std.Io.net.Socket,
+                runtime: *auth_runtime.Runtime,
+                ok: bool = false,
+
+                fn run(server: *@This()) void {
+                    listener.serveUdpOnce(server.socket, server.io, server.runtime) catch return;
+                    server.ok = true;
+                }
+            };
+            var server = Server{ .io = self.io, .socket = &server_socket, .runtime = self.runtime };
+            const server_thread = try std.Thread.spawn(.{}, Server.run, .{&server});
+
+            var port_buffer: [8]u8 = undefined;
+            const port_text = try std.fmt.bufPrint(&port_buffer, "{}", .{server_socket.address.getPort()});
+            var args: [8][]const u8 = undefined;
+            var count: usize = 0;
+            args[count] = "zimdns";
+            count += 1;
+            args[count] = "query";
+            count += 1;
+            args[count] = "@127.0.0.1";
+            count += 1;
+            args[count] = "-p";
+            count += 1;
+            args[count] = port_text;
+            count += 1;
+            if (self.randomized) {
+                args[count] = "--0x20";
+                count += 1;
+            }
+            args[count] = self.typed;
+            count += 1;
+            args[count] = "A";
+            count += 1;
+
+            var output: std.Io.Writer.Allocating = .init(self.allocator);
+            defer output.deinit();
+            try handleQuery(args[0..count], self.io, self.allocator, &output.writer);
+            server_thread.join();
+            try std.testing.expect(server.ok);
+            return self.allocator.dupe(u8, output.written());
+        }
+    };
+
+    const Printed = struct {
+        // The question the CLI printed: the line under the section heading.
+        fn question(output: []const u8) []const u8 {
+            const marker = ";; QUESTION SECTION:\n";
+            const start = std.mem.indexOf(u8, output, marker) orelse return "";
+            const rest = output[start + marker.len ..];
+            const end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+            return rest[0..end];
+        }
+
+        // The printed name must differ from the typed one only in the case of
+        // a label's first letter.
+        fn onlyLabelFirstCaseChanged(wanted: []const u8, printed: []const u8) bool {
+            if (wanted.len != printed.len) return false;
+            var label_start = true;
+            for (wanted, printed) |wanted_byte, printed_byte| {
+                if (wanted_byte == '.') {
+                    if (printed_byte != '.') return false;
+                    label_start = true;
+                    continue;
+                }
+                if (label_start) {
+                    if (std.ascii.toLower(wanted_byte) != std.ascii.toLower(printed_byte)) return false;
+                } else if (wanted_byte != printed_byte) {
+                    return false;
+                }
+                label_start = false;
+            }
+            return true;
+        }
+    };
+
+    var questions: [4][]const u8 = undefined;
+    for (&questions) |*question| {
+        var randomized = Query{
+            .io = io,
+            .allocator = allocator,
+            .runtime = &runtime,
+            .typed = typed,
+            .randomized = true,
+        };
+        const output = try randomized.run();
+        question.* = Printed.question(output);
+        // The answer carries the zone's own case; the question carries the
+        // case the client chose.
+        try std.testing.expect(std.mem.indexOf(u8, output, "a.b.c.d.e.f.g.h.home.arpa. 3600 IN A 192.0.2.1") != null);
+        try std.testing.expect(Printed.onlyLabelFirstCaseChanged(typed, question.*));
+    }
+    // The case is drawn, so the runs do not all ask the same name.
+    var same = true;
+    for (questions[1..]) |question| {
+        if (!std.mem.eql(u8, question, questions[0])) same = false;
+    }
+    try std.testing.expect(!same);
+
+    // Without the switch the query is unchanged: no question section, and the
+    // answer as it was.
+    var plain_query = Query{
+        .io = io,
+        .allocator = allocator,
+        .runtime = &runtime,
+        .typed = typed,
+        .randomized = false,
+    };
+    const plain = try plain_query.run();
+    try std.testing.expect(std.mem.indexOf(u8, plain, ";; QUESTION SECTION:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "a.b.c.d.e.f.g.h.home.arpa. 3600 IN A 192.0.2.1") != null);
 }
 
 test "query command renders a maximum escaped URI target" {

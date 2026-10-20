@@ -43,7 +43,11 @@ pub const Opcode = enum(u4) {
     unassigned_15 = 15,
 };
 
-pub const Rcode = enum(u4) {
+/// The response codes. The header's RCODE field carries the low four bits, so
+/// every base code is 0-15. RFC 7873 section 8 assigns BADCOOKIE the
+/// extended code 23, which is the low bits 7 plus an OPT extended-rcode of 1
+/// (RFC 6891 section 6.1.3), so it is named here but never fits the field.
+pub const Rcode = enum(u8) {
     no_error = 0,
     formerr = 1,
     servfail = 2,
@@ -51,27 +55,33 @@ pub const Rcode = enum(u4) {
     notimp = 4,
     refused = 5,
     yxdomain = 6,
-    /// Low 4 wire bits shared by RFC 7873 BADCOOKIE. A bare 7 without an
-    /// accompanying OPT extended-rcode of 1 is reserved, not BADCOOKIE;
-    /// use `isBadCookie`/`extendedCode` to split the two cases.
-    badcookie = 7,
+    /// RFC 2136 section 1.3: YXRRSET is base RCODE 7. A header that carries
+    /// only 7 is YXRRSET; only an OPT extended-rcode of 1 makes it BADCOOKIE.
+    yxrrset = 7,
     nxrrset = 8,
     notauth = 9,
     notzone = 10,
+    /// RFC 7873 section 8: BADCOOKIE is the extended RCODE 23.
+    badcookie = 23,
 
     /// Full RFC 7873 extended code: OPT extended-rcode 1 + low bits 7.
     pub const BADCOOKIE_EXTENDED_CODE: u16 = 23;
+    /// The OPT extended-rcode byte that carries BADCOOKIE, RFC 6891 section 6.1.3.
+    pub const BADCOOKIE_EXTENDED_RCODE: u8 = 1;
 
     /// Combines the 4-bit header code with the OPT extended-rcode byte into
-    /// the 12-bit extended RCODE. Without OPT the extended byte is zero.
+    /// the 12-bit extended RCODE. Without OPT the extended byte is zero; a
+    /// BADCOOKIE code already is the full extended code.
     pub fn extendedCode(self: Rcode, extended_rcode: u8) u16 {
+        if (self == .badcookie) return BADCOOKIE_EXTENDED_CODE;
         return (@as(u16, extended_rcode) << 4) | @as(u16, @backingInt(self));
     }
 
     /// True only for extended RCODE 23: header low bits 7 plus OPT
-    /// extended-rcode 1. A bare header 7 with no OPT is reserved.
+    /// extended-rcode 1. A bare header 7 is YXRRSET.
     pub fn isBadCookie(self: Rcode, extended_rcode: u8) bool {
-        return self == .badcookie and extended_rcode == 1;
+        if (self == .badcookie) return true;
+        return self == .yxrrset and extended_rcode == BADCOOKIE_EXTENDED_RCODE;
     }
 };
 
@@ -119,7 +129,7 @@ pub const Header = struct {
             4 => Rcode.notimp,
             5 => Rcode.refused,
             6 => Rcode.yxdomain,
-            7 => Rcode.badcookie,
+            7 => Rcode.yxrrset,
             8 => Rcode.nxrrset,
             9 => Rcode.notauth,
             10 => Rcode.notzone,
@@ -157,6 +167,10 @@ pub const Header = struct {
         if (self.checking_disabled) flags |= Flags.cd;
         // RFC 1035 section 4.1.1: the Z bit must be zero in all queries and
         // responses, so the reserved bit is never written.
+        //
+        // RFC 1035 section 4.1.1: the RCODE field is four bits wide, so an
+        // extended code such as BADCOOKIE contributes only its low bits and
+        // rides in the OPT record's extended-rcode byte.
         flags |= @as(u16, @backingInt(self.rcode)) & Flags.rcode;
 
         try writer.writeU16(self.id);
@@ -256,14 +270,36 @@ test "header round trips NXRRSET and NOTZONE" {
     try std.testing.expectEqual(Rcode.notzone, (try Header.parse(&reader)).rcode);
 }
 
-test "header splits bare RCODE 7 from extended BADCOOKIE 23" {
+test "a received base RCODE 7 is YXRRSET" {
+    var reader = Reader.init(&.{ 0x12, 0x34, 0x85, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 });
+    const parsed = try Header.parse(&reader);
+    try std.testing.expectEqual(Rcode.yxrrset, parsed.rcode);
+    // RFC 2136 section 1.3: the bare low nibble 7 is YXRRSET, never BADCOOKIE.
+    try std.testing.expect(!parsed.rcode.isBadCookie(0));
+
+    var output: [12]u8 = undefined;
+    var writer = Writer.init(&output);
+    try (Header{ .id = 0x1234, .rcode = .yxrrset }).encode(&writer);
+    try std.testing.expectEqual(@as(u8, 7), output[3] & 0x0f);
+}
+
+test "the BADCOOKIE extended code still writes the low bits 7 in the header" {
+    var output: [12]u8 = undefined;
+    var writer = Writer.init(&output);
+    try (Header{ .id = 0x1234, .rcode = .badcookie }).encode(&writer);
+    // RFC 7873 section 8: code 23 is the low bits 7 plus an OPT
+    // extended-rcode of 1, so the header keeps the low bits.
+    try std.testing.expectEqual(@as(u8, 7), output[3] & 0x0f);
+}
+
+test "header splits YXRRSET 7 from extended BADCOOKIE 23" {
     try std.testing.expectEqual(@as(u16, 23), Rcode.BADCOOKIE_EXTENDED_CODE);
-    // Bare header 7 with no OPT extended byte is reserved, not BADCOOKIE.
-    try std.testing.expect(!(Rcode.badcookie.isBadCookie(0)));
-    try std.testing.expectEqual(@as(u16, 7), Rcode.badcookie.extendedCode(0));
+    // A bare header 7 with no OPT extended byte is YXRRSET, not BADCOOKIE.
+    try std.testing.expect(!Rcode.yxrrset.isBadCookie(0));
+    try std.testing.expectEqual(@as(u16, 7), Rcode.yxrrset.extendedCode(0));
     // Header 7 plus OPT extended-rcode 1 is BADCOOKIE (23).
-    try std.testing.expect(Rcode.badcookie.isBadCookie(1));
-    try std.testing.expectEqual(@as(u16, 23), Rcode.badcookie.extendedCode(1));
+    try std.testing.expect(Rcode.yxrrset.isBadCookie(1));
+    try std.testing.expectEqual(@as(u16, 23), Rcode.yxrrset.extendedCode(1));
     try std.testing.expect(!Rcode.servfail.isBadCookie(1));
 }
 

@@ -27,6 +27,14 @@ jobs:
               zig_target=aarch64-linux
               zig_sha=9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8
               ;;
+            Darwin-arm64|Darwin-aarch64)
+              zig_target=aarch64-macos
+              zig_sha=b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a
+              ;;
+            Darwin-x86_64)
+              zig_target=x86_64-macos
+              zig_sha=4f9a1c5269aa17ebda5e6d3c2b89d6cbf36f7d2b22a0306e9ab98f25f95529c6
+              ;;
             *)
               echo "unsupported runner: $(uname -s) $(uname -m)" >&2
               exit 1
@@ -36,7 +44,13 @@ jobs:
           zig_dir="$RUNNER_TEMP/zig"
           curl --fail --location --retry 3 --output "$zig_archive" \
             "https://ziglang.org/download/$zig_version/zig-$zig_target-$zig_version.tar.xz"
-          echo "$zig_sha  $zig_archive" | sha256sum --check --strict
+          # openssl ships on both runners, so one check covers both platforms.
+          zig_sha_actual="$(openssl dgst -sha256 "$zig_archive")"
+          zig_sha_actual="${zig_sha_actual##* }"
+          if [ "$zig_sha_actual" != "$zig_sha" ]; then
+            echo "zig archive checksum mismatch: $zig_sha_actual != $zig_sha" >&2
+            exit 1
+          fi
           mkdir -p "$zig_dir"
           tar -xJf "$zig_archive" --strip-components=1 --directory "$zig_dir"
           echo "$zig_dir" >> "$GITHUB_PATH"
@@ -84,3 +98,94 @@ jobs:
 
       - name: Build Docker image
         run: docker build -t zimdns:ci .
+
+  quality-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Zig 0.17.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          zig_version=0.17.0
+          # The checksums are the ones published in
+          # https://ziglang.org/download/index.json for this release.
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64)
+              zig_target=x86_64-linux
+              zig_sha=1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
+              ;;
+            Linux-aarch64|Linux-arm64)
+              zig_target=aarch64-linux
+              zig_sha=9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8
+              ;;
+            Darwin-arm64|Darwin-aarch64)
+              zig_target=aarch64-macos
+              zig_sha=b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a
+              ;;
+            Darwin-x86_64)
+              zig_target=x86_64-macos
+              zig_sha=4f9a1c5269aa17ebda5e6d3c2b89d6cbf36f7d2b22a0306e9ab98f25f95529c6
+              ;;
+            *)
+              echo "unsupported runner: $(uname -s) $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+          zig_archive="$RUNNER_TEMP/zig.tar.xz"
+          zig_dir="$RUNNER_TEMP/zig"
+          curl --fail --location --retry 3 --output "$zig_archive" \
+            "https://ziglang.org/download/$zig_version/zig-$zig_target-$zig_version.tar.xz"
+          # openssl ships on both runners, so one check covers both platforms.
+          zig_sha_actual="$(openssl dgst -sha256 "$zig_archive")"
+          zig_sha_actual="${zig_sha_actual##* }"
+          if [ "$zig_sha_actual" != "$zig_sha" ]; then
+            echo "zig archive checksum mismatch: $zig_sha_actual != $zig_sha" >&2
+            exit 1
+          fi
+          mkdir -p "$zig_dir"
+          tar -xJf "$zig_archive" --strip-components=1 --directory "$zig_dir"
+          echo "$zig_dir" >> "$GITHUB_PATH"
+          "$zig_dir/zig" version
+
+      - name: Check formatting
+        run: zig fmt --check .
+
+      - name: Build
+        run: zig build
+
+      - name: Run unit tests
+        run: zig build test
+
+      - name: Run golden tests
+        run: zig build test-golden
+
+      - name: Run config tests
+        run: zig build test-config
+
+      - name: Run parser fuzz tests
+        run: zig build test-fuzz
+
+      - name: Run socket integration tests
+        run: zig build test-integration
+
+      - name: Run documented CLI invocation tests
+        run: zig build test-cli
+
+      - name: Scan tracked sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          conflict_pattern='^(<<<<<<<|=======|>>>>>>>)'
+          private_key_prefix='-----BEGIN '
+          private_key_pattern="${private_key_prefix}.*PRIVATE KEY.*-----"
+          if git grep -nE -e "$conflict_pattern" -- .; then
+            echo "tracked conflict marker found" >&2
+            exit 1
+          fi
+          if git grep -nE -e "$private_key_pattern" -- .; then
+            echo "tracked private-key material found" >&2
+            exit 1
+          fi

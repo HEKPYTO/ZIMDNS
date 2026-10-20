@@ -65,15 +65,16 @@ pub const report_max_len = 1024;
 
 /// Registry lookups over the raw RDATA octet. Values outside the enum are
 /// Unassigned or Private Use in the RFC 8976 section 5 registries and are not
-/// verifiable here.
-fn schemeFromCode(code: u8) ?Scheme {
+/// verifiable here. The publisher resolves the operator's registry codes
+/// through the same lookups the verifier uses.
+pub fn schemeFromCode(code: u8) ?Scheme {
     return switch (code) {
         @backingInt(Scheme.simple) => Scheme.simple,
         else => null,
     };
 }
 
-fn hashFromCode(code: u8) ?Hash {
+pub fn hashFromCode(code: u8) ?Hash {
     return switch (code) {
         @backingInt(Hash.sha384) => Hash.sha384,
         @backingInt(Hash.sha512) => Hash.sha512,
@@ -254,7 +255,9 @@ fn canonicalEntries(zone: *const zone_index.Zone, allocator: std.mem.Allocator) 
 
 /// digest = hash( RR(1) | RR(2) | ... ) over the canonically ordered zone
 /// (RFC 8976 section 3.3.1.2). Each RR contributes its canonical wire form.
-fn computeDigest(zone: *const zone_index.Zone, hash: Hash, allocator: std.mem.Allocator, out: *[dns_rdata.max_zonemd_digest_len]u8) Error!void {
+/// The publisher and the verifier call this one function, so a published
+/// digest and a verified digest cannot disagree.
+pub fn computeDigest(zone: *const zone_index.Zone, hash: Hash, allocator: std.mem.Allocator, out: *[dns_rdata.max_zonemd_digest_len]u8) Error!void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const entries = try canonicalEntries(zone, arena.allocator());

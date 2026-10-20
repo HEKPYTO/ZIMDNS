@@ -19,6 +19,12 @@ pub const Error = error{
 
 pub const Transport = enum { udp, tcp, dot, doh };
 
+/// RFC 9520 section 3.2: a resolution failure is cached for at least one
+/// second and never longer than five minutes, so the operator's cache time
+/// is a number of seconds inside those bounds.
+pub const FAILURE_CACHE_MIN_SECONDS: u32 = 1;
+pub const FAILURE_CACHE_MAX_SECONDS: u32 = 300;
+
 const Text = struct {
     bytes: [max_text]u8 = undefined,
     len: usize = 0,
@@ -232,6 +238,11 @@ pub const Config = struct {
     /// default; set via `nat64-prefix <prefix>`.
     nat64_prefix: ?Nat64Prefix = null,
 
+    /// RFC 9520 section 3.2: the time a resolution failure stays cached, in
+    /// seconds. Null means the resolver's own default; set via
+    /// `minimum-failure-cache-time <seconds>`.
+    minimum_failure_cache_time: ?u32 = null,
+
     pub fn tlsCertFileText(self: *const Config) ?[]const u8 {
         if (!self.has_tls_cert_file) return null;
         return self.tls_cert_file.text();
@@ -294,6 +305,7 @@ pub const Config = struct {
         if (std.mem.eql(u8, first, "zoneversion")) return self.parseZoneversion(&tokens);
         if (std.mem.eql(u8, first, "minimal-any-ttl")) return self.parseMinimalAnyTtl(&tokens);
         if (std.mem.eql(u8, first, "nat64-prefix")) return self.parseNat64Prefix(&tokens);
+        if (std.mem.eql(u8, first, "minimum-failure-cache-time")) return self.parseMinimumFailureCacheTime(&tokens);
         return Error.UnknownDirective;
     }
 
@@ -485,6 +497,17 @@ pub const Config = struct {
         const value = tokens.next() orelse return Error.BadDirective;
         try requireNoTrailingTokens(tokens);
         self.nat64_prefix = try Nat64Prefix.parse(value);
+    }
+
+    fn parseMinimumFailureCacheTime(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        if (self.minimum_failure_cache_time != null) return Error.BadDirective;
+        const value = tokens.next() orelse return Error.BadDirective;
+        const parsed = std.fmt.parseInt(u32, value, 10) catch return Error.BadDirective;
+        // RFC 9520 section 3.2: a failure is cached for at least one second
+        // and never for longer than five minutes.
+        if (parsed < FAILURE_CACHE_MIN_SECONDS or parsed > FAILURE_CACHE_MAX_SECONDS) return Error.BadDirective;
+        try requireNoTrailingTokens(tokens);
+        self.minimum_failure_cache_time = parsed;
     }
 };
 
@@ -760,6 +783,34 @@ test "config parser accepts minimal-any-ttl as a guarded unsigned TTL" {
     // Typical zone config plus the new directive survives parsing.
     const config = try Config.parse("zone one.example primary one.zone\nminimal-any-ttl 7200\n");
     try std.testing.expectEqual(@as(u32, 7200), config.minimal_any_ttl.?);
+}
+
+test "config parser takes one RFC 9520 failure cache time and rejects every other shape" {
+    // No directive means the resolver's own default.
+    try std.testing.expect((try Config.parse("zone one.example primary one.zone\n")).minimum_failure_cache_time == null);
+
+    const configured = try Config.parse("minimum-failure-cache-time 30\n");
+    try std.testing.expectEqual(@as(u32, 30), configured.minimum_failure_cache_time.?);
+
+    // RFC 9520 section 3.2: a failure is cached for at least one second and
+    // never for longer than five minutes.
+    try std.testing.expectEqual(@as(u32, 1), (try Config.parse("minimum-failure-cache-time 1\n")).minimum_failure_cache_time.?);
+    try std.testing.expectEqual(@as(u32, 300), (try Config.parse("minimum-failure-cache-time 300\n")).minimum_failure_cache_time.?);
+
+    for ([_][]const u8{
+        "minimum-failure-cache-time\n",
+        "minimum-failure-cache-time 30 extra\n",
+        "minimum-failure-cache-time abc\n",
+        "minimum-failure-cache-time -1\n",
+        "minimum-failure-cache-time 0\n",
+        "minimum-failure-cache-time 301\n",
+    }) |text| {
+        try std.testing.expectError(error.BadDirective, Config.parse(text));
+    }
+    try std.testing.expectError(error.BadDirective, Config.parse(
+        "minimum-failure-cache-time 30\nminimum-failure-cache-time 60\n",
+    ));
+    try std.testing.expectError(error.UnknownDirective, Config.parse("failure-cache-time 30\n"));
 }
 
 test "config parser takes one RFC 6052 NAT64 prefix and rejects every other shape" {

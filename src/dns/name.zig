@@ -64,6 +64,24 @@ pub const Name = struct {
         return self.wire[0..self.wire_len];
     }
 
+    /// The 0x20 mechanism: the case of the first letter of each label is
+    /// drawn at random and the rest of the label keeps its case. The name
+    /// still compares equal to the one it was built from, so the responder's
+    /// case-insensitive comparison (RFC 1035 section 2.3.3) still matches it,
+    /// while a forged answer has to carry the exact case to be accepted.
+    pub fn withRandomizedLabelFirstCase(self: *const Name, random: std.Random) Name {
+        var out = self.*;
+        var index: usize = 0;
+        while (index < out.wire_len) {
+            const len: usize = out.wire[index];
+            if (len == 0) break;
+            const first = index + 1;
+            if (first < out.wire_len) out.wire[first] = randomLetterCase(out.wire[first], random);
+            index += 1 + len;
+        }
+        return out;
+    }
+
     pub fn eql(a: *const Name, b: *const Name) bool {
         return std.ascii.eqlIgnoreCase(a.asWire(), b.asWire());
     }
@@ -188,6 +206,13 @@ pub const Name = struct {
         self.wire[self.wire_len] = byte;
         self.wire_len += 1;
     }
+
+    /// The case of one ASCII letter, drawn at random. A byte that is not a
+    /// letter carries no 0x20 bit, so it keeps its value.
+    fn randomLetterCase(byte: u8, random: std.Random) u8 {
+        if (!std.ascii.isAlphabetic(byte)) return byte;
+        return if (random.int(u1) == 1) std.ascii.toUpper(byte) else std.ascii.toLower(byte);
+    }
 };
 
 test "name parses root and normal names" {
@@ -219,6 +244,43 @@ test "RFC 4343 4.1: the received case is kept, the canonical form folds it" {
     try std.testing.expect(received.name.eql(&canonical.name));
     const folded = received.name.folded();
     try std.testing.expectEqualSlices(u8, canonical.name.asWire(), folded.asWire());
+}
+
+test "0x20: the first letter of each label takes a random case, the rest keeps its case" {
+    // A fixed seed keeps the drawn case reproducible; the CLI draws it from
+    // the system CSPRNG.
+    var prng = std.Random.Pcg.init(0x0020_2020);
+    const random = prng.random();
+    const name = try Name.fromText("www.example.com.");
+
+    var upper: usize = 0;
+    var lower: usize = 0;
+    for (0..64) |_| {
+        const randomized = name.withRandomizedLabelFirstCase(random);
+        // RFC 1035 section 2.3.3: the name still compares equal.
+        try std.testing.expect(randomized.eql(&name));
+
+        var index: usize = 0;
+        while (index < name.asWire().len) {
+            const len: usize = name.asWire()[index];
+            if (len == 0) break;
+            const first = name.asWire()[index + 1];
+            const drawn = randomized.asWire()[index + 1];
+            // The first letter is the same letter in either case, and the
+            // rest of the label is untouched.
+            try std.testing.expectEqual(std.ascii.toLower(first), std.ascii.toLower(drawn));
+            try std.testing.expectEqualSlices(
+                u8,
+                name.asWire()[index + 2 .. index + 1 + len],
+                randomized.asWire()[index + 2 .. index + 1 + len],
+            );
+            if (std.ascii.isUpper(drawn)) upper += 1 else lower += 1;
+            index += 1 + len;
+        }
+    }
+    // The case is drawn, not fixed.
+    try std.testing.expect(upper > 0);
+    try std.testing.expect(lower > 0);
 }
 
 test "name decodes compression pointer and nested pointer" {

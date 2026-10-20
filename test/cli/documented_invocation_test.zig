@@ -71,6 +71,9 @@ const Kind = enum {
     serve,
     /// `zimdns query`: needs a server, must exit 0 with an answer.
     query,
+    /// `zimdns zonemd publish`: computes the zone digest, must exit 0 with
+    /// the ZONEMD record in zone text.
+    zonemd,
 };
 
 const Case = struct {
@@ -352,6 +355,11 @@ fn classify(allocator: std.mem.Allocator, io: std.Io, tmp_prefix: []const u8, ar
         };
     }
 
+    if (std.mem.eql(u8, argv[0], "zonemd")) {
+        if (argv.len < 2 or !std.mem.eql(u8, argv[1], "publish")) return error.UndocumentedInvocation;
+        return plain(argv, .zonemd, port);
+    }
+
     return error.UndocumentedInvocation;
 }
 
@@ -532,7 +540,23 @@ fn execute(allocator: std.mem.Allocator, io: std.Io, case: Case) !bool {
         .encrypted_refusal => runRefusal(allocator, io, case, argv.items),
         .serve => runServe(allocator, io, case, argv.items),
         .query => runQuery(allocator, io, case, argv.items),
+        .zonemd => runZonemd(allocator, io, case, argv.items),
     };
+}
+
+/// A documented `zonemd publish` must publish a digest: the record it prints
+/// is the one the zone verifier accepts, so the run must end with a ZONEMD
+/// record in zone text.
+fn runZonemd(allocator: std.mem.Allocator, io: std.Io, case: Case, argv: []const []const u8) !bool {
+    const result = std.process.run(allocator, io, .{ .argv = argv, .timeout = child_deadline }) catch |err| {
+        report(case, null, "", @errorName(err), "zonemd child did not terminate");
+        return false;
+    };
+    const code = exitCode(result.term);
+    const published = code == 0 and std.mem.indexOf(u8, result.stdout, " IN ZONEMD ") != null;
+    if (published) return true;
+    report(case, code, result.stdout, result.stderr, "zonemd publish printed no ZONEMD record");
+    return false;
 }
 
 fn runToCompletion(allocator: std.mem.Allocator, io: std.Io, case: Case, argv: []const []const u8) !bool {
