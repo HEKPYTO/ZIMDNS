@@ -812,6 +812,61 @@ test "TCP request pipeline answers ISDN query without synthesized additional" {
     try expectIsdnResponse(response, 0x4260);
 }
 
+test "UDP request pipeline answers HINFO query without synthesized additional" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(fixture_zone);
+    defer runtime.deinit();
+
+    var server_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server_socket = try std.Io.net.IpAddress.bind(&server_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer server_socket.close(io);
+
+    var client_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var client_socket = try std.Io.net.IpAddress.bind(&client_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer client_socket.close(io);
+
+    var query_buffer: [512]u8 = undefined;
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4265, "hinfo.home.arpa.", .HINFO, false);
+    try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, query);
+    try listener.serveUdpOnce(&server_socket, io, &runtime);
+
+    var response_buffer: [512]u8 = undefined;
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    try expectHinfoResponse(response, 0x4265);
+}
+
+test "TCP request pipeline answers HINFO query without synthesized additional" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(fixture_zone);
+    defer runtime.deinit();
+
+    var listen_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try std.Io.net.IpAddress.listen(&listen_addr, io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    var client_stream = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer client_stream.close(io);
+    const server_stream = try server.accept(io);
+    defer server_stream.close(io);
+
+    var query_buffer: [512]u8 = undefined;
+    const query = try cli_query.buildQueryPacket(&query_buffer, 0x4266, "hinfo.home.arpa.", .HINFO, false);
+    try cli_query.sendTcpQuery(client_stream, io, query);
+    try client_stream.shutdown(io, .send);
+
+    try listener.serveTcpStreamOnce(server_stream, io, &runtime);
+
+    var response_buffer: [512]u8 = undefined;
+    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query);
+    try expectHinfoResponse(response, 0x4266);
+}
+
 test "UDP request pipeline answers RT query without synthesized additionals" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -2989,6 +3044,18 @@ fn expectIsdnResponse(response: anytype, expected_id: u16) !void {
     try std.testing.expectEqualStrings("aBf", answer.rdata.ISDN.subaddressText());
 }
 
+fn expectHinfoResponse(response: anytype, expected_id: u16) !void {
+    try std.testing.expect(response.header.qr);
+    try std.testing.expectEqual(@as(@TypeOf(response.header.rcode), .no_error), response.header.rcode);
+    try std.testing.expectEqual(expected_id, response.header.id);
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+    try std.testing.expectEqual(@as(u16, 0), response.header.additional_count);
+    const answer = response.answers.items[0];
+    try std.testing.expect(answer.rrtype.eql(.HINFO));
+    try std.testing.expectEqualStrings("Intel", answer.rdata.HINFO.cpuText());
+    try std.testing.expectEqualStrings("Linux", answer.rdata.HINFO.osText());
+}
+
 fn expectRtResponse(response: anytype, expected_id: u16) !void {
     try std.testing.expect(response.header.qr);
     try std.testing.expectEqual(@as(@TypeOf(response.header.rcode), .no_error), response.header.rcode);
@@ -3176,6 +3243,7 @@ const fixture_zone =
     \\server IN A 192.0.2.53
     \\x25 IN X25 1234
     \\isdn IN ISDN 1234 "aBf"
+    \\hinfo IN HINFO "Intel" "Linux"
     \\rt IN RT 100 target.home.arpa.
     \\srv IN SRV 10 20 8443 target.home.arpa.
     \\legacy IN DNAME target.example.
@@ -3484,5 +3552,7 @@ test "UDP request pipeline ANY answers one synthesized HINFO at the operator TTL
     try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
     try std.testing.expect(response.answers.items[0].rrtype.eql(.{ .value = 13 }));
     try std.testing.expectEqual(@as(u32, 300), response.answers.items[0].ttl);
-    try std.testing.expectEqualSlices(u8, &.{ 0x07, 'R', 'F', 'C', '8', '4', '8', '2', 0x00 }, response.answers.items[0].rdata.Unknown.bytes());
+    const hinfo = response.answers.items[0].rdata.HINFO;
+    try std.testing.expectEqualStrings("RFC8482", hinfo.cpuText());
+    try std.testing.expectEqualStrings("", hinfo.osText());
 }

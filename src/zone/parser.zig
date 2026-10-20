@@ -350,6 +350,7 @@ fn parseRecordType(text: []const u8) ?RecordType {
     if (std.mem.eql(u8, text, "AFSDB")) return .AFSDB;
     if (std.mem.eql(u8, text, "X25")) return .X25;
     if (std.mem.eql(u8, text, "ISDN")) return .ISDN;
+    if (std.mem.eql(u8, text, "HINFO")) return .HINFO;
     if (std.mem.eql(u8, text, "TXT")) return .TXT;
     if (std.mem.eql(u8, text, "SRV")) return .SRV;
     if (std.mem.eql(u8, text, "NAPTR")) return .NAPTR;
@@ -394,6 +395,7 @@ pub fn parseRData(rrtype: RecordType, text: []const u8) Error!dns_rdata.RData {
     if (rrtype.eql(.AFSDB)) return .{ .AFSDB = try parseAfsdb(text) };
     if (rrtype.eql(.X25)) return .{ .X25 = try parseX25(text) };
     if (rrtype.eql(.ISDN)) return .{ .ISDN = try parseIsdn(text) };
+    if (rrtype.eql(.HINFO)) return .{ .HINFO = try parseHinfo(text) };
     if (rrtype.eql(.TXT)) return .{ .TXT = try parseTxt(text) };
     if (rrtype.eql(.SRV)) return .{ .SRV = try parseSrv(text) };
     if (rrtype.eql(.NAPTR)) return .{ .NAPTR = try parseNaptr(text) };
@@ -911,6 +913,43 @@ fn parseIsdnField(input: []const u8, index: *usize) Error![]const u8 {
     return input[start..index.*];
 }
 
+/// RFC 1035 section 5.1 character-string: a quoted string whose escapes are
+/// resolved, or a bare run of characters without interior spaces.
+fn parseCharacterString(input: []const u8, index: *usize, output: []u8) Error!usize {
+    if (index.* >= input.len) return Error.BadRecord;
+    if (input[index.*] == '"') return parseQuotedString(input, index, output);
+
+    const start = index.*;
+    while (index.* < input.len and !std.ascii.isWhitespace(input[index.*])) index.* += 1;
+    const bare = input[start..index.*];
+    if (bare.len == 0 or bare.len > output.len) return Error.BadRecord;
+    for (bare) |byte| {
+        if (byte == '"' or byte == '\\') return Error.BadRecord;
+    }
+    @memcpy(output[0..bare.len], bare);
+    return bare.len;
+}
+
+/// RFC 1035 section 3.3.2 HINFO zone text: a CPU character-string followed by
+/// an OS character-string.
+fn parseHinfo(text: []const u8) Error!dns_rdata.Hinfo {
+    const input = std.mem.trim(u8, text, " \t\r\n");
+    if (input.len == 0) return Error.BadRecord;
+
+    var index: usize = 0;
+    var cpu_buffer: [255]u8 = undefined;
+    const cpu_len = try parseCharacterString(input, &index, &cpu_buffer);
+    if (index == input.len or !std.ascii.isWhitespace(input[index])) return Error.BadRecord;
+    while (index < input.len and std.ascii.isWhitespace(input[index])) index += 1;
+
+    var os_buffer: [255]u8 = undefined;
+    const os_len = try parseCharacterString(input, &index, &os_buffer);
+    while (index < input.len and std.ascii.isWhitespace(input[index])) index += 1;
+    if (index != input.len) return Error.BadRecord;
+
+    return dns_rdata.Hinfo.init(cpu_buffer[0..cpu_len], os_buffer[0..os_len]) catch Error.BadRecord;
+}
+
 fn parseSrv(text: []const u8) Error!dns_rdata.Srv {
     var tokens = std.mem.tokenizeAny(u8, text, " \t\r\n");
     const priority = parseStrictDecimal(u16, tokens.next() orelse return Error.BadRecord) orelse return Error.BadRecord;
@@ -956,7 +995,7 @@ fn parseCaa(text: []const u8) Error!dns_rdata.Caa {
 
     var value: [509]u8 = undefined;
     const value_len: usize = if (input[index] == '"') blk: {
-        const decoded_len = try parseCaaQuoted(input, &index, value[0..]);
+        const decoded_len = try parseQuotedString(input, &index, value[0..]);
         while (index < input.len and std.ascii.isWhitespace(input[index])) index += 1;
         if (index != input.len) return Error.BadRecord;
         break :blk decoded_len;
@@ -977,7 +1016,9 @@ fn parseCaa(text: []const u8) Error!dns_rdata.Caa {
     return dns_rdata.Caa.init(flags, tag, value[0..value_len]) catch Error.BadRecord;
 }
 
-fn parseCaaQuoted(input: []const u8, index: *usize, output: []u8) Error!usize {
+/// Decode one RFC 1035 section 5.1 quoted string: a backslash quotes a
+/// non-digit character and three decimal digits are a decimal octet.
+fn parseQuotedString(input: []const u8, index: *usize, output: []u8) Error!usize {
     if (index.* >= input.len or input[index.*] != '"') return Error.BadRecord;
     index.* += 1;
     var length: usize = 0;
@@ -2157,6 +2198,72 @@ test "zone parser recognizes and validates ISDN records" {
     const isdn = try parseRData(.ISDN, zone.records.items[2].rdataText());
     try std.testing.expectEqualStrings("1234", isdn.ISDN.addressText());
     try std.testing.expectEqualStrings("aBf", isdn.ISDN.subaddressText());
+}
+
+test "HINFO zone text parses quoted unquoted and escaped character strings" {
+    const quoted = try parseRData(.HINFO, "\"Intel\" \"Linux\"");
+    try std.testing.expectEqualStrings("Intel", quoted.HINFO.cpuText());
+    try std.testing.expectEqualStrings("Linux", quoted.HINFO.osText());
+
+    const unquoted = try parseRData(.HINFO, "Intel Linux");
+    try std.testing.expectEqualStrings("Intel", unquoted.HINFO.cpuText());
+    try std.testing.expectEqualStrings("Linux", unquoted.HINFO.osText());
+
+    const escaped = try parseRData(.HINFO, "\"Intel\\032x\" \"Li\\010ux\"");
+    try std.testing.expectEqualStrings("Intel x", escaped.HINFO.cpuText());
+    try std.testing.expectEqualStrings("Li\nux", escaped.HINFO.osText());
+
+    const escaped_quote = try parseRData(.HINFO, "\"Intel\\\"x\" \"Linux\"");
+    try std.testing.expectEqualStrings("Intel\"x", escaped_quote.HINFO.cpuText());
+    try std.testing.expectEqualStrings("Linux", escaped_quote.HINFO.osText());
+
+    const empty_os = try parseRData(.HINFO, "\"RFC8482\" \"\"");
+    try std.testing.expectEqualStrings("RFC8482", empty_os.HINFO.cpuText());
+    try std.testing.expectEqualStrings("", empty_os.HINFO.osText());
+}
+
+test "HINFO zone text rejects malformed presentation" {
+    const invalid = [_][]const u8{
+        "",
+        "Intel",
+        "Intel Linux extra",
+        "\"Intel",
+        "Intel\" Linux",
+        "Intel\\Linux \"Linux\"",
+        "\"Intel\\256\" \"Linux\"",
+        "\"Intel\"Linux",
+    };
+    for (invalid) |text| try std.testing.expectError(Error.BadRecord, parseRData(.HINFO, text));
+
+    var overlong_cpu: [256]u8 = undefined;
+    @memset(&overlong_cpu, 'x');
+    try std.testing.expectError(Error.BadRecord, parseRData(.HINFO, &overlong_cpu));
+
+    var overlong_os: [256]u8 = undefined;
+    @memset(&overlong_os, 'x');
+    var overlong_input: [1 + 256 + 1]u8 = undefined;
+    @memcpy(overlong_input[0..1], "x");
+    overlong_input[1] = ' ';
+    @memcpy(overlong_input[2..], &overlong_os);
+    try std.testing.expectError(Error.BadRecord, parseRData(.HINFO, &overlong_input));
+}
+
+test "zone parser recognizes and validates HINFO records" {
+    var zone = try ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns hostmaster 1 3600 900 1209600 3600
+        \\@ IN NS ns
+        \\host IN HINFO "Intel" "Linux"
+        \\
+    );
+    defer zone.deinit();
+
+    try std.testing.expectEqual(RecordType.HINFO, zone.records.items[2].rrtype);
+    try std.testing.expectEqualStrings("\"Intel\" \"Linux\"", zone.records.items[2].rdataText());
+    const hinfo = try parseRData(.HINFO, zone.records.items[2].rdataText());
+    try std.testing.expectEqualStrings("Intel", hinfo.HINFO.cpuText());
+    try std.testing.expectEqualStrings("Linux", hinfo.HINFO.osText());
 }
 
 test "RP zone text parses two absolute names and either root field" {

@@ -31,6 +31,7 @@ pub const RecordType = struct {
     pub const DNAME = RecordType{ .value = 39 };
     pub const SOA = RecordType{ .value = 6 };
     pub const PTR = RecordType{ .value = 12 };
+    pub const HINFO = RecordType{ .value = 13 };
     pub const MX = RecordType{ .value = 15 };
     pub const RP = RecordType{ .value = 17 };
     pub const AFSDB = RecordType{ .value = 18 };
@@ -87,6 +88,11 @@ test "TSIG record type and ANY class use their RFC wire codes" {
     try std.testing.expectEqual(RecordType.TSIG, RecordType.fromCode(250));
     try std.testing.expectEqual(@as(u16, 255), Class.ANY.code());
     try std.testing.expectEqual(Class.ANY, Class.fromCode(255));
+}
+
+test "HINFO record type uses wire code 13" {
+    try std.testing.expectEqual(@as(u16, 13), RecordType.HINFO.code());
+    try std.testing.expectEqual(RecordType.HINFO, RecordType.fromCode(13));
 }
 
 test "ISDN record type uses wire code 20" {

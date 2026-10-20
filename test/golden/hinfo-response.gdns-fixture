@@ -1,0 +1,16 @@
+name: hinfo-response
+rfc: RFC 1035 section 3.3.2
+phase: 3
+description: Exact authoritative HINFO response with the CPU and OS character strings and no synthesized additional record.
+input_hex:
+  44 65 01 00 00 01 00 00 00 00 00 00
+  05 68 69 6e 66 6f 04 68 6f 6d 65 04 61 72 70 61 00 00 0d 00 01
+response_hex:
+  44 65 85 00 00 01 00 01 00 00 00 00
+  05 68 69 6e 66 6f 04 68 6f 6d 65 04 61 72 70 61 00 00 0d 00 01
+  c0 0c 00 0d 00 01 00 00 0e 10 00 0c 05 49 6e 74 65 6c 05 4c 69 6e 75 78
+expect:
+  parse_ok: true
+  id: 0x4465
+  qname: hinfo.home.arpa.
+  qclass: IN

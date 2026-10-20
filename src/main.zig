@@ -35,6 +35,26 @@ pub const zone_signer = @import("zone/signer.zig");
 
 const ServerRunMode = enum { none, udp_once, tcp_once, udp_loop, tcp_loop, dot_loop, doh_loop, xfr_loop };
 
+/// The runtime a SIGHUP asks to reload its zone. A signal handler cannot
+/// take user data, so the running server is a process-wide pointer.
+var reload_runtime: ?*auth_runtime.Runtime = null;
+
+/// The SIGHUP handler sets the reload flag and nothing else: the zone file
+/// is read and the zone is swapped by the serve path, outside the handler.
+fn onSighup(_: std.posix.SIG) callconv(.c) void {
+    if (reload_runtime) |runtime| runtime.requestZoneReload();
+}
+
+fn installReloadHandler(runtime: *auth_runtime.Runtime) void {
+    reload_runtime = runtime;
+    const action = std.posix.Sigaction{
+        .handler = .{ .handler = onSighup },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.HUP, &action, null);
+}
+
 test {
     _ = @import("dns/reader.zig");
     _ = @import("dns/writer.zig");
@@ -146,6 +166,10 @@ fn printHelp(writer: *std.Io.Writer) !void {
         \\  are answered ahead of the cache and the forwarder. A configuration
         \\  turns them off with 'local-zones off'; examples/local-zones.gdns
         \\  is a worked configuration.
+        \\
+        \\  SIGHUP asks a running server to re-read its zone file and to
+        \\  serve the new zone. A zone file that cannot be parsed, or that
+        \\  carries no newer SOA serial, leaves the served zone in place.
         \\
         \\  --dnssec sets the RFC 6891 DO bit so the server returns its RRSIG
         \\  and NSEC records, which arrive in the answer and authority
@@ -477,6 +501,16 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
     }
 
     var runtime: auth_runtime.Runtime = undefined;
+    // A configuration names the zone file it loads. Only a single-zone
+    // configuration is reloadable: replacing a whole zone set is a different
+    // operation this profile does not have.
+    const config_zone_path: ?[]const u8 = if (server_context) |*context|
+        if (context.config.zones.len == 1)
+            try allocator.dupe(u8, context.config.zones.items[0].fileText())
+        else
+            null
+    else
+        null;
     if (!explicit_zone_file and server_context != null) {
         if (server_context.?.zones.items.len == 0) {
             try writer.writeAll("error: server run requires --zone-file or --config with a zone\n");
@@ -496,6 +530,18 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
         }
     }
     defer runtime.deinit();
+    // The handler must not reach a runtime that is already gone.
+    defer reload_runtime = null;
+    // SIGHUP replaces the zone from the zone file the server was started
+    // from. The handler only sets a flag; the serve path reads the file and
+    // swaps the zone.
+    const reload_path: ?[]const u8 = if (explicit_zone_file) zone_file else config_zone_path;
+    if (reload_path) |path| {
+        if (runtime.zones.items.len == 1) {
+            try runtime.setReloadSource(std.Io.Dir.cwd(), path, runtime.zones.items[0].originText());
+        }
+    }
+    installReloadHandler(&runtime);
     var counters = metrics.Counters{};
 
     switch (mode) {
@@ -818,7 +864,7 @@ test "query command renders a maximum escaped URI target" {
     const ServerArgs = struct {
         io: std.Io,
         server: *std.Io.net.Server,
-        runtime: *const auth_runtime.Runtime,
+        runtime: *auth_runtime.Runtime,
         ok: bool = false,
 
         fn run(self: *@This()) void {
@@ -852,4 +898,28 @@ test "query command renders a maximum escaped URI target" {
     try expected.writer.writeAll("\"\n");
     try std.testing.expect(expected.written().len > 2048);
     try std.testing.expectEqualSlices(u8, expected.written(), output.written());
+}
+
+test "the SIGHUP handler asks for a zone reload and does nothing else" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var runtime = try auth_runtime.Runtime.fromZoneText(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 10 3600 900 1209600 3600
+        \\@ IN NS ns.example.
+        \\www IN A 192.0.2.1
+        \\
+    );
+    defer runtime.deinit();
+    defer reload_runtime = null;
+    installReloadHandler(&runtime);
+
+    // No reload was asked for yet.
+    try std.testing.expect(runtime.reloadZoneIfRequested(io) == null);
+
+    try std.posix.raise(std.posix.SIG.HUP);
+
+    // The handler only set the flag: the reload itself happens outside it.
+    try std.testing.expectEqual(auth_runtime.ReloadOutcome.no_source, runtime.reloadZoneIfRequested(io).?);
+    try std.testing.expect(runtime.reloadZoneIfRequested(io) == null);
 }

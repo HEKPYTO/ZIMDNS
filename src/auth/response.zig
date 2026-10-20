@@ -277,18 +277,17 @@ fn synthesizedCnameRecord(synthetic: zone_index.SynthesizedCname) dns_record.Res
 /// "RFC8482" and whose OS field is the null string, so the response stays as
 /// small as possible. Its TTL is the operator's choice (RFC 8482 section 4.2);
 /// the AnswerPolicy carries it, defaulting to a day.
-const hinfo_type: dns_types.RecordType = .{ .value = 13 };
+const hinfo_type: dns_types.RecordType = dns_types.RecordType.HINFO;
 
 fn anyMinimalAnswer(owner: dns_name.Name, ttl: u32) dns_record.ResourceRecord {
-    const payload = [_]u8{ 0x07, 'R', 'F', 'C', '8', '4', '8', '2', 0x00 };
-    var rdata = dns_rdata.Unknown{ .len = @intCast(payload.len) };
-    @memcpy(rdata.data[0..payload.len], &payload);
+    // The two strings are constants, so the typed constructor cannot fail.
+    const rdata = dns_rdata.Hinfo.init("RFC8482", "") catch unreachable;
     return .{
         .owner = owner,
         .rrtype = hinfo_type,
         .class = dns_types.Class.IN,
         .ttl = ttl,
-        .rdata = .{ .Unknown = rdata },
+        .rdata = .{ .HINFO = rdata },
     };
 }
 
@@ -1542,13 +1541,11 @@ test "RFC 8482: ANY at an existing owner answers one synthesized HINFO" {
     try std.testing.expectEqual(@as(u16, 0), response.header.authority_count);
     try std.testing.expectEqual(@as(u32, 86400), response.answers.items[0].ttl);
     try std.testing.expect(response.answers.items[0].rrtype.eql(hinfo_type));
-    try std.testing.expectEqualSlices(
-        u8,
-        // CPU "RFC8482" then the null OS string: 07 + 7 octets + 00, nine in
-        // all. Anything longer would be octets past the end of both strings.
-        &.{ 0x07, 'R', 'F', 'C', '8', '4', '8', '2', 0x00 },
-        response.answers.items[0].rdata.Unknown.bytes(),
-    );
+    const answer_hinfo = response.answers.items[0].rdata.HINFO;
+    // Section 4.2: the CPU field is "RFC8482" and the OS field is the null
+    // string.
+    try std.testing.expectEqualStrings("RFC8482", answer_hinfo.cpuText());
+    try std.testing.expectEqualStrings("", answer_hinfo.osText());
 
     var encoded: [512]u8 = undefined;
     var writer = @import("../dns/writer.zig").Writer.init(&encoded);
@@ -1556,6 +1553,7 @@ test "RFC 8482: ANY at an existing owner answers one synthesized HINFO" {
     const round_trip = try dns_message.Message.parse(arena.allocator(), writer.written());
     try std.testing.expect(!round_trip.header.truncated);
     try std.testing.expectEqual(@as(u16, 1), round_trip.header.answer_count);
+    try std.testing.expectEqual(@as(u16, 0), round_trip.header.additional_count);
     try std.testing.expect(round_trip.answers.items[0].rrtype.eql(hinfo_type));
 
     // Decode the answer straight off the wire from the RFC 1035 section 3.3.2
@@ -1563,7 +1561,18 @@ test "RFC 8482: ANY at an existing owner answers one synthesized HINFO" {
     // nothing after. Deliberately not the project's own HINFO reader, so the
     // two fields being swapped or a trailing octet fails here rather than
     // passing an encoder/decoder round trip that would agree with itself.
-    const hinfo_wire = round_trip.answers.items[0].rdata.Unknown.bytes();
+    // The answer is the last record in the message, so its RDATA is the tail
+    // and the two octets before that tail are its RDLENGTH.
+    const wire = writer.written();
+    const hinfo = round_trip.answers.items[0].rdata.HINFO;
+    const cpu = hinfo.cpuText();
+    const os = hinfo.osText();
+    const rdata_len = 1 + cpu.len + 1 + os.len;
+    try std.testing.expectEqual(
+        @as(u16, 9),
+        std.mem.readInt(u16, wire[wire.len - rdata_len - 2 ..][0..2], .big),
+    );
+    const hinfo_wire = wire[wire.len - rdata_len ..];
     var at: usize = 0;
     var fields: [2][]const u8 = undefined;
     for (&fields) |*field| {
@@ -1577,6 +1586,20 @@ test "RFC 8482: ANY at an existing owner answers one synthesized HINFO" {
     try std.testing.expectEqual(hinfo_wire.len, at);
     try std.testing.expectEqualStrings("RFC8482", fields[0]);
     try std.testing.expectEqualStrings("", fields[1]);
+
+    // The typed fields rebuild to the octets the answer carries: the CPU
+    // length, the CPU, the OS length, and the OS.
+    var rebuilt: [16]u8 = undefined;
+    var rebuilt_len: usize = 0;
+    rebuilt[rebuilt_len] = @intCast(cpu.len);
+    rebuilt_len += 1;
+    @memcpy(rebuilt[rebuilt_len..][0..cpu.len], cpu);
+    rebuilt_len += cpu.len;
+    rebuilt[rebuilt_len] = @intCast(os.len);
+    rebuilt_len += 1;
+    @memcpy(rebuilt[rebuilt_len..][0..os.len], os);
+    rebuilt_len += os.len;
+    try std.testing.expectEqualSlices(u8, rebuilt[0..rebuilt_len], hinfo_wire);
 
     // A CNAME at the owner is not synthesized over: section 4.1 answers the
     // single CNAME RRset instead.

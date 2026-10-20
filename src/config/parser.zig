@@ -12,6 +12,7 @@ pub const Error = error{
     BadPort,
     BadAddress,
     BadCidr,
+    BadNat64Prefix,
     TextTooLong,
     TooManyItems,
 };
@@ -91,6 +92,34 @@ fn maskedEqual(left: []const u8, right: []const u8, prefix: u8) bool {
     const mask: u8 = @as(u8, 0xff) << @intCast(8 - remainder);
     return (left[whole] & mask) == (right[whole] & mask);
 }
+
+/// RFC 6052 section 2.2: an IPv4-embedded IPv6 address is a prefix, the
+/// embedded IPv4 address, and a suffix. The prefix is one of the six
+/// lengths the RFC allows, and the reserved u octet (bits 64 to 71) must
+/// be zero.
+pub const Nat64Prefix = struct {
+    bytes: [16]u8 = @splat(0),
+    length: u8 = 96,
+
+    pub fn parse(value: []const u8) Error!Nat64Prefix {
+        const slash = std.mem.lastIndexOfScalar(u8, value, '/') orelse return Error.BadNat64Prefix;
+        if (slash == 0 or slash + 1 >= value.len) return Error.BadNat64Prefix;
+        const length = std.fmt.parseInt(u8, value[slash + 1 ..], 10) catch return Error.BadNat64Prefix;
+        const address = std.Io.net.IpAddress.parse(value[0..slash], 0) catch return Error.BadAddress;
+        const ip6 = switch (address) {
+            .ip6 => |ip6| ip6,
+            .ip4 => return Error.BadAddress,
+        };
+        switch (length) {
+            32, 40, 48, 56, 64, 96 => {},
+            else => return Error.BadNat64Prefix,
+        }
+        // RFC 6052 section 2.2: bits 64 to 71 are the reserved u octet and
+        // must be zero, which for a /96 prefix lies inside the prefix itself.
+        if (ip6.bytes[8] != 0) return Error.BadNat64Prefix;
+        return .{ .bytes = ip6.bytes, .length = length };
+    }
+};
 
 pub const Forwarder = struct {
     address: Text = .{},
@@ -198,6 +227,11 @@ pub const Config = struct {
     /// (see AnswerPolicy.minimal_any_ttl); set via `minimal-any-ttl <seconds>`.
     minimal_any_ttl: ?u32 = null,
 
+    /// RFC 6147 DNS64 synthesis prefix, in the RFC 6052 section 2.2 format.
+    /// Null means the forwarder never synthesizes an AAAA, which is the
+    /// default; set via `nat64-prefix <prefix>`.
+    nat64_prefix: ?Nat64Prefix = null,
+
     pub fn tlsCertFileText(self: *const Config) ?[]const u8 {
         if (!self.has_tls_cert_file) return null;
         return self.tls_cert_file.text();
@@ -259,6 +293,7 @@ pub const Config = struct {
         if (std.mem.eql(u8, first, "nsid")) return self.parseNsid(&tokens);
         if (std.mem.eql(u8, first, "zoneversion")) return self.parseZoneversion(&tokens);
         if (std.mem.eql(u8, first, "minimal-any-ttl")) return self.parseMinimalAnyTtl(&tokens);
+        if (std.mem.eql(u8, first, "nat64-prefix")) return self.parseNat64Prefix(&tokens);
         return Error.UnknownDirective;
     }
 
@@ -443,6 +478,13 @@ pub const Config = struct {
         const parsed = std.fmt.parseInt(u32, value, 10) catch return Error.BadDirective;
         if (parsed > 0x7fffffff) return Error.BadDirective;
         self.minimal_any_ttl = parsed;
+    }
+
+    fn parseNat64Prefix(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        if (self.nat64_prefix != null) return Error.BadDirective;
+        const value = tokens.next() orelse return Error.BadDirective;
+        try requireNoTrailingTokens(tokens);
+        self.nat64_prefix = try Nat64Prefix.parse(value);
     }
 };
 
@@ -718,4 +760,41 @@ test "config parser accepts minimal-any-ttl as a guarded unsigned TTL" {
     // Typical zone config plus the new directive survives parsing.
     const config = try Config.parse("zone one.example primary one.zone\nminimal-any-ttl 7200\n");
     try std.testing.expectEqual(@as(u32, 7200), config.minimal_any_ttl.?);
+}
+
+test "config parser takes one RFC 6052 NAT64 prefix and rejects every other shape" {
+    // No prefix means no synthesis, which is the default.
+    try std.testing.expect((try Config.parse("zone one.example primary one.zone\n")).nat64_prefix == null);
+
+    // RFC 6052 section 2.2: the well-known prefix and a network-specific
+    // prefix are both valid, and the reserved u octet is zero in each.
+    const well_known = try Config.parse("nat64-prefix 64:ff9b::/96\n");
+    try std.testing.expectEqual(@as(u8, 96), well_known.nat64_prefix.?.length);
+    try std.testing.expectEqual(@as(u8, 0), well_known.nat64_prefix.?.bytes[8]);
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x64, 0xff, 0x9b }, well_known.nat64_prefix.?.bytes[0..4]);
+
+    const specific = try Config.parse("nat64-prefix 2001:db8::/32\n");
+    try std.testing.expectEqual(@as(u8, 32), specific.nat64_prefix.?.length);
+    try std.testing.expectEqualSlices(u8, &.{ 0x20, 0x01, 0x0d, 0xb8 }, specific.nat64_prefix.?.bytes[0..4]);
+
+    // RFC 6052 section 2.2 allows only these prefix lengths, and the u
+    // octet (bits 64 to 71) must be zero.
+    for ([_][]const u8{
+        "nat64-prefix 2001:db8::/60\n",
+        "nat64-prefix 2001:db8::/128\n",
+        "nat64-prefix 2001:db8::/0\n",
+        "nat64-prefix 2001:db8::\n",
+        "nat64-prefix 2001:db8::/abc\n",
+        "nat64-prefix 2001:db8:0:0:100::/96\n",
+    }) |text| {
+        try std.testing.expectError(error.BadNat64Prefix, Config.parse(text));
+    }
+    // The prefix is an IPv6 prefix, so an IPv4 address is not one.
+    try std.testing.expectError(error.BadAddress, Config.parse("nat64-prefix 192.0.2.0/96\n"));
+    try std.testing.expectError(error.BadAddress, Config.parse("nat64-prefix not-an-address/96\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("nat64-prefix\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("nat64-prefix 64:ff9b::/96 extra\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse(
+        "nat64-prefix 64:ff9b::/96\nnat64-prefix 2001:db8::/32\n",
+    ));
 }

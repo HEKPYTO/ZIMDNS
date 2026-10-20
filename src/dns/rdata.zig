@@ -32,7 +32,9 @@ const max_caa_payload_len = max_unknown_len - 2;
 const max_sshfp_fingerprint_len = 32;
 const max_tlsa_association_len = 509;
 const max_uri_target_len = 508;
-const max_tsig_mac_len = 32;
+/// The longest keyed hash output of the RFC 8945 section 6 HMAC-SHA family, so
+/// an hmac-sha512 MAC fits on the wire.
+const max_tsig_mac_len = 64;
 const max_tsig_other_len = 512;
 const max_tsig_rdata_len = 512;
 const max_tsig_time: u64 = 0x0000ffffffffffff;
@@ -320,6 +322,36 @@ pub const Isdn = struct {
         if (!validIsdnAddress(self.addressText())) return false;
         if (!self.has_subaddress) return self.subaddress_len == 0;
         return validIsdnSubaddress(self.subaddressText());
+    }
+};
+
+/// RFC 1035 section 3.3.2 HINFO RDATA: a CPU character-string followed by
+/// an OS character-string. Each string carries at most 255 characters, the
+/// bound the section 3.3 preamble sets for one character-string.
+pub const Hinfo = struct {
+    cpu: [max_txt_len]u8 = undefined,
+    cpu_len: u8 = 0,
+    os: [max_txt_len]u8 = undefined,
+    os_len: u8 = 0,
+
+    pub fn init(cpu: []const u8, os: []const u8) Error!Hinfo {
+        if (cpu.len > max_txt_len or os.len > max_txt_len) return Error.InvalidLength;
+
+        var hinfo = Hinfo{
+            .cpu_len = @intCast(cpu.len),
+            .os_len = @intCast(os.len),
+        };
+        @memcpy(hinfo.cpu[0..cpu.len], cpu);
+        @memcpy(hinfo.os[0..os.len], os);
+        return hinfo;
+    }
+
+    pub fn cpuText(self: *const Hinfo) []const u8 {
+        return self.cpu[0..self.cpu_len];
+    }
+
+    pub fn osText(self: *const Hinfo) []const u8 {
+        return self.os[0..self.os_len];
     }
 };
 
@@ -659,6 +691,7 @@ pub const RData = union(enum) {
     AFSDB: Mx,
     X25: Txt,
     ISDN: Isdn,
+    HINFO: Hinfo,
     TXT: Txt,
     SRV: Srv,
     NAPTR: Naptr,
@@ -741,6 +774,7 @@ pub const RData = union(enum) {
                 break :blk .{ .X25 = x25 };
             },
             RecordType.ISDN.value => .{ .ISDN = try parseIsdn(message, offset, end) },
+            RecordType.HINFO.value => .{ .HINFO = try parseHinfo(message, offset, end) },
             RecordType.SRV.value => blk: {
                 if (len < 7) return Error.InvalidLength;
                 const priority = std.mem.readInt(u16, message[offset..][0..2], .big);
@@ -914,6 +948,12 @@ pub const RData = union(enum) {
                     try writer.writeBytes(isdn.subaddressText());
                 }
             },
+            .HINFO => |hinfo| {
+                try writer.writeU8(hinfo.cpu_len);
+                try writer.writeBytes(hinfo.cpuText());
+                try writer.writeU8(hinfo.os_len);
+                try writer.writeBytes(hinfo.osText());
+            },
             .CAA => |caa| {
                 try writer.writeU8(caa.flags);
                 try writer.writeU8(caa.tag_len);
@@ -1000,6 +1040,7 @@ pub const RData = union(enum) {
             },
             .X25 => try self.encode(writer),
             .ISDN => try self.encode(writer),
+            .HINFO => try self.encode(writer),
             .CAA => |caa| {
                 try writer.writeU8(caa.flags);
                 try writer.writeU8(caa.tag_len);
@@ -1075,6 +1116,22 @@ fn parseNameOnly(message: []const u8, offset: usize, end: usize) Error!Name {
     const result = Name.parse(message, offset) catch return Error.BadName;
     if (result.next_offset != end) return Error.TrailingData;
     return result.name;
+}
+
+/// Parse RFC 1035 section 3.3.2 HINFO RDATA: a CPU character-string followed
+/// by an OS character-string. The RDLENGTH must match the two length octets.
+fn parseHinfo(message: []const u8, offset: usize, end: usize) Error!Hinfo {
+    const len = end - offset;
+    if (len < 2) return Error.InvalidLength;
+    const cpu_len = message[offset];
+    if (len < 2 + @as(usize, cpu_len)) return Error.EndOfInput;
+    const os_len = message[offset + 1 + cpu_len];
+    const expected = 2 + @as(usize, cpu_len) + @as(usize, os_len);
+    if (len < expected) return Error.EndOfInput;
+    if (len > expected) return Error.TrailingData;
+    const cpu = message[offset + 1 ..][0..cpu_len];
+    const os = message[offset + 2 + cpu_len ..][0..os_len];
+    return Hinfo.init(cpu, os) catch return Error.InvalidLength;
 }
 
 fn parseIsdn(message: []const u8, offset: usize, end: usize) Error!Isdn {
@@ -1665,6 +1722,60 @@ test "ISDN wire rejects count, truncation, trailing, invalid, and overlong field
     var invalid_output: [512]u8 = undefined;
     var invalid_writer = Writer.init(&invalid_output);
     try std.testing.expectError(Error.InvalidLength, (RData{ .ISDN = invalid }).encode(&invalid_writer));
+}
+
+test "HINFO wire round trips the CPU and OS character strings" {
+    const bytes = [_]u8{ 6, 'I', 'B', 'M', '-', 'P', 'C', 4, 'U', 'N', 'I', 'X' };
+    const parsed = try RData.parse(.HINFO, &bytes, 0, bytes.len);
+    try std.testing.expectEqualStrings("IBM-PC", parsed.HINFO.cpuText());
+    try std.testing.expectEqualStrings("UNIX", parsed.HINFO.osText());
+
+    var output: [bytes.len]u8 = undefined;
+    var writer = Writer.init(&output);
+    try parsed.encode(&writer);
+    try std.testing.expectEqualSlices(u8, &bytes, writer.written());
+
+    var compressed_output: [bytes.len]u8 = undefined;
+    var compressed_writer = Writer.init(&compressed_output);
+    var table = CompressionTable{};
+    try parsed.encodeCompressed(&compressed_writer, &table);
+    try std.testing.expectEqualSlices(u8, &bytes, compressed_writer.written());
+
+    // RFC 8482 section 4.2 asks for an empty OS field.
+    const minimal = [_]u8{ 7, 'R', 'F', 'C', '8', '4', '8', '2', 0 };
+    const parsed_minimal = try RData.parse(.HINFO, &minimal, 0, minimal.len);
+    try std.testing.expectEqualStrings("RFC8482", parsed_minimal.HINFO.cpuText());
+    try std.testing.expectEqualStrings("", parsed_minimal.HINFO.osText());
+}
+
+test "HINFO wire accepts the maximum character strings and rejects overlong fields" {
+    var bytes: [2 + 255 + 255]u8 = undefined;
+    bytes[0] = 255;
+    @memset(bytes[1..256], 'c');
+    bytes[256] = 255;
+    @memset(bytes[257..], 'o');
+
+    const parsed = try RData.parse(.HINFO, &bytes, 0, bytes.len);
+    try std.testing.expectEqual(@as(usize, 255), parsed.HINFO.cpuText().len);
+    try std.testing.expectEqual(@as(usize, 255), parsed.HINFO.osText().len);
+
+    var output: [bytes.len]u8 = undefined;
+    var writer = Writer.init(&output);
+    try parsed.encode(&writer);
+    try std.testing.expectEqualSlices(u8, &bytes, writer.written());
+
+    var overlong: [256]u8 = undefined;
+    @memset(&overlong, 'x');
+    try std.testing.expectError(Error.InvalidLength, Hinfo.init(&overlong, "os"));
+    try std.testing.expectError(Error.InvalidLength, Hinfo.init("cpu", &overlong));
+}
+
+test "HINFO wire rejects mismatched lengths, truncation, and trailing data" {
+    try std.testing.expectError(Error.InvalidLength, RData.parse(.HINFO, &.{}, 0, 0));
+    try std.testing.expectError(Error.InvalidLength, RData.parse(.HINFO, &.{3}, 0, 1));
+    try std.testing.expectError(Error.EndOfInput, RData.parse(.HINFO, &.{ 3, 'a', 'b' }, 0, 3));
+    try std.testing.expectError(Error.EndOfInput, RData.parse(.HINFO, &.{ 1, 'a', 2, 'b' }, 0, 4));
+    try std.testing.expectError(Error.TrailingData, RData.parse(.HINFO, &.{ 1, 'a', 1, 'b', 0xaa }, 0, 5));
 }
 
 test "rdata parses SOA, SRV, and CAA records" {

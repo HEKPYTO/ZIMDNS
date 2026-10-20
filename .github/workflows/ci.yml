@@ -27,14 +27,6 @@ jobs:
               zig_target=aarch64-linux
               zig_sha=9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8
               ;;
-            Darwin-x86_64)
-              zig_target=x86_64-macos
-              zig_sha=4f9a1c5269aa17ebda5e6d3c2b89d6cbf36f7d2b22a0306e9ab98f25f95529c6
-              ;;
-            Darwin-aarch64|Darwin-arm64)
-              zig_target=aarch64-macos
-              zig_sha=b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a
-              ;;
             *)
               echo "unsupported runner: $(uname -s) $(uname -m)" >&2
               exit 1
@@ -44,11 +36,7 @@ jobs:
           zig_dir="$RUNNER_TEMP/zig"
           curl --fail --location --retry 3 --output "$zig_archive" \
             "https://ziglang.org/download/$zig_version/zig-$zig_target-$zig_version.tar.xz"
-          if command -v sha256sum >/dev/null; then
-            echo "$zig_sha  $zig_archive" | sha256sum --check --strict
-          else
-            echo "$zig_sha  $zig_archive" | shasum -a 256 --check
-          fi
+          echo "$zig_sha  $zig_archive" | sha256sum --check --strict
           mkdir -p "$zig_dir"
           tar -xJf "$zig_archive" --strip-components=1 --directory "$zig_dir"
           echo "$zig_dir" >> "$GITHUB_PATH"

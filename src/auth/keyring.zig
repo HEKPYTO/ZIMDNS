@@ -155,10 +155,9 @@ fn parseKey(scanner: *Scanner) Error!Key {
     try scanner.expect(';');
 
     const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(encoded_secret) catch return Error.BadSecret;
-    const minimum: usize = switch (algorithm) {
-        .hmac_sha1 => 20,
-        .hmac_sha256 => 32,
-    };
+    // RFC 8945 section 8: the secret SHOULD be at least as long as the keyed
+    // hash output, and the project holds that floor for every algorithm.
+    const minimum = tsig.digestLength(algorithm);
     if (decoded_len < minimum) return Error.SecretTooShort;
     if (decoded_len > max_secret_len) return Error.SecretTooLong;
 
@@ -175,9 +174,15 @@ fn validNameText(text: []const u8) bool {
     return true;
 }
 
+/// The RFC 8945 section 6 algorithm names this server implements. Every other
+/// name is refused: HMAC-MD5.SIG-ALG.REG.INT is a MUST NOT use there, and
+/// gss-tsig delegates the cryptography to GSS, which is not implemented.
 fn parseAlgorithm(text: []const u8) Error!tsig.Algorithm {
     if (std.ascii.eqlIgnoreCase(text, "hmac-sha1")) return .hmac_sha1;
+    if (std.ascii.eqlIgnoreCase(text, "hmac-sha224")) return .hmac_sha224;
     if (std.ascii.eqlIgnoreCase(text, "hmac-sha256")) return .hmac_sha256;
+    if (std.ascii.eqlIgnoreCase(text, "hmac-sha384")) return .hmac_sha384;
+    if (std.ascii.eqlIgnoreCase(text, "hmac-sha512")) return .hmac_sha512;
     return Error.UnsupportedAlgorithm;
 }
 
@@ -220,4 +225,48 @@ test "keyring deinit clears owned secret bytes" {
     var ring = try Keyring.parse("key \"one.\" { algorithm hmac-sha1; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODk=\"; };");
     ring.deinit();
     for (ring.keys[0].secret) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+}
+
+test "keyring accepts every RFC 8945 section 6 HMAC-SHA algorithm" {
+    const cases = [_]struct { name: []const u8, secret: []const u8, algorithm: tsig.Algorithm }{
+        .{ .name = "hmac-sha1", .secret = "MDEyMzQ1Njc4OTAxMjM0NTY3ODk=", .algorithm = .hmac_sha1 },
+        .{ .name = "hmac-sha224", .secret = "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nw==", .algorithm = .hmac_sha224 },
+        .{ .name = "hmac-sha256", .secret = "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=", .algorithm = .hmac_sha256 },
+        .{ .name = "hmac-sha384", .secret = "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3", .algorithm = .hmac_sha384 },
+        .{ .name = "hmac-sha512", .secret = "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEyMw==", .algorithm = .hmac_sha512 },
+    };
+    for (cases) |case| {
+        const text = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "key \"one.\" {{ algorithm {s}; secret \"{s}\"; }};",
+            .{ case.name, case.secret },
+        );
+        defer std.testing.allocator.free(text);
+        var ring = try Keyring.parse(text);
+        defer ring.deinit();
+
+        const key = ring.find(try Name.fromText("one.")).?;
+        try std.testing.expectEqual(case.algorithm, key.algorithm);
+        try std.testing.expectEqual(tsig.digestLength(case.algorithm), key.secretBytes().len);
+    }
+}
+
+test "keyring refuses a secret shorter than the algorithm's keyed hash output" {
+    const cases = [_][]const u8{ "hmac-sha1", "hmac-sha224", "hmac-sha256", "hmac-sha384", "hmac-sha512" };
+    for (cases) |name| {
+        const text = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "key \"one.\" {{ algorithm {s}; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3OA==\"; }};",
+            .{name},
+        );
+        defer std.testing.allocator.free(text);
+        try std.testing.expectError(Error.SecretTooShort, Keyring.parse(text));
+    }
+}
+
+test "keyring refuses the algorithm names RFC 8945 section 6 does not allow" {
+    // HMAC-MD5.SIG-ALG.REG.INT is a MUST NOT use, and gss-tsig delegates the
+    // cryptography to GSS, which this server does not implement.
+    try std.testing.expectError(Error.UnsupportedAlgorithm, Keyring.parse("key \"one.\" { algorithm HMAC-MD5.SIG-ALG.REG.INT; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };"));
+    try std.testing.expectError(Error.UnsupportedAlgorithm, Keyring.parse("key \"one.\" { algorithm gss-tsig; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };"));
 }

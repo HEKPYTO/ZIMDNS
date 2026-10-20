@@ -70,8 +70,14 @@ pub fn readTcpFrameExact(fd: std.posix.fd_t, io: std.Io, frame_buffer: []u8, fra
 }
 
 fn serveUdpOnceWithTimeout(socket: *const std.Io.net.Socket, io: std.Io, runtime: *Runtime, timeout: std.Io.Timeout) !void {
+    // A SIGHUP asks for the zone to be re-read. The reload happens here,
+    // outside the signal handler. The first check answers an idle server,
+    // the second one answers a request that arrived while the flag was set,
+    // so the answer that follows a reload always comes from the new zone.
+    _ = runtime.reloadZoneIfRequested(io);
     var request_buffer: [UDP_REQUEST_BUFFER_SIZE]u8 = undefined;
     const incoming = try socket.receiveTimeout(io, &request_buffer, timeout);
+    _ = runtime.reloadZoneIfRequested(io);
     var response_buffer: [UDP_RESPONSE_BUFFER_SIZE]u8 = undefined;
     var classic_response_buffer: [UDP_RESPONSE_BUFFER_SIZE]u8 = undefined;
     const response_bytes = try runtime.answerFrom(incoming.data, &response_buffer, &incoming.from);
@@ -84,8 +90,12 @@ pub fn serveUdpOnce(socket: *const std.Io.net.Socket, io: std.Io, runtime: *Runt
 }
 
 fn serveUdpOnceWithMetricsTimeout(socket: *const std.Io.net.Socket, io: std.Io, runtime: *Runtime, counters: *metrics.Counters, timeout: std.Io.Timeout) !void {
+    // The same reload the plain UDP path performs, so a metrics run reloads
+    // its zone on the same trigger.
+    _ = runtime.reloadZoneIfRequested(io);
     var request_buffer: [UDP_REQUEST_BUFFER_SIZE]u8 = undefined;
     const incoming = try socket.receiveTimeout(io, &request_buffer, timeout);
+    _ = runtime.reloadZoneIfRequested(io);
     var response_buffer: [UDP_RESPONSE_BUFFER_SIZE]u8 = undefined;
     var classic_response_buffer: [UDP_RESPONSE_BUFFER_SIZE]u8 = undefined;
     const response_bytes = try runtime.answerFromWithMetrics(incoming.data, &response_buffer, &incoming.from, counters);
@@ -176,29 +186,33 @@ pub fn serveUdpLoopOnAddressWithMetrics(io: std.Io, runtime: *Runtime, address: 
     try serveUdpLoopWithMetrics(&socket, io, runtime, max_requests, counters);
 }
 
-pub fn serveTcpStreamOnce(stream: std.Io.net.Stream, io: std.Io, runtime: *const Runtime) !void {
+pub fn serveTcpStreamOnce(stream: std.Io.net.Stream, io: std.Io, runtime: *Runtime) !void {
     return serveTcpStreamOnceWithTimeout(stream, io, runtime, TCP_IO_TIMEOUT, null);
 }
 
-pub fn serveTcpStreamOnceWithMetrics(stream: std.Io.net.Stream, io: std.Io, runtime: *const Runtime, counters: *metrics.Counters) !void {
+pub fn serveTcpStreamOnceWithMetrics(stream: std.Io.net.Stream, io: std.Io, runtime: *Runtime, counters: *metrics.Counters) !void {
     return serveTcpStreamOnceWithTimeout(stream, io, runtime, TCP_IO_TIMEOUT, counters);
 }
 
-fn serveTcpStreamOnceWithTimeout(stream: std.Io.net.Stream, io: std.Io, runtime: *const Runtime, timeout: TcpIoTimeout, counters: ?*metrics.Counters) !void {
+fn serveTcpStreamOnceWithTimeout(stream: std.Io.net.Stream, io: std.Io, runtime: *Runtime, timeout: TcpIoTimeout, counters: ?*metrics.Counters) !void {
     if (comptime !TCP_DEADLINES_SUPPORTED) return Error.UnsupportedPlatform;
+    // A SIGHUP asks for the zone to be re-read. The reload happens here,
+    // outside the signal handler, so the answer that follows it comes from
+    // the new zone.
+    _ = runtime.reloadZoneIfRequested(io);
     return unix_tcp_deadlines.serve(stream, io, runtime, timeout, counters);
 }
 
-pub fn serveTcpLoop(server: anytype, io: std.Io, runtime: *const Runtime, max_requests: ?usize) !void {
+pub fn serveTcpLoop(server: anytype, io: std.Io, runtime: *Runtime, max_requests: ?usize) !void {
     return serveTcpLoopWithTimeout(server, io, runtime, max_requests, TCP_IO_TIMEOUT);
 }
 
-fn serveTcpStreamWorker(stream: std.Io.net.Stream, io: std.Io, runtime: *const Runtime, timeout: TcpIoTimeout) void {
+fn serveTcpStreamWorker(stream: std.Io.net.Stream, io: std.Io, runtime: *Runtime, timeout: TcpIoTimeout) void {
     defer stream.close(io);
     serveTcpStreamOnceWithTimeout(stream, io, runtime, timeout, null) catch {};
 }
 
-fn serveTcpLoopWithTimeout(server: anytype, io: std.Io, runtime: *const Runtime, max_requests: ?usize, timeout: TcpIoTimeout) !void {
+fn serveTcpLoopWithTimeout(server: anytype, io: std.Io, runtime: *Runtime, max_requests: ?usize, timeout: TcpIoTimeout) !void {
     var group: std.Io.Group = .init;
     defer group.await(io) catch unreachable;
 
@@ -212,14 +226,14 @@ fn serveTcpLoopWithTimeout(server: anytype, io: std.Io, runtime: *const Runtime,
     }
 }
 
-pub fn serveTcpLoopOnAddress(io: std.Io, runtime: *const Runtime, address: *const std.Io.net.IpAddress, max_requests: ?usize) !void {
+pub fn serveTcpLoopOnAddress(io: std.Io, runtime: *Runtime, address: *const std.Io.net.IpAddress, max_requests: ?usize) !void {
     var bind_address = address.*;
     var server = try std.Io.net.IpAddress.listen(&bind_address, io, .{ .reuse_address = true });
     defer server.deinit(io);
     try serveTcpLoop(&server, io, runtime, max_requests);
 }
 
-pub fn serveTcpOnceOnAddress(io: std.Io, runtime: *const Runtime, address: *const std.Io.net.IpAddress) !void {
+pub fn serveTcpOnceOnAddress(io: std.Io, runtime: *Runtime, address: *const std.Io.net.IpAddress) !void {
     var bind_address = address.*;
     var server = try std.Io.net.IpAddress.listen(&bind_address, io, .{ .reuse_address = true });
     defer server.deinit(io);
@@ -965,7 +979,7 @@ fn buildSignedListenerQueryWithEdns(time_signed: u64, include_edns: bool) !Signe
 }
 
 const unix_tcp_deadlines = if (TCP_DEADLINES_SUPPORTED) struct {
-    fn serve(stream: std.Io.net.Stream, io: std.Io, runtime: *const Runtime, timeout: TcpIoTimeout, counters: ?*metrics.Counters) !void {
+    fn serve(stream: std.Io.net.Stream, io: std.Io, runtime: *Runtime, timeout: TcpIoTimeout, counters: ?*metrics.Counters) !void {
         tcp_deadline.setSocketTimeout(stream.socket.handle, timeout);
 
         var request_buffer: [TCP_MAX_FRAME_SIZE]u8 = undefined;
@@ -1003,7 +1017,7 @@ const unix_tcp_deadlines = if (TCP_DEADLINES_SUPPORTED) struct {
         request: []const u8,
         stream: std.Io.net.Stream,
         io: std.Io,
-        runtime: *const Runtime,
+        runtime: *Runtime,
         timeout: TcpIoTimeout,
         counters: ?*metrics.Counters,
     ) !void {

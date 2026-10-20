@@ -686,3 +686,27 @@ test "server context checks the ZONEMD digest only when no trust anchor covers t
     defer context.deinit();
     try std.testing.expectEqual(@as(usize, 1), context.zones.items.len);
 }
+
+test "server context carries the NAT64 prefix into the forwarding policy" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{ .sub_path = "one.zone", .data = "$ORIGIN one.example.\n$TTL 3600\n@ IN SOA ns.one.example. hostmaster.one.example. 1 3600 900 1209600 3600\n@ IN NS ns.one.example.\n" });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data =
+        \\zone one.example primary one.zone
+        \\forwarder 127.0.0.1:5353
+        \\nat64-prefix 64:ff9b::/96
+        \\
+    });
+
+    var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+    defer context.deinit();
+    var runtime = try context.takeRuntime(io);
+    defer runtime.deinit();
+
+    // The prefix reaches the resolver that answers the forwarding path.
+    const prefix = runtime.resolver.?.policy.nat64_prefix.?;
+    try std.testing.expectEqual(@as(u8, 96), prefix.length);
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x64, 0xff, 0x9b }, prefix.bytes[0..4]);
+}

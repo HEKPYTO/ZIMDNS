@@ -1,26 +1,13 @@
 const std = @import("std");
 
-// Test discovery rule, for contributors:
-//
-//   test/<group>/<name>_test.zig  is a test root for <group>.
-//
-// <group> must be one of: unit, golden, config, fuzz, integration, cli.
-// A new test file needs no edit here: drop it into its group directory and
-// the matching step runs it. Files under test/ that do not end in _test.zig
-// are fixtures, not roots, and are ignored. A *_test.zig file under any
-// other directory fails the build, so a mistyped directory cannot silently
-// drop tests.
+// A test root is test/<group>/<name>_test.zig, with <group> one of unit,
+// golden, config, fuzz, integration, cli. Roots are discovered, so a new test
+// file needs no edit here; a file that does not end in _test.zig is a
+// fixture, and a root outside a group directory fails the build.
 //
 //   unit         -> test               golden -> test-golden
 //   config       -> test-config        fuzz   -> test-fuzz
 //   integration  -> test-integration   cli    -> test-cli
-//
-// Every root imports the "zimdns" module. The fuzz group also imports
-// "fuzz_options" (seed, iterations); the cli group also imports
-// "build_options" (version, exe_path) and runs with the project root as its
-// working directory. The unit group imports "zimdns" only: the unit tests
-// embedded in src/main.zig are the root module of the main test artifact and
-// read the build options themselves.
 
 /// The options module a group's roots import next to "zimdns".
 const Extra = enum {

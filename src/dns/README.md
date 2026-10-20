@@ -2,8 +2,9 @@
 
 ## TSIG cryptography (RFC 8945)
 
-Use the Zig standard library for raw-wire HMAC-SHA1 and HMAC-SHA256 TSIG:
-wire parsing, MAC construction, verification, request/response chaining,
+Use the Zig standard library for raw-wire TSIG over the RFC 8945 section 6
+HMAC-SHA family (HMAC-SHA1, SHA-224, SHA-256, SHA-384, SHA-512): wire
+parsing, MAC construction, verification, request/response chaining,
 strict key-file loading, ordinary authoritative query authentication, and
 response signing. No third-party crypto dependency — the tree already uses
 stdlib HMAC and timing-safe comparison for DNS Cookies. Secrets are cleared
@@ -13,8 +14,9 @@ crypto APIs at each compiler bump.
 ## TSIG vectors
 
 Fixed SHA-256, chained, altered-intermediary-ID, and SHA-1 known-answer
-vectors are reproduced independently in `src/dns/tsig.zig` tests. See that
-file for the packets.
+vectors are reproduced independently in `src/dns/tsig.zig` tests, together
+with the SHA-224, SHA-384, and SHA-512 answers of the same request. See
+that file for the packets.
 
 ## DNSSEC deferral — current status
 

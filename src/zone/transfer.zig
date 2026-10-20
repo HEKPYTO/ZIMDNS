@@ -428,7 +428,10 @@ pub fn encodeFramed(
 fn algorithmName(algorithm: dns_tsig.Algorithm) dns_name.Name {
     return dns_name.Name.fromText(switch (algorithm) {
         .hmac_sha1 => "hmac-sha1.",
+        .hmac_sha224 => "hmac-sha224.",
         .hmac_sha256 => "hmac-sha256.",
+        .hmac_sha384 => "hmac-sha384.",
+        .hmac_sha512 => "hmac-sha512.",
     }) catch unreachable;
 }
 
@@ -443,7 +446,8 @@ pub fn appendTsigStub(
     now: u64,
 ) Error!void {
     const digest_len: usize = dns_tsig.digestLength(algorithm);
-    var zero_mac: [32]u8 = @splat(0);
+    // The longest keyed hash output of the RFC 8945 section 6 HMAC-SHA set.
+    var zero_mac: [64]u8 = @splat(0);
     const value = dns_rdata.Tsig.init(
         algorithmName(algorithm),
         now,

@@ -2,6 +2,7 @@
 /// Ownership: Runtime owns its Zone and inline Blocklist; call Runtime.deinit; query and output buffers are borrowed.
 /// Errors: Query and response failures are typed; transport I/O is handled by platform listeners.
 const std = @import("std");
+const builtin = @import("builtin");
 const dns_message = @import("../dns/message.zig");
 const dns_writer = @import("../dns/writer.zig");
 const response = @import("response.zig");
@@ -19,6 +20,34 @@ const journal_mod = @import("../zone/journal.zig");
 pub const Error = error{
     BadQuery,
     EncodeFailed,
+};
+
+/// The zone file an operator can replace, and the apex that file must
+/// provide. The directory and the path are borrowed; the runtime copies the
+/// path and the apex.
+pub const ReloadSource = struct {
+    dir: std.Io.Dir,
+    path: []const u8,
+    origin: []const u8,
+};
+
+/// What one zone replacement did. The served zone changes only when the
+/// outcome is `replaced`; every other outcome keeps the old zone serving.
+pub const ReloadOutcome = enum {
+    /// The zone was replaced and the serial transition was recorded.
+    replaced,
+    /// No zone file is configured, so there is nothing to reload.
+    no_source,
+    /// The zone file could not be read or the zone text could not be parsed.
+    load_failed,
+    /// The server does not serve a zone with that apex.
+    no_zone,
+    /// The new zone provides another apex than the zone it replaces.
+    wrong_zone,
+    /// The new zone's SOA serial is not RFC 1982 newer than the served one.
+    serial_not_newer,
+    /// The served zone is signed at startup, and a reload cannot re-sign it.
+    signed_zone,
 };
 
 const TsigAuth = struct {
@@ -77,6 +106,12 @@ pub const Runtime = struct {
     /// bulk-loaded runtimes need no fallible log setup. A length mismatch
     /// means no usable history and decideIxfr falls back to AXFR.
     transfer_delta_logs: std.ArrayList(journal_mod.DeltaLog) = .empty,
+    /// The zone file an operator can replace, and the apex it must provide.
+    /// Null when no zone file is reloadable.
+    reload_source: ?ReloadSource = null,
+    /// Set by the SIGHUP handler and cleared by the reload that answers it.
+    /// The handler only stores the flag; the file is read outside it.
+    reload_requested: std.atomic.Value(bool) = .init(false),
     // ceiling: global runtime lock serializes all zone reads; use per-zone or read/write locks if contention matters.
     mutex: std.Io.Mutex = .init,
 
@@ -172,6 +207,11 @@ pub const Runtime = struct {
         self.zones = .empty;
         self.transfer_delta_logs.deinit(self.allocator);
         self.transfer_delta_logs = .empty;
+        if (self.reload_source) |source| {
+            self.allocator.free(source.path);
+            self.allocator.free(source.origin);
+            self.reload_source = null;
+        }
         self.blocklist = .{};
         if (self.answer_policy.nsid) |nsid| self.allocator.free(nsid);
         self.answer_policy = .{};
@@ -192,6 +232,140 @@ pub const Runtime = struct {
         for (self.zones.items, 0..) |*zone, index| {
             if (!std.ascii.eqlIgnoreCase(zone.originText(), origin)) continue;
             return &self.transfer_delta_logs.items[index];
+        }
+        return null;
+    }
+
+    /// Names the zone file an operator can replace, and the apex that file
+    /// must provide. The runtime copies the path and the apex, so the caller
+    /// keeps ownership of its own text; the directory is borrowed.
+    pub fn setReloadSource(self: *Runtime, dir: std.Io.Dir, path: []const u8, origin: []const u8) !void {
+        const owned_path = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(owned_path);
+        const owned_origin = try self.allocator.dupe(u8, origin);
+        if (self.reload_source) |source| {
+            self.allocator.free(source.path);
+            self.allocator.free(source.origin);
+        }
+        self.reload_source = .{ .dir = dir, .path = owned_path, .origin = owned_origin };
+    }
+
+    /// Asks for the configured zone to be re-read. The signal handler calls
+    /// this and nothing else: the file is read and the zone is swapped
+    /// outside the handler.
+    pub fn requestZoneReload(self: *Runtime) void {
+        self.reload_requested.store(true, .release);
+    }
+
+    /// Replaces the configured zone when a reload was requested. Returns the
+    /// outcome, or null when no reload was pending.
+    pub fn reloadZoneIfRequested(self: *Runtime, io: std.Io) ?ReloadOutcome {
+        if (!self.reload_requested.swap(false, .acq_rel)) return null;
+        return self.reloadZone(io);
+    }
+
+    /// Re-reads the configured zone file and replaces the zone it provides.
+    /// The file is read, parsed, and built completely before the served zone
+    /// changes, so a broken file leaves the old zone serving.
+    pub fn reloadZone(self: *Runtime, io: std.Io) ReloadOutcome {
+        const source = self.reload_source orelse {
+            reportReload(io, "error: no zone file is configured to reload", .{});
+            return .no_source;
+        };
+        const text = source.dir.readFileAlloc(io, source.path, self.allocator, .limited(1024 * 1024)) catch |err| {
+            reportReload(io, "error: cannot read the zone file {s}: {t}", .{ source.path, err });
+            return .load_failed;
+        };
+        defer self.allocator.free(text);
+        return self.replaceZoneText(io, source.origin, text);
+    }
+
+    /// Replaces the zone with apex `origin` by the zone built from `text`.
+    /// The new zone is parsed and built completely before the served zone
+    /// changes, so a text that does not parse, names another apex, or
+    /// carries no RFC 1982 newer serial leaves the old zone serving. The
+    /// serial transition is recorded, so an IXFR client at the old serial
+    /// gets the incremental answer instead of a full AXFR.
+    pub fn replaceZoneText(self: *Runtime, io: std.Io, origin: []const u8, text: []const u8) ReloadOutcome {
+        var zone_file = zone_parser.ZoneFile.parse(text) catch |err| {
+            reportReload(io, "error: cannot parse the zone file for {s}: {t}", .{ origin, err });
+            return .load_failed;
+        };
+        var zone = zone_index.Zone.fromZoneFile(&zone_file) catch |err| {
+            zone_file.deinit();
+            reportReload(io, "error: cannot build the zone for {s}: {t}", .{ origin, err });
+            return .load_failed;
+        };
+        var replaced = false;
+        defer if (!replaced) zone.deinit();
+
+        if (!std.ascii.eqlIgnoreCase(zone.originText(), origin)) {
+            reportReload(io, "error: the zone file for {s} provides {s}", .{ origin, zone.originText() });
+            return .wrong_zone;
+        }
+
+        // The new zone is built before the lock is taken, so a reload does
+        // not hold up the answers it does not change.
+        self.lock();
+        defer self.unlock();
+
+        const target = self.zoneIndexForOrigin(origin) orelse {
+            reportReload(io, "error: the server does not serve a zone for {s}", .{origin});
+            return .no_zone;
+        };
+        // A zone signed at startup carries records the zone file does not
+        // have, so replacing it would drop the signatures.
+        if (self.zones.items[target].generated.len != 0) {
+            reportReload(io, "error: the zone for {s} is signed at startup and cannot be replaced", .{origin});
+            return .signed_zone;
+        }
+        const new_serial = zone.soaSerial() orelse {
+            reportReload(io, "error: the zone file for {s} has no SOA serial", .{origin});
+            return .load_failed;
+        };
+        const old_serial = self.zones.items[target].soaSerial() orelse {
+            reportReload(io, "error: the served zone for {s} has no SOA serial", .{origin});
+            return .load_failed;
+        };
+        switch (journal_mod.compareSerial(new_serial, old_serial)) {
+            .newer => {},
+            .equal => {
+                reportReload(io, "error: the zone file for {s} carries serial {d}, the serial already served", .{ origin, new_serial });
+                return .serial_not_newer;
+            },
+            .older => {
+                reportReload(io, "error: the zone file for {s} carries serial {d}, older than the served serial {d}", .{ origin, new_serial, old_serial });
+                return .serial_not_newer;
+            },
+            .undefined => {
+                reportReload(io, "error: the zone file for {s} carries serial {d}, not comparable with the served serial {d}", .{ origin, new_serial, old_serial });
+                return .serial_not_newer;
+            },
+        }
+        // The delta log is parallel to the zone list, and a runtime built
+        // from a zone list starts without one.
+        while (self.transfer_delta_logs.items.len < self.zones.items.len) {
+            self.transfer_delta_logs.append(self.allocator, .{}) catch {
+                reportReload(io, "error: cannot record the serial transition for {s}", .{origin});
+                return .load_failed;
+            };
+        }
+        self.transfer_delta_logs.items[target].record(old_serial, new_serial) catch |err| {
+            reportReload(io, "error: cannot record the serial transition for {s}: {t}", .{ origin, err });
+            return .serial_not_newer;
+        };
+        // Swap only after the new zone is built and the transition recorded.
+        self.zones.items[target].deinit();
+        self.zones.items[target] = zone;
+        replaced = true;
+        reportReload(io, "reloaded the zone for {s}: serial {d} -> {d}", .{ origin, old_serial, new_serial });
+        return .replaced;
+    }
+
+    fn zoneIndexForOrigin(self: *const Runtime, origin: []const u8) ?usize {
+        for (self.zones.items, 0..) |zone, index| {
+            if (!std.ascii.eqlIgnoreCase(zone.originText(), origin)) continue;
+            return index;
         }
         return null;
     }
@@ -292,7 +466,7 @@ pub const Runtime = struct {
         const request_mac = copyMac(final_record.tsig.macBytes()) orelse {
             return .{ .failure = .{ .code = .badsig, .final = final_record, .key = key } };
         };
-        _ = tsig.verify(packet, key.secretBytes(), null, tsig.digestLength(algorithm)) catch |err| switch (err) {
+        _ = tsig.verify(packet, key.secretBytes(), null, tsig.minimumMacLength(algorithm)) catch |err| switch (err) {
             error.BadTrunc => return .{ .failure = .{
                 .code = .badtrunc,
                 .final = final_record,
@@ -442,11 +616,13 @@ pub const Runtime = struct {
 
         const algorithm = tsig.algorithmForName(&auth.final.tsig.algorithm) catch return Error.EncodeFailed;
         const digest_len = tsig.digestLength(algorithm);
+        // RFC 8945 section 7: a reply carries a MAC at least as long as the request's.
+        const reply_mac_len = @max(digest_len, @as(usize, auth.request_mac.len));
         var value = auth.final.tsig;
         value.time_signed = time_signed orelse self.currentTsigTime();
         value.original_id = auth.final.tsig.original_id;
-        value.mac_len = @intCast(digest_len);
-        @memset(value.mac[0..digest_len], 0);
+        value.mac_len = @intCast(reply_mac_len);
+        @memset(value.mac[0..reply_mac_len], 0);
         value.error_code = error_code;
         value.other_len = @intCast(other_data.len);
         @memcpy(value.other_data[0..other_data.len], other_data);
@@ -911,6 +1087,20 @@ pub const Runtime = struct {
     }
 };
 
+/// One operator-facing line about a zone replacement. A test build has no
+/// operator and the test runner fails on any stderr write.
+fn reportReload(io: std.Io, comptime format: []const u8, args: anytype) void {
+    if (builtin.is_test) return;
+    var line_buffer: [256]u8 = undefined;
+    const line = std.fmt.bufPrint(&line_buffer, format, args) catch return;
+    var stderr_buffer: [256]u8 = undefined;
+    // The streaming writer appends at the shared file position; the
+    // positional one would rewrite every line from the start of the file.
+    var stderr_writer = std.Io.File.stderr().writerStreaming(io, &stderr_buffer);
+    stderr_writer.interface.print("{s}\n", .{line}) catch {};
+    stderr_writer.interface.flush() catch {};
+}
+
 test "authoritative runtime answers raw query bytes" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1061,7 +1251,7 @@ test "runtime maps TSIG key and MAC failures before query dispatch" {
     try std.testing.expectEqual(@as(usize, 0), parsed.additionals.items[0].rdata.TSIG.macBytes().len);
 }
 
-test "runtime signs BADTIME and BADTRUNC responses" {
+test "runtime signs BADTIME responses" {
     const request_time = 1_700_000_000;
     var keyring = try keyring_mod.Keyring.parse("key \"key.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };");
     var runtime = try Runtime.fromZoneTextWithKeyring(
@@ -1074,11 +1264,11 @@ test "runtime signs BADTIME and BADTRUNC responses" {
     , &keyring);
     defer runtime.deinit();
 
-    var query = try makeSignedQuery(request_time, 32);
+    const query = try makeSignedQuery(request_time, 32);
     runtime.setTsigNow(request_time + 1000);
     var output: [1024]u8 = undefined;
-    var response_bytes = try runtime.answer(query.packet[0..query.len], &output);
-    var response_final = (try tsig.parseFinalAdditional(response_bytes)).?;
+    const response_bytes = try runtime.answer(query.packet[0..query.len], &output);
+    const response_final = (try tsig.parseFinalAdditional(response_bytes)).?;
     try std.testing.expectEqual(@as(u16, 18), response_final.tsig.error_code);
     try std.testing.expectEqual(@as(usize, 6), response_final.tsig.otherData().len);
     const request_final = (try tsig.parseFinalAdditional(query.packet[0..query.len])).?;
@@ -1093,28 +1283,129 @@ test "runtime signs BADTIME and BADTRUNC responses" {
     expected_server_time[5] = @intCast((request_time + 1000) & 0xff);
     try std.testing.expectEqualSlices(u8, &expected_server_time, response_final.tsig.otherData());
     _ = try tsig.verify(response_bytes, "01234567890123456789012345678901", request_final.tsig.macBytes(), 32);
+}
 
-    query = try makeSignedQuery(request_time, 16);
+test "runtime answers a MAC below the policy floor with a signed BADTRUNC" {
+    const request_time = 1_700_000_000;
+    var keyring = try keyring_mod.Keyring.parse("key \"key.\" { algorithm hmac-sha1; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODk=\"; };");
+    var runtime = try Runtime.fromZoneTextWithKeyring(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
+        \\
+    , &keyring);
+    defer runtime.deinit();
     runtime.setTsigNow(request_time);
-    response_bytes = try runtime.answer(query.packet[0..query.len], &output);
-    response_final = (try tsig.parseFinalAdditional(response_bytes)).?;
+
+    // RFC 8945 section 5.2.4: a MAC that is too short for the local policy is
+    // answered with a signed BADTRUNC. Eleven octets clear the section
+    // 5.2.2.1 case 3 floor of ten but not the twelve-octet SHA-1 policy floor.
+    const query = try makeSignedQueryWithKey(request_time, 11, sha1_test_key);
+    var output: [1024]u8 = undefined;
+    const response_bytes = try runtime.answer(query.packet[0..query.len], &output);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
     try std.testing.expectEqual(@as(@TypeOf(parsed.header.rcode), .notauth), parsed.header.rcode);
+    const response_final = (try tsig.parseFinalAdditional(response_bytes)).?;
     try std.testing.expectEqual(@as(u16, 22), response_final.tsig.error_code);
-    try std.testing.expectEqual(@as(usize, 32), response_final.tsig.macBytes().len);
-    const badtrunc_request_final = (try tsig.parseFinalAdditional(query.packet[0..query.len])).?;
-    _ = try tsig.verify(response_bytes, "01234567890123456789012345678901", badtrunc_request_final.tsig.macBytes(), 32);
+    try std.testing.expectEqual(@as(usize, 20), response_final.tsig.macBytes().len);
+    const request_final = (try tsig.parseFinalAdditional(query.packet[0..query.len])).?;
+    _ = try tsig.verify(response_bytes, sha1_test_key.secret, request_final.tsig.macBytes(), 12);
+}
+
+test "runtime accepts a truncated MAC and answers with a MAC at least as long" {
+    const request_time = 1_700_000_000;
+    var keyring = try keyring_mod.Keyring.parse("key \"key.\" { algorithm hmac-sha1; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODk=\"; };");
+    var runtime = try Runtime.fromZoneTextWithKeyring(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
+        \\
+    , &keyring);
+    defer runtime.deinit();
+    runtime.setTsigNow(request_time);
+
+    // RFC 8945 section 4.2: the MAC Size gives the length of the MAC field, so
+    // a twelve-octet truncation of the SHA-1 MAC authenticates the request.
+    const query = try makeSignedQueryWithKey(request_time, 12, sha1_test_key);
+    var output: [1024]u8 = undefined;
+    const response_bytes = try runtime.answer(query.packet[0..query.len], &output);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@as(@TypeOf(parsed.header.rcode), .no_error), parsed.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.answer_count);
+    const request_final = (try tsig.parseFinalAdditional(query.packet[0..query.len])).?;
+    const response_final = (try tsig.parseFinalAdditional(response_bytes)).?;
+    try std.testing.expectEqual(@as(usize, 12), request_final.tsig.macBytes().len);
+    // RFC 8945 section 7: the reply MAC is at least as long as the request's.
+    try std.testing.expect(response_final.tsig.macBytes().len >= request_final.tsig.macBytes().len);
+    try std.testing.expectEqual(@as(usize, 20), response_final.tsig.macBytes().len);
+    _ = try tsig.verify(response_bytes, sha1_test_key.secret, request_final.tsig.macBytes(), 12);
+}
+
+test "runtime rejects a MAC longer than the keyed hash output" {
+    const request_time = 1_700_000_000;
+    var keyring = try keyring_mod.Keyring.parse("key \"key.\" { algorithm hmac-sha1; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODk=\"; };");
+    var runtime = try Runtime.fromZoneTextWithKeyring(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
+        \\
+    , &keyring);
+    defer runtime.deinit();
+    runtime.setTsigNow(request_time);
+
+    // RFC 8945 section 5.2.2.1 case 1: a MAC Size above the keyed hash
+    // output length is a format error.
+    const query = try makeSignedQueryWithKey(request_time, 21, sha1_test_key);
+    var output: [1024]u8 = undefined;
+    const response_bytes = try runtime.answer(query.packet[0..query.len], &output);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@as(@TypeOf(parsed.header.rcode), .formerr), parsed.header.rcode);
+}
+
+test "runtime rejects a zero-length MAC" {
+    const request_time = 1_700_000_000;
+    var keyring = try keyring_mod.Keyring.parse("key \"key.\" { algorithm hmac-sha1; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODk=\"; };");
+    var runtime = try Runtime.fromZoneTextWithKeyring(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
+        \\
+    , &keyring);
+    defer runtime.deinit();
+    runtime.setTsigNow(request_time);
+
+    // RFC 8945 section 5.2.2.1 case 3: a MAC Size of zero is the unsigned
+    // case and never authenticates a request.
+    const query = try makeSignedQueryWithKey(request_time, 0, sha1_test_key);
+    var output: [1024]u8 = undefined;
+    const response_bytes = try runtime.answer(query.packet[0..query.len], &output);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@as(@TypeOf(parsed.header.rcode), .formerr), parsed.header.rcode);
 }
 
 test "runtime rejects oversize MAC without overflowing copyMac" {
-    var oversize = @as([33]u8, @splat(@as(u8, 0xab)));
+    var oversize = @as([65]u8, @splat(@as(u8, 0xab)));
     try std.testing.expect(Runtime.copyMac(&oversize) == null);
 
-    var exact = @as([32]u8, @splat(@as(u8, 0xcd)));
+    var exact = @as([64]u8, @splat(@as(u8, 0xcd)));
     const mac = Runtime.copyMac(&exact).?;
-    try std.testing.expectEqual(@as(u8, 32), mac.len);
+    try std.testing.expectEqual(@as(u8, 64), mac.len);
     try std.testing.expectEqualSlices(u8, &exact, mac.slice());
 }
 
@@ -1149,6 +1440,16 @@ const SignedQuery = struct {
     owner_start: usize,
 };
 
+/// The key material a test request is signed with, matched by the keyring the
+/// runtime is built from.
+const TestKey = struct {
+    algorithm: []const u8,
+    secret: []const u8,
+};
+
+const sha256_test_key = TestKey{ .algorithm = "hmac-sha256.", .secret = "01234567890123456789012345678901" };
+const sha1_test_key = TestKey{ .algorithm = "hmac-sha1.", .secret = "01234567890123456789" };
+
 fn makeSignedQuery(time_signed: u64, mac_len: usize) !SignedQuery {
     return makeSignedQueryWithEdnsOption(time_signed, mac_len, false);
 }
@@ -1164,7 +1465,11 @@ const signed_question_wire = [_]u8{
 };
 
 fn makeSignedQueryWithEdnsOption(time_signed: u64, mac_len: usize, include_edns: bool) !SignedQuery {
-    return makeSignedQueryWithQuestions(time_signed, mac_len, include_edns, 1, &signed_question_wire);
+    return makeSignedQueryWithQuestions(time_signed, mac_len, include_edns, 1, &signed_question_wire, sha256_test_key);
+}
+
+fn makeSignedQueryWithKey(time_signed: u64, mac_len: usize, key: TestKey) !SignedQuery {
+    return makeSignedQueryWithQuestions(time_signed, mac_len, false, 1, &signed_question_wire, key);
 }
 
 /// Builds a TSIG-signed query carrying `question_count` questions.
@@ -1174,8 +1479,9 @@ fn makeSignedQueryWithQuestions(
     include_edns: bool,
     question_count: u16,
     questions: []const u8,
+    key: TestKey,
 ) !SignedQuery {
-    const algorithm = try @import("../dns/name.zig").Name.fromText("hmac-sha256.");
+    const algorithm = try @import("../dns/name.zig").Name.fromText(key.algorithm);
     const owner = try @import("../dns/name.zig").Name.fromText("key.");
     const root = @import("../dns/name.zig").Name.root();
     var packet: [512]u8 = undefined;
@@ -1207,8 +1513,13 @@ fn makeSignedQueryWithQuestions(
         .rdata = .{ .TSIG = value },
     }).encode(&writer);
     const final = (try tsig.parseFinalAdditional(writer.written())).?;
-    const signed = try tsig.sign(writer.written(), "01234567890123456789012345678901", final.owner, final.tsig, null);
-    try tsig.patchMac(packet[0..writer.len()], final, signed.slice()[0..mac_len]);
+    const signed = try tsig.sign(writer.written(), key.secret, final.owner, final.tsig, null);
+    // The digest never covers the MAC field, so a request can also carry a MAC
+    // longer than the keyed hash output; the extra octets stay zero.
+    var mac_bytes: [32]u8 = @splat(0);
+    const copied = @min(mac_len, signed.slice().len);
+    @memcpy(mac_bytes[0..copied], signed.slice()[0..copied]);
+    try tsig.patchMac(packet[0..writer.len()], final, mac_bytes[0..mac_len]);
     return .{ .packet = packet, .len = writer.len(), .question_start = question_start, .owner_start = owner_start };
 }
 
@@ -1362,7 +1673,7 @@ test "RFC 9619: a TSIG-signed OPCODE 0 query with QDCOUNT 2 is answered FORMERR"
         's',  4,    'h',  'o',  'm',  'e',  4,    'a', 'r', 'p', 'a', 0,
         0x00, 0x01, 0x00, 0x01,
     };
-    const query = try makeSignedQueryWithQuestions(now, 32, false, 2, &two_questions);
+    const query = try makeSignedQueryWithQuestions(now, 32, false, 2, &two_questions, sha256_test_key);
     try std.testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, query.packet[4..6], .big));
     var output: [1024]u8 = undefined;
     const response_bytes = try runtime.answer(query.packet[0..query.len], &output);
@@ -1853,4 +2164,141 @@ test "runtime serves AXFR as one bounded TCP blob opening and closing with SOA" 
     try std.testing.expect(only.answers.items[only.answers.len - 1].rrtype.eql(.SOA));
     try std.testing.expectEqual(@as(u32, 10), only.answers.items[0].rdata.SOA.serial);
     try std.testing.expectEqual(@as(u32, 10), only.answers.items[only.answers.len - 1].rdata.SOA.serial);
+}
+
+const reload_zone =
+    \\$ORIGIN example.
+    \\$TTL 3600
+    \\@ IN SOA ns.example. hostmaster.example. 10 3600 900 1209600 3600
+    \\@ IN NS ns.example.
+    \\www IN A 192.0.2.1
+    \\
+;
+
+const reload_zone_next =
+    \\$ORIGIN example.
+    \\$TTL 3600
+    \\@ IN SOA ns.example. hostmaster.example. 11 3600 900 1209600 3600
+    \\@ IN NS ns.example.
+    \\www IN A 192.0.2.2
+    \\
+;
+
+const reload_zone_older =
+    \\$ORIGIN example.
+    \\$TTL 3600
+    \\@ IN SOA ns.example. hostmaster.example. 9 3600 900 1209600 3600
+    \\@ IN NS ns.example.
+    \\www IN A 192.0.2.3
+    \\
+;
+
+const reload_zone_other_apex =
+    \\$ORIGIN other.example.
+    \\$TTL 3600
+    \\@ IN SOA ns.other.example. hostmaster.other.example. 11 3600 900 1209600 3600
+    \\@ IN NS ns.other.example.
+    \\www IN A 192.0.2.4
+    \\
+;
+
+const reload_a_query = [_]u8{
+    0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    3,    'w',  'w',  'w',  7,    'e',  'x',  'a',  'm',  'p',  'l',  'e',
+    0,    0x00, 0x01, 0x00, 0x01,
+};
+
+fn expectReloadedAddress(runtime: *const Runtime, arena: std.mem.Allocator, expected: [4]u8) !void {
+    var output: [512]u8 = undefined;
+    const response_bytes = try runtime.answer(&reload_a_query, &output);
+    const parsed = try dns_message.Message.parse(arena, response_bytes);
+    try std.testing.expectEqual(@as(usize, 1), parsed.answers.len);
+    try std.testing.expectEqualSlices(u8, &expected, &parsed.answers.items[0].rdata.A);
+}
+
+test "a replaced zone serves the new data and records the serial transition" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var runtime = try Runtime.fromZoneText(reload_zone);
+    defer runtime.deinit();
+
+    try std.testing.expectEqual(ReloadOutcome.replaced, runtime.replaceZoneText(io, "example.", reload_zone_next));
+    try expectReloadedAddress(&runtime, arena.allocator(), .{ 192, 0, 2, 2 });
+
+    // The recorded transition lets an IXFR client at the old serial get the
+    // incremental answer, and a client at an unknown serial still gets the
+    // full transfer.
+    const log = runtime.deltaLogForOriginConst("example.").?;
+    try std.testing.expect(log.hasSerial(10));
+    try std.testing.expect(log.hasSerial(11));
+    try std.testing.expectEqual(transfer.IxfrDecision.incremental, transfer.decideIxfr(11, 10, log));
+    try std.testing.expectEqual(transfer.IxfrDecision.up_to_date, transfer.decideIxfr(11, 11, log));
+    try std.testing.expectEqual(transfer.IxfrDecision.fallback_axfr, transfer.decideIxfr(11, 5, log));
+}
+
+test "a zone file that does not parse leaves the served zone in place" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var runtime = try Runtime.fromZoneText(reload_zone);
+    defer runtime.deinit();
+
+    try std.testing.expectEqual(ReloadOutcome.load_failed, runtime.replaceZoneText(io, "example.", "not a zone file\n"));
+    try expectReloadedAddress(&runtime, arena.allocator(), .{ 192, 0, 2, 1 });
+
+    // No transition was recorded, so the served zone is still the only one.
+    const log = runtime.deltaLogForOriginConst("example.").?;
+    try std.testing.expect(!log.hasSerial(10));
+    try std.testing.expectEqual(transfer.IxfrDecision.fallback_axfr, transfer.decideIxfr(10, 9, log));
+}
+
+test "a zone file without a newer serial leaves the served zone in place" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var runtime = try Runtime.fromZoneText(reload_zone);
+    defer runtime.deinit();
+
+    try std.testing.expectEqual(ReloadOutcome.serial_not_newer, runtime.replaceZoneText(io, "example.", reload_zone_older));
+    try expectReloadedAddress(&runtime, arena.allocator(), .{ 192, 0, 2, 1 });
+
+    // The refused transition is not recorded, so an IXFR client at the
+    // refused serial still gets the full transfer.
+    const log = runtime.deltaLogForOriginConst("example.").?;
+    try std.testing.expect(!log.hasSerial(9));
+    try std.testing.expectEqual(transfer.IxfrDecision.fallback_axfr, transfer.decideIxfr(10, 9, log));
+}
+
+test "a zone file for another apex is refused" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var runtime = try Runtime.fromZoneText(reload_zone);
+    defer runtime.deinit();
+
+    try std.testing.expectEqual(ReloadOutcome.wrong_zone, runtime.replaceZoneText(io, "example.", reload_zone_other_apex));
+    try expectReloadedAddress(&runtime, arena.allocator(), .{ 192, 0, 2, 1 });
+}
+
+test "a zone signed at startup is not replaced" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var runtime = try Runtime.fromZoneText(reload_zone);
+    defer runtime.deinit();
+
+    // The startup signer installs the records it generates in the zone's
+    // `generated` field. A zone that carries them cannot be replaced by the
+    // zone file, because the file has no signatures to offer.
+    var generated = [_]zone_parser.ZoneRecord{.{
+        .owner = "example.",
+        .ttl = 3600,
+        .rrtype = .RRSIG,
+        .rdata = "",
+    }};
+    runtime.zones.items[0].generated = generated[0..];
+
+    try std.testing.expectEqual(ReloadOutcome.signed_zone, runtime.replaceZoneText(io, "example.", reload_zone_next));
+    try expectReloadedAddress(&runtime, arena.allocator(), .{ 192, 0, 2, 1 });
 }

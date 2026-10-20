@@ -386,6 +386,12 @@ fn writeRecord(record: dns_record.ResourceRecord, writer: *std.Io.Writer) !void 
             try writer.writeAll(" ");
             try writeQuoted(writer, isdn.subaddressText(), false);
         }
+    } else if (record.rrtype.eql(.HINFO)) {
+        const hinfo = record.rdata.HINFO;
+        try writer.writeAll("HINFO ");
+        try writeQuoted(writer, hinfo.cpuText(), false);
+        try writer.writeAll(" ");
+        try writeQuoted(writer, hinfo.osText(), false);
     } else if (record.rrtype.eql(.APL)) {
         try writer.writeAll("APL");
         try writeApl(writer, record.rdata.APL.bytes());
@@ -1032,7 +1038,7 @@ test "query formatter prints RT preference and intermediate hostname" {
     );
 }
 
-test "query formatter prints MX SOA PTR DNAME and generic HINFO" {
+test "query formatter prints MX SOA PTR DNAME and typed HINFO" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1061,7 +1067,7 @@ test "query formatter prints MX SOA PTR DNAME and generic HINFO" {
             "example. 3600 IN SOA ns1.example. hostmaster.example. 1 3600 900 1209600 300\n" ++
             "ptr.example. 3600 IN PTR host.example.\n" ++
             "alias.example. 3600 IN DNAME target.example.\n" ++
-            "info.example. 3600 IN TYPE13 \\# 02504304554e4958\n",
+            "info.example. 3600 IN HINFO \"PC\" \"UNIX\"\n",
         output.written(),
     );
 }
@@ -1161,6 +1167,26 @@ test "query formatter prints ISDN address and optional subaddress" {
     try writeResponse(response, &output.writer);
     try std.testing.expectEqualStrings(
         "isdn.home.arpa. 3600 IN ISDN \"1234\" \"aBf\"\n",
+        output.written(),
+    );
+}
+
+test "query formatter prints HINFO as two quoted strings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const response = try dns_message.Message.parse(arena.allocator(), &.{
+        0x44, 0x65, 0x85, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x05, 'h',  'i',  'n',  'f',  'o',  0x04, 'h',  'o',  'm',  'e',  0x04,
+        'a',  'r',  'p',  'a',  0x00, 0x00, 0x0d, 0x00, 0x01, 0xc0, 0x0c, 0x00,
+        0x0d, 0x00, 0x01, 0x00, 0x00, 0x0e, 0x10, 0x00, 0x0c, 0x05, 'I',  'n',
+        't',  'e',  'l',  0x05, 'L',  'i',  'n',  'u',  'x',
+    });
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try writeResponse(response, &output.writer);
+    try std.testing.expectEqualStrings(
+        "hinfo.home.arpa. 3600 IN HINFO \"Intel\" \"Linux\"\n",
         output.written(),
     );
 }
