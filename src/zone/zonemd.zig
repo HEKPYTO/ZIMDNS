@@ -552,48 +552,122 @@ test "RFC 8976 A.2 complex EXAMPLE zone digest verifies" {
     try std.testing.expect(std.mem.startsWith(u8, message, "zone example.: ZONEMD verified"));
 }
 
-test "RFC 8976 A.3 zone verifies on SHA512 and ignores private-use digests" {
+/// RFC 8976 Appendix A.3 zone without its ZONEMD records. The apex ZONEMD
+/// RRset never enters the digest, so the body is shared by the tests below
+/// and the records can be varied one at a time.
+const rfc_a3_zone_body =
+    \\$ORIGIN example.
+    \\$TTL 86400
+    \\@ IN SOA ns1 admin 2018031900 1800 900 604800 86400
+    \\@ IN NS ns1.example.
+    \\@ IN NS ns2.example.
+    \\ns1.example. 3600 IN A 203.0.113.63
+    \\ns2.example. 86400 IN TXT "This example has multiple digests"
+    \\NS2.EXAMPLE. 3600 IN AAAA 2001:db8::63
+    \\
+;
+
+/// The SIMPLE/SHA384 digest the RFC publishes for the A.3 zone.
+const rfc_a3_sha384_record =
+    \\@ IN ZONEMD 2018031900 1 1 (
+    \\    62e6cf51b02e54b9
+    \\    b5f967d547ce4313
+    \\    6792901f9f88e637
+    \\    493daaf401c92c27
+    \\    9dd10f0edb1c56f8
+    \\    080211f8480ee306 )
+    \\
+;
+
+/// The SIMPLE/SHA512 digest the RFC publishes for the same A.3 zone.
+const rfc_a3_sha512_record =
+    \\@ IN ZONEMD 2018031900 1 2 (
+    \\    08cfa1115c7b948c
+    \\    4163a901270395ea
+    \\    226a930cd2cbcf2f
+    \\    a9a5e6eb85f37c8a
+    \\    4e114d884e66f176
+    \\    eab121cb02db7d65
+    \\    2e0cc4827e7a3204
+    \\    f166b47e5613fd27 )
+    \\
+;
+
+/// A Private Use hash algorithm (240), which nothing here can compute.
+const rfc_a3_private_hash_record =
+    \\@ IN ZONEMD 2018031900 1 240 (
+    \\    e2d523f654b9422a
+    \\    96c5a8f44607bbee )
+    \\
+;
+
+/// A Private Use scheme (241), which nothing here can collate.
+const rfc_a3_private_scheme_record =
+    \\@ IN ZONEMD 2018031900 241 1 (
+    \\    e1846540e33a9e41
+    \\    89792d18d5d131f6
+    \\    05fc283e )
+    \\
+;
+
+test "RFC 8976 A.3 zone verifies on SHA384" {
     var zone = try loadZone(
-        \\$ORIGIN example.
-        \\$TTL 86400
-        \\@ IN SOA ns1 admin 2018031900 1800 900 604800 86400
-        \\@ IN NS ns1.example.
-        \\@ IN NS ns2.example.
-        \\@ IN ZONEMD 2018031900 1 1 (
-        \\    62e6cf51b02e54b9
-        \\    b5f967d547ce4313
-        \\    6792901f9f88e637
-        \\    493daaf401c92c27
-        \\    9dd10f0edb1c56f8
-        \\    080211f8480ee306 )
-        \\@ IN ZONEMD 2018031900 1 2 (
-        \\    08cfa1115c7b948c
-        \\    4163a901270395ea
-        \\    226a930cd2cbcf2f
-        \\    a9a5e6eb85f37c8a
-        \\    4e114d884e66f176
-        \\    eab121cb02db7d65
-        \\    2e0cc4827e7a3204
-        \\    f166b47e5613fd27 )
-        \\@ IN ZONEMD 2018031900 1 240 (
-        \\    e2d523f654b9422a
-        \\    96c5a8f44607bbee )
-        \\@ IN ZONEMD 2018031900 241 1 (
-        \\    e1846540e33a9e41
-        \\    89792d18d5d131f6
-        \\    05fc283e )
-        \\ns1.example. 3600 IN A 203.0.113.63
-        \\ns2.example. 86400 IN TXT "This example has multiple digests"
-        \\NS2.EXAMPLE. 3600 IN AAAA 2001:db8::63
-        \\
+        rfc_a3_zone_body ++
+            rfc_a3_sha384_record ++
+            rfc_a3_sha512_record ++
+            rfc_a3_private_hash_record ++
+            rfc_a3_private_scheme_record,
     );
     defer zone.deinit();
 
     var report: [report_max_len]u8 = undefined;
     const message = try verify(&zone, std.testing.allocator, &report);
-    // The SHA512 RR matched first; the private-use ones are reported as
-    // unsupported but a single supported match still verifies the zone.
+    // The SHA384 record matches first; a single supported match verifies the
+    // zone, and the Private Use records have their own test below.
     try std.testing.expect(std.mem.startsWith(u8, message, "zone example.: ZONEMD verified (SIMPLE SHA384"));
+}
+
+test "RFC 8976 A.3 SHA512 digest verifies on its own" {
+    // The RFC publishes a SIMPLE/SHA512 digest for the A.3 zone next to the
+    // SHA384 one. Verifying a zone that carries only the SHA512 record proves
+    // the SHA512 computation itself, not just the SHA384 one.
+    var zone = try loadZone(rfc_a3_zone_body ++ rfc_a3_sha512_record);
+    defer zone.deinit();
+
+    var report: [report_max_len]u8 = undefined;
+    const message = try verify(&zone, std.testing.allocator, &report);
+    try std.testing.expect(std.mem.startsWith(u8, message, "zone example.: ZONEMD verified (SIMPLE SHA512"));
+}
+
+test "private-use ZONEMD scheme and hash records are unverifiable" {
+    // RFC 8976 A.3 also carries records in the Private Use ranges. No scheme
+    // or hash algorithm outside the standardized registries can be computed
+    // here, so verification must fail closed rather than treat an unknown
+    // scheme or hash as a match.
+    {
+        var zone = try loadZone(rfc_a3_zone_body ++ rfc_a3_private_scheme_record);
+        defer zone.deinit();
+
+        var report: [report_max_len]u8 = undefined;
+        try std.testing.expectError(Error.UnsupportedScheme, verify(&zone, std.testing.allocator, &report));
+        try std.testing.expect(std.mem.startsWith(
+            u8,
+            report[0..],
+            "zone example.: ZONEMD scheme 241 is not the standardized SIMPLE scheme",
+        ));
+    }
+    {
+        var zone = try loadZone(rfc_a3_zone_body ++ rfc_a3_private_hash_record);
+        defer zone.deinit();
+
+        var report: [report_max_len]u8 = undefined;
+        try std.testing.expectError(Error.UnsupportedHash, verify(&zone, std.testing.allocator, &report));
+        try std.testing.expect(std.mem.startsWith(
+            u8,
+            report[0..],
+            "zone example.: ZONEMD hash algorithm 240 is not supported",
+        ));
+    }
 }
 
 /// Computes the SIMPLE/SHA384 digest of one zone text and releases the zone.
