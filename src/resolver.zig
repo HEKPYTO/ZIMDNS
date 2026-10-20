@@ -28,6 +28,9 @@ pub const MAX_FAILURE_CACHE_ENTRIES = 64;
 pub const DEFAULT_FAILURE_CACHE_SECONDS: u32 = 5;
 pub const STALE_WINDOW_SECONDS: i64 = 24 * 60 * 60;
 pub const STALE_TTL: u32 = 30;
+/// RFC 2308 section 5 and RFC 8198 section 5.4: the effective TTL of a
+/// negative answer is capped at three hours.
+pub const MAX_NEGATIVE_TTL: u32 = 3 * 60 * 60;
 pub const UDP_ATTEMPTS = 2;
 pub const UDP_TIMEOUT: std.Io.Timeout = .{ .duration = .{
     .raw = .fromMilliseconds(1000),
@@ -426,6 +429,21 @@ const Cache = struct {
         if (message.header.truncated or (message.header.rcode != .no_error and message.header.rcode != .nxdomain)) return;
         const ttl_info = cacheTtl(message) orelse return;
         if (ttl_info.ttl == 0) return;
+        try self.store(key, message, now, ttl_info);
+    }
+
+    /// Stores a denial this server synthesized (RFC 8198). It carries no SOA,
+    /// so its TTL comes from the proof it rests on, not from the message.
+    fn putDenial(self: *Cache, key: CacheKey, message: *dns_message.Message, ttl: u32, now: i64) !void {
+        if (ttl == 0) return;
+        try self.store(key, message, now, .{
+            .ttl = ttl,
+            .negative = true,
+            .nxdomain = message.header.rcode == .nxdomain,
+        });
+    }
+
+    fn store(self: *Cache, key: CacheKey, message: *dns_message.Message, now: i64, ttl_info: TtlInfo) !void {
         var raw: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
         stripOptions(message);
         var writer = dns_writer.Writer.init(&raw);
@@ -723,7 +741,7 @@ pub const Resolver = struct {
                     return bytes;
                 };
                 if (denial) |d| {
-                    const bytes = try self.aggressiveAnswer(query, d, output);
+                    const bytes = try self.aggressiveAnswer(query, d, key, now, output);
                     if (cookie == .valid) return self.addCachedCookie(output, query, cookie.valid);
                     return bytes;
                 }
@@ -892,8 +910,10 @@ pub const Resolver = struct {
         harvestSectionNsec(&self.dnssec_aggressive, response.authorities.slice(), now);
     }
 
-    fn aggressiveAnswer(self: *const Resolver, query: dns_message.Message, denial: dnssec.Denial, output: []u8) ![]const u8 {
-        _ = self;
+    /// RFC 8198 section 5: the denial this server synthesizes from a cached
+    /// NSEC proof. It is kept in the negative cache, so the next client for
+    /// a name the denial covers is answered without an upstream query.
+    fn aggressiveAnswer(self: *Resolver, query: dns_message.Message, denial: dnssec.Denial, key: CacheKey, now: i64, output: []u8) ![]const u8 {
         const q = query.question orelse return Error.BadUpstreamResponse;
         var message = dns_message.Message{
             .allocator = query.allocator,
@@ -923,7 +943,27 @@ pub const Resolver = struct {
         if (query.edns) |edns| try appendOpt(&message, edns);
         var writer = dns_writer.Writer.init(output);
         message.encode(&writer) catch return Error.ResponseTooLarge;
+        // The denial carries no DNSSEC record, so it is kept as the variant
+        // for the clients that did not ask for the proofs.
+        var denial_key = key;
+        denial_key.dnssec_ok = false;
+        self.cache.putDenial(denial_key, &message, self.denialTtl(now), now) catch {};
         return writer.written();
+    }
+
+    /// RFC 8198 section 4: a denial lives no longer than the proof it rests
+    /// on, so the shortest live proof bounds it. RFC 8198 section 5.4 caps
+    /// the effective TTL of a negative answer at the three hours RFC 2308
+    /// section 5 sets.
+    fn denialTtl(self: *const Resolver, now: i64) u32 {
+        var ttl: u32 = MAX_NEGATIVE_TTL;
+        for (self.dnssec_aggressive.entries) |entry| {
+            if (!entry.valid) continue;
+            const remaining = entry.expires_at - now;
+            if (remaining <= 0) continue;
+            ttl = @min(ttl, @as(u32, @intCast(remaining)));
+        }
+        return ttl;
     }
 
     const CookieDecision = union(enum) { disabled, absent, valid: [24]u8, invalid };
@@ -2473,7 +2513,7 @@ test "aggressive NSEC answers denials without upstream and honors CD" {
         now,
     );
     try std.testing.expectEqual(dnssec.Denial.nxdomain, denial.?);
-    const bytes = try resolver.aggressiveAnswer(query, denial.?, &output);
+    const bytes = try resolver.aggressiveAnswer(query, denial.?, try CacheKey.fromQuestion(query), now, &output);
     const parsed = try dns_message.Message.parse(arena.allocator(), bytes);
     try std.testing.expectEqual(dns_header.Rcode.nxdomain, parsed.header.rcode);
     try std.testing.expect(parsed.edns.?.dnssec_ok);
@@ -2483,6 +2523,193 @@ test "aggressive NSEC answers denials without upstream and honors CD" {
     cd_query.header.checking_disabled = true;
     cd_query.edns.?.dnssec_ok = true;
     try std.testing.expect(!wantsDnssecProofs(cd_query));
+}
+
+test "RFC 8198 section 4: a synthesized denial is reused from the negative cache" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = try std.Io.net.IpAddress.parse("127.0.0.1", 9) },
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // Closest-encloser and wildcard-cover proofs, as harvestSectionNsec
+    // would take them from an upstream answer (RFC 8198 section 5).
+    const bitmap = [_]u8{ 0x00, 0x06, 0x40, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    const now: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+    resolver.dnssec_aggressive.insertNsec(
+        try dns_name.Name.fromText("example."),
+        try dns_name.Name.fromText("mail.example."),
+        &bitmap,
+        now,
+        3600,
+    );
+    resolver.dnssec_aggressive.insertNsec(
+        try dns_name.Name.fromText("mail.example."),
+        try dns_name.Name.fromText("www.example."),
+        &bitmap,
+        now,
+        3600,
+    );
+
+    var client = try std.Io.net.IpAddress.parse("127.0.0.1", 42620);
+    var output: [2048]u8 = undefined;
+
+    // The first client asks for the proofs: the denial is synthesized from
+    // the cached NSEC proofs, with no upstream query.
+    var first = try makeTestQuery(arena.allocator(), 0x2860, "nx.example.", true);
+    defer first.deinit();
+    first.edns.?.dnssec_ok = true;
+    first.additionals.items[0].ttl |= 0x8000;
+    var first_bytes: [1024]u8 = undefined;
+    const encoded_first = try encodeTestMessage(first, &first_bytes);
+    const denial_bytes = try resolver.answer(encoded_first, first, &client, &output);
+    const denial = try dns_message.Message.parse(arena.allocator(), denial_bytes);
+    try std.testing.expectEqual(dns_header.Rcode.nxdomain, denial.header.rcode);
+
+    // The second client asks for a name below the same cut: the denial comes
+    // from the negative cache. The forwarder points at a closed port, so an
+    // upstream attempt would fail instead of answering.
+    var second = try makeTestQuery(arena.allocator(), 0x2861, "deep.nx.example.", false);
+    defer second.deinit();
+    var second_bytes: [1024]u8 = undefined;
+    const encoded_second = try encodeTestMessage(second, &second_bytes);
+    const cut_bytes = try resolver.answer(encoded_second, second, &client, &output);
+    const cut = try dns_message.Message.parse(arena.allocator(), cut_bytes);
+    try std.testing.expectEqual(dns_header.Rcode.nxdomain, cut.header.rcode);
+    try std.testing.expectEqual(@as(u16, 0), cut.header.answer_count);
+    var question_buffer: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("deep.nx.example.", try cut.question.?.name.toText(&question_buffer));
+
+    // A name outside the cut is not answered from that entry: the upstream
+    // is asked for it.
+    var outside = try makeTestQuery(arena.allocator(), 0x2862, "other.example.", false);
+    defer outside.deinit();
+    var outside_bytes: [1024]u8 = undefined;
+    const encoded_outside = try encodeTestMessage(outside, &outside_bytes);
+    try std.testing.expectError(Error.UpstreamFailure, resolver.answer(encoded_outside, outside, &client, &output));
+}
+
+test "RFC 8198 section 5.4: a synthesized denial lives as long as its proof" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const now: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+    const bitmap = [_]u8{ 0x00, 0x06, 0x40, 0x00, 0x00, 0x00, 0x00, 0x01 };
+
+    // The TTL of the denial is the TTL of the proof it rests on.
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = try std.Io.net.IpAddress.parse("127.0.0.1", 9) },
+    });
+    defer resolver.deinit();
+    resolver.dnssec_aggressive.insertNsec(
+        try dns_name.Name.fromText("example."),
+        try dns_name.Name.fromText("mail.example."),
+        &bitmap,
+        now,
+        3600,
+    );
+    resolver.dnssec_aggressive.insertNsec(
+        try dns_name.Name.fromText("mail.example."),
+        try dns_name.Name.fromText("www.example."),
+        &bitmap,
+        now,
+        3600,
+    );
+    var query = try makeTestQuery(arena.allocator(), 0x2864, "nx.example.", true);
+    defer query.deinit();
+    query.edns.?.dnssec_ok = true;
+    query.additionals.items[0].ttl |= 0x8000;
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    var client = try std.Io.net.IpAddress.parse("127.0.0.1", 42621);
+    _ = try resolver.answer(encoded, query, &client, &output);
+    try std.testing.expectEqual(@as(u32, 3600), resolver.cache.entries[0].ttl);
+
+    // RFC 8198 section 5.4 caps the effective TTL of a negative answer at
+    // the three hours RFC 2308 section 5 sets.
+    var capped = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = try std.Io.net.IpAddress.parse("127.0.0.1", 9) },
+    });
+    defer capped.deinit();
+    capped.dnssec_aggressive.insertNsec(
+        try dns_name.Name.fromText("example."),
+        try dns_name.Name.fromText("mail.example."),
+        &bitmap,
+        now,
+        200000,
+    );
+    capped.dnssec_aggressive.insertNsec(
+        try dns_name.Name.fromText("mail.example."),
+        try dns_name.Name.fromText("www.example."),
+        &bitmap,
+        now,
+        200000,
+    );
+    var capped_query = try makeTestQuery(arena.allocator(), 0x2865, "nx.example.", true);
+    defer capped_query.deinit();
+    capped_query.edns.?.dnssec_ok = true;
+    capped_query.additionals.items[0].ttl |= 0x8000;
+    var capped_bytes: [1024]u8 = undefined;
+    const encoded_capped = try encodeTestMessage(capped_query, &capped_bytes);
+    _ = try capped.answer(encoded_capped, capped_query, &client, &output);
+    try std.testing.expectEqual(MAX_NEGATIVE_TTL, capped.cache.entries[0].ttl);
+}
+
+test "RFC 2308 section 5: a synthesized NODATA covers its own name only" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = try std.Io.net.IpAddress.parse("127.0.0.1", 9) },
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // Exact-owner proof whose bitmap lists NSEC (47) and no A: the denial is
+    // a NODATA for that name.
+    const bitmap = [_]u8{ 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    const now: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+    resolver.dnssec_aggressive.insertNsec(
+        try dns_name.Name.fromText("www.example."),
+        try dns_name.Name.fromText("zzz.example."),
+        &bitmap,
+        now,
+        3600,
+    );
+
+    var client = try std.Io.net.IpAddress.parse("127.0.0.1", 42622);
+    var output: [2048]u8 = undefined;
+
+    var first = try makeTestQuery(arena.allocator(), 0x2866, "www.example.", true);
+    defer first.deinit();
+    first.edns.?.dnssec_ok = true;
+    first.additionals.items[0].ttl |= 0x8000;
+    var first_bytes: [1024]u8 = undefined;
+    const encoded_first = try encodeTestMessage(first, &first_bytes);
+    const denial_bytes = try resolver.answer(encoded_first, first, &client, &output);
+    const denial = try dns_message.Message.parse(arena.allocator(), denial_bytes);
+    try std.testing.expectEqual(dns_header.Rcode.no_error, denial.header.rcode);
+    try std.testing.expectEqual(@as(u16, 0), denial.header.answer_count);
+
+    // The same name is answered from the cache.
+    var second = try makeTestQuery(arena.allocator(), 0x2867, "www.example.", false);
+    defer second.deinit();
+    var second_bytes: [1024]u8 = undefined;
+    const encoded_second = try encodeTestMessage(second, &second_bytes);
+    const cached_bytes = try resolver.answer(encoded_second, second, &client, &output);
+    const cached = try dns_message.Message.parse(arena.allocator(), cached_bytes);
+    try std.testing.expectEqual(dns_header.Rcode.no_error, cached.header.rcode);
+    try std.testing.expectEqual(@as(u16, 0), cached.header.answer_count);
+
+    // A name below it is not covered by a NODATA (RFC 2308 section 5), so
+    // the upstream is asked for it.
+    var below = try makeTestQuery(arena.allocator(), 0x2868, "sub.www.example.", false);
+    defer below.deinit();
+    var below_bytes: [1024]u8 = undefined;
+    const encoded_below = try encodeTestMessage(below, &below_bytes);
+    try std.testing.expectError(Error.UpstreamFailure, resolver.answer(encoded_below, below, &client, &output));
 }
 
 test "aggressive NSEC answers SERVFAIL with bogus EDE on malformed bitmap" {

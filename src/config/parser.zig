@@ -204,6 +204,11 @@ pub const Config = struct {
     /// against; see `trust-anchor-file` in the loader.
     trust_anchor_file: Text = .{},
     has_trust_anchor_file: bool = false,
+    /// Path to the file that keeps the RFC 1995 IXFR delta log across a
+    /// restart. Null when the operator did not ask for a durable log; see
+    /// `ixfr-journal-file` in the loader.
+    ixfr_journal_file: Text = .{},
+    has_ixfr_journal_file: bool = false,
     tls_cert_file: Text = .{},
     has_tls_cert_file: bool = false,
     tls_key_file: Text = .{},
@@ -268,6 +273,11 @@ pub const Config = struct {
         return self.trust_anchor_file.text();
     }
 
+    pub fn ixfrJournalFileText(self: *const Config) ?[]const u8 {
+        if (!self.has_ixfr_journal_file) return null;
+        return self.ixfr_journal_file.text();
+    }
+
     pub fn nsidText(self: *const Config) ?[]const u8 {
         if (!self.has_nsid) return null;
         return self.nsid.text();
@@ -297,6 +307,7 @@ pub const Config = struct {
         if (std.mem.eql(u8, first, "tsig-key-file")) return self.parseTsigKeyFile(&tokens);
         if (std.mem.eql(u8, first, "dnssec-key-file")) return self.parseDnssecKeyFile(&tokens);
         if (std.mem.eql(u8, first, "trust-anchor-file")) return self.parseTrustAnchorFile(&tokens);
+        if (std.mem.eql(u8, first, "ixfr-journal-file")) return self.parseIxfrJournalFile(&tokens);
         if (std.mem.eql(u8, first, "tls-cert-file")) return self.parseTlsCertFile(&tokens);
         if (std.mem.eql(u8, first, "tls-key-file")) return self.parseTlsKeyFile(&tokens);
         if (std.mem.eql(u8, first, "encrypted-dns")) return self.parseEncryptedDns(&tokens);
@@ -398,6 +409,15 @@ pub const Config = struct {
         if (path.len == 0) return Error.BadDirective;
         try self.trust_anchor_file.set(path);
         self.has_trust_anchor_file = true;
+    }
+
+    fn parseIxfrJournalFile(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        if (self.has_ixfr_journal_file) return Error.BadDirective;
+        const path = tokens.next() orelse return Error.BadDirective;
+        try requireNoTrailingTokens(tokens);
+        if (path.len == 0) return Error.BadDirective;
+        try self.ixfr_journal_file.set(path);
+        self.has_ixfr_journal_file = true;
     }
 
     fn parseTlsCertFile(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
@@ -675,6 +695,19 @@ test "config parser accepts one DNSSEC trust-anchor path and rejects every other
     try std.testing.expectError(error.BadDirective, Config.parse("trust-anchor-file\n"));
     try std.testing.expectError(error.BadDirective, Config.parse("trust-anchor-file a.anchor b.anchor\n"));
     try std.testing.expectError(error.UnknownDirective, Config.parse("trust-anchor ed25519-key\n"));
+}
+
+test "config parser takes one IXFR journal path and rejects every other shape" {
+    const config = try Config.parse("ixfr-journal-file ixfr.log\n");
+    try std.testing.expectEqualStrings("ixfr.log", config.ixfrJournalFileText().?);
+    // No journal file means the delta log lives in memory only.
+    try std.testing.expect((try Config.parse("zone one.example primary one.zone\n")).ixfrJournalFileText() == null);
+    try std.testing.expectError(error.BadDirective, Config.parse(
+        "ixfr-journal-file a.log\nixfr-journal-file b.log\n",
+    ));
+    try std.testing.expectError(error.BadDirective, Config.parse("ixfr-journal-file\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("ixfr-journal-file a.log b.log\n"));
+    try std.testing.expectError(error.UnknownDirective, Config.parse("ixfr-journal ixfr.log\n"));
 }
 
 test "config parser keeps locally served zones on unless an operator turns them off" {

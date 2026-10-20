@@ -2876,3 +2876,117 @@ test "the empty, refused, and FORMERR answers follow the same header flag policy
     try expectHeaderFlagPolicy(try buildRefusedResponse(query), .refused);
     try expectHeaderFlagPolicy(try buildFormerrResponse(query), .formerr);
 }
+
+test "a referral carries only the glue of the delegation it names" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+        \\@ IN NS ns.example.
+        \\ns IN A 192.0.2.1
+        \\child IN NS ns.child.example.
+        \\child IN NS ns.sibling.example.
+        \\child IN NS ns.evil.other.
+        \\ns.child.example. IN A 192.0.2.10
+        \\ns.sibling.example. IN A 192.0.2.11
+        \\ns.evil.other. IN A 192.0.2.99
+        \\
+    );
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    // RFC 9471 section 3.1: the glue of the delegation's own name servers
+    // rides along; RFC 5452 section 6: the address of a name this server is
+    // not authoritative for never does.
+    const response = try buildResponse(try testQuery(arena.allocator(), "www.child.example.", .A), &zone);
+    try std.testing.expect(!response.header.authoritative);
+    try std.testing.expectEqual(@as(usize, 2), response.additionals.len);
+    var owner: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("ns.child.example.", try response.additionals.items[0].owner.toText(&owner));
+    try std.testing.expectEqualStrings("ns.sibling.example.", try response.additionals.items[1].owner.toText(&owner));
+}
+
+test "a referral carries the glue of a name server of a sibling zone" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+        \\@ IN NS ns.example.
+        \\ns IN A 192.0.2.1
+        \\child IN NS ns.sibling.example.
+        \\sibling IN NS ns.sibling.example.
+        \\ns.sibling.example. IN A 192.0.2.11
+        \\
+    );
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    // RFC 9471 section 2.2: a name server of another zone delegated from the
+    // same parent is a sibling domain name server, and section 3.2 asks for
+    // its glue in the additional section.
+    const response = try buildResponse(try testQuery(arena.allocator(), "www.child.example.", .A), &zone);
+    try std.testing.expect(!response.header.authoritative);
+    try std.testing.expectEqual(@as(usize, 1), response.additionals.len);
+    var owner: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("ns.sibling.example.", try response.additionals.items[0].owner.toText(&owner));
+}
+
+test "an authoritative answer keeps its additional section byte for byte" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+        \\@ IN NS ns.example.
+        \\ns IN A 192.0.2.1
+        \\alias IN CNAME www
+        \\www IN A 192.0.2.2
+        \\
+    );
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    var request = try testQuery(arena.allocator(), "alias.example.", .A);
+    request.header.id = 0x4405;
+    request.edns = .{ .udp_payload_size = 1232, .extended_rcode = 0, .version = 0, .dnssec_ok = false };
+    try request.additionals.append(.{
+        .owner = dns_name.Name.root(),
+        .rrtype = .OPT,
+        .class = dns_types.Class.fromCode(1232),
+        .ttl = 0,
+        .rdata = .{ .OPT = .{} },
+    });
+
+    // The alias answer and its address keep the bytes they have always had,
+    // and the EDNS OPT record stays in the additional section.
+    const response = try buildResponse(request, &zone);
+    try std.testing.expect(response.header.authoritative);
+    try std.testing.expectEqual(@as(usize, 2), response.answers.len);
+    try std.testing.expectEqual(@as(usize, 1), response.additionals.len);
+    try std.testing.expect(response.additionals.items[0].rrtype.eql(.OPT));
+
+    var encoded: [512]u8 = undefined;
+    var writer = @import("../dns/writer.zig").Writer.init(&encoded);
+    try response.encode(&writer);
+    try std.testing.expectEqualSlices(u8, &authoritative_alias_answer_bytes, writer.written());
+}
+
+/// The bytes an authoritative alias answer with an EDNS(0) request has always
+/// carried: the CNAME, the address it points at, and the OPT record.
+const authoritative_alias_answer_bytes = [_]u8{
+    0x44, 0x05, 0x84, 0x00, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01,
+    0x05, 0x61, 0x6c, 0x69, 0x61, 0x73, 0x07, 0x65, 0x78, 0x61, 0x6d, 0x70,
+    0x6c, 0x65, 0x00, 0x00, 0x01, 0x00, 0x01, 0xc0, 0x0c, 0x00, 0x05, 0x00,
+    0x01, 0x00, 0x00, 0x0e, 0x10, 0x00, 0x06, 0x03, 0x77, 0x77, 0x77, 0xc0,
+    0x12, 0xc0, 0x2b, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x0e, 0x10, 0x00,
+    0x04, 0xc0, 0x00, 0x02, 0x02, 0x00, 0x00, 0x29, 0x04, 0xd0, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,
+};

@@ -15,6 +15,7 @@ const zone_parser = @import("../zone/parser.zig");
 const resolver_mod = @import("../resolver.zig");
 const zonemd = @import("../zone/zonemd.zig");
 const signer = @import("../zone/signer.zig");
+const journal_mod = @import("../zone/journal.zig");
 
 const validate_mod = @import("../dns/validate.zig");
 const RecordType = @import("../dns/types.zig").RecordType;
@@ -54,6 +55,10 @@ pub const ServerContext = struct {
     /// no `trust-anchor-file` is configured, which is what keeps the forwarder
     /// a non-validating one.
     anchors: validate_mod.Anchors = .{},
+    /// The RFC 1995 delta journal the operator asked for. Null when the
+    /// configuration names no journal file, and the delta log then lives in
+    /// memory only.
+    journal: ?journal_mod.Journal = null,
 
     pub fn load(dir: std.Io.Dir, io: std.Io, config_path: []const u8, allocator: std.mem.Allocator) !ServerContext {
         try ensureConfined(dir, io, config_path);
@@ -65,6 +70,13 @@ pub const ServerContext = struct {
             .config = try parser.Config.parse(config_text),
         };
         errdefer context.deinit();
+
+        // RFC 1995 section 3: the delta log can be kept in a file, so an
+        // IXFR client at an old serial is still answered incrementally after
+        // the server comes back.
+        if (context.config.ixfrJournalFileText()) |path| {
+            context.journal = try openJournal(dir, io, path);
+        }
 
         if (context.config.tsigKeyFileText()) |key_path| {
             const key_text = try readReferencedFile(dir, io, key_path, allocator);
@@ -225,12 +237,24 @@ pub const ServerContext = struct {
         // and wipes it when it is deinited.
         runtime.dnssec_session = self.dnssec_session;
         self.dnssec_session = null;
+        // The delta log of every zone is restored from the journal file, and
+        // the journal the running server appends to is the one the file is
+        // open on.
+        if (self.journal) |*journal| {
+            restoreJournal(self.allocator, &runtime, journal) catch return Error.BadConfiguration;
+            journal_mod.activate(journal);
+        }
         self.blocklist = .{};
         self.config = .{};
         return runtime;
     }
 
     pub fn deinit(self: *ServerContext) void {
+        if (self.journal) |*journal| {
+            journal_mod.deactivate(journal);
+            journal.close();
+            self.journal = null;
+        }
         for (self.zones.items) |*zone| zone.deinit();
         self.zones.deinit(self.allocator);
         self.zones = .empty;
@@ -245,6 +269,45 @@ pub const ServerContext = struct {
         self.anchors = .{};
     }
 };
+
+/// Opens the RFC 1995 delta journal the configuration names. The file is
+/// created when it is not there yet, and it sits directly in the
+/// configuration directory: a symlink could carry the server's writes
+/// outside it.
+fn openJournal(dir: std.Io.Dir, io: std.Io, path: []const u8) !journal_mod.Journal {
+    if (!isConfinedPath(path)) return Error.InvalidReferencedPath;
+    if (std.mem.indexOfScalar(u8, path, '/') != null) return Error.InvalidReferencedPath;
+    const stat = dir.statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return journal_mod.Journal.open(io, dir, path),
+        else => return err,
+    };
+    if (stat.kind != .file) return Error.InvalidReferencedPath;
+    return journal_mod.Journal.open(io, dir, path);
+}
+
+/// Puts the transitions the journal file holds back into the runtime's
+/// per-zone delta logs, so an IXFR client at an old serial is answered
+/// incrementally after a restart.
+fn restoreJournal(allocator: std.mem.Allocator, runtime: *auth_runtime.Runtime, journal: *const journal_mod.Journal) !void {
+    // The delta log is parallel to the zone list: the runtime reads the log
+    // of a zone by index, and a length mismatch means no history at all.
+    while (runtime.transfer_delta_logs.items.len < runtime.zones.items.len) {
+        runtime.transfer_delta_logs.append(runtime.allocator, .{}) catch return error.OutOfMemory;
+    }
+    for (runtime.zones.items, 0..) |*zone, index| {
+        runtime.transfer_delta_logs.items[index].setOrigin(zone.originText());
+    }
+    const transitions = try journal.read(allocator);
+    defer allocator.free(transitions);
+    for (transitions) |transition| {
+        for (runtime.zones.items, 0..) |*zone, index| {
+            if (!std.ascii.eqlIgnoreCase(zone.originText(), transition.originText())) continue;
+            // A transition that is not RFC 1982 newer is a corrupt record:
+            // it is skipped, and the zone falls back to a full transfer.
+            runtime.transfer_delta_logs.items[index].restore(transition.from_serial, transition.to_serial) catch continue;
+        }
+    }
+}
 
 /// One operator-facing startup failure line. A test build has no operator and
 /// the test runner fails on any stderr write, so the line is printed by the
@@ -830,4 +893,167 @@ test "server context carries the RFC 9520 failure cache time into the forwarding
 
     // The cache time reaches the resolver that holds the failure cache.
     try std.testing.expectEqual(@as(u32, 42), runtime.resolver.?.policy.failure_cache_seconds);
+}
+
+/// The zone the IXFR journal tests serve, at the serial the client asks
+/// from.
+const journal_zone_text =
+    \\$ORIGIN one.example.
+    \\$TTL 3600
+    \\@ IN SOA ns.one.example. hostmaster.one.example. 10 3600 900 1209600 3600
+    \\@ IN NS ns.one.example.
+    \\www IN A 192.0.2.1
+    \\
+;
+
+/// The same zone at the next serial, which the operator's replacement zone
+/// file carries.
+const journal_zone_next_text =
+    \\$ORIGIN one.example.
+    \\$TTL 3600
+    \\@ IN SOA ns.one.example. hostmaster.one.example. 11 3600 900 1209600 3600
+    \\@ IN NS ns.one.example.
+    \\www IN A 192.0.2.2
+    \\
+;
+
+/// An RFC 1995 IXFR request for one.example. from serial 10: the question
+/// plus the client's serial in an authority SOA owned by the question name.
+const ixfr_query_bytes = [_]u8{
+    0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+    3,    'o',  'n',  'e',  7,    'e',  'x',  'a',  'm',  'p',  'l',  'e',
+    0,    0x00, 0xfb, 0x00, 0x01, 3,    'o',  'n',  'e',  7,    'e',  'x',
+    'a',  'm',  'p',  'l',  'e',  0,    0x00, 0x06, 0x00, 0x01, 0x00, 0x00,
+    0x0e, 0x10, 0x00, 0x3c, 2,    'n',  's',  3,    'o',  'n',  'e',  7,
+    'e',  'x',  'a',  'm',  'p',  'l',  'e',  0,    10,   'h',  'o',  's',
+    't',  'm',  'a',  's',  't',  'e',  'r',  3,    'o',  'n',  'e',  7,
+    'e',  'x',  'a',  'm',  'p',  'l',  'e',  0,    0x00, 0x00, 0x00, 0x0a,
+    0x00, 0x00, 0x0e, 0x10, 0x00, 0x00, 0x03, 0x84, 0x00, 0x12, 0x75, 0x00,
+    0x00, 0x00, 0x0e, 0x10,
+};
+
+/// The messages one IXFR exchange answers with, read from the length
+/// prefixed frames the transfer path returns.
+fn ixfrFrames(allocator: std.mem.Allocator, runtime: *const auth_runtime.Runtime, query: []const u8) ![]dns_message.Message {
+    const blob = try runtime.encodeTransferFrames(allocator, query);
+    defer allocator.free(blob);
+    var frames: std.ArrayList(dns_message.Message) = .empty;
+    errdefer frames.deinit(allocator);
+    var offset: usize = 0;
+    while (offset + 2 <= blob.len) {
+        const length = std.mem.readInt(u16, blob[offset..][0..2], .big);
+        offset += 2;
+        try frames.append(allocator, try dns_message.Message.parse(allocator, blob[offset..][0..length]));
+        offset += length;
+    }
+    return frames.toOwnedSlice(allocator);
+}
+
+/// Counts the SOA records of one serial in the answers of every frame. The
+/// incremental sequence carries the superseded SOA the client asked from, and
+/// a full transfer carries only the current one.
+fn countSoaSerial(frames: []const dns_message.Message, serial: u32) usize {
+    var count: usize = 0;
+    for (frames) |frame| {
+        for (frame.answers.slice()) |record| {
+            if (!record.rrtype.eql(.SOA)) continue;
+            if (record.rdata.SOA.serial != serial) continue;
+            count += 1;
+        }
+    }
+    return count;
+}
+
+test "the IXFR journal keeps a zone change across a restart" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{ .sub_path = "one.zone", .data = journal_zone_text });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone one.example primary one.zone\nixfr-journal-file journal.log\n" });
+
+    // The first run: the operator replaces the zone and the server records
+    // the transition in the journal.
+    {
+        var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+        defer context.deinit();
+        var runtime = try context.takeRuntime(io);
+        defer runtime.deinit();
+        try std.testing.expectEqual(auth_runtime.ReloadOutcome.replaced, runtime.replaceZoneText(io, "one.example.", journal_zone_next_text));
+    }
+
+    // The journal holds the transition, and nothing but the transition.
+    const journal_text = try dir.dir.readFileAlloc(io, "journal.log", std.testing.allocator, .limited(4096));
+    defer std.testing.allocator.free(journal_text);
+    try std.testing.expectEqualStrings("one.example. 10 11\n", journal_text);
+
+    // The operator's replacement zone file is what the restarted server
+    // serves.
+    try dir.dir.writeFile(io, .{ .sub_path = "one.zone", .data = journal_zone_next_text });
+
+    // The second run: the journal gives the delta log back, so the client at
+    // the old serial is answered incrementally again.
+    var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+    defer context.deinit();
+    var runtime = try context.takeRuntime(io);
+    defer runtime.deinit();
+
+    const frames = try ixfrFrames(arena.allocator(), &runtime, &ixfr_query_bytes);
+    try std.testing.expectEqual(@as(usize, 1), countSoaSerial(frames, 10));
+    try std.testing.expectEqual(@as(usize, 2), countSoaSerial(frames, 11));
+}
+
+test "a corrupt IXFR journal is skipped and the zone falls back to a full transfer" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{ .sub_path = "one.zone", .data = journal_zone_next_text });
+    try dir.dir.writeFile(io, .{ .sub_path = "journal.log", .data = "one.example. 10\n" });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone one.example primary one.zone\nixfr-journal-file journal.log\n" });
+
+    // The truncated record is refused, and the server starts anyway.
+    var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+    defer context.deinit();
+    var runtime = try context.takeRuntime(io);
+    defer runtime.deinit();
+
+    const frames = try ixfrFrames(arena.allocator(), &runtime, &ixfr_query_bytes);
+    try std.testing.expectEqual(@as(usize, 0), countSoaSerial(frames, 10));
+}
+
+test "without the journal directive no file is written and the delta log stays in memory" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{ .sub_path = "one.zone", .data = journal_zone_text });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone one.example primary one.zone\n" });
+
+    {
+        var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+        defer context.deinit();
+        var runtime = try context.takeRuntime(io);
+        defer runtime.deinit();
+        try std.testing.expectEqual(auth_runtime.ReloadOutcome.replaced, runtime.replaceZoneText(io, "one.example.", journal_zone_next_text));
+    }
+
+    // No journal file is created, and the client at the old serial gets the
+    // full transfer, exactly as it did before the directive existed.
+    try std.testing.expectError(error.FileNotFound, dir.dir.statFile(io, "journal.log", .{}));
+    try dir.dir.writeFile(io, .{ .sub_path = "one.zone", .data = journal_zone_next_text });
+
+    var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+    defer context.deinit();
+    var runtime = try context.takeRuntime(io);
+    defer runtime.deinit();
+
+    const frames = try ixfrFrames(arena.allocator(), &runtime, &ixfr_query_bytes);
+    try std.testing.expectEqual(@as(usize, 0), countSoaSerial(frames, 10));
 }

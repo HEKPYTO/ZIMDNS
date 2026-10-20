@@ -5,6 +5,9 @@
 const std = @import("std");
 const Name = @import("../dns/name.zig").Name;
 const tsig = @import("../dns/tsig.zig");
+const dns_record = @import("../dns/record.zig");
+const dns_rdata = @import("../dns/rdata.zig");
+const dns_writer = @import("../dns/writer.zig");
 
 pub const max_keys = 16;
 pub const max_secret_len = 64;
@@ -166,8 +169,10 @@ fn parseKey(scanner: *Scanner) Error!Key {
 
     const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(encoded_secret) catch return Error.BadSecret;
     // RFC 8945 section 8: the secret SHOULD be at least as long as the keyed
-    // hash output, and the project holds that floor for every algorithm.
-    const minimum = tsig.digestLength(algorithm);
+    // hash output, and the project holds that floor for every algorithm. A
+    // truncated name truncates the MAC, not the key, so its floor is the
+    // hash it truncates (RFC 4868 section 2.6).
+    const minimum = tsig.hashLength(algorithm);
     if (decoded_len < minimum) return Error.SecretTooShort;
     if (decoded_len > max_secret_len) return Error.SecretTooLong;
 
@@ -184,8 +189,9 @@ fn validNameText(text: []const u8) bool {
     return true;
 }
 
-/// The RFC 8945 section 6 algorithm names this server implements. Every other
-/// name is refused: HMAC-MD5.SIG-ALG.REG.INT is a MUST NOT use there, and
+/// The RFC 8945 section 6 algorithm names this server implements, plus the
+/// three truncated names of RFC 4868 section 2.6. Every other name is
+/// refused: HMAC-MD5.SIG-ALG.REG.INT is a MUST NOT use there, and
 /// gss-tsig delegates the cryptography to GSS, which is not implemented.
 fn parseAlgorithm(text: []const u8) Error!tsig.Algorithm {
     if (std.ascii.eqlIgnoreCase(text, "hmac-sha1")) return .hmac_sha1;
@@ -193,6 +199,9 @@ fn parseAlgorithm(text: []const u8) Error!tsig.Algorithm {
     if (std.ascii.eqlIgnoreCase(text, "hmac-sha256")) return .hmac_sha256;
     if (std.ascii.eqlIgnoreCase(text, "hmac-sha384")) return .hmac_sha384;
     if (std.ascii.eqlIgnoreCase(text, "hmac-sha512")) return .hmac_sha512;
+    if (std.ascii.eqlIgnoreCase(text, "hmac-sha256-128")) return .hmac_sha256_128;
+    if (std.ascii.eqlIgnoreCase(text, "hmac-sha384-192")) return .hmac_sha384_192;
+    if (std.ascii.eqlIgnoreCase(text, "hmac-sha512-256")) return .hmac_sha512_256;
     return Error.UnsupportedAlgorithm;
 }
 
@@ -297,4 +306,113 @@ test "keyring refuses the algorithm names RFC 8945 section 6 does not allow" {
     // cryptography to GSS, which this server does not implement.
     try std.testing.expectError(Error.UnsupportedAlgorithm, Keyring.parse("key \"one.\" { algorithm HMAC-MD5.SIG-ALG.REG.INT; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };"));
     try std.testing.expectError(Error.UnsupportedAlgorithm, Keyring.parse("key \"one.\" { algorithm gss-tsig; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };"));
+}
+
+const truncated_algorithms = [_]struct {
+    name: []const u8,
+    wire: []const u8,
+    secret: []const u8,
+    algorithm: tsig.Algorithm,
+}{
+    .{
+        .name = "hmac-sha256-128",
+        .wire = "hmac-sha256-128.",
+        .secret = "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=",
+        .algorithm = .hmac_sha256_128,
+    },
+    .{
+        .name = "hmac-sha384-192",
+        .wire = "hmac-sha384-192.",
+        .secret = "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3",
+        .algorithm = .hmac_sha384_192,
+    },
+    .{
+        .name = "hmac-sha512-256",
+        .wire = "hmac-sha512-256.",
+        .secret = "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEyMw==",
+        .algorithm = .hmac_sha512_256,
+    },
+};
+
+test "keyring accepts the truncated algorithm names with the hash-length secret" {
+    for (truncated_algorithms) |case| {
+        const text = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "key \"one.\" {{ algorithm {s}; secret \"{s}\"; }};",
+            .{ case.name, case.secret },
+        );
+        defer std.testing.allocator.free(text);
+        var ring = try Keyring.parse(text);
+        defer ring.deinit();
+
+        const name = try Name.fromText("one.");
+        const key = ring.findAlgorithm(name, case.algorithm).?;
+        try std.testing.expectEqual(case.algorithm, key.algorithm);
+        // RFC 4868 section 2.6: the truncated name keeps the key length of
+        // the hash it truncates, not the length of its MAC.
+        try std.testing.expectEqual(tsig.hashLength(case.algorithm), key.secretBytes().len);
+        // A key of the truncated name never answers for the full name.
+        try std.testing.expect(ring.findAlgorithm(name, .hmac_sha256) == null);
+    }
+}
+
+test "keyring refuses a secret shorter than the hash a truncated name truncates" {
+    for (truncated_algorithms) |case| {
+        const text = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "key \"one.\" {{ algorithm {s}; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3OA==\"; }};",
+            .{case.name},
+        );
+        defer std.testing.allocator.free(text);
+        try std.testing.expectError(Error.SecretTooShort, Keyring.parse(text));
+    }
+}
+
+/// Writes a TSIG request for `algorithm` whose MAC field holds `mac_len`
+/// zeroed octets. The digest never covers the MAC field, so the computed
+/// MAC stays the same once it is patched in.
+fn writeTsigRequest(writer: *dns_writer.Writer, algorithm: []const u8, mac_len: usize) !void {
+    try writer.writeBytes(&.{
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+    });
+    try writer.writeBytes(&.{ 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0 });
+    try writer.writeU16(1);
+    try writer.writeU16(1);
+    var mac = @as([64]u8, @splat(@as(u8, 0)));
+    const value = try dns_rdata.Tsig.init(try Name.fromText(algorithm), 1, 300, mac[0..mac_len], 0x1234, 0, &.{});
+    try (dns_record.ResourceRecord{
+        .owner = try Name.fromText("one."),
+        .rrtype = .TSIG,
+        .class = .ANY,
+        .ttl = 0,
+        .rdata = .{ .TSIG = value },
+    }).encode(writer);
+}
+
+test "a request signed with a truncated algorithm name is verified with the keyring key" {
+    for (truncated_algorithms) |case| {
+        const text = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "key \"one.\" {{ algorithm {s}; secret \"{s}\"; }};",
+            .{ case.name, case.secret },
+        );
+        defer std.testing.allocator.free(text);
+        var ring = try Keyring.parse(text);
+        defer ring.deinit();
+
+        const key = ring.findAlgorithm(try Name.fromText("one."), case.algorithm).?;
+        var packet: [512]u8 = undefined;
+        var writer = dns_writer.Writer.init(&packet);
+        try writeTsigRequest(&writer, case.wire, tsig.digestLength(case.algorithm));
+        const final = (try tsig.parseFinalAdditional(writer.written())).?;
+        const mac = try tsig.sign(writer.written(), key.secretBytes(), final.owner, final.tsig, null);
+        try tsig.patchMac(packet[0..writer.len()], final, mac.slice());
+        const verified = try tsig.verify(
+            packet[0..writer.len()],
+            key.secretBytes(),
+            null,
+            tsig.minimumMacLength(case.algorithm),
+        );
+        try std.testing.expectEqualSlices(u8, mac.slice(), verified.slice());
+    }
 }
