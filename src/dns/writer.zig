@@ -114,7 +114,9 @@ pub const CompressionTable = struct {
 
     fn find(self: *const CompressionTable, wire: []const u8) ?u16 {
         for (self.entries[0..self.len]) |entry| {
-            if (entry.len == wire.len and std.mem.eql(u8, entry.name[0..entry.len], wire)) {
+            // RFC 4343 section 4.1: DNS names compare case-insensitively, so
+            // a folded owner still compresses against a mixed-case question.
+            if (entry.len == wire.len and std.ascii.eqlIgnoreCase(entry.name[0..entry.len], wire)) {
                 return entry.offset;
             }
         }

@@ -1727,7 +1727,6 @@ test "zone parser refuses TTLs above 2^31-1, including SOA MINIMUM (RFC 2181 §8
     try std.testing.expectEqual(@as(u32, 2147483647), zone.records.items[2].ttl);
 }
 
-
 test "zone parser rejects missing SOA or missing apex NS" {
     try std.testing.expectError(error.MissingSoa, ZoneFile.parse(
         \\$ORIGIN home.arpa.

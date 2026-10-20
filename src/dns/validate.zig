@@ -7,6 +7,9 @@
 /// signed-data assembly, ECDSA P-256/P-384 and Ed25519 verification, NSEC
 /// NXDOMAIN and NODATA proofs, NSEC3 closest-encloser and opt-out proofs, and
 /// the secure/insecure/bogus outcome with an RFC 8914 INFO-CODE for bogus.
+/// `zoneSignedToAnchor` answers the same question for a loaded zone: do the
+/// RRsets named at its apex carry valid signatures chaining up to a
+/// configured anchor (RFC 8976 section 4 step 3).
 /// What this module does NOT do: iterative resolution, chasing a delegation
 /// chain across several zones, RFC 5011 anchor rollover, NSEC3 generation, and
 /// RSA or Ed448, for which the standard library carries no primitive.
@@ -17,12 +20,15 @@
 /// outcome to SERVFAIL and the other two to the relayed answer.
 const std = @import("std");
 const Name = @import("name.zig").Name;
+const Class = @import("types.zig").Class;
 const RecordType = @import("types.zig").RecordType;
 const dns_record = @import("record.zig");
 const dns_message = @import("message.zig");
 const dns_rdata = @import("rdata.zig");
 const dns_writer = @import("writer.zig");
 const dnssec = @import("dnssec.zig");
+const zone_index = @import("../zone/index.zig");
+const zone_parser = @import("../zone/parser.zig");
 
 const EcdsaP256Sha256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 const EcdsaP384Sha384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
@@ -138,6 +144,18 @@ pub const Anchors = struct {
     pub fn covers(self: *const Anchors, name: Name) bool {
         for (self.items[0..self.len]) |anchor| {
             if (isSuffix(anchor.owner, name)) return true;
+        }
+        return false;
+    }
+
+    /// True when a configured anchor names `name` itself. RFC 8976 section 4
+    /// step 1 asks whether a zone is expected to carry DNSSEC records: an
+    /// anchor for the zone says yes, an anchor for a zone above it does not,
+    /// because a delegation without a DS is insecure (RFC 4035 section 5.2)
+    /// and the parent side of that chain is not reachable from a zone file.
+    pub fn anchorsZone(self: *const Anchors, name: Name) bool {
+        for (self.items[0..self.len]) |anchor| {
+            if (anchor.owner.eql(&name)) return true;
         }
         return false;
     }
@@ -1190,12 +1208,84 @@ pub fn validate(
     return .{ .status = .secure };
 }
 
+/// RFC 8976 section 4 step 3: the RRsets named by `types` must carry valid
+/// signatures that chain up to a configured trust anchor. `zone` is the
+/// loaded zone, and only its apex records take part, because the SOA and the
+/// ZONEMD live there. A zone that no configured anchor names needs no chain,
+/// and is reported as signed.
+pub fn zoneSignedToAnchor(
+    allocator: std.mem.Allocator,
+    anchors: *const Anchors,
+    zone: *const zone_index.Zone,
+    types: []const u16,
+    now: u32,
+) Error!bool {
+    const apex = Name.fromText(zone.originText()) catch return Error.MalformedRdata;
+    if (!anchors.anchorsZone(apex)) return true;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+
+    var validator = Validator{ .allocator = scratch, .anchors = anchors, .now = now };
+    const records = try apexRecords(scratch, zone, apex);
+    for (records) |record| {
+        if (record.rrtype.eql(.RRSIG)) {
+            try validator.addSignature(record);
+        } else {
+            try validator.addRecord(record);
+        }
+    }
+    for (types) |rrtype| {
+        const rrset = findRrset(&validator, apex, rrtype) orelse return false;
+        if (try validator.checkRrset(rrset) != .secure) return false;
+    }
+    return true;
+}
+
+/// The apex records the chain check reads, in the wire form the validator
+/// signs over: the SOA, the ZONEMD, the DNSKEY RRset, and every RRSIG at the
+/// apex. Nothing below the apex can authenticate it, and the set is small
+/// enough to bound the work. Every record is class IN, which is the only
+/// class the zone parser reads.
+fn apexRecords(
+    allocator: std.mem.Allocator,
+    zone: *const zone_index.Zone,
+    apex: Name,
+) Error![]*const dns_record.ResourceRecord {
+    var list: std.ArrayList(dns_record.ResourceRecord) = .empty;
+    for (zone.records.items[0..zone.records.len]) |record| {
+        if (!std.ascii.eqlIgnoreCase(record.ownerText(), zone.originText())) continue;
+        if (!record.rrtype.eql(.SOA) and !record.rrtype.eql(.ZONEMD) and
+            !record.rrtype.eql(.DNSKEY) and !record.rrtype.eql(.RRSIG)) continue;
+        const rdata = zone_parser.parseRData(record.rrtype, record.rdataText()) catch return Error.MalformedRdata;
+        try list.append(allocator, .{
+            .owner = apex,
+            .rrtype = record.rrtype,
+            .class = Class.IN,
+            .ttl = record.ttl,
+            .rdata = rdata,
+        });
+    }
+    const pointers = try allocator.alloc(*const dns_record.ResourceRecord, list.items.len);
+    for (list.items, 0..) |*record, index| pointers[index] = record;
+    return pointers;
+}
+
+/// The RRset the validator grouped for one owner and one type.
+fn findRrset(validator: *const Validator, owner: Name, rrtype: u16) ?*const Rrset {
+    for (validator.rrsets.items) |*rrset| {
+        if (rrset.rrtype != rrtype) continue;
+        if (!rrset.owner.eql(&owner)) continue;
+        return rrset;
+    }
+    return null;
+}
+
 // ------------------------------------------------------------------- tests
 
 const dns_header = @import("header.zig");
 const dns_question = @import("question.zig");
-const zone_index = @import("../zone/index.zig");
-const zone_parser = @import("../zone/parser.zig");
 const zone_signer = @import("../zone/signer.zig");
 
 /// The RFC 6605 and RFC 8080 test keys the signer already uses. A validator
@@ -1910,4 +2000,186 @@ test "the anchor file is bounded and an empty file is an empty store" {
         try text.appendSlice(std.testing.allocator, line);
     }
     try std.testing.expectError(Error.TooManyAnchors, Anchors.parse(std.testing.allocator, text.items));
+}
+
+/// A zone with an apex ZONEMD, so the RFC 8976 section 4 step 3 chain over
+/// the SOA and the ZONEMD RRsets can be checked. The digest is a placeholder:
+/// that chain is about the signatures, not about the digest.
+const zonemd_zone_text =
+    \\$ORIGIN example.com.
+    \\$TTL 3600
+    \\@ IN SOA ns1.example.com. hostmaster.example.com. 1 3600 900 1209600 3600
+    \\@ IN NS ns1.example.com.
+    \\@ IN ZONEMD 1 1 1 0000000000000000000000000000000000000000000000000000000000000000
+    \\ns1 IN A 192.0.2.1
+;
+
+/// The RRsets RFC 8976 section 4 step 3 names: the SOA and the ZONEMD.
+const zonemd_chain_types = [_]u16{ RecordType.SOA.code(), RecordType.ZONEMD.code() };
+
+/// The trust anchor an operator writes for a zone's own key: the DNSKEY in
+/// the anchor file's presentation form (RFC 4034 section 5.1.1).
+fn dnskeyAnchorText(allocator: std.mem.Allocator, owner: []const u8, dnskey_rdata: []const u8) ![]u8 {
+    const encoded = try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(dnskey_rdata.len - 4));
+    _ = std.base64.standard.Encoder.encode(encoded, dnskey_rdata[4..]);
+    return std.fmt.allocPrint(allocator, "{s} DNSKEY {d} 3 {d} {s}\n", .{
+        owner,
+        std.mem.readInt(u16, dnskey_rdata[0..2], .big),
+        dnskey_rdata[3],
+        encoded,
+    });
+}
+
+test "RFC 8976 section 4 step 3: the apex SOA and ZONEMD RRsets chain to a DNSKEY anchor" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var signed = try signZoneText(allocator, zonemd_zone_text, ed25519_secret);
+    defer signed.deinit(allocator);
+
+    var anchors = try Anchors.parse(allocator, try dnskeyAnchorText(allocator, "example.com.", signed.dnskey));
+    defer anchors.deinit(allocator);
+
+    try std.testing.expect(try zoneSignedToAnchor(allocator, &anchors, &signed.zone, &zonemd_chain_types, now_seconds));
+}
+
+test "RFC 8976 section 4 step 3: a DS anchor reaches the zone's own DNSKEY RRset" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var signed = try signZoneText(allocator, zonemd_zone_text, ed25519_secret);
+    defer signed.deinit(allocator);
+
+    // The RFC 8080 section 6.1 DS for the Ed25519 key the zone is signed
+    // with: the chain runs through the zone's DNSKEY RRset and the signature
+    // that RRset carries.
+    var anchors = try Anchors.parse(allocator,
+        \\example.com. DS 35217 15 2 401781b934e392de492ec77ae2e15d70f6575a1c0bc59c5275c04ebe80c6614c
+        \\
+    );
+    defer anchors.deinit(allocator);
+
+    try std.testing.expect(try zoneSignedToAnchor(allocator, &anchors, &signed.zone, &zonemd_chain_types, now_seconds));
+}
+
+test "RFC 8976 section 4 step 3: a zone signed by another key does not chain to the anchor" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var signed = try signZoneText(allocator, zonemd_zone_text, ed25519_secret);
+    defer signed.deinit(allocator);
+
+    // The anchor holds the RFC 6605 section 6.1 P-256 key, and the zone is
+    // signed with the Ed25519 one: no signature over the apex RRsets can be
+    // made by the anchored key.
+    var other = try zone_signer.parseKey(p256_secret);
+    defer other.deinit();
+    const other_dnskey = try other.dnskeyRdata(allocator);
+    var anchors = try Anchors.parse(allocator, try dnskeyAnchorText(allocator, "example.com.", other_dnskey));
+    defer anchors.deinit(allocator);
+
+    try std.testing.expect(!try zoneSignedToAnchor(allocator, &anchors, &signed.zone, &zonemd_chain_types, now_seconds));
+}
+
+test "RFC 8976 section 4 step 3: an unsigned zone does not chain to the anchor" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var zone_file = try zone_parser.ZoneFile.parse(zonemd_zone_text);
+    defer zone_file.deinit();
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    var anchors = try Anchors.parse(allocator,
+        \\example.com. DNSKEY 257 3 15 zPnZ/QwEe7S8C5SPz2OfS5RR40ATk2/rYnE9xHIEijs=
+        \\
+    );
+    defer anchors.deinit(allocator);
+
+    try std.testing.expect(!try zoneSignedToAnchor(allocator, &anchors, &zone, &zonemd_chain_types, now_seconds));
+}
+
+test "RFC 8976 section 4 step 1: a zone no anchor names is not checked" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var signed = try signZoneText(allocator, zonemd_zone_text, ed25519_secret);
+    defer signed.deinit(allocator);
+
+    // An anchor for a zone above says nothing about this one: a delegation
+    // without a DS is insecure, and the parent's side of that chain is not
+    // reachable from a zone file.
+    var anchors = try Anchors.parse(allocator,
+        \\. DNSKEY 257 3 15 zPnZ/QwEe7S8C5SPz2OfS5RR40ATk2/rYnE9xHIEijs=
+        \\
+    );
+    defer anchors.deinit(allocator);
+
+    try std.testing.expect(try zoneSignedToAnchor(allocator, &anchors, &signed.zone, &zonemd_chain_types, now_seconds));
+}
+
+/// The apex RRSIGs of a signed zone in the RFC 4034 section 3.2 presentation
+/// form, so a zone file that carries the publisher's own signatures can be
+/// loaded and checked the way a zone this server signed is.
+fn rrsigPresentationLines(allocator: std.mem.Allocator, zone: *const zone_index.Zone) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (zone.records.items[0..zone.records.len]) |record| {
+        if (!record.rrtype.eql(.RRSIG)) continue;
+        if (!std.ascii.eqlIgnoreCase(record.ownerText(), zone.originText())) continue;
+        const rdata = try zone_parser.parseRData(.RRSIG, record.rdataText());
+        const bytes = switch (rdata) {
+            .Unknown => |*unknown| unknown.bytes(),
+            else => return error.TestUnexpectedResult,
+        };
+        const parsed = try Name.parse(bytes, 18);
+        var signer_buffer: [256]u8 = undefined;
+        const signer = try parsed.name.toText(&signer_buffer);
+        const signature = try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len - parsed.next_offset));
+        _ = std.base64.standard.Encoder.encode(signature, bytes[parsed.next_offset..]);
+        // RFC 4034 section 3.2 lets an unknown type mnemonic be written as
+        // TYPE followed by its number, which is what the zone parser reads.
+        try out.print(allocator, "@ IN RRSIG TYPE{d} {d} {d} {d} {d} {d} {d} {s} {s}\n", .{
+            std.mem.readInt(u16, bytes[0..2], .big),
+            bytes[2],
+            bytes[3],
+            std.mem.readInt(u32, bytes[4..8], .big),
+            std.mem.readInt(u32, bytes[8..12], .big),
+            std.mem.readInt(u32, bytes[12..16], .big),
+            std.mem.readInt(u16, bytes[16..18], .big),
+            signer,
+            signature,
+        });
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+test "RFC 8976 section 4 step 3: a zone file carrying the publisher's own signatures chains to the anchor" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var signed = try signZoneText(allocator, zonemd_zone_text, ed25519_secret);
+    defer signed.deinit(allocator);
+
+    // The zone file the publisher would ship: the same zone with its
+    // signatures in the RFC 4034 section 3.2 presentation form.
+    var text: std.ArrayList(u8) = .empty;
+    try text.appendSlice(allocator, zonemd_zone_text);
+    try text.append(allocator, '\n');
+    try text.appendSlice(allocator, try rrsigPresentationLines(allocator, &signed.zone));
+
+    var zone_file = try zone_parser.ZoneFile.parse(text.items);
+    defer zone_file.deinit();
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    var anchors = try Anchors.parse(allocator, try dnskeyAnchorText(allocator, "example.com.", signed.dnskey));
+    defer anchors.deinit(allocator);
+
+    try std.testing.expect(try zoneSignedToAnchor(allocator, &anchors, &zone, &zonemd_chain_types, now_seconds));
 }

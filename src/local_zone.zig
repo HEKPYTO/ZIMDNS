@@ -110,8 +110,9 @@ pub const Kind = enum {
 };
 
 pub const Zone = struct {
-    /// Enclosing zone apex in lowercase presentation form with its trailing
-    /// dot. Borrows the query's own name text, never a copy.
+    /// Enclosing zone apex with its trailing dot. Borrows the query's own
+    /// name text, never a copy, so it keeps the caller's spelling — compare
+    /// case-insensitively (RFC 1035 section 2.3.2).
     apex: []const u8,
     kind: Kind,
     /// True when the question is for the apex itself rather than a name below.

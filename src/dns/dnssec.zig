@@ -301,12 +301,12 @@ pub fn nsecCovers(owner: Name, next: Name, qname: Name) bool {
     return compareNames(owner, qname) < 0 and compareNames(qname, next) < 0;
 }
 
-/// NSEC3 hash (RFC 5155 section 7.1): iterated salted SHA-1 over the
+/// NSEC3 hash (RFC 5155 section 5): iterated salted SHA-1 over the
 /// canonical owner wire name. `out` must be 20 bytes (SHA-1).
 pub fn nsec3Hash(owner: Name, salt: []const u8, iterations: u16, out: *[20]u8) void {
     var digest: [20]u8 = undefined;
     var hasher = std.crypto.hash.Sha1.init(.{});
-    // RFC 5155 section 7.1 hashes the canonical owner name, so the case the
+    // RFC 5155 section 5 hashes the canonical owner name, so the case the
     // name arrived with never reaches the digest.
     const canonical = owner.folded();
     hasher.update(canonical.asWire());
@@ -703,7 +703,7 @@ test "aggressive NSEC3 cache denies only types missing from the bitmap" {
     try std.testing.expect((try cache.denyNsec3(@as([20]u8, @splat(@as(u8, 0xcd))), 16, now)) == null);
 }
 
-test "NSEC3 hash matches an independent SHA-1 recomputation (RFC 5155 7.1)" {
+test "NSEC3 hash matches an independent SHA-1 recomputation (RFC 5155 5)" {
     const owner = try Name.fromText("example.");
     const salt = [_]u8{ 0x73, 0x61, 0x6c, 0x74 }; // "salt"
     var hashed: [20]u8 = undefined;
@@ -727,7 +727,7 @@ test "NSEC3 hash matches an independent SHA-1 recomputation (RFC 5155 7.1)" {
     try std.testing.expect(!std.mem.eql(u8, &hashed, &different));
 }
 
-test "RFC 5155 7.1: the NSEC3 hash covers the canonical owner name, not the case it arrived in" {
+test "RFC 5155 5: the NSEC3 hash covers the canonical owner name, not the case it arrived in" {
     const mixed = (try Name.parsePreservingCase(&.{ 7, 'E', 'x', 'a', 'm', 'p', 'l', 'e', 0 }, 0)).name;
     const canonical = (try Name.parse(&.{ 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0 }, 0)).name;
     var mixed_hash: [20]u8 = undefined;

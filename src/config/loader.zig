@@ -16,6 +16,7 @@ const zonemd = @import("../zone/zonemd.zig");
 const signer = @import("../zone/signer.zig");
 
 const validate_mod = @import("../dns/validate.zig");
+const RecordType = @import("../dns/types.zig").RecordType;
 /// RFC 4034 section 3.1.5 signature window for a zone signed at startup. The
 /// key file is re-read and every zone re-signed on each start, so the window
 /// only has to outlast one uptime: an operator who serves longer without
@@ -30,6 +31,8 @@ pub const Error = error{
     BadConfiguration,
     ZoneNameMismatch,
     ZonemdMismatch,
+    /// The apex ZONEMD record is signed, but not to a configured trust anchor.
+    ZonemdSignatureInvalid,
     BadDnssecKey,
     BadTrustAnchorFile,
 };
@@ -98,25 +101,6 @@ pub const ServerContext = struct {
             }
             var zone = try zone_index.Zone.fromZoneFile(&zone_file);
             errdefer zone.deinit();
-            // RFC 8976 section 4: refuse to serve a zone whose apex ZONEMD
-            // record does not match the loaded data, so a corrupted or
-            // tampered zone file fails closed at startup instead of answering
-            // queries. The report names the zone and both digests.
-            var zonemd_report: [zonemd.report_max_len]u8 = undefined;
-            _ = zonemd.verify(&zone, allocator, &zonemd_report) catch {
-                // The report names the zone and both digests for the operator
-                // who starts the server. A test build has no operator and the
-                // test runner fails on any stderr write, so the line is
-                // printed by the server build only.
-                if (!builtin.is_test) {
-                    const written = std.mem.indexOfScalar(u8, &zonemd_report, 0) orelse zonemd_report.len;
-                    var stderr_buffer: [256]u8 = undefined;
-                    var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buffer);
-                    stderr_writer.interface.print("error: {s}\n", .{zonemd_report[0..written]}) catch {};
-                    stderr_writer.interface.flush() catch {};
-                }
-                return Error.ZonemdMismatch;
-            };
             // RFC 4035 section 2.3: signing adds DNSKEY, DS, RRSIG, and NSEC to
             // the loaded zone, so the signed RRsets are served from here on
             // without touching the zone file on disk.
@@ -126,6 +110,37 @@ pub const ServerContext = struct {
                     .expiration = now_seconds + signature_validity_seconds,
                 }) catch return Error.BadDnssecKey;
             }
+            // RFC 8976 section 4 steps 1 to 3: a zone that carries an apex
+            // ZONEMD record and is named by a configured trust anchor is
+            // expected to be signed, and its SOA and ZONEMD RRsets must carry
+            // valid signatures chaining up to that anchor. The chain is
+            // checked before the digest, so a zone that is not authentic is
+            // never accepted on the strength of its digest alone.
+            if (zonemd.hasApexRecord(&zone)) {
+                const chained = validate_mod.zoneSignedToAnchor(
+                    allocator,
+                    &context.anchors,
+                    &zone,
+                    &.{ RecordType.SOA.code(), RecordType.ZONEMD.code() },
+                    now_seconds,
+                ) catch false;
+                if (!chained) {
+                    var report: [256]u8 = undefined;
+                    const message = std.fmt.bufPrint(&report, "zone {s}: the SOA and ZONEMD RRsets do not carry valid signatures chaining to a configured trust anchor", .{zone.originText()}) catch "zone: the SOA and ZONEMD RRsets are not signed to a configured trust anchor";
+                    printStartupError(io, message);
+                    return Error.ZonemdSignatureInvalid;
+                }
+            }
+            // RFC 8976 section 4: refuse to serve a zone whose apex ZONEMD
+            // record does not match the loaded data, so a corrupted or
+            // tampered zone file fails closed at startup instead of answering
+            // queries. The report names the zone and both digests.
+            var zonemd_report: [zonemd.report_max_len]u8 = undefined;
+            _ = zonemd.verify(&zone, allocator, &zonemd_report) catch {
+                const written = std.mem.indexOfScalar(u8, &zonemd_report, 0) orelse zonemd_report.len;
+                printStartupError(io, zonemd_report[0..written]);
+                return Error.ZonemdMismatch;
+            };
             try context.zones.append(allocator, zone);
         }
 
@@ -203,6 +218,17 @@ pub const ServerContext = struct {
         self.anchors = .{};
     }
 };
+
+/// One operator-facing startup failure line. A test build has no operator and
+/// the test runner fails on any stderr write, so the line is printed by the
+/// server build only.
+fn printStartupError(io: std.Io, message: []const u8) void {
+    if (builtin.is_test) return;
+    var stderr_buffer: [256]u8 = undefined;
+    var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buffer);
+    stderr_writer.interface.print("error: {s}\n", .{message}) catch {};
+    stderr_writer.interface.flush() catch {};
+}
 
 fn readReferencedFile(dir: std.Io.Dir, io: std.Io, sub_path: []const u8, allocator: std.mem.Allocator) ![]u8 {
     ensureConfined(dir, io, sub_path) catch |err| switch (err) {
@@ -404,7 +430,6 @@ test "server context signs every zone named by the configured DNSSEC key file" {
     defer context.deinit();
 
     const zone = context.zones.items[0];
-    const RecordType = @import("../dns/types.zig").RecordType;
     try std.testing.expectEqual(@as(usize, 1), countType(zone, .DNSKEY));
     try std.testing.expectEqual(@as(usize, 1), countType(zone, .DS));
     // Apex, ns1, www, and the wildcard owner are authoritative, so each joins
@@ -594,4 +619,70 @@ test "server context refuses to start on a ZONEMD digest mismatch" {
         Error.ZonemdMismatch,
         ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator),
     );
+}
+
+/// The RFC 8080 section 6.1 Ed25519 DNSKEY: the trust anchor an operator
+/// writes for the key this server signs a zone with.
+const dnssec_test_anchor =
+    \\example. DNSKEY 257 3 15 zPnZ/QwEe7S8C5SPz2OfS5RR40ATk2/rYnE9xHIEijs=
+;
+
+/// The RFC 6605 section 6.1 P-256 DNSKEY: a trust anchor for a key the zone
+/// is not signed with.
+const dnssec_test_other_anchor =
+    \\example. DNSKEY 257 3 13 GojIhhXUN/u4v54ZQqGSnyhWJwaubCvTmeexv7bR6edbkrSqQpF64cYbcB7wNcP+e+MAnLr+Wi9xMWyQLc8NAA==
+;
+
+test "server context accepts a signed zone whose apex ZONEMD chains to the trust anchor" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    // RFC 8976 section 4: the zone carries an apex ZONEMD record, a trust
+    // anchor names the zone, and the SOA and ZONEMD RRsets are signed to that
+    // anchor, so the zone is accepted on the strength of both.
+    try dir.dir.writeFile(io, .{ .sub_path = "example.zone", .data = zonemd_verified_zone_text });
+    try dir.dir.writeFile(io, .{ .sub_path = "zsk.key", .data = dnssec_test_key });
+    try dir.dir.writeFile(io, .{ .sub_path = "anchors.txt", .data = dnssec_test_anchor });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone example. primary example.zone\ndnssec-key-file zsk.key\ntrust-anchor-file anchors.txt\n" });
+
+    var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 1), context.zones.items.len);
+}
+
+test "server context refuses to start when the apex ZONEMD does not chain to the trust anchor" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    // The same zone and the same digest, but the anchor holds another key: the
+    // signatures over the SOA and the ZONEMD cannot be made by it, so the zone
+    // is not authentic and the server refuses to start.
+    try dir.dir.writeFile(io, .{ .sub_path = "example.zone", .data = zonemd_verified_zone_text });
+    try dir.dir.writeFile(io, .{ .sub_path = "zsk.key", .data = dnssec_test_key });
+    try dir.dir.writeFile(io, .{ .sub_path = "anchors.txt", .data = dnssec_test_other_anchor });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone example. primary example.zone\ndnssec-key-file zsk.key\ntrust-anchor-file anchors.txt\n" });
+
+    try std.testing.expectError(
+        Error.ZonemdSignatureInvalid,
+        ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator),
+    );
+}
+
+test "server context checks the ZONEMD digest only when no trust anchor covers the zone" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    // An anchor for another zone says nothing about this one, so the digest is
+    // still checked as a checksum and the zone loads.
+    try dir.dir.writeFile(io, .{ .sub_path = "example.zone", .data = zonemd_verified_zone_text });
+    try dir.dir.writeFile(io, .{ .sub_path = "zsk.key", .data = dnssec_test_key });
+    try dir.dir.writeFile(io, .{ .sub_path = "anchors.txt", .data = ". DNSKEY 257 3 15 zPnZ/QwEe7S8C5SPz2OfS5RR40ATk2/rYnE9xHIEijs=\n" });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone example. primary example.zone\ndnssec-key-file zsk.key\ntrust-anchor-file anchors.txt\n" });
+
+    var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 1), context.zones.items.len);
 }

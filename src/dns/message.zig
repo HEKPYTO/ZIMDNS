@@ -331,6 +331,31 @@ test "message accepts unassigned opcode and rejects unsupported question count" 
     }));
 }
 
+test "message rejects a well-formed two-question message before parsing sections" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // Two complete questions: the count itself is the format error, so the
+    // parser must report it instead of a section error from the trailing
+    // bytes the second question would otherwise leave behind.
+    const two_questions = [_]u8{
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        3,    'd',  'n',  's',  4,    'h',  'o',  'm',  'e',  4,    'a',  'r',
+        'p',  'a',  0,    0x00, 0x01, 0x00, 0x01, 5,    'a',  'l',  'i',  'a',
+        's',  4,    'h',  'o',  'm',  'e',  4,    'a',  'r',  'p',  'a',  0,
+        0x00, 0x01, 0x00, 0x01,
+    };
+    try std.testing.expectError(Error.TooManyQuestions, Message.parse(arena.allocator(), &two_questions));
+
+    // The FORMERR answer echoes a question, so the header-only parse yields
+    // the first one even though the count is malformed.
+    var partial = try Message.parseHeaderQuestion(arena.allocator(), &two_questions);
+    defer partial.deinit();
+    try std.testing.expectEqual(@as(u16, 2), partial.header.question_count);
+    var text: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("dns.home.arpa.", try partial.question.?.name.toText(&text));
+}
+
 test "message rejects response packets as queries" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

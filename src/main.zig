@@ -140,6 +140,7 @@ fn printHelp(writer: *std.Io.Writer) !void {
         \\  zimdns server run --zone-file examples/zones/home.arpa.zone --serve-tcp
         \\  zimdns query @127.0.0.1 -p 1055 --dnssec signed.example. A
         \\  zimdns query @127.0.0.1 -p 1055 --zoneversion example.com A
+        \\  zimdns query @127.0.0.1 -p 1055 --nsid example.com A
         \\
         \\  RFC 6303/6761/7793/8375 locally served zones are on by default and
         \\  are answered ahead of the cache and the forwarder. A configuration
@@ -151,6 +152,11 @@ fn printHelp(writer: *std.Io.Writer) !void {
         \\  sections and are printed under their section headings. Signing a
         \\  zone is a config directive: 'dnssec-key-file <path>' in
         \\  examples/dnssec/config.gdns is a worked configuration.
+        \\
+        \\  --nsid asks a server for its own identifier (RFC 5001 option
+        \\  code 3) with an empty option. The answer prints the payload as
+        \\  hexadecimal, two digits per octet. A server with no 'nsid'
+        \\  directive answers no identifier at all.
         \\
         \\  --serve-dot, --serve-doh, and --serve-xfr are accepted but always
         \\  refuse to start: this build links no TLS server, so it cannot
@@ -167,6 +173,7 @@ fn handleQuery(args: []const []const u8, io: std.Io, allocator: std.mem.Allocato
     var server_text: []const u8 = "127.0.0.1";
     var use_dnssec = false;
     var use_zoneversion = false;
+    var use_nsid = false;
     var port: u16 = 1053;
     var use_tcp = false;
     var name: ?[]const u8 = null;
@@ -193,6 +200,8 @@ fn handleQuery(args: []const []const u8, io: std.Io, allocator: std.mem.Allocato
             use_dnssec = true;
         } else if (std.mem.eql(u8, arg, "--zoneversion")) {
             use_zoneversion = true;
+        } else if (std.mem.eql(u8, arg, "--nsid")) {
+            use_nsid = true;
         } else if (name == null) {
             name = arg;
         } else {
@@ -215,7 +224,7 @@ fn handleQuery(args: []const []const u8, io: std.Io, allocator: std.mem.Allocato
     io.random(&query_id_bytes);
     const query_id = std.mem.readInt(u16, &query_id_bytes, .big);
     var packet_buffer: [512]u8 = undefined;
-    const query = try cli_query.buildQueryPacketWithEdns(&packet_buffer, query_id, absolute_name, qtype, .{ .dnssec_ok = use_dnssec, .zoneversion = use_zoneversion });
+    const query = try cli_query.buildQueryPacketWithEdns(&packet_buffer, query_id, absolute_name, qtype, .{ .dnssec_ok = use_dnssec, .zoneversion = use_zoneversion, .nsid = use_nsid });
     const server = std.Io.net.IpAddress.parse(server_text, port) catch {
         try writer.writeAll("error: query server must be an IP address for now\n");
         try exitUsage(writer);

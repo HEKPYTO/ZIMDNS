@@ -328,7 +328,6 @@ pub fn serveDohStreamOnce(stream: std.Io.net.Stream, io: std.Io, runtime: *const
     return serveDohStream(stream, io, runtime, null);
 }
 
-
 fn serveDohStream(stream: std.Io.net.Stream, io: std.Io, runtime: *const Runtime, counters: ?*metrics.Counters) !void {
     tcp_deadline.setSocketTimeout(stream.socket.handle, DOH_IO_TIMEOUT);
 

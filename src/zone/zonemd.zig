@@ -196,15 +196,21 @@ fn rrsigCoversZonemd(rdata: dns_rdata.RData) bool {
 /// Builds the deduplicated, canonically ordered record set that the SIMPLE
 /// scheme digests (RFC 8976 sections 3.3.1 and 3.3.1.1). Excluded: records
 /// outside the zone, the apex ZONEMD RRset, and the RRSIG covering that RRset,
-/// which the publisher rewrites after every digest is computed. Every other DNSSEC
-/// RR stays in, and a non-apex ZONEMD is ordinary zone data.
+/// which the publisher rewrites after every digest is computed, and the records
+/// this server generated when it signed the zone at startup, whose signatures
+/// no publisher could have covered. Every other DNSSEC RR in the zone file
+/// stays in, and a non-apex ZONEMD is ordinary zone data.
 fn canonicalEntries(zone: *const zone_index.Zone, allocator: std.mem.Allocator) Error![]Entry {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const scratch = arena.allocator();
 
     var entries: std.ArrayList(Entry) = .empty;
-    for (zone.records.items[0..zone.records.len]) |record| {
+    // The records this server generated when it signed the zone at startup are
+    // not part of the zone the publisher digested: their signatures depend on
+    // the run, so no publisher can have covered them.
+    const file_len = zone.records.len -| zone.generated.len;
+    for (zone.records.items[0..file_len]) |record| {
         if (!zone.contains(record.ownerText())) continue;
         const is_apex = std.ascii.eqlIgnoreCase(record.ownerText(), zone.originText());
         if (record.rrtype.eql(.ZONEMD) and is_apex) continue;
@@ -324,6 +330,17 @@ fn writeMismatchReport(
     writer.writeAll(", computed ") catch return Error.ReportTooSmall;
     writeHex(&writer, computed) catch return Error.ReportTooSmall;
     return finishReport(&writer);
+}
+
+/// True when the zone carries an apex ZONEMD record. RFC 8976 section 4
+/// verifies a zone that has one: without it there is no digest to verify.
+pub fn hasApexRecord(zone: *const zone_index.Zone) bool {
+    for (zone.records.items[0..zone.records.len]) |record| {
+        if (!record.rrtype.eql(.ZONEMD)) continue;
+        if (!std.ascii.eqlIgnoreCase(record.ownerText(), zone.originText())) continue;
+        return true;
+    }
+    return false;
 }
 
 /// Verifies every apex ZONEMD RR against `zone` following RFC 8976 section 4

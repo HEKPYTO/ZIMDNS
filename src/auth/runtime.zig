@@ -1157,21 +1157,36 @@ fn makeSignedQueryWithEdns(time_signed: u64, mac_len: usize) !SignedQuery {
     return makeSignedQueryWithEdnsOption(time_signed, mac_len, true);
 }
 
+/// One question on the wire: dns.home.arpa. A IN.
+const signed_question_wire = [_]u8{
+    3,   'd', 'n', 's',  4,    'h',  'o',  'm', 'e', 4, 'a', 'r',
+    'p', 'a', 0,   0x00, 0x01, 0x00, 0x01,
+};
+
 fn makeSignedQueryWithEdnsOption(time_signed: u64, mac_len: usize, include_edns: bool) !SignedQuery {
+    return makeSignedQueryWithQuestions(time_signed, mac_len, include_edns, 1, &signed_question_wire);
+}
+
+/// Builds a TSIG-signed query carrying `question_count` questions.
+fn makeSignedQueryWithQuestions(
+    time_signed: u64,
+    mac_len: usize,
+    include_edns: bool,
+    question_count: u16,
+    questions: []const u8,
+) !SignedQuery {
     const algorithm = try @import("../dns/name.zig").Name.fromText("hmac-sha256.");
     const owner = try @import("../dns/name.zig").Name.fromText("key.");
     const root = @import("../dns/name.zig").Name.root();
     var packet: [512]u8 = undefined;
     var writer = dns_writer.Writer.init(&packet);
     const additional_count: u16 = if (include_edns) 2 else 1;
-    try writer.writeBytes(&.{
-        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
-    });
+    try writer.writeBytes(&.{ 0x12, 0x34, 0x01, 0x00 });
+    try writer.writeU16(question_count);
+    try writer.writeBytes(&.{ 0x00, 0x00, 0x00, 0x00 });
     try writer.writeU16(additional_count);
     const question_start = writer.len();
-    try writer.writeBytes(&.{ 3, 'd', 'n', 's', 4, 'h', 'o', 'm', 'e', 4, 'a', 'r', 'p', 'a', 0 });
-    try writer.writeU16(1);
-    try writer.writeU16(1);
+    try writer.writeBytes(questions);
     if (include_edns) {
         try (@import("../dns/record.zig").ResourceRecord{
             .owner = root,
@@ -1288,7 +1303,6 @@ test "RFC 6891: an OPT whose option overruns RDLENGTH is answered FORMERR" {
     try std.testing.expectEqual(@as(@TypeOf(parsed.header.rcode), .formerr), parsed.header.rcode);
 }
 
-
 test "RFC 9619: an OPCODE 0 query with QDCOUNT 2 is answered FORMERR" {
     var runtime = try Runtime.fromZoneText(
         \\$ORIGIN home.arpa.
@@ -1324,6 +1338,46 @@ test "RFC 9619: an OPCODE 0 query with QDCOUNT 2 is answered FORMERR" {
     var text: [64]u8 = undefined;
     try std.testing.expectEqualStrings("dns.home.arpa.", try parsed.question.?.name.toText(&text));
 }
+
+test "RFC 9619: a TSIG-signed OPCODE 0 query with QDCOUNT 2 is answered FORMERR" {
+    const now = 1_700_000_000;
+    var keyring = try keyring_mod.Keyring.parse("key \"key.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };");
+    var runtime = try Runtime.fromZoneTextWithKeyring(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
+        \\
+    , &keyring);
+    defer runtime.deinit();
+    runtime.setTsigNow(now);
+
+    // The signed path strips the TSIG record and parses the rest, so the
+    // QDCOUNT > 1 rejection has to hold there too, not only on the
+    // unsigned path.
+    const two_questions = [_]u8{
+        3,    'd',  'n',  's',  4,    'h',  'o',  'm', 'e', 4,   'a', 'r',
+        'p',  'a',  0,    0x00, 0x01, 0x00, 0x01, 5,   'a', 'l', 'i', 'a',
+        's',  4,    'h',  'o',  'm',  'e',  4,    'a', 'r', 'p', 'a', 0,
+        0x00, 0x01, 0x00, 0x01,
+    };
+    const query = try makeSignedQueryWithQuestions(now, 32, false, 2, &two_questions);
+    try std.testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, query.packet[4..6], .big));
+    var output: [1024]u8 = undefined;
+    const response_bytes = try runtime.answer(query.packet[0..query.len], &output);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expect(parsed.header.qr);
+    try std.testing.expectEqual(@as(@TypeOf(parsed.header.rcode), .formerr), parsed.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.question_count);
+    try std.testing.expectEqual(@as(u16, 0), parsed.header.answer_count);
+    var text: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("dns.home.arpa.", try parsed.question.?.name.toText(&text));
+}
+
 test "RFC 9619: a non-query OPCODE with QDCOUNT 2 is answered FORMERR" {
     var runtime = try Runtime.fromZoneText(
         \\$ORIGIN home.arpa.

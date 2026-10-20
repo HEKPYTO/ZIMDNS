@@ -1270,6 +1270,39 @@ test "UDP request pipeline answers NSID with configured payload" {
     try std.testing.expect(found);
 }
 
+test "the query CLI asks for NSID and prints the server's identifier" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(fixture_zone);
+    defer runtime.deinit();
+    runtime.answer_policy.nsid = try std.heap.page_allocator.dupe(u8, "ns1.example.");
+
+    var server_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server_socket = try std.Io.net.IpAddress.bind(&server_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer server_socket.close(io);
+
+    var client_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var client_socket = try std.Io.net.IpAddress.bind(&client_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer client_socket.close(io);
+
+    // The CLI's own packet: the NSID request is the empty RFC 5001 option.
+    var query_buffer: [512]u8 = undefined;
+    const query = try cli_query.buildQueryPacketWithEdns(&query_buffer, 0x42f1, "target.home.arpa.", .A, .{ .nsid = true });
+    try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, query);
+    try listener.serveUdpOnce(&server_socket, io, &runtime);
+
+    var response_buffer: [512]u8 = undefined;
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try cli_query.writeResponse(response, &output.writer);
+    // RFC 5001 section 2.4: the identifier prints as two hexadecimal digits
+    // per octet.
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "; NSID: 6e73312e6578616d706c652e") != null);
+}
+
 test "TCP request pipeline answers NSID with configured payload" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

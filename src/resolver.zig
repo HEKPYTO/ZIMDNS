@@ -257,6 +257,8 @@ pub const CookieReplayDb = struct {
 };
 
 const CacheKey = struct {
+    /// The question name in wire form: the RFC 8020 cut compares a name
+    /// with its ancestors, and only the label structure says where one ends.
     name: [256]u8 = undefined,
     name_len: usize = 0,
     qtype: u16 = 0,
@@ -272,8 +274,8 @@ const CacheKey = struct {
             .checking_disabled = question.header.checking_disabled,
             .dnssec_ok = if (question.edns) |edns| edns.dnssec_ok else false,
         };
-        const name = q.name.toText(&key.name) catch return error.BadQuery;
-        key.name_len = name.len;
+        @memcpy(key.name[0..q.name.wire_len], q.name.asWire());
+        key.name_len = q.name.wire_len;
         return key;
     }
 
@@ -289,6 +291,7 @@ const CacheEntry = struct {
     key: CacheKey = .{},
     stored_at: i64 = 0,
     ttl: u32 = 0,
+    negative: bool = false,
     nxdomain: bool = false,
 };
 
@@ -351,6 +354,7 @@ const Cache = struct {
             .key = key,
             .stored_at = now,
             .ttl = ttl_info.ttl,
+            .negative = ttl_info.negative,
             .nxdomain = ttl_info.nxdomain,
         };
     }
@@ -369,11 +373,12 @@ const Cache = struct {
             if (!fresh and (!allow_stale or !stale)) {
                 self.allocator.free(entry.response.?);
                 entry.* = .{};
-                return null;
+                break;
             }
 
             var message = dns_message.Message.parse(arena.allocator(), entry.response.?) catch return null;
             ageMessage(&message, @intCast(elapsed), if (fresh) null else STALE_TTL);
+            if (fresh and entry.negative) applyNegativeTtl(&message, remainingTtl(entry, elapsed));
             message.header.id = query.header.id;
             message.header.recursion_desired = query.header.recursion_desired;
             message.header.recursion_available = true;
@@ -386,34 +391,113 @@ const Cache = struct {
             message.encode(&writer) catch return Error.ResponseTooLarge;
             return .{ .stale = !fresh, .bytes = writer.written() };
         }
-        return null;
+        return self.cutLookup(key, query, now, output, arena.allocator());
+    }
+
+    /// RFC 8020 section 2: a cached NXDOMAIN makes every name at or below it
+    /// unreachable, so a later query for a descendant is answered from the
+    /// cache with that denial instead of going upstream. RFC 8020 section 3.2
+    /// revises RFC 2308 section 5 the same way: the descendant of the
+    /// original QNAME with the same class is answered from the cache. The
+    /// scan walks the same table, so the cache keeps its entry limit.
+    fn cutLookup(self: *Cache, key: *const CacheKey, query: dns_message.Message, now: i64, output: []u8, allocator: std.mem.Allocator) !?LookupResult {
+        var cut: ?*CacheEntry = null;
+        var index: usize = 0;
+        while (index < self.len) : (index += 1) {
+            const entry = &self.entries[index];
+            if (entry.response == null) continue;
+            if (!entry.nxdomain) continue;
+            if (entry.key.qclass != key.qclass) continue;
+            if (entry.key.checking_disabled != key.checking_disabled) continue;
+            if (entry.key.dnssec_ok != key.dnssec_ok) continue;
+            const elapsed = @max(@as(i64, 0), now - entry.stored_at);
+            if (elapsed >= @as(i64, entry.ttl)) continue;
+            if (!isDescendant(key.name[0..key.name_len], entry.key.name[0..entry.key.name_len])) continue;
+            // The closest enclosing denial is the one that names the answer.
+            if (cut == null or entry.key.name_len > cut.?.key.name_len) cut = entry;
+        }
+        const entry = cut orelse return null;
+        const elapsed = @max(@as(i64, 0), now - entry.stored_at);
+        var message = try dns_message.Message.parse(allocator, entry.response.?);
+        // The cached answer belongs to the name above, so its records do not
+        // answer this one; the denial and its SOA do.
+        message.answers.len = 0;
+        message.header.answer_count = 0;
+        message.header.id = query.header.id;
+        message.header.recursion_desired = query.header.recursion_desired;
+        message.header.recursion_available = true;
+        message.header.checking_disabled = query.header.checking_disabled;
+        message.question = query.question;
+        ageMessage(&message, elapsed, null);
+        applyNegativeTtl(&message, remainingTtl(entry, elapsed));
+        stripProofsForClient(&message, query);
+        if (query.edns != null) try appendOpt(&message, query.edns.?);
+        var writer = dns_writer.Writer.init(output);
+        message.encode(&writer) catch return Error.ResponseTooLarge;
+        return .{ .stale = false, .bytes = writer.written() };
     }
 };
+
+/// The TTL a negative answer still has left, which is the negative TTL of
+/// the entry (RFC 2308 section 5) less the time it has been cached.
+fn remainingTtl(entry: *const CacheEntry, elapsed: i64) u32 {
+    return entry.ttl -| @as(u32, @intCast(elapsed));
+}
+
+/// RFC 2308 section 6: the cached SOA record joins the answer with the TTL
+/// it has left, so the client sees when the denial expires.
+fn applyNegativeTtl(message: *dns_message.Message, ttl: u32) void {
+    for (message.authorities.items[0..message.authorities.len]) |*record| {
+        if (record.rrtype.eql(.SOA)) record.ttl = ttl;
+    }
+}
+
+/// True when `name` sits strictly below `ancestor` in the DNS tree. Both
+/// are wire names, so the label structure decides where the ancestor starts.
+fn isDescendant(name: []const u8, ancestor: []const u8) bool {
+    if (ancestor.len >= name.len) return false;
+    if (!std.mem.endsWith(u8, name, ancestor)) return false;
+    // The root sits above every other name.
+    if (ancestor.len == 1 and ancestor[0] == 0) return true;
+    const offset = name.len - ancestor.len;
+    var index: usize = 0;
+    while (index < name.len) {
+        const len = name[index];
+        if (len == 0) break;
+        if (index == offset) return true;
+        index += 1 + len;
+    }
+    return false;
+}
 
 const LookupResult = struct {
     stale: bool,
     bytes: []const u8,
 };
 
-const TtlInfo = struct { ttl: u32, nxdomain: bool };
+const TtlInfo = struct { ttl: u32, negative: bool, nxdomain: bool };
 
+/// RFC 2308 section 5: a negative answer is carried by the SOA record in
+/// the authority section, and its TTL is the smaller of that record's TTL
+/// and the SOA MINIMUM field. RFC 9520 section 2 keeps NXDOMAIN and NODATA
+/// out of the resolution-failure cache, so they follow this rule.
 fn cacheTtl(message: *const dns_message.Message) ?TtlInfo {
     if (message.header.rcode == .nxdomain) {
         var ttl: ?u32 = null;
         for (message.authorities.slice()) |record| {
             if (record.rrtype.eql(.SOA)) ttl = @min(ttl orelse record.ttl, @min(record.ttl, record.rdata.SOA.minimum));
         }
-        return if (ttl) |value| .{ .ttl = value, .nxdomain = true } else null;
+        return if (ttl) |value| .{ .ttl = value, .negative = true, .nxdomain = true } else null;
     }
     if (message.header.answer_count == 0) {
         for (message.authorities.slice()) |record| {
-            if (record.rrtype.eql(.SOA)) return .{ .ttl = @min(record.ttl, record.rdata.SOA.minimum), .nxdomain = false };
+            if (record.rrtype.eql(.SOA)) return .{ .ttl = @min(record.ttl, record.rdata.SOA.minimum), .negative = true, .nxdomain = false };
         }
         return null;
     }
     var ttl: ?u32 = null;
     for (message.answers.slice()) |record| ttl = @min(ttl orelse record.ttl, record.ttl);
-    return if (ttl) |value| .{ .ttl = value, .nxdomain = false } else null;
+    return if (ttl) |value| .{ .ttl = value, .negative = false, .nxdomain = false } else null;
 }
 
 fn ageMessage(message: *dns_message.Message, elapsed: i64, stale_ttl: ?u32) void {
@@ -1352,6 +1436,179 @@ test "cache reuses an expired slot instead of evicting a live entry" {
     try std.testing.expect(!fresh.stale);
 }
 
+test "RFC 8020 section 2: a cached NXDOMAIN cuts the names below it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cache = Cache.init(std.testing.allocator);
+    defer cache.deinit();
+    var output: [2048]u8 = undefined;
+
+    var denied = try makeTestQuery(arena.allocator(), 0x2800, "a.example.", false);
+    defer denied.deinit();
+    var denial = try makeNxdomainResponse(arena.allocator(), "a.example.", 60, 30);
+    defer denial.deinit();
+    const denied_key = try CacheKey.fromQuestion(denied);
+    try cache.put(denied_key, &denial, 1000);
+
+    // A direct child of the denied name is cut.
+    var child = try makeTestQuery(arena.allocator(), 0x2801, "b.a.example.", false);
+    defer child.deinit();
+    const child_key = try CacheKey.fromQuestion(child);
+    const child_hit = (try cache.lookup(&child_key, child, 1000, &output, false)).?;
+    try std.testing.expect(!child_hit.stale);
+    const child_message = try dns_message.Message.parse(arena.allocator(), child_hit.bytes);
+    try std.testing.expectEqual(dns_header.Rcode.nxdomain, child_message.header.rcode);
+    try std.testing.expectEqual(@as(u16, 0), child_message.header.answer_count);
+    try std.testing.expectEqual(@as(u16, 1), child_message.header.authority_count);
+    try std.testing.expect(child_message.authorities.items[0].rrtype.eql(.SOA));
+    var question_buffer: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("b.a.example.", try child_message.question.?.name.toText(&question_buffer));
+
+    // A deeper descendant is cut as well.
+    var deep = try makeTestQuery(arena.allocator(), 0x2802, "c.d.a.example.", false);
+    defer deep.deinit();
+    const deep_key = try CacheKey.fromQuestion(deep);
+    const deep_hit = (try cache.lookup(&deep_key, deep, 1000, &output, false)).?;
+    const deep_message = try dns_message.Message.parse(arena.allocator(), deep_hit.bytes);
+    try std.testing.expectEqual(dns_header.Rcode.nxdomain, deep_message.header.rcode);
+
+    // A sibling of the denied name and the name above it are not cut.
+    var sibling = try makeTestQuery(arena.allocator(), 0x2803, "x.example.", false);
+    defer sibling.deinit();
+    const sibling_key = try CacheKey.fromQuestion(sibling);
+    try std.testing.expect((try cache.lookup(&sibling_key, sibling, 1000, &output, false)) == null);
+
+    var ancestor = try makeTestQuery(arena.allocator(), 0x2804, "example.", false);
+    defer ancestor.deinit();
+    const ancestor_key = try CacheKey.fromQuestion(ancestor);
+    try std.testing.expect((try cache.lookup(&ancestor_key, ancestor, 1000, &output, false)) == null);
+}
+
+test "RFC 8020 section 2: a cached answer below a cut name still wins" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cache = Cache.init(std.testing.allocator);
+    defer cache.deinit();
+    var output: [2048]u8 = undefined;
+
+    var denied = try makeTestQuery(arena.allocator(), 0x2810, "a.example.", false);
+    defer denied.deinit();
+    var denial = try makeNxdomainResponse(arena.allocator(), "a.example.", 60, 30);
+    defer denial.deinit();
+    const denied_key = try CacheKey.fromQuestion(denied);
+    try cache.put(denied_key, &denial, 1000);
+
+    var positive_query = try makeTestQuery(arena.allocator(), 0x2811, "b.a.example.", false);
+    defer positive_query.deinit();
+    var positive = try makePositiveResponseFor(arena.allocator(), "b.a.example.", 120);
+    defer positive.deinit();
+    const positive_key = try CacheKey.fromQuestion(positive_query);
+    try cache.put(positive_key, &positive, 1000);
+
+    const hit = (try cache.lookup(&positive_key, positive_query, 1000, &output, false)).?;
+    const message = try dns_message.Message.parse(arena.allocator(), hit.bytes);
+    try std.testing.expectEqual(dns_header.Rcode.no_error, message.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), message.header.answer_count);
+    try std.testing.expect(message.answers.items[0].rrtype.eql(.A));
+}
+
+test "RFC 8020 section 2: the cut expires with the cached entry" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cache = Cache.init(std.testing.allocator);
+    defer cache.deinit();
+    var output: [2048]u8 = undefined;
+
+    var denied = try makeTestQuery(arena.allocator(), 0x2820, "a.example.", false);
+    defer denied.deinit();
+    var denial = try makeNxdomainResponse(arena.allocator(), "a.example.", 60, 30);
+    defer denial.deinit();
+    const denied_key = try CacheKey.fromQuestion(denied);
+    try cache.put(denied_key, &denial, 1000);
+
+    var child = try makeTestQuery(arena.allocator(), 0x2821, "b.a.example.", false);
+    defer child.deinit();
+    const child_key = try CacheKey.fromQuestion(child);
+    // The negative TTL is 30 seconds, so the cut lives exactly that long.
+    const hit = (try cache.lookup(&child_key, child, 1029, &output, false)).?;
+    try std.testing.expect(!hit.stale);
+    try std.testing.expect((try cache.lookup(&child_key, child, 1030, &output, false)) == null);
+}
+
+test "RFC 2308 section 5: the negative TTL is the smaller of the SOA TTL and the SOA MINIMUM" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cache = Cache.init(std.testing.allocator);
+    defer cache.deinit();
+    var output: [2048]u8 = undefined;
+
+    var denied = try makeTestQuery(arena.allocator(), 0x2830, "a.example.", false);
+    defer denied.deinit();
+    // SOA TTL 60 with MINIMUM 30: the denial lives 30 seconds.
+    var denial = try makeNxdomainResponse(arena.allocator(), "a.example.", 60, 30);
+    defer denial.deinit();
+    const denied_key = try CacheKey.fromQuestion(denied);
+    try cache.put(denied_key, &denial, 1000);
+
+    const exact = (try cache.lookup(&denied_key, denied, 1000, &output, false)).?;
+    const exact_message = try dns_message.Message.parse(arena.allocator(), exact.bytes);
+    try std.testing.expectEqual(@as(u32, 30), exact_message.authorities.items[0].ttl);
+    const later = (try cache.lookup(&denied_key, denied, 1001, &output, false)).?;
+    const later_message = try dns_message.Message.parse(arena.allocator(), later.bytes);
+    try std.testing.expectEqual(@as(u32, 29), later_message.authorities.items[0].ttl);
+
+    var child = try makeTestQuery(arena.allocator(), 0x2831, "b.a.example.", false);
+    defer child.deinit();
+    const child_key = try CacheKey.fromQuestion(child);
+    const cut = (try cache.lookup(&child_key, child, 1000, &output, false)).?;
+    const cut_message = try dns_message.Message.parse(arena.allocator(), cut.bytes);
+    try std.testing.expectEqual(@as(u32, 30), cut_message.authorities.items[0].ttl);
+
+    // SOA TTL 20 with MINIMUM 300: the denial lives 20 seconds.
+    var short = try makeTestQuery(arena.allocator(), 0x2832, "c.example.", false);
+    defer short.deinit();
+    var short_denial = try makeNxdomainResponse(arena.allocator(), "c.example.", 20, 300);
+    defer short_denial.deinit();
+    const short_key = try CacheKey.fromQuestion(short);
+    try cache.put(short_key, &short_denial, 1000);
+    const short_hit = (try cache.lookup(&short_key, short, 1000, &output, false)).?;
+    const short_message = try dns_message.Message.parse(arena.allocator(), short_hit.bytes);
+    try std.testing.expectEqual(@as(u32, 20), short_message.authorities.items[0].ttl);
+}
+
+test "RFC 8020 section 2: a descendant of a cached NXDOMAIN is answered without an upstream query" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = try std.Io.net.IpAddress.parse("127.0.0.1", 9) },
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const now: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+
+    var denied = try makeTestQuery(arena.allocator(), 0x2840, "a.example.", false);
+    defer denied.deinit();
+    var denial = try makeNxdomainResponse(arena.allocator(), "a.example.", 60, 30);
+    defer denial.deinit();
+    const denied_key = try CacheKey.fromQuestion(denied);
+    try resolver.cache.put(denied_key, &denial, now);
+
+    var query = try makeTestQuery(arena.allocator(), 0x2841, "b.a.example.", false);
+    defer query.deinit();
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42610);
+    // The forwarder points at a closed port, so an upstream attempt would
+    // fail instead of answering.
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    const parsed = try dns_message.Message.parse(arena.allocator(), bytes);
+    try std.testing.expectEqual(dns_header.Rcode.nxdomain, parsed.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.authority_count);
+    try std.testing.expectEqual(@as(u16, 0), parsed.header.answer_count);
+}
+
 test "resolver treats missing cookie normally and rejects an invalid cookie" {
     const io = std.Io.Threaded.global_single_threaded.io();
     const client = try std.Io.net.IpAddress.parse("127.0.0.1", 12346);
@@ -2153,12 +2410,16 @@ fn encodeTestMessage(message: dns_message.Message, buffer: []u8) ![]const u8 {
 }
 
 fn makePositiveResponse(allocator: std.mem.Allocator, ttl: u32) !dns_message.Message {
-    var message = try makeTestQuery(allocator, 0x1100, "example.com.", false);
+    return makePositiveResponseFor(allocator, "example.com.", ttl);
+}
+
+fn makePositiveResponseFor(allocator: std.mem.Allocator, name_text: []const u8, ttl: u32) !dns_message.Message {
+    var message = try makeTestQuery(allocator, 0x1100, name_text, false);
     message.header.qr = true;
     message.header.recursion_available = true;
     errdefer message.deinit();
     try message.answers.append(.{
-        .owner = try dns_name.Name.fromText("example.com."),
+        .owner = try dns_name.Name.fromText(name_text),
         .rrtype = .A,
         .class = .IN,
         .ttl = ttl,
@@ -2169,7 +2430,14 @@ fn makePositiveResponse(allocator: std.mem.Allocator, ttl: u32) !dns_message.Mes
 }
 
 fn makeNegativeResponse(allocator: std.mem.Allocator, ttl: u32, minimum: u32) !dns_message.Message {
-    var message = try makeTestQuery(allocator, 0x1101, "missing.example.", false);
+    return makeNxdomainResponse(allocator, "missing.example.", ttl, minimum);
+}
+
+/// An NXDOMAIN answer for `name_text` whose authority section carries the
+/// SOA of the zone, with the record TTL and the MINIMUM field given apart
+/// so the negative TTL rule can be exercised.
+fn makeNxdomainResponse(allocator: std.mem.Allocator, name_text: []const u8, ttl: u32, minimum: u32) !dns_message.Message {
+    var message = try makeTestQuery(allocator, 0x1101, name_text, false);
     message.header.qr = true;
     message.header.rcode = .nxdomain;
     errdefer message.deinit();

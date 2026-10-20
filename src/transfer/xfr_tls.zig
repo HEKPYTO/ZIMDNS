@@ -24,7 +24,6 @@ pub const MAX_FRAMES_PER_CONNECTION = listener.TCP_MAX_FRAMES_PER_CONNECTION;
 pub const MAX_CONNECTION_WORKERS = listener.TCP_MAX_CONNECTION_WORKERS;
 const IO_TIMEOUT = listener.TCP_IO_TIMEOUT;
 
-
 pub fn serveXfrStreamOnceWithMetrics(
     stream: std.Io.net.Stream,
     io: std.Io,

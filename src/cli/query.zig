@@ -36,6 +36,9 @@ pub const EdnsRequest = struct {
     /// RFC 9660 section 3.1: an empty ZONEVERSION option asks an
     /// authoritative server for the version of the zone it answered from.
     zoneversion: bool = false,
+    /// RFC 5001 section 2.1: an empty NSID option asks a server for its own
+    /// identifier. The request carries no payload data of its own.
+    nsid: bool = false,
 };
 
 /// Builds the query packet. `dnssec_ok` sets the RFC 6891 section 6.1.1 DO
@@ -66,7 +69,7 @@ pub fn buildQueryPacketWithEdns(
 ) ![]const u8 {
     var writer = dns_writer.Writer.init(buffer);
     const qname = dns_name.Name.fromText(name_text) catch return Error.BadName;
-    const want_opt = edns.dnssec_ok or edns.zoneversion;
+    const want_opt = edns.dnssec_ok or edns.zoneversion or edns.nsid;
     const message = dns_message.Message{
         .header = dns_header.Header{
             .id = id,
@@ -82,14 +85,18 @@ pub fn buildQueryPacketWithEdns(
     };
     try message.encode(&writer);
     if (want_opt) {
-        var options: [4]u8 = undefined;
-        var options_len: usize = 0;
+        // RFC 6891 section 6.1.2 option framing: code, length, payload. The
+        // shared builder writes it and keeps the bound in one place.
+        var opt = dns_rdata.Opt{};
         if (edns.zoneversion) {
             // RFC 9660 section 3.1: the query's ZONEVERSION option is empty,
             // and a query carries it at most once.
-            std.mem.writeInt(u16, options[0..2], dns_rdata.EDNS_ZONEVERSION_OPTION_CODE, .big);
-            std.mem.writeInt(u16, options[2..4], 0, .big);
-            options_len = 4;
+            _ = opt.appendOption(dns_rdata.EDNS_ZONEVERSION_OPTION_CODE, &.{});
+        }
+        if (edns.nsid) {
+            // RFC 5001 section 2.1: the querier signals with an empty NSID
+            // option and must not send payload data of its own.
+            _ = opt.appendOption(dns_rdata.EDNS_NSID_OPTION_CODE, &.{});
         }
         // owner is root, type OPT, CLASS is the payload size, TTL carries
         // extended RCODE (high byte), version, and DO (0x8000).
@@ -97,8 +104,8 @@ pub fn buildQueryPacketWithEdns(
         try writer.writeU16(dns_types.RecordType.OPT.code());
         try writer.writeU16(dns_message.DEFAULT_EDNS_UDP_PAYLOAD_SIZE);
         try writer.writeU32(if (edns.dnssec_ok) 0x8000 else 0);
-        try writer.writeU16(@intCast(options_len));
-        try writer.writeBytes(options[0..options_len]);
+        try writer.writeU16(@intCast(opt.bytes().len));
+        try writer.writeBytes(opt.bytes());
     }
     return writer.written();
 }
@@ -161,10 +168,13 @@ fn writeOptPseudoSection(response: dns_message.Message, writer: *std.Io.Writer) 
 }
 
 fn optOptions(response: dns_message.Message) ?[]const u8 {
-    for (response.additionals.slice()) |record| {
+    // The OPT payload is read through a pointer into the message: a
+    // by-value capture copies the record, and the slice would then point into
+    // a temporary that is gone before the caller reads the bytes.
+    for (response.additionals.slice()) |*record| {
         if (!record.rrtype.eql(.OPT)) continue;
         return switch (record.rdata) {
-            .OPT => |opt| opt.bytes(),
+            .OPT => |*opt| opt.bytes(),
             else => unreachable,
         };
     }
@@ -1308,14 +1318,39 @@ test "the query packet carries an empty ZONEVERSION option when the operator ask
     const opt_data = dns_rdata.findOption(options, dns_rdata.EDNS_ZONEVERSION_OPTION_CODE) orelse return error.ZoneversionMissing;
     try std.testing.expectEqual(@as(usize, 0), opt_data.len);
 }
+test "the query packet carries an empty NSID option when the operator asks" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buffer: [512]u8 = undefined;
+    const packet = try buildQueryPacketWithEdns(&buffer, 0x1234, "target.home.arpa.", .A, .{ .nsid = true });
+    const parsed = try dns_message.Message.parseQuery(arena.allocator(), packet);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.additional_count);
+    const options = optOptions(parsed) orelse return error.NoEdnsOptions;
+    const opt_data = dns_rdata.findOption(options, dns_rdata.EDNS_NSID_OPTION_CODE) orelse return error.NsidMissing;
+    // RFC 5001 section 2.1: the request carries no payload data of its own.
+    try std.testing.expectEqual(@as(usize, 0), opt_data.len);
+}
+test "the query packet carries both EDNS options in one OPT record" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buffer: [512]u8 = undefined;
+    const packet = try buildQueryPacketWithEdns(&buffer, 0x1234, "target.home.arpa.", .A, .{ .zoneversion = true, .nsid = true });
+    const parsed = try dns_message.Message.parseQuery(arena.allocator(), packet);
+    const options = optOptions(parsed) orelse return error.NoEdnsOptions;
+    try std.testing.expect(dns_rdata.findOption(options, dns_rdata.EDNS_ZONEVERSION_OPTION_CODE) != null);
+    try std.testing.expect(dns_rdata.findOption(options, dns_rdata.EDNS_NSID_OPTION_CODE) != null);
+}
 test "query formatter prints the OPT pseudosection with the RFC 9660 zone version" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const response = try dns_message.Message.parse(arena.allocator(), &.{
         0x12, 0x34, 0x85, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
-        0x03, 'w', 'w', 'w', 0x07, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0x03, 'c', 'o', 'm', 0x00,
-        0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x29, 0x05, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x0a, 0x00, 0x13, 0x00, 0x06, 0x02, 0x00, 0x78, 0x95, 0xa4, 0xe9,
+        0x03, 'w',  'w',  'w',  0x07, 'e',  'x',  'a',  'm',  'p',  'l',  'e',
+        0x03, 'c',  'o',  'm',  0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x29,
+        0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x13, 0x00, 0x06,
+        0x02, 0x00, 0x78, 0x95, 0xa4, 0xe9,
     });
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
@@ -1325,3 +1360,22 @@ test "query formatter prints the OPT pseudosection with the RFC 9660 zone versio
     try std.testing.expect(std.mem.indexOf(u8, text, "; ZONEVERSION: SOA-SERIAL 2023073001 (example.com.)") != null);
 }
 
+test "query formatter prints the NSID payload as hexadecimal per RFC 5001 section 2.4" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // A response whose OPT carries an NSID option (code 3) with the payload
+    // octets 0x0a 0xff 0x6e. Section 2.4 presents every octet as two
+    // hexadecimal digits, so an octet below 0x10 keeps its leading zero.
+    const response = try dns_message.Message.parse(arena.allocator(), &.{
+        0x12, 0x34, 0x85, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        0x03, 'w',  'w',  'w',  0x07, 'e',  'x',  'a',  'm',  'p',  'l',  'e',
+        0x03, 'c',  'o',  'm',  0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x29,
+        0x04, 0xd0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x00, 0x03, 0x00, 0x03,
+        0x0a, 0xff, 0x6e,
+    });
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try writeResponse(response, &output.writer);
+    const text = output.written();
+    try std.testing.expect(std.mem.indexOf(u8, text, "; NSID: 0aff6e") != null);
+}

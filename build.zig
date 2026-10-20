@@ -1,5 +1,66 @@
 const std = @import("std");
 
+// Test discovery rule, for contributors:
+//
+//   test/<group>/<name>_test.zig  is a test root for <group>.
+//
+// <group> must be one of: unit, golden, config, fuzz, integration, cli.
+// A new test file needs no edit here: drop it into its group directory and
+// the matching step runs it. Files under test/ that do not end in _test.zig
+// are fixtures, not roots, and are ignored. A *_test.zig file under any
+// other directory fails the build, so a mistyped directory cannot silently
+// drop tests.
+//
+//   unit         -> test               golden -> test-golden
+//   config       -> test-config        fuzz   -> test-fuzz
+//   integration  -> test-integration   cli    -> test-cli
+//
+// Every root imports the "zimdns" module. The fuzz group also imports
+// "fuzz_options" (seed, iterations); the cli group also imports
+// "build_options" (version, exe_path) and runs with the project root as its
+// working directory. The unit group imports "zimdns" only: the unit tests
+// embedded in src/main.zig are the root module of the main test artifact and
+// read the build options themselves.
+
+/// The options module a group's roots import next to "zimdns".
+const Extra = enum {
+    /// No options module, like the unit, golden, config and integration roots.
+    none,
+    /// "fuzz_options" with the seed and the iteration budget.
+    fuzz,
+    /// "build_options" with the version string and the executable path.
+    cli,
+};
+
+const Group = struct {
+    /// Directory under test/ holding the group's roots.
+    dir: []const u8,
+    /// Build step that runs them.
+    step: []const u8,
+    /// Description of that step.
+    desc: []const u8,
+    /// Options module the group's roots import.
+    extra: Extra,
+};
+
+const groups = [_]Group{
+    .{ .dir = "unit", .step = "test", .desc = "Run unit tests", .extra = .none },
+    .{ .dir = "golden", .step = "test-golden", .desc = "Run DNS wire-format golden tests", .extra = .none },
+    .{ .dir = "config", .step = "test-config", .desc = "Run config file integration tests", .extra = .none },
+    .{ .dir = "fuzz", .step = "test-fuzz", .desc = "Run deterministic DNS parser fuzz tests", .extra = .fuzz },
+    .{ .dir = "integration", .step = "test-integration", .desc = "Run loopback DNS pipeline integration tests", .extra = .none },
+    .{ .dir = "cli", .step = "test-cli", .desc = "Run every invocation documented in --help and examples/", .extra = .cli },
+};
+
+/// The known group names, for error messages.
+const group_names = blk: {
+    var names: []const u8 = "";
+    for (groups, 0..) |group, i| {
+        names = names ++ (if (i == 0) "" else ", ") ++ group.dir;
+    }
+    break :blk names;
+};
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -23,77 +84,11 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run zimdns");
     run_step.dependOn(&run_cmd.step);
 
-    const unit_test_module = mainModule(b, target, optimize, build_options);
-    const unit_tests = b.addTest(.{
-        .root_module = unit_test_module,
-    });
-    const run_unit_tests = b.addRunArtifact(unit_tests);
-
-    const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_unit_tests.step);
-
-    const golden_test_module = b.createModule(.{
-        .root_source_file = b.path("test/golden/golden_test.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    golden_test_module.addImport("zimdns", mainModule(b, target, optimize, build_options));
-    const golden_tests = b.addTest(.{
-        .root_module = golden_test_module,
-    });
-    const run_golden_tests = b.addRunArtifact(golden_tests);
-
-    const golden_step = b.step("test-golden", "Run DNS wire-format golden tests");
-    golden_step.dependOn(&run_golden_tests.step);
-
-    const config_test_module = b.createModule(.{
-        .root_source_file = b.path("test/config/config_test.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    config_test_module.addImport("zimdns", mainModule(b, target, optimize, build_options));
-    const config_tests = b.addTest(.{
-        .root_module = config_test_module,
-    });
-    const run_config_tests = b.addRunArtifact(config_tests);
-
-    const config_step = b.step("test-config", "Run config file integration tests");
-    config_step.dependOn(&run_config_tests.step);
-
     const fuzz_seed = b.option(u64, "fuzz-seed", "Seed for deterministic parser fuzzing") orelse 0x5eed_7a57;
     const fuzz_iterations = b.option(usize, "fuzz-iterations", "Parser fuzz iteration budget") orelse 4096;
     const fuzz_options = b.addOptions();
     fuzz_options.addOption(u64, "seed", fuzz_seed);
     fuzz_options.addOption(usize, "iterations", fuzz_iterations);
-
-    const fuzz_test_module = b.createModule(.{
-        .root_source_file = b.path("test/fuzz/fuzz_dns_parser.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    fuzz_test_module.addOptions("fuzz_options", fuzz_options);
-    fuzz_test_module.addImport("zimdns", mainModule(b, target, optimize, build_options));
-    const fuzz_tests = b.addTest(.{
-        .root_module = fuzz_test_module,
-    });
-    const run_fuzz_tests = b.addRunArtifact(fuzz_tests);
-
-    const fuzz_step = b.step("test-fuzz", "Run deterministic DNS parser fuzz tests");
-    fuzz_step.dependOn(&run_fuzz_tests.step);
-
-    const integration_test_module = b.createModule(.{
-        .root_source_file = b.path("test/integration/pipeline_test.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    integration_test_module.addImport("zimdns", mainModule(b, target, optimize, build_options));
-    const integration_tests = b.addTest(.{
-        .root_module = integration_test_module,
-    });
-    const run_integration_tests = b.addRunArtifact(integration_tests);
-
-    const integration_step = b.step("test-integration", "Run loopback DNS pipeline integration tests");
-    integration_step.dependOn(&run_integration_tests.step);
 
     // The documented-CLI guard runs the built binary, so it needs the emitted
     // artifact path and a working directory at the project root, where the
@@ -102,23 +97,45 @@ pub fn build(b: *std.Build) void {
     cli_options.addOption([]const u8, "version", version);
     cli_options.addOptionPath("exe_path", exe.getEmittedBin());
 
-    const cli_test_module = b.createModule(.{
-        .root_source_file = b.path("test/cli/documented_invocation_test.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    cli_test_module.addOptions("build_options", cli_options);
-    cli_test_module.addImport("zimdns", mainModule(b, target, optimize, build_options));
-    const cli_tests = b.addTest(.{ .root_module = cli_test_module });
-    const run_cli_tests = b.addRunArtifact(cli_tests);
-    run_cli_tests.setCwd(b.path("."));
+    var group_steps: [groups.len]*std.Build.Step = undefined;
+    for (groups, 0..) |group, i| group_steps[i] = b.step(group.step, group.desc);
 
-    const cli_step = b.step("test-cli", "Run every invocation documented in --help and examples/");
-    cli_step.dependOn(&run_cli_tests.step);
+    // groups[0] is the unit group: the unit tests embedded in src/main.zig
+    // stay the root module of the main test artifact and share that step.
+    const unit_test_module = mainModule(b, target, optimize, build_options);
+    const unit_tests = b.addTest(.{
+        .root_module = unit_test_module,
+    });
+    const run_unit_tests = b.addRunArtifact(unit_tests);
+    group_steps[0].dependOn(&run_unit_tests.step);
+
+    // One test artifact per discovered root, wired to its group's step.
+    const roots = discoverTestRoots(b);
+    for (groups, roots, group_steps) |group, group_roots, group_step| {
+        for (group_roots) |root| {
+            const module = b.createModule(.{
+                .root_source_file = b.path(root),
+                .target = target,
+                .optimize = optimize,
+            });
+            module.addImport("zimdns", mainModule(b, target, optimize, build_options));
+            switch (group.extra) {
+                .none => {},
+                .fuzz => module.addOptions("fuzz_options", fuzz_options),
+                .cli => module.addOptions("build_options", cli_options),
+            }
+            const tests = b.addTest(.{
+                .root_module = module,
+            });
+            const run = b.addRunArtifact(tests);
+            if (group.extra == .cli) run.setCwd(b.path("."));
+            group_step.dependOn(&run.step);
+        }
+    }
 }
 
 /// Every artifact above compiles `src/main.zig`, so the build options it reads
-/// are attached here once instead of at six call sites.
+/// are attached here once instead of at every call site.
 fn mainModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, build_options: *std.Build.Step.Options) *std.Build.Module {
     const module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -127,4 +144,82 @@ fn mainModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     });
     module.addOptions("build_options", build_options);
     return module;
+}
+
+/// The test roots under test/, one list per group, in directory order.
+fn discoverTestRoots(b: *std.Build) [groups.len][]const []const u8 {
+    const arena = b.allocator;
+    var lists: [groups.len]std.ArrayList([]const u8) = @splat(.empty);
+
+    const io = b.graph.io;
+    const test_dir = b.root.openDir(io, "test", .{ .iterate = true }) catch |err| {
+        std.process.fatal("cannot open the test directory: {t}", .{err});
+    };
+    defer test_dir.close(io);
+
+    // A root added later must be picked up without a build.zig edit, so the
+    // configure phase is repeated when the test tree changes.
+    b.dependOnDirectoryContents(b.path("test"));
+
+    scanTestDir(b, test_dir, "test", null, 0, &lists);
+
+    var roots: [groups.len][]const []const u8 = undefined;
+    for (&lists, 0..) |*list, i| {
+        roots[i] = list.toOwnedSlice(arena) catch @panic("OOM");
+    }
+    return roots;
+}
+
+/// Collects the test roots of one directory, recursing into sub-directories.
+/// `rel` is the path of `dir` relative to the build root, `group` the name of
+/// the group directory holding it, and `depth` the distance below test/.
+fn scanTestDir(b: *std.Build, dir: std.Io.Dir, rel: []const u8, group: ?[]const u8, depth: usize, lists: *[groups.len]std.ArrayList([]const u8)) void {
+    const io = b.graph.io;
+    const arena = b.allocator;
+    var it = dir.iterate();
+    while (it.next(io) catch |err| {
+        std.process.fatal("cannot read the test directory {s}: {t}", .{ rel, err });
+    }) |entry| {
+        if (entry.kind == .directory) {
+            // A file added to a group directory later must repeat the
+            // configure phase, or the discovery result would go stale.
+            if (depth == 0) {
+                const path = joinPath(arena, &.{ "test", entry.name }) catch @panic("OOM");
+                b.dependOnDirectoryContents(b.path(path));
+            }
+            const child_rel = joinPath(arena, &.{ rel, entry.name }) catch @panic("OOM");
+            const child = dir.openDir(io, entry.name, .{ .iterate = true }) catch |err| {
+                std.process.fatal("cannot open the test directory {s}: {t}", .{ child_rel, err });
+            };
+            defer child.close(io);
+            scanTestDir(b, child, child_rel, group orelse entry.name, depth + 1, lists);
+            continue;
+        }
+        if (!std.mem.endsWith(u8, entry.name, "_test.zig")) continue;
+
+        // A test root must sit directly in a known group directory.
+        const path = joinPath(arena, &.{ rel, entry.name }) catch @panic("OOM");
+        const group_dir = group orelse {
+            std.process.fatal("test root {s} must live in a group directory ({s})", .{ path, group_names });
+        };
+        const index = groupIndex(group_dir) orelse {
+            std.process.fatal("unknown test group directory \"{s}\": expected one of {s}", .{ group_dir, group_names });
+        };
+        if (depth > 1) {
+            std.process.fatal("test root {s} must live directly in a group directory", .{path});
+        }
+        lists[index].append(arena, path) catch @panic("OOM");
+    }
+}
+
+/// The index of a group directory, or null when the name is not a group.
+fn groupIndex(dir: []const u8) ?usize {
+    for (groups, 0..) |group, i| {
+        if (std.mem.eql(u8, group.dir, dir)) return i;
+    }
+    return null;
+}
+
+fn joinPath(arena: std.mem.Allocator, parts: []const []const u8) ![]const u8 {
+    return std.mem.join(arena, "/", parts);
 }

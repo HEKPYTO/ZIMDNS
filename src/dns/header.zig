@@ -5,6 +5,25 @@ const std = @import("std");
 const Reader = @import("reader.zig").Reader;
 const Writer = @import("writer.zig").Writer;
 
+/// The flag bits of the header flags word, RFC 1035 section 4.1.1. AD and
+/// CD are two of the three bits the Z field reserved; RFC 4035 section 3.1.6
+/// and section 3.2.2 give their meaning, and the third Z bit stays reserved.
+pub const Flags = struct {
+    pub const qr: u16 = 0x8000;
+    pub const aa: u16 = 0x0400;
+    pub const tc: u16 = 0x0200;
+    pub const rd: u16 = 0x0100;
+    pub const ra: u16 = 0x0080;
+    /// RFC 1035 section 4.1.1: the Z bit, reserved for future use.
+    pub const reserved: u16 = 0x0040;
+    /// RFC 4035 section 3.1.6: the AD bit.
+    pub const ad: u16 = 0x0020;
+    /// RFC 4035 section 3.2.2: the CD bit.
+    pub const cd: u16 = 0x0010;
+    /// The RCODE field, the low four bits of the flags word.
+    pub const rcode: u16 = 0x000f;
+};
+
 pub const Opcode = enum(u4) {
     query = 0,
     iquery = 1,
@@ -70,6 +89,10 @@ pub const Header = struct {
     recursion_available: bool = false,
     authenticated_data: bool = false,
     checking_disabled: bool = false,
+    /// RFC 1035 section 4.1.1: the Z bit, reserved for future use. It must
+    /// be zero in every query and every response, so a received value is
+    /// recorded here and `encode` never writes it.
+    reserved: bool = false,
     rcode: Rcode = .no_error,
     question_count: u16 = 0,
     answer_count: u16 = 0,
@@ -105,14 +128,15 @@ pub const Header = struct {
 
         return .{
             .id = id,
-            .qr = (flags & 0x8000) != 0,
+            .qr = (flags & Flags.qr) != 0,
             .opcode = opcode,
-            .authoritative = (flags & 0x0400) != 0,
-            .truncated = (flags & 0x0200) != 0,
-            .recursion_desired = (flags & 0x0100) != 0,
-            .recursion_available = (flags & 0x0080) != 0,
-            .authenticated_data = (flags & 0x0020) != 0,
-            .checking_disabled = (flags & 0x0010) != 0,
+            .authoritative = (flags & Flags.aa) != 0,
+            .truncated = (flags & Flags.tc) != 0,
+            .recursion_desired = (flags & Flags.rd) != 0,
+            .recursion_available = (flags & Flags.ra) != 0,
+            .authenticated_data = (flags & Flags.ad) != 0,
+            .checking_disabled = (flags & Flags.cd) != 0,
+            .reserved = (flags & Flags.reserved) != 0,
             .rcode = rcode,
             .question_count = qd,
             .answer_count = an,
@@ -123,15 +147,17 @@ pub const Header = struct {
 
     pub fn encode(self: Header, writer: *Writer) !void {
         var flags: u16 = 0;
-        if (self.qr) flags |= 0x8000;
+        if (self.qr) flags |= Flags.qr;
         flags |= (@as(u16, @backingInt(self.opcode)) & 0x0f) << 11;
-        if (self.authoritative) flags |= 0x0400;
-        if (self.truncated) flags |= 0x0200;
-        if (self.recursion_desired) flags |= 0x0100;
-        if (self.recursion_available) flags |= 0x0080;
-        if (self.authenticated_data) flags |= 0x0020;
-        if (self.checking_disabled) flags |= 0x0010;
-        flags |= @as(u16, @backingInt(self.rcode)) & 0x0f;
+        if (self.authoritative) flags |= Flags.aa;
+        if (self.truncated) flags |= Flags.tc;
+        if (self.recursion_desired) flags |= Flags.rd;
+        if (self.recursion_available) flags |= Flags.ra;
+        if (self.authenticated_data) flags |= Flags.ad;
+        if (self.checking_disabled) flags |= Flags.cd;
+        // RFC 1035 section 4.1.1: the Z bit must be zero in all queries and
+        // responses, so the reserved bit is never written.
+        flags |= @as(u16, @backingInt(self.rcode)) & Flags.rcode;
 
         try writer.writeU16(self.id);
         try writer.writeU16(flags);
@@ -139,6 +165,45 @@ pub const Header = struct {
         try writer.writeU16(self.answer_count);
         try writer.writeU16(self.authority_count);
         try writer.writeU16(self.additional_count);
+    }
+};
+
+/// The flag bits of a response that the request does not supply. This is the
+/// one place the response header flags are decided, so the AD, CD, and Z
+/// rules are stated once.
+pub const ResponseFlags = struct {
+    /// AA, RFC 1035 section 4.1.1.
+    authoritative: bool = false,
+    /// TC, RFC 1035 section 4.1.1.
+    truncated: bool = false,
+    /// RA, RFC 1035 section 4.1.1.
+    recursion_available: bool = false,
+    /// AD, RFC 4035 section 3.1.6: set only when every RRset in the answer
+    /// and authority sections is authentic, so a validated answer carries it
+    /// and an authoritative one never does.
+    authenticated_data: bool = false,
+    /// RCODE, RFC 1035 section 4.1.1.
+    rcode: Rcode = .no_error,
+
+    /// The response header for `request`: QR set, OPCODE and RD copied from
+    /// the request, CD copied from the request (RFC 4035 section 3.2.2), and
+    /// the reserved Z bit never copied (RFC 1035 section 4.1.1). RFC 4035
+    /// section 3.1.6 only recommends clearing CD in an authoritative
+    /// response; the copy is kept because this server never validates.
+    pub fn header(self: ResponseFlags, request: Header) Header {
+        return .{
+            .id = request.id,
+            .qr = true,
+            .opcode = request.opcode,
+            .authoritative = self.authoritative,
+            .truncated = self.truncated,
+            .recursion_desired = request.recursion_desired,
+            .recursion_available = self.recursion_available,
+            .authenticated_data = self.authenticated_data,
+            .checking_disabled = request.checking_disabled,
+            .reserved = false,
+            .rcode = self.rcode,
+        };
     }
 };
 
@@ -209,4 +274,42 @@ test "header round trips NOTAUTH" {
     try std.testing.expectEqual(@as(u8, 9), output[3] & 0x0f);
     var reader = Reader.init(&output);
     try std.testing.expectEqual(Rcode.notauth, (try Header.parse(&reader)).rcode);
+}
+
+test "the reserved Z bit is parsed but never encoded" {
+    // RFC 1035 section 4.1.1: the Z bit must be zero in all queries and
+    // responses, so a received value is recorded and never written back.
+    var reader = Reader.init(&.{ 0x12, 0x34, 0x01, 0x40, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 });
+    const parsed = try Header.parse(&reader);
+    try std.testing.expect(parsed.reserved);
+
+    var output: [12]u8 = undefined;
+    var writer = Writer.init(&output);
+    try (Header{ .id = 0x1234, .reserved = true }).encode(&writer);
+    const flags = std.mem.readInt(u16, output[2..4], .big);
+    try std.testing.expectEqual(@as(u16, 0), flags & Flags.reserved);
+}
+
+test "the response flag policy copies CD and clears the reserved bit" {
+    const request = Header{
+        .id = 0x1234,
+        .opcode = .query,
+        .recursion_desired = true,
+        .authenticated_data = true,
+        .checking_disabled = true,
+        .reserved = true,
+    };
+    const response = (ResponseFlags{ .authoritative = true, .recursion_available = true }).header(request);
+    try std.testing.expect(response.qr);
+    try std.testing.expectEqual(Opcode.query, response.opcode);
+    try std.testing.expect(response.recursion_desired);
+    try std.testing.expect(response.authoritative);
+    try std.testing.expect(response.recursion_available);
+    // RFC 4035 section 3.1.6: AD is the responder's own claim that the
+    // answer was authenticated, never a bit copied from the query.
+    try std.testing.expect(!response.authenticated_data);
+    // RFC 4035 section 3.2.2: the CD bit of the query is copied.
+    try std.testing.expect(response.checking_disabled);
+    // RFC 1035 section 4.1.1: the reserved Z bit is never copied.
+    try std.testing.expect(!response.reserved);
 }

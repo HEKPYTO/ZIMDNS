@@ -66,7 +66,7 @@ pub fn truncateClassicUdpResponse(response_bytes: []const u8, output: []u8) Erro
 
     @memcpy(output[0..question_end], response_bytes[0..question_end]);
     var flags = std.mem.readInt(u16, output[2..4], .big);
-    flags |= 0x0200;
+    flags |= header.Flags.tc;
     std.mem.writeInt(u16, output[2..4], flags, .big);
     std.mem.writeInt(u16, output[6..8], 0, .big);
     std.mem.writeInt(u16, output[8..10], 0, .big);
@@ -106,7 +106,7 @@ pub fn truncateSignedClassicUdpResponse(response_bytes: []const u8, output: []u8
 
     @memcpy(output[0..question_end], response_bytes[0..question_end]);
     var flags = std.mem.readInt(u16, output[2..4], .big);
-    flags = (flags | 0x0200) & 0xfff0;
+    flags = (flags | header.Flags.tc) & 0xfff0;
     std.mem.writeInt(u16, output[2..4], flags, .big);
     std.mem.writeInt(u16, output[6..8], 0, .big);
     std.mem.writeInt(u16, output[8..10], 0, .big);
@@ -165,15 +165,8 @@ pub fn buildResponseWithPolicy(request: dns_message.Message, zone: *const zone_i
 
     var response = dns_message.Message{
         .allocator = request.allocator,
-        .header = .{
-            .id = request.header.id,
-            .qr = true,
+        .header = (header.ResponseFlags{
             .authoritative = lookup.kind != .not_authoritative and lookup.kind != .referral and lookup.kind != .servfail,
-            .recursion_desired = request.header.recursion_desired,
-            .recursion_available = false,
-            // RFC 4035 section 3.2: the CD bit of the query is copied into
-            // the response.
-            .checking_disabled = request.header.checking_disabled,
             .rcode = switch (lookup.kind) {
                 .nxdomain => .nxdomain,
                 .yxdomain => .yxdomain,
@@ -181,8 +174,7 @@ pub fn buildResponseWithPolicy(request: dns_message.Message, zone: *const zone_i
                 .not_authoritative => .refused,
                 else => .no_error,
             },
-            .question_count = 1,
-        },
+        }).header(request.header),
         .question = q,
         .answers = try dns_message.RecordSection.init(request.allocator, 0),
         .authorities = try dns_message.RecordSection.init(request.allocator, 0),
@@ -438,16 +430,7 @@ pub fn buildNotImplementedResponse(request: dns_message.Message) !dns_message.Me
 fn buildEmptyResponse(request: dns_message.Message, q: ?question.Question, rcode: header.Rcode) !dns_message.Message {
     var response = dns_message.Message{
         .allocator = request.allocator,
-        .header = .{
-            .id = request.header.id,
-            .qr = true,
-            .opcode = request.header.opcode,
-            .recursion_desired = request.header.recursion_desired,
-            .recursion_available = false,
-            .checking_disabled = request.header.checking_disabled,
-            .question_count = if (q == null) 0 else 1,
-            .rcode = rcode,
-        },
+        .header = (header.ResponseFlags{ .rcode = rcode }).header(request.header),
         .question = q,
         .answers = try dns_message.RecordSection.init(request.allocator, 0),
         .authorities = try dns_message.RecordSection.init(request.allocator, 0),
@@ -474,15 +457,7 @@ pub fn buildBadVersionResponse(request: dns_message.Message, q: question.Questio
     const request_edns = request.edns orelse return Error.BadResponse;
     var response = dns_message.Message{
         .allocator = request.allocator,
-        .header = .{
-            .id = request.header.id,
-            .qr = true,
-            .recursion_desired = request.header.recursion_desired,
-            .recursion_available = false,
-            .checking_disabled = request.header.checking_disabled,
-            .rcode = .no_error,
-            .question_count = 1,
-        },
+        .header = (header.ResponseFlags{ .rcode = .no_error }).header(request.header),
         .question = q,
         .answers = try dns_message.RecordSection.init(request.allocator, 0),
         .authorities = try dns_message.RecordSection.init(request.allocator, 0),
@@ -604,6 +579,7 @@ fn setHeaderCounts(response: *dns_message.Message) Error!void {
     if (response.answers.len > max_count or response.authorities.len > max_count or response.additionals.len > max_count) {
         return Error.TooManyRecords;
     }
+    response.header.question_count = if (response.question == null) 0 else 1;
     response.header.answer_count = @intCast(response.answers.len);
     response.header.authority_count = @intCast(response.authorities.len);
     response.header.additional_count = @intCast(response.additionals.len);
@@ -1436,6 +1412,30 @@ test "RFC 5001: NSID is echoed only when configured and only when requested" {
     try std.testing.expectEqualSlices(u8, policy.nsid.?, dns_rdata.findOption(ignored_options, dns_rdata.EDNS_NSID_OPTION_CODE).?);
 }
 
+test "RFC 5001: a repeated NSID request is answered with one identifier, not an error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(zoneversion_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    // Section 2.2 makes an unsolicited option the only error this option
+    // carries, so a request that repeats it is answered, not refused.
+    const repeated = [_]TestOption{
+        .{ .code = dns_rdata.EDNS_NSID_OPTION_CODE, .data = &.{} },
+        .{ .code = dns_rdata.EDNS_NSID_OPTION_CODE, .data = &.{} },
+    };
+    const policy = AnswerPolicy{ .nsid = "ns1.example.com." };
+    const response = try buildResponseWithPolicy(try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &repeated), &zone, policy);
+    try std.testing.expectEqual(header.Rcode.no_error, response.header.rcode);
+    const options = ednsOptions(&response) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualSlices(u8, policy.nsid.?, dns_rdata.findOption(options, dns_rdata.EDNS_NSID_OPTION_CODE).?);
+    // One option and nothing else: the answer carries the identifier once, and
+    // no option the query did not ask for rides along with it.
+    try std.testing.expectEqual(4 + policy.nsid.?.len, options.len);
+}
+
 test "RFC 8145 section 4.3: a responder never answers with the edns-key-tag option" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1786,4 +1786,111 @@ test "the CD bit is copied from the query into the authoritative response" {
     const plain_answer = try buildResponse(plain_query, &zone);
     try std.testing.expect(!plain_answer.header.checking_disabled);
     try std.testing.expect(!(try buildFormerrResponse(plain_query)).header.checking_disabled);
+}
+
+// RFC 1035 section 4.1.1: the Z bit must be zero in all queries and
+// responses, so a query that arrives with it set is answered with it clear.
+test "a query with the reserved bit set is answered with the reserved bit clear" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 3600
+        \\@ IN NS ns.example.
+        \\www IN A 192.0.2.2
+        \\
+    );
+    defer zone_file.deinit();
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    // A query received on the wire with the reserved Z bit set (flags
+    // 0x0140: RD and Z).
+    const query = try dns_message.Message.parseQuery(arena.allocator(), &.{
+        0x12, 0x34, 0x01, 0x40, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        3,    'w',  'w',  'w',  7,    'e',  'x',  'a',  'm',  'p',  'l',  'e',
+        0,    0x00, 0x01, 0x00, 0x01,
+    });
+    try std.testing.expect(query.header.reserved);
+
+    const answer = try buildResponse(query, &zone);
+    try std.testing.expect(answer.header.authoritative);
+    try std.testing.expect(!answer.header.reserved);
+
+    var encoded: [512]u8 = undefined;
+    var writer = @import("../dns/writer.zig").Writer.init(&encoded);
+    try answer.encode(&writer);
+    const flags = std.mem.readInt(u16, encoded[2..4], .big);
+    try std.testing.expectEqual(@as(u16, 0), flags & header.Flags.reserved);
+}
+
+// RFC 4035 section 3.1.6: a name server MUST NOT set AD unless it considers
+// every RRset in the answer and authority sections authentic, so an
+// authoritative answer never carries the AD bit of the query.
+test "a query with the AD bit set is answered with AD clear" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 3600
+        \\@ IN NS ns.example.
+        \\www IN A 192.0.2.2
+        \\
+    );
+    defer zone_file.deinit();
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    // A query received on the wire with AD set (flags 0x0120: RD and AD).
+    const query = try dns_message.Message.parseQuery(arena.allocator(), &.{
+        0x12, 0x34, 0x01, 0x20, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        3,    'w',  'w',  'w',  7,    'e',  'x',  'a',  'm',  'p',  'l',  'e',
+        0,    0x00, 0x01, 0x00, 0x01,
+    });
+    try std.testing.expect(query.header.authenticated_data);
+
+    const answer = try buildResponse(query, &zone);
+    try std.testing.expect(answer.header.authoritative);
+    try std.testing.expect(!answer.header.authenticated_data);
+    try std.testing.expect(!(try buildFormerrResponse(query)).header.authenticated_data);
+    try std.testing.expect(!(try buildRefusedResponse(query)).header.authenticated_data);
+}
+
+/// The one header flag policy every answer of this module follows.
+fn expectHeaderFlagPolicy(answer: dns_message.Message, rcode: header.Rcode) !void {
+    try std.testing.expect(answer.header.qr);
+    try std.testing.expectEqual(header.Opcode.query, answer.header.opcode);
+    try std.testing.expect(answer.header.recursion_desired);
+    // RFC 4035 section 3.2.2: the CD bit of the query is copied.
+    try std.testing.expect(answer.header.checking_disabled);
+    // RFC 4035 section 3.1.6: AD is the responder's own claim about the
+    // answer, never a bit taken from the query.
+    try std.testing.expect(!answer.header.authenticated_data);
+    // RFC 1035 section 4.1.1: the reserved Z bit is never copied.
+    try std.testing.expect(!answer.header.reserved);
+    try std.testing.expectEqual(rcode, answer.header.rcode);
+}
+
+test "the empty, refused, and FORMERR answers follow the same header flag policy" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // A query received on the wire with RD, AD, CD, and the reserved Z bit
+    // set (flags 0x0170).
+    const query = try dns_message.Message.parseQuery(arena.allocator(), &.{
+        0x12, 0x34, 0x01, 0x70, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        3,    'w',  'w',  'w',  7,    'e',  'x',  'a',  'm',  'p',  'l',  'e',
+        0,    0x00, 0x01, 0x00, 0x01,
+    });
+    try std.testing.expect(query.header.reserved);
+    try std.testing.expect(query.header.authenticated_data);
+    try std.testing.expect(query.header.checking_disabled);
+
+    try expectHeaderFlagPolicy(try buildEmptyResponse(query, query.question, .no_error), .no_error);
+    try expectHeaderFlagPolicy(try buildRefusedResponse(query), .refused);
+    try expectHeaderFlagPolicy(try buildFormerrResponse(query), .formerr);
 }
