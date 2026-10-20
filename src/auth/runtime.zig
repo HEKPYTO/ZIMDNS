@@ -8,6 +8,7 @@ const dns_writer = @import("../dns/writer.zig");
 const response = @import("response.zig");
 const zone_parser = @import("../zone/parser.zig");
 const zone_index = @import("../zone/index.zig");
+const zone_signer = @import("../zone/signer.zig");
 const metrics = @import("../metrics.zig");
 const blocklist_mod = @import("../blocklist.zig");
 const resolver_mod = @import("../resolver.zig");
@@ -99,6 +100,10 @@ pub const Runtime = struct {
     /// `nsid` and `zoneversion` directives. `nsid` is heap-owned so it outlives
     /// the config text it was decoded from.
     answer_policy: response.AnswerPolicy = .{},
+    /// The signing material of a signed zone, kept so the answer path can sign
+    /// an RRset that is not in the zone file (RFC 8482 section 4.2). Null
+    /// when no zone is signed.
+    dnssec_session: ?zone_signer.Session = null,
     keyring: keyring_mod.Keyring = .{},
     tsig_now: ?u64 = null,
     /// Volatile per-zone RFC 1995 serial transitions feeding IXFR delta
@@ -215,6 +220,8 @@ pub const Runtime = struct {
         self.blocklist = .{};
         if (self.answer_policy.nsid) |nsid| self.allocator.free(nsid);
         self.answer_policy = .{};
+        if (self.dnssec_session) |*session| session.deinit();
+        self.dnssec_session = null;
         for (self.local_zones_except) |apex| self.allocator.free(apex);
         if (self.local_zones_except.len != 0) self.allocator.free(self.local_zones_except);
         self.local_zones_except = &.{};
@@ -451,15 +458,15 @@ pub const Runtime = struct {
             return .{ .incoming = .{ .query = query } };
         };
 
-        const key = self.keyring.find(final_record.owner) orelse {
-            return .{ .failure = .{ .code = .badkey, .final = final_record } };
-        };
         const algorithm = tsig.algorithmForName(&final_record.tsig.algorithm) catch {
             return .{ .failure = .{ .code = .badkey, .final = final_record } };
         };
-        if (algorithm != key.algorithm) {
+        // RFC 8945 sections 4.2 and 5.2.1: the key name may carry several
+        // algorithms, so every key holding the name is a candidate and the
+        // algorithm the request names selects the one that authenticates it.
+        const key = self.keyring.findAlgorithm(final_record.owner, algorithm) orelse {
             return .{ .failure = .{ .code = .badkey, .final = final_record } };
-        }
+        };
         if (final_record.tsig.error_code != 0) {
             return .{ .failure = .{ .code = .formerr, .final = final_record } };
         }
@@ -614,8 +621,9 @@ pub const Runtime = struct {
         var message = response_message;
         defer message.deinit();
 
-        const algorithm = tsig.algorithmForName(&auth.final.tsig.algorithm) catch return Error.EncodeFailed;
-        const digest_len = tsig.digestLength(algorithm);
+        // The reply is signed with the same key and algorithm that
+        // authenticated the request (RFC 8945 section 5.3).
+        const digest_len = tsig.digestLength(auth.key.algorithm);
         // RFC 8945 section 7: a reply carries a MAC at least as long as the request's.
         const reply_mac_len = @max(digest_len, @as(usize, auth.request_mac.len));
         var value = auth.final.tsig;
@@ -738,7 +746,8 @@ pub const Runtime = struct {
         self.lock();
         defer self.unlock();
         const request_final = (tsig.parseFinalAdditional(query_bytes) catch return Error.EncodeFailed) orelse return Error.EncodeFailed;
-        const key = self.keyring.find(request_final.owner) orelse return Error.EncodeFailed;
+        const algorithm = tsig.algorithmForName(&request_final.tsig.algorithm) catch return Error.EncodeFailed;
+        const key = self.keyring.findAlgorithm(request_final.owner, algorithm) orelse return Error.EncodeFailed;
         const truncated = response.truncateSignedClassicUdpResponse(response_bytes, output) catch return Error.EncodeFailed;
         const final = (tsig.parseFinalAdditional(truncated) catch return Error.EncodeFailed) orelse return Error.EncodeFailed;
         const signed = tsig.sign(
@@ -1077,7 +1086,13 @@ pub const Runtime = struct {
         // partial zone can never leak through one datagram or frame.
         if (transfer.classify(q.qtype, q.qclass) != .none) return response.buildRefusedResponse(query);
         const selected = self.selectZone(qname_text) orelse return response.buildRefusedResponse(query);
-        return response.buildResponseWithPolicy(query, selected, self.answer_policy);
+        return response.buildResponseWithPolicy(query, selected, self.answer_policy, self.signingSession());
+    }
+
+    /// The signing material of a signed zone, when there is one.
+    fn signingSession(self: *const Runtime) ?*const zone_signer.Session {
+        if (self.dnssec_session) |*session| return session;
+        return null;
     }
 
     fn appendZoneText(self: *Runtime, text: []const u8) !void {
@@ -1142,6 +1157,26 @@ test "authoritative runtime answers raw query bytes" {
     try std.testing.expectEqualSlices(u8, &.{ 192, 168, 1, 1 }, &parsed.answers.items[0].rdata.A);
 }
 
+test "the runtime holds no signing key once it is deinitialized" {
+    var runtime = try Runtime.fromZoneText(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
+        \\
+    );
+    var key = try zone_signer.parseKey("ed25519 DSSF3o0s0f+ElWzj9E/Osxw8hLpk55chkmx0LYN5WiY=\n");
+    defer key.deinit();
+    runtime.dnssec_session = zone_signer.Session.start(&key, .{ .inception = 1_000_000_000, .expiration = 2_000_000_000 });
+    try std.testing.expect(runtime.dnssec_session != null);
+
+    // The private key is wiped with the session, so the runtime holds no
+    // signing material once it is deinitialized.
+    runtime.deinit();
+    try std.testing.expect(runtime.dnssec_session == null);
+}
+
 test "authoritative runtime preserves bad-query errors for truncated unsigned sections" {
     var runtime = try Runtime.fromZoneText(
         \\$ORIGIN home.arpa.
@@ -1191,6 +1226,73 @@ test "runtime authenticates a signed query and signs the authoritative response"
     try std.testing.expectEqual(@as(u16, 0), response_final.tsig.error_code);
     try std.testing.expectEqual(@as(usize, 32), response_final.tsig.macBytes().len);
     _ = try tsig.verify(response_bytes, "01234567890123456789012345678901", request_final.tsig.macBytes(), 32);
+}
+
+test "runtime authenticates a key name bundled with several algorithms" {
+    const now = 1_700_000_000;
+    var keyring = try keyring_mod.Keyring.parse(
+        "key \"key.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };" ++
+            "key \"key.\" { algorithm hmac-sha512; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEyMw==\"; };",
+    );
+    var runtime = try Runtime.fromZoneTextWithKeyring(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
+        \\
+    , &keyring);
+    defer runtime.deinit();
+    runtime.setTsigNow(now);
+
+    var query = try makeSignedQueryWithKey(now, 64, sha512_test_key);
+    var output: [1024]u8 = undefined;
+    const response_bytes = try runtime.answer(query.packet[0..query.len], &output);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@as(@TypeOf(parsed.header.rcode), .no_error), parsed.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.answer_count);
+    const request_final = (try tsig.parseFinalAdditional(query.packet[0..query.len])).?;
+    const response_final = (try tsig.parseFinalAdditional(response_bytes)).?;
+    try std.testing.expectEqual(@as(u16, 0), response_final.tsig.error_code);
+    // The reply carries the algorithm the request named and is signed with
+    // the key that authenticated it, not with the first key of the name.
+    try std.testing.expectEqual(tsig.Algorithm.hmac_sha512, try tsig.algorithmForName(&response_final.tsig.algorithm));
+    try std.testing.expectEqual(@as(usize, 64), response_final.tsig.macBytes().len);
+    _ = try tsig.verify(response_bytes, sha512_test_key.secret, request_final.tsig.macBytes(), 32);
+    try std.testing.expectError(error.BadMac, tsig.verify(response_bytes, sha256_test_key.secret, request_final.tsig.macBytes(), 32));
+}
+
+test "runtime refuses a request whose algorithm no key of the name carries" {
+    const now = 1_700_000_000;
+    var keyring = try keyring_mod.Keyring.parse(
+        "key \"key.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };" ++
+            "key \"key.\" { algorithm hmac-sha512; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEyMw==\"; };",
+    );
+    var runtime = try Runtime.fromZoneTextWithKeyring(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
+        \\
+    , &keyring);
+    defer runtime.deinit();
+    runtime.setTsigNow(now);
+
+    var query = try makeSignedQueryWithKey(now, 20, sha1_test_key);
+    var output: [1024]u8 = undefined;
+    const response_bytes = try runtime.answer(query.packet[0..query.len], &output);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@as(@TypeOf(parsed.header.rcode), .notauth), parsed.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.additional_count);
+    try std.testing.expectEqual(@as(u16, 17), parsed.additionals.items[0].rdata.TSIG.error_code);
+    try std.testing.expectEqual(@as(usize, 0), parsed.additionals.items[0].rdata.TSIG.macBytes().len);
 }
 
 test "runtime accepts a signed query whose Original ID differs from the packet ID" {
@@ -1463,6 +1565,7 @@ const TestKey = struct {
 
 const sha256_test_key = TestKey{ .algorithm = "hmac-sha256.", .secret = "01234567890123456789012345678901" };
 const sha1_test_key = TestKey{ .algorithm = "hmac-sha1.", .secret = "01234567890123456789" };
+const sha512_test_key = TestKey{ .algorithm = "hmac-sha512.", .secret = "0123456789012345678901234567890123456789012345678901234567890123" };
 
 fn makeSignedQuery(time_signed: u64, mac_len: usize) !SignedQuery {
     return makeSignedQueryWithEdnsOption(time_signed, mac_len, false);
@@ -1517,7 +1620,7 @@ fn makeSignedQueryWithQuestions(
         }).encode(&writer);
     }
     const owner_start = writer.len();
-    var zeros: [32]u8 = @splat(0);
+    var zeros: [64]u8 = @splat(0);
     const value = try @import("../dns/rdata.zig").Tsig.init(algorithm, time_signed, 300, zeros[0..mac_len], 0x1234, 0, &.{});
     try (@import("../dns/record.zig").ResourceRecord{
         .owner = owner,
@@ -1530,7 +1633,7 @@ fn makeSignedQueryWithQuestions(
     const signed = try tsig.sign(writer.written(), key.secret, final.owner, final.tsig, null);
     // The digest never covers the MAC field, so a request can also carry a MAC
     // longer than the keyed hash output; the extra octets stay zero.
-    var mac_bytes: [32]u8 = @splat(0);
+    var mac_bytes: [64]u8 = @splat(0);
     const copied = @min(mac_len, signed.slice().len);
     @memcpy(mac_bytes[0..copied], signed.slice()[0..copied]);
     try tsig.patchMac(packet[0..writer.len()], final, mac_bytes[0..mac_len]);

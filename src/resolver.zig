@@ -2034,6 +2034,9 @@ test "buildUpstreamQuery strips client EDNS options but preserves payload size a
     try appendOption(&query, dns_rdata.EDNS_ECS_OPTION_CODE, &.{ 0, 1, 0, 0 });
     try appendOption(&query, COOKIE_OPTION_CODE, &.{ 1, 2, 3, 4, 5, 6, 7, 8 });
     try appendOption(&query, 65000, &.{ 9, 8, 7 });
+    // RFC 7314 section 3.3: the forwarder is not authoritative for the zone,
+    // so it neither forwards nor answers with the EXPIRE option.
+    try appendOption(&query, dns_rdata.EDNS_EXPIRE_OPTION_CODE, &.{});
 
     var output: [512]u8 = undefined;
     const encoded = try buildUpstreamQuery(&.{ 0xde, 0xad }, query, &output, &.{});
@@ -2048,6 +2051,7 @@ test "buildUpstreamQuery strips client EDNS options but preserves payload size a
     try std.testing.expect(findOption(upstream, dns_rdata.EDNS_ECS_OPTION_CODE) == null);
     try std.testing.expect(findOption(upstream, COOKIE_OPTION_CODE) == null);
     try std.testing.expect(findOption(upstream, 65000) == null);
+    try std.testing.expect(findOption(upstream, dns_rdata.EDNS_EXPIRE_OPTION_CODE) == null);
 }
 
 test "RFC 3225: buildUpstreamQuery sets DO=1 when the client cleared DO" {

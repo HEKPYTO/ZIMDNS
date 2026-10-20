@@ -182,9 +182,10 @@ pub const Header = struct {
     }
 };
 
-/// The flag bits of a response that the request does not supply. This is the
-/// one place the response header flags are decided, so the AD, CD, and Z
-/// rules are stated once.
+/// The flag bits of a response that the request does not supply. The flags of
+/// a response header are decided here, so the AD, CD, and Z rules are stated
+/// once. A built header can still be refused later, which replaces its
+/// RCODE (an unproven denial is answered with server failure).
 pub const ResponseFlags = struct {
     /// AA, RFC 1035 section 4.1.1.
     authoritative: bool = false,

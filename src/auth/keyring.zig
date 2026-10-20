@@ -1,6 +1,7 @@
 /// Contract: Parses a bounded BIND-compatible TSIG key file and owns secrets.
 /// Ownership: Keyring stores copied names and secret bytes; deinit clears secrets.
 /// Errors: Malformed declarations and secret policy violations are typed; no I/O occurs.
+/// One key name may carry several algorithms; the name with the algorithm is the key.
 const std = @import("std");
 const Name = @import("../dns/name.zig").Name;
 const tsig = @import("../dns/tsig.zig");
@@ -14,7 +15,7 @@ pub const Error = error{
     BadSecret,
     SecretTooShort,
     SecretTooLong,
-    DuplicateName,
+    DuplicateKey,
     TooManyKeys,
 };
 
@@ -51,7 +52,13 @@ pub const Keyring = struct {
             var key = try parseKey(&scanner);
             defer key.clear();
             for (ring.keys[0..ring.len]) |existing| {
-                if (existing.name.eql(&key.name)) return Error.DuplicateName;
+                // RFC 8945 section 10 says there SHOULD only be one algorithm
+                // associated with any given key name. This project departs
+                // from that SHOULD on purpose: a name may carry several
+                // algorithms, so a peer that rotates its algorithm stays
+                // verifiable, and only the same name with the same algorithm
+                // is the same key twice.
+                if (existing.name.eql(&key.name) and existing.algorithm == key.algorithm) return Error.DuplicateKey;
             }
             ring.keys[ring.len] = key;
             ring.len += 1;
@@ -60,9 +67,12 @@ pub const Keyring = struct {
         return ring;
     }
 
-    pub fn find(self: *const Keyring, name: Name) ?*const Key {
+    /// The key that carries `name` with `algorithm`. Every key holding the
+    /// name is checked, so a request that names an algorithm the first key
+    /// of the name does not carry still finds its key.
+    pub fn findAlgorithm(self: *const Keyring, name: Name, algorithm: tsig.Algorithm) ?*const Key {
         for (self.keys[0..self.len]) |*key| {
-            if (key.name.eql(&name)) return key;
+            if (key.name.eql(&name) and key.algorithm == algorithm) return key;
         }
         return null;
     }
@@ -192,7 +202,7 @@ test "keyring parses and canonicalizes a SHA-256 key" {
     defer ring.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), ring.len);
-    const key = ring.find(try Name.fromText("example.com.")).?;
+    const key = ring.findAlgorithm(try Name.fromText("example.com."), .hmac_sha256).?;
     try std.testing.expectEqual(tsig.Algorithm.hmac_sha256, key.algorithm);
     try std.testing.expectEqualSlices(u8, "01234567890123456789012345678901", key.secretBytes());
 }
@@ -204,11 +214,29 @@ test "keyring supports SHA-1 rotation and case-insensitive lookup" {
     defer ring.deinit();
 
     try std.testing.expectEqual(@as(usize, 2), ring.len);
-    try std.testing.expectEqual(tsig.Algorithm.hmac_sha1, ring.find(try Name.fromText("two.")).?.algorithm);
+    try std.testing.expectEqual(tsig.Algorithm.hmac_sha1, ring.findAlgorithm(try Name.fromText("two."), .hmac_sha1).?.algorithm);
+}
+
+test "keyring accepts one key name bundled with several algorithms" {
+    const text = "key \"one.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };" ++
+        "key \"one.\" { algorithm hmac-sha1; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODk=\"; };";
+    var ring = try Keyring.parse(text);
+    defer ring.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), ring.len);
+    const name = try Name.fromText("one.");
+    try std.testing.expectEqual(tsig.Algorithm.hmac_sha256, ring.findAlgorithm(name, .hmac_sha256).?.algorithm);
+    try std.testing.expectEqual(tsig.Algorithm.hmac_sha1, ring.findAlgorithm(name, .hmac_sha1).?.algorithm);
+    try std.testing.expect(ring.findAlgorithm(name, .hmac_sha512) == null);
+    try std.testing.expectEqual(tsig.Algorithm.hmac_sha256, ring.findAlgorithm(name, .hmac_sha256).?.algorithm);
+}
+
+test "keyring refuses the same key name with the same algorithm twice" {
+    try std.testing.expectError(Error.DuplicateKey, Keyring.parse("key \"one.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; }; key \"one.\" { algorithm hmac-sha256; secret \"YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY=\"; };"));
 }
 
 test "keyring rejects duplicate names, unsupported algorithms, bad base64, and trailing syntax" {
-    try std.testing.expectError(Error.DuplicateName, Keyring.parse("key \"one.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; }; key \"ONE.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };"));
+    try std.testing.expectError(Error.DuplicateKey, Keyring.parse("key \"one.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; }; key \"ONE.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };"));
     try std.testing.expectError(Error.UnsupportedAlgorithm, Keyring.parse("key \"one.\" { algorithm hmac-md5; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };"));
     try std.testing.expectError(Error.BadSecret, Keyring.parse("key \"one.\" { algorithm hmac-sha256; secret \"not-base64\"; };"));
     try std.testing.expectError(Error.BadSyntax, Keyring.parse("key \"one.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; }; trailing"));
@@ -245,7 +273,7 @@ test "keyring accepts every RFC 8945 section 6 HMAC-SHA algorithm" {
         var ring = try Keyring.parse(text);
         defer ring.deinit();
 
-        const key = ring.find(try Name.fromText("one.")).?;
+        const key = ring.findAlgorithm(try Name.fromText("one."), case.algorithm).?;
         try std.testing.expectEqual(case.algorithm, key.algorithm);
         try std.testing.expectEqual(tsig.digestLength(case.algorithm), key.secretBytes().len);
     }

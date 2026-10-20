@@ -6,6 +6,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const auth_runtime = @import("../auth/runtime.zig");
+const dns_message = @import("../dns/message.zig");
 const keyring_mod = @import("../auth/keyring.zig");
 const blocklist_mod = @import("../blocklist.zig");
 const parser = @import("parser.zig");
@@ -17,6 +18,7 @@ const signer = @import("../zone/signer.zig");
 
 const validate_mod = @import("../dns/validate.zig");
 const RecordType = @import("../dns/types.zig").RecordType;
+const tsig = @import("../dns/tsig.zig");
 /// RFC 4034 section 3.1.5 signature window for a zone signed at startup. The
 /// key file is re-read and every zone re-signed on each start, so the window
 /// only has to outlast one uptime: an operator who serves longer without
@@ -43,6 +45,11 @@ pub const ServerContext = struct {
     zones: std.ArrayList(zone_index.Zone) = .empty,
     blocklist: blocklist_mod.Blocklist = .{},
     keyring: keyring_mod.Keyring = .{},
+    /// The zone signing key, kept so the serving path can sign an RRset that
+    /// is not in the zone file (RFC 8482 section 4.2). Null when no
+    /// `dnssec-key-file` is configured. The runtime that inherits it owns it
+    /// and wipes it when it is deinited.
+    dnssec_session: ?signer.Session = null,
     /// RFC 4035 section 5.2 trust anchors for the forwarding path. Empty when
     /// no `trust-anchor-file` is configured, which is what keeps the forwarder
     /// a non-validating one.
@@ -67,7 +74,9 @@ pub const ServerContext = struct {
 
         // The key is read before any zone is loaded, so a bad key file fails
         // startup without leaving a half-signed zone behind. The private
-        // scalar is wiped as soon as every zone has been signed.
+        // scalar is wiped as soon as every zone has been signed, unless the
+        // serving path needs it: an RRset that is not in the zone file can
+        // only be signed while the key is held (RFC 8482 section 4.2).
         var dnssec_key: ?signer.Key = null;
         defer if (dnssec_key) |*key| key.deinit();
         if (context.config.dnssecKeyFileText()) |key_path| {
@@ -144,6 +153,18 @@ pub const ServerContext = struct {
             try context.zones.append(allocator, zone);
         }
 
+        // The key outlives the startup signing pass: the serving path signs
+        // the RFC 8482 minimal answer, which is not part of the signed zone.
+        if (dnssec_key) |*key| {
+            context.dnssec_session = signer.Session.start(key, .{
+                .inception = now_seconds,
+                .expiration = now_seconds + signature_validity_seconds,
+            });
+            // The session holds its own copy, so the local one is wiped here.
+            key.deinit();
+            dnssec_key = null;
+        }
+
         var blocklist_index: usize = 0;
         while (blocklist_index < context.config.blocklists.len) : (blocklist_index += 1) {
             const blocklist_path = context.config.blocklists.items[blocklist_index].pathText();
@@ -200,6 +221,10 @@ pub const ServerContext = struct {
         runtime.answer_policy.nsid = nsid;
         runtime.answer_policy.zoneversion = self.config.zoneversion;
         if (self.config.minimal_any_ttl) |ttl| runtime.answer_policy.minimal_any_ttl = ttl;
+        // The signing key moves into the runtime, which owns it from here on
+        // and wipes it when it is deinited.
+        runtime.dnssec_session = self.dnssec_session;
+        self.dnssec_session = null;
         self.blocklist = .{};
         self.config = .{};
         return runtime;
@@ -212,6 +237,8 @@ pub const ServerContext = struct {
         self.blocklist = .{};
         self.keyring.deinit();
         self.config = .{};
+        if (self.dnssec_session) |*session| session.deinit();
+        self.dnssec_session = null;
         // Anchors that never reached a policy (load failed, or the context was
         // dropped without takeRuntime) are still owned here.
         self.anchors.deinit(self.allocator);
@@ -334,7 +361,7 @@ test "server context loads the configured TSIG key file during startup" {
 
     try std.testing.expectEqual(@as(usize, 1), context.keyring.len);
     const name = try @import("../dns/name.zig").Name.fromText("example.com.");
-    try std.testing.expect(context.keyring.find(name) != null);
+    try std.testing.expect(context.keyring.findAlgorithm(name, .hmac_sha256) != null);
 }
 
 test "server context rejects an unreadable TSIG key file" {
@@ -412,6 +439,78 @@ fn hasRrsigCovering(zone: zone_index.Zone, owner: []const u8, covered: u16) bool
         if (std.mem.readInt(u16, bytes[0..2], .big) == covered) return true;
     }
     return false;
+}
+
+/// The DNSKEY RDATA the zone publishes, which a validator anchors on. The
+/// record is served opaque, so the bytes are copied out of the parser's
+/// value.
+fn zoneDnskeyRdata(allocator: std.mem.Allocator, zone: zone_index.Zone) ![]const u8 {
+    for (zone.records.items[0..zone.records.len]) |record| {
+        if (!record.rrtype.eql(.DNSKEY)) continue;
+        const rdata = try zone_parser.parseRData(.DNSKEY, record.rdataText());
+        switch (rdata) {
+            .Unknown => |unknown| return allocator.dupe(u8, unknown.bytes()),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "a signed zone served by the runtime answers a DO=1 ANY query with a valid RRSIG" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{ .sub_path = "signed.example.zone", .data = dnssec_test_zone });
+    try dir.dir.writeFile(io, .{ .sub_path = "zsk.key", .data = dnssec_test_key });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone signed.example primary signed.example.zone\ndnssec-key-file zsk.key\n" });
+
+    var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+    defer context.deinit();
+    var runtime = try context.takeRuntime(io);
+    defer runtime.deinit();
+
+    // A QTYPE=ANY query for www.signed.example. with an EDNS(0) OPT record
+    // that sets DO.
+    const query_bytes = [_]u8{
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        3,    'w',  'w',  'w',  6,    's',  'i',  'g',  'n',  'e',  'd',  7,
+        'e',  'x',  'a',  'm',  'p',  'l',  'e',  0,    0x00, 0xff, 0x00, 0x01,
+        0x00, 0x00, 0x29, 0x04, 0xd0, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00,
+    };
+    var output: [1024]u8 = undefined;
+    const response_bytes = try runtime.answer(&query_bytes, &output);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const response = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    // RFC 8482 section 4.2: the synthesized HINFO and, because the zone is
+    // signed and the query set DO=1, a valid RRSIG over it.
+    try std.testing.expectEqual(@as(u16, 2), response.header.answer_count);
+    try std.testing.expect(response.answers.items[0].rrtype.eql(.HINFO));
+    try std.testing.expect(response.answers.items[1].rrtype.eql(.RRSIG));
+
+    // The signature is checked by the project's own validator, against the
+    // DNSKEY the zone publishes.
+    const dnskey_rdata = try zoneDnskeyRdata(arena.allocator(), runtime.zones.items[0]);
+    var anchors = validate_mod.Anchors{};
+    anchors.items[0] = .{
+        .owner = try @import("../dns/name.zig").Name.fromText("signed.example."),
+        .rrtype = .DNSKEY,
+        .rdata = dnskey_rdata,
+    };
+    anchors.len = 1;
+    const query = try dns_message.Message.parseQuery(arena.allocator(), &query_bytes);
+    const now_seconds: u32 = @intCast(@divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+    const result = try validate_mod.validate(arena.allocator(), &anchors, query, response, &.{}, now_seconds);
+    try std.testing.expectEqual(validate_mod.Status.secure, result.status);
+
+    // The private key never reaches the wire: neither the secret as it is
+    // written in the key file nor the octets it decodes to.
+    try std.testing.expect(std.mem.indexOf(u8, response_bytes, dnssec_test_key) == null);
+    var secret: [32]u8 = undefined;
+    try std.base64.standard.Decoder.decode(&secret, "DSSF3o0s0f+ElWzj9E/Osxw8hLpk55chkmx0LYN5WiY=");
+    try std.testing.expect(std.mem.indexOf(u8, response_bytes, &secret) == null);
 }
 
 test "server context signs every zone named by the configured DNSSEC key file" {

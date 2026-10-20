@@ -7,6 +7,8 @@
 /// signed-data assembly, ECDSA P-256/P-384 and Ed25519 verification, NSEC
 /// NXDOMAIN and NODATA proofs, NSEC3 closest-encloser and opt-out proofs, and
 /// the secure/insecure/bogus outcome with an RFC 8914 INFO-CODE for bogus.
+/// The NSEC3 RDATA decoder and the hash span test are shared with the
+/// authoritative path, which picks the NSEC3 denial proofs a zone serves.
 /// `zoneSignedToAnchor` answers the same question for a loaded zone: do the
 /// RRsets named at its apex carry valid signatures chaining up to a
 /// configured anchor (RFC 8976 section 4 step 3).
@@ -545,8 +547,11 @@ fn deniesWildcard(labels: u8, owner: Name) bool {
 
 /// NSEC3 span test (RFC 5155 section 7.1): the target hash falls strictly
 /// between the owner hash and the next hash, wrapping past the end of the hash
-/// space when the next hash sorts before the owner hash.
-fn hashCovers(owner: [20]u8, next: [20]u8, target: [20]u8) bool {
+/// space when the next hash sorts before the owner hash. A validator uses it
+/// to find the NSEC3 that covers a name (RFC 5155 section 8.3); an
+/// authoritative server uses the same test to pick the record it serves
+/// (RFC 5155 section 7.2.1).
+pub fn nsec3Covers(owner: [20]u8, next: [20]u8, target: [20]u8) bool {
     const span = octetOrder(&owner, &next);
     // A zone whose last NSEC3 points back at its own owner hash has one hash
     // in the chain, and that single span wraps the whole space.
@@ -582,6 +587,46 @@ fn base32hexLabel(label: []const u8, out: *[20]u8) bool {
         written += 1;
     }
     return written == out.len;
+}
+
+/// The NSEC3 RDATA fields (RFC 5155 section 3.1) as the wire carries them.
+pub const Nsec3Rdata = struct {
+    flags: u8,
+    iterations: u16,
+    salt: []const u8,
+    next_hash: []const u8,
+    bitmap: []const u8,
+};
+
+/// Decode NSEC3 RDATA (RFC 5155 section 3.2): hash algorithm, flags,
+/// iterations, salt, hash length, next hashed owner name, type bitmap. The
+/// hash algorithm must be 1 (RFC 5155 section 3.1.1 fixes SHA-1) and the hash
+/// length 20 (RFC 5155 section 3.1.6), the only pair this build computes.
+pub fn parseNsec3Rdata(raw: []const u8) ?Nsec3Rdata {
+    if (raw.len < 6 or raw[0] != 1) return null;
+    const salt_len = raw[4];
+    if (6 + salt_len > raw.len) return null;
+    const hash_len = raw[5 + salt_len];
+    if (hash_len != 20) return null;
+    if (6 + salt_len + hash_len > raw.len) return null;
+    return .{
+        .flags = raw[1],
+        .iterations = std.mem.readInt(u16, raw[2..4], .big),
+        .salt = raw[5 .. 5 + salt_len],
+        .next_hash = raw[6 + salt_len ..][0..hash_len],
+        .bitmap = raw[6 + salt_len + hash_len ..],
+    };
+}
+
+/// The hash an NSEC3 owner name carries (RFC 5155 section 3): the first label
+/// of the owner name is the unpadded base32hex encoding of the 20-octet hash
+/// of the original owner name.
+pub fn nsec3OwnerHash(owner: Name) ?[20]u8 {
+    const wire = owner.asWire();
+    if (wire.len < 34 or wire[0] != 32) return null;
+    var out: [20]u8 = undefined;
+    if (!base32hexLabel(wire[1..33], &out)) return null;
+    return out;
 }
 
 // ----------------------------------------------------------------- proofs
@@ -724,27 +769,20 @@ const Validator = struct {
 
     fn addNsec3(self: *Validator, record: *const dns_record.ResourceRecord, raw: []const u8) Error!void {
         if (self.nsec3s.items.len >= max_proofs) return Error.TooManyRecords;
-        // RFC 5155 section 3 fixes the hash algorithm at 1 (SHA-1); the only
-        // other registered value is reserved for a future SHA-256 profile.
-        if (raw.len < 5 or raw[0] != 1) return Error.MalformedRdata;
-        const salt_len = raw[4];
-        if (6 + salt_len + 20 > raw.len) return Error.MalformedRdata;
-        const salt = raw[5 .. 5 + salt_len];
-        if (raw[5 + salt_len] != 20) return Error.MalformedRdata;
+        const rdata = parseNsec3Rdata(raw) orelse return Error.MalformedRdata;
         const rrsig = self.coveringRrsig(record.owner, RecordType.NSEC3.code()) orelse return;
         // The hashed name's label must sit at the front of the owner name, and
         // the RRSIG's signer must be the zone the rest of it names.
         const owner_wire = record.owner.asWire();
         if (owner_wire[0] != 32 or !isSuffix(rrsig.signer, record.owner)) return Error.MalformedRdata;
-        var owner_hash: [20]u8 = undefined;
-        if (!base32hexLabel(owner_wire[1..33], &owner_hash)) return Error.MalformedRdata;
+        const owner_hash = nsec3OwnerHash(record.owner) orelse return Error.MalformedRdata;
         try self.nsec3s.append(self.allocator, .{
             .owner_hash = owner_hash,
-            .next_hash = raw[6 + salt_len ..][0..20].*,
-            .flags = raw[1],
-            .iterations = std.mem.readInt(u16, raw[2..4], .big),
-            .salt = salt,
-            .bitmap = raw[26 + salt_len ..],
+            .next_hash = rdata.next_hash[0..20].*,
+            .flags = rdata.flags,
+            .iterations = rdata.iterations,
+            .salt = rdata.salt,
+            .bitmap = rdata.bitmap,
             .signer = rrsig.signer,
             .owner_labels = rrsig.labels,
         });
@@ -987,7 +1025,7 @@ const Validator = struct {
             var spans = false;
             for (self.nsec3s.items) |proof| {
                 if (std.mem.eql(u8, &proof.owner_hash, &digest)) matched = proof;
-                if (hashCovers(proof.owner_hash, proof.next_hash, digest)) spans = true;
+                if (nsec3Covers(proof.owner_hash, proof.next_hash, digest)) spans = true;
             }
             if (matched == null) covered = false;
             if (spans) covered = true;
@@ -1059,7 +1097,7 @@ const Validator = struct {
         const wildcard = wildcardName(encloser.name) catch return self.fail(dnssec.EDE_DNSSEC_BOGUS);
         const digest = self.hash(wildcard);
         for (self.nsec3s.items) |proof| {
-            if (!hashCovers(proof.owner_hash, proof.next_hash, digest)) continue;
+            if (!nsec3Covers(proof.owner_hash, proof.next_hash, digest)) continue;
             return if (try self.anchored(encloser.proof.signer)) .secure else .insecure;
         }
         return self.fail(dnssec.EDE_DNSSEC_BOGUS);
@@ -1111,7 +1149,7 @@ const Validator = struct {
             if (parent.eql(&encloser.name)) {
                 const digest = self.hash(next_closer);
                 for (self.nsec3s.items) |proof| {
-                    if (!hashCovers(proof.owner_hash, proof.next_hash, digest)) continue;
+                    if (!nsec3Covers(proof.owner_hash, proof.next_hash, digest)) continue;
                     if (proof.flags & nsec3_opt_out == 0) return self.fail(dnssec.EDE_DNSSEC_BOGUS);
                     // The opt-out proof is what is authenticated here; either
                     // way nothing below the cut can be vouched for.

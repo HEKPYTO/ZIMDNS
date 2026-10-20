@@ -281,6 +281,26 @@ pub const Options = struct {
     expiration: u32,
 };
 
+/// The signing material the serving path keeps once the zone has been signed:
+/// the private key and the window every signature it makes uses. An RRset that
+/// is not in the zone file -- the RFC 8482 minimal answer -- can only be
+/// signed while the key is still held, so the key outlives the startup
+/// signing pass and is wiped when the holder is deinited.
+pub const Session = struct {
+    key: Key,
+    options: Options,
+
+    /// Take over a copy of `key` and the window every signature uses.
+    pub fn start(key: *const Key, options: Options) Session {
+        return .{ .key = key.*, .options = options };
+    }
+
+    /// Wipes the private key.
+    pub fn deinit(self: *Session) void {
+        self.key.deinit();
+    }
+};
+
 /// Signs `zone` in place: appends the apex DNSKEY and DS, one NSEC per
 /// authoritative owner name, and one RRSIG per RRset. The zone's SOA serial is
 /// left alone -- nothing is written back to disk, so the published zone is
@@ -1160,6 +1180,16 @@ test "a zone that already carries DNSSEC records is refused rather than signed t
     );
     defer zone.deinit();
     try std.testing.expectError(Error.AlreadySigned, signZone(arena.allocator(), &zone, &key, rfc8080_window));
+}
+
+test "the signing session wipes the private key when it is deinitialized" {
+    var key = try parseKey(rfc8080_ed25519_key);
+    var session = Session.start(&key, rfc8080_window);
+    const material = &session.key.material;
+    // The key is still there before the session is dropped.
+    try std.testing.expect(!std.mem.allEqual(u8, std.mem.asBytes(material), 0));
+    session.deinit();
+    for (std.mem.asBytes(material)) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
 }
 
 test "the key file accepts only one known algorithm and a correctly sized secret" {

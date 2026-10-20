@@ -49,9 +49,12 @@ pub const EDNS_NSID_OPTION_CODE: u16 = 3;
 /// RFC 8145 section 4 edns-key-tag: one or more 16-bit DNSSEC Key Tags.
 pub const EDNS_KEY_TAG_OPTION_CODE: u16 = 14;
 /// RFC 9660 section 2.1 ZONEVERSION: the version of the zone an answer came
-/// from. Code 9 is RFC 7314 EDNS EXPIRE and code 11 is RFC 7828
-/// edns-tcp-keepalive, neither of which this server interprets.
+/// from. Code 11 is RFC 7828 edns-tcp-keepalive, which this server does not
+/// interpret.
 pub const EDNS_ZONEVERSION_OPTION_CODE: u16 = 19;
+/// RFC 7314 section 2: the EXPIRE option, zero-length in a query and four
+/// octets of SOA EXPIRE seconds in the answer.
+pub const EDNS_EXPIRE_OPTION_CODE: u16 = 9;
 
 /// RFC 9460 SVCB/HTTPS SvcParam keys with assigned presentation names.
 pub const SVCB_MANDATORY_KEY: u16 = 0;

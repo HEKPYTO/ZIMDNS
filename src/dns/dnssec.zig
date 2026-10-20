@@ -6,9 +6,7 @@
 /// - A bounded aggressive-NSEC cache (RFC 8198 sections 4-5) for validators.
 /// - EDE DNSSEC-bogus INFO-CODEs (RFC 8914 codes 6-10) for validation failures.
 /// What this module does NOT do: zone signing, cryptographic validation (no
-/// RSA/ECDSA chain building and no trust-anchor management), and
-/// authoritative NSEC3 denial serving with closest-encloser/opt-out proofs
-/// (deferred behind the typed error below). A full-validating
+/// RSA/ECDSA chain building and no trust-anchor management). A full-validating
 /// resolver MUST NOT claim `secure` from this module alone. Presence,
 /// time-window, and denial checks report `bogus`/`insecure` only; `secure`
 /// requires an external cryptographic verifier over the same opaque RDATA.
@@ -42,17 +40,7 @@ pub const Error = error{
     MalformedNsec,
     MalformedNsec3,
     NameTooLong,
-    /// Authoritative NSEC3 denial serving is deferred: no closest-encloser or
-    /// opt-out proofs are synthesized for authoritative answers.
-    Nsec3DenialDeferred,
 };
-
-/// Authoritative NSEC3 denial serving is deferred; the aggressive cache below
-/// consumes NSEC proofs only and never synthesizes an NSEC3 denial. Fails with
-/// its typed error instead of a silent fallback or an unsigned answer.
-pub fn serveNsec3DenialDeferred() Error!void {
-    return Error.Nsec3DenialDeferred;
-}
 
 /// True for the proof/key RRsets this minimum serves (RFC 4034 + RFC 5155).
 pub fn isDnssecType(rrtype: RecordType) bool {
@@ -513,10 +501,6 @@ test "EDE DNSSEC-bogus codes use RFC 8914 INFO-CODEs 6 through 10" {
     try std.testing.expectEqualStrings("signature expired", edeText(7));
     try std.testing.expectEqualStrings("rrsigs missing", edeText(10));
     try std.testing.expectEqualStrings("", edeText(99));
-}
-
-test "deferred NSEC3 denial fails with a typed error" {
-    try std.testing.expectError(Error.Nsec3DenialDeferred, serveNsec3DenialDeferred());
 }
 
 test "DO-bit inclusion keeps explicit queries and gates proof RRsets" {

@@ -8,6 +8,7 @@ const question = @import("../dns/question.zig");
 const dns_name = @import("../dns/name.zig");
 const dns_record = @import("../dns/record.zig");
 const dns_rdata = @import("../dns/rdata.zig");
+const dns_writer = @import("../dns/writer.zig");
 const dns_types = @import("../dns/types.zig");
 const zone_parser = @import("../zone/parser.zig");
 const zone_index = @import("../zone/index.zig");
@@ -140,12 +141,18 @@ fn findEdnsOpt(response_bytes: []const u8) ?dns_record.ResourceRecord {
 /// Answer from the shipping default EDNS policy: no NSID identifier to give
 /// and ZONEVERSION answered whenever a query asks for it.
 pub fn buildResponse(request: dns_message.Message, zone: *const zone_index.Zone) !dns_message.Message {
-    return buildResponseWithPolicy(request, zone, .{});
+    return buildResponseWithPolicy(request, zone, .{}, null);
 }
 
 /// `policy` is the operator's EDNS answer policy, from the `nsid` and
-/// `zoneversion` directives.
-pub fn buildResponseWithPolicy(request: dns_message.Message, zone: *const zone_index.Zone, policy: AnswerPolicy) !dns_message.Message {
+/// `zoneversion` directives. `session` is the signing material of a signed
+/// zone, and is null when the zone carries no key to sign with.
+pub fn buildResponseWithPolicy(
+    request: dns_message.Message,
+    zone: *const zone_index.Zone,
+    policy: AnswerPolicy,
+    session: ?*const zone_signer.Session,
+) !dns_message.Message {
     const q = request.question orelse return Error.MissingQuestion;
     if (request.header.opcode != .query) return buildNotImplementedResponse(request);
     if (!q.qclass.eql(dns_types.Class.IN)) return buildEmptyResponse(request, q, .notimp);
@@ -156,8 +163,9 @@ pub fn buildResponseWithPolicy(request: dns_message.Message, zone: *const zone_i
     }
     // RFC 9660 section 3.2.1: a ZONEVERSION option is empty in a query and
     // appears at most once. A server that understands the option answers
-    // FORMERR to anything else rather than ignoring it.
-    if (zoneversionIsMalformed(&request)) return buildFormerrResponse(request);
+    // FORMERR to anything else rather than ignoring it. RFC 7314 section 2
+    // gives the EXPIRE option the same zero-length query form.
+    if (ednsOptionIsMalformed(&request)) return buildFormerrResponse(request);
     var qname_text_buffer: [256]u8 = undefined;
     const qname_text = q.name.toText(&qname_text_buffer) catch return Error.BadQName;
     var lookup = zone.lookup(request.allocator, qname_text, q.qtype);
@@ -193,6 +201,14 @@ pub fn buildResponseWithPolicy(request: dns_message.Message, zone: *const zone_i
         appendRequestedEdnsOptions(&response, &request, zone, policy);
     }
 
+    // DNSSEC minimum (RFC 4035 section 3.1, RFC 5155): RRSIGs covering the
+    // answer RRsets and NSEC/NSEC3 denial proofs ride along only when the
+    // query set DO=1; without DO, proof RRsets are stripped unless the
+    // QTYPE asked for them explicitly. The AD bit is never set here: the
+    // authoritative path does not validate (validation lives on the
+    // forwarding path in `src/dns/validate.zig`).
+    const dnssec_ok = if (request.edns) |edns| edns.dnssec_ok else false;
+
     switch (lookup.kind) {
         .answer, .cname, .dname, .yxdomain => {
             var index: usize = 0;
@@ -224,7 +240,15 @@ pub fn buildResponseWithPolicy(request: dns_message.Message, zone: *const zone_i
                 q.qtype.eql(dns_types.RecordType.ANY) and
                 zone.hasOwner(qname_text);
             if (minimal_any) {
-                try response.answers.append(anyMinimalAnswer(q.name, policy.minimal_any_ttl));
+                const answer = anyMinimalAnswer(q.name, policy.minimal_any_ttl);
+                try response.answers.append(answer);
+                // RFC 8482 section 4.2: a signed zone must return a valid
+                // RRSIG for the RRsets in the answer when the query sets DO=1.
+                // The HINFO is synthesized, so no signature over it exists in
+                // the zone and one is made here.
+                if (dnssec_ok) {
+                    if (session) |signing| try appendMinimalAnyRrsig(&response, zone, signing, answer);
+                }
             } else {
                 // RFC 8020 section 2 Warning: a denial reached through a CNAME
                 // or DNAME chain is for the last name of the chain, so the
@@ -248,11 +272,11 @@ pub fn buildResponseWithPolicy(request: dns_message.Message, zone: *const zone_i
     // QTYPE asked for them explicitly. The AD bit is never set here: the
     // authoritative path does not validate (validation lives on the
     // forwarding path in `src/dns/validate.zig`).
-    const dnssec_ok = if (request.edns) |edns| edns.dnssec_ok else false;
     if (dnssec_ok) {
         appendCoveringRrsigs(&response, zone, q.qtype, lookup.answer_owner) catch {};
         if (lookup.kind == .nodata or lookup.kind == .nxdomain) {
-            appendDenialProofs(&response, zone, qname_text, q.qtype) catch {};
+            const proved = appendDenialProofs(&response, zone, qname_text, q.qtype, lookup.kind) catch false;
+            if (!proved) refuseUnprovenDenial(&response);
         }
     } else {
         dns_dnssec.stripProofRecords(&response, q.qtype);
@@ -289,6 +313,51 @@ fn anyMinimalAnswer(owner: dns_name.Name, ttl: u32) dns_record.ResourceRecord {
         .ttl = ttl,
         .rdata = .{ .HINFO = rdata },
     };
+}
+
+/// RFC 8482 section 4.2: the minimal ANY answer is synthesized, so it is not
+/// in the zone file and no signature over it exists. The clause "a valid RRSIG
+/// for the RRsets in the answer ... MUST be returned" is met by signing the
+/// RRset the answer carries, over the canonical form RFC 4034 section 6.2
+/// asks for: the owner name, the type, the class, the original TTL, and the
+/// RDATA.
+fn appendMinimalAnyRrsig(
+    response: *dns_message.Message,
+    zone: *const zone_index.Zone,
+    session: *const zone_signer.Session,
+    answer: dns_record.ResourceRecord,
+) !void {
+    var rdata_buffer: [dns_rdata.max_unknown_len]u8 = undefined;
+    var rdata_writer = dns_writer.Writer.init(&rdata_buffer);
+    answer.rdata.encode(&rdata_writer) catch return Error.BadResponse;
+    const rdata = rdata_writer.written();
+
+    // RFC 4034 section 3.1.7: the Signer's Name is the zone of the covered
+    // RRset, which is the zone that answered.
+    const signer_name = dns_name.Name.fromText(zone.originText()) catch return Error.BadQName;
+
+    const rrsig_rdata = try zone_signer.signRrset(
+        response.allocator,
+        answer.owner,
+        signer_name,
+        answer.rrtype.code(),
+        &.{rdata},
+        answer.ttl,
+        &session.key,
+        session.options,
+    );
+    defer response.allocator.free(rrsig_rdata);
+    if (rrsig_rdata.len > dns_rdata.max_unknown_len) return Error.BadResponse;
+
+    var unknown = dns_rdata.Unknown{ .len = @intCast(rrsig_rdata.len) };
+    @memcpy(unknown.data[0..rrsig_rdata.len], rrsig_rdata);
+    try response.answers.append(.{
+        .owner = answer.owner,
+        .rrtype = .RRSIG,
+        .class = dns_types.Class.IN,
+        .ttl = answer.ttl,
+        .rdata = .{ .Unknown = unknown },
+    });
 }
 
 /// Maximum RRSIGs attached to one response. Answers name few RRsets, so this
@@ -362,13 +431,31 @@ fn appendCoveringRrsigs(response: *dns_message.Message, zone: *const zone_index.
     }
 }
 
-/// Best-effort authenticated denial for NODATA/NXDOMAIN when DO=1: attach an
-/// exact-owner NSEC that denies the QTYPE, else any zone NSEC whose span
-/// covers the QNAME, plus apex NSEC3PARAM RRsets. Capped so denial proofs
-/// cannot amplify a small query into a large response.
-fn appendDenialProofs(response: *dns_message.Message, zone: *const zone_index.Zone, qname_text: []const u8, qtype: dns_types.RecordType) !void {
+/// Authenticated denial for NODATA/NXDOMAIN when DO=1. A zone that
+/// publishes an NSEC3 chain proves its denials with NSEC3 records
+/// (RFC 5155 section 7.2); a zone without one answers with the NSEC proofs
+/// it has always served. The result is false when the chain cannot prove the
+/// denial: a wrong proof is worse than none, so the caller answers server
+/// failure instead.
+fn appendDenialProofs(
+    response: *dns_message.Message,
+    zone: *const zone_index.Zone,
+    qname_text: []const u8,
+    qtype: dns_types.RecordType,
+    kind: zone_index.LookupKind,
+) !bool {
     const dnssec = @import("../dns/dnssec.zig");
-    const qname = dns_name.Name.fromText(qname_text) catch return;
+    const qname = dns_name.Name.fromText(qname_text) catch return true;
+    var chain = try nsec3Chain(response.allocator, zone);
+    defer chain.deinit(response.allocator);
+    if (chain.entries != null) {
+        if (!chain.consistent) return false;
+        if (!try appendNsec3Proofs(response, zone, &chain, qname, qtype, kind == .nxdomain)) return false;
+        // RFC 5155 section 7.3: the apex NSEC3PARAM states the parameters of
+        // the chain, so a validator can check the hash the proof was built with.
+        try appendApexNsec3Param(response, zone);
+        return true;
+    }
     var attached: usize = 0;
     var index: usize = 0;
     while (index < zone.records.len and attached < 4) : (index += 1) {
@@ -393,16 +480,305 @@ fn appendDenialProofs(response: *dns_message.Message, zone: *const zone_index.Zo
             attached += 1;
         }
     }
-    index = 0;
-    while (index < zone.records.len and attached < 6) : (index += 1) {
+    try appendApexNsec3Param(response, zone);
+    return true;
+}
+
+/// The apex NSEC3PARAM of the zone: the parameters every record of the chain
+/// shares (RFC 5155 section 7.3), so a validator can check the hash a proof
+/// was built with.
+fn appendApexNsec3Param(response: *dns_message.Message, zone: *const zone_index.Zone) !void {
+    var index: usize = 0;
+    while (index < zone.records.len) : (index += 1) {
         const candidate = zone.records.items[index];
         if (!candidate.rrtype.eql(.NSEC3PARAM)) continue;
         if (!std.ascii.eqlIgnoreCase(candidate.ownerText(), zone.originText())) continue;
         const rr = toResourceRecord(candidate, null) catch continue;
         try response.authorities.append(rr);
-        attached += 1;
+        return;
     }
 }
+
+/// A denial the zone cannot prove is answered with server failure
+/// (RFC 5155 section 7.2.9): the zone claims the name does not exist, and
+/// the only honest answer is that the server cannot prove it.
+fn refuseUnprovenDenial(response: *dns_message.Message) void {
+    response.header.rcode = .servfail;
+    response.answers.len = 0;
+    response.authorities.len = 0;
+}
+
+// ------------------------------------------------------------------- NSEC3
+
+/// One NSEC3 record of a zone's chain (RFC 5155 section 3).
+const Nsec3Entry = struct {
+    /// The hash of the original owner name, decoded from the NSEC3 owner.
+    owner_hash: [20]u8,
+    /// The next hashed owner name the record points at.
+    next_hash: [20]u8,
+    /// The zone record, so the proof can carry the record itself.
+    record: zone_parser.ZoneRecord,
+};
+
+/// The NSEC3 chain a zone publishes (RFC 5155 section 7.1) with the
+/// parameters every record of the chain shares.
+const Nsec3Chain = struct {
+    /// The records of the chain, or null when the zone publishes no NSEC3.
+    entries: ?[]Nsec3Entry = null,
+    salt_buffer: [255]u8 = undefined,
+    salt_len: u8 = 0,
+    iterations: u16 = 0,
+    /// False when the chain mixes the salt or the iteration count RFC 5155
+    /// section 7.2 forbids, so no proof can be built from it.
+    consistent: bool = true,
+
+    fn salt(self: *const Nsec3Chain) []const u8 {
+        return self.salt_buffer[0..self.salt_len];
+    }
+
+    fn deinit(self: *Nsec3Chain, allocator: std.mem.Allocator) void {
+        if (self.entries) |entries| allocator.free(entries);
+        self.entries = null;
+    }
+};
+
+/// Read the NSEC3 chain the zone publishes. A zone with no NSEC3 record has
+/// no chain, and the caller keeps serving the NSEC proofs.
+fn nsec3Chain(allocator: std.mem.Allocator, zone: *const zone_index.Zone) !Nsec3Chain {
+    var entries: std.ArrayList(Nsec3Entry) = .empty;
+    errdefer entries.deinit(allocator);
+    var chain = Nsec3Chain{};
+    var index: usize = 0;
+    while (index < zone.records.len) : (index += 1) {
+        const record = zone.records.items[index];
+        if (!record.rrtype.eql(.NSEC3)) continue;
+        const raw = zone_parser.parseRData(record.rrtype, record.rdataText()) catch continue;
+        const bytes = switch (raw) {
+            .Unknown => |*unknown| unknown.bytes(),
+            else => continue,
+        };
+        const rdata = dns_validate.parseNsec3Rdata(bytes) orelse continue;
+        const owner = dns_name.Name.fromText(record.ownerText()) catch continue;
+        const owner_hash = dns_validate.nsec3OwnerHash(owner) orelse continue;
+        if (entries.items.len == 0) {
+            chain.salt_len = @intCast(rdata.salt.len);
+            @memcpy(chain.salt_buffer[0..rdata.salt.len], rdata.salt);
+            chain.iterations = rdata.iterations;
+        } else {
+            // RFC 5155 section 7.2: every NSEC3 in a response uses the same
+            // hash algorithm, iteration count, and salt.
+            if (rdata.iterations != chain.iterations) chain.consistent = false;
+            if (!std.mem.eql(u8, rdata.salt, chain.salt())) chain.consistent = false;
+        }
+        try entries.append(allocator, .{
+            .owner_hash = owner_hash,
+            .next_hash = rdata.next_hash[0..20].*,
+            .record = record,
+        });
+    }
+    if (entries.items.len == 0) return chain;
+    chain.entries = entries.items;
+    return chain;
+}
+
+/// The hash the chain computes for a name (RFC 5155 section 5).
+fn nsec3HashOf(chain: *const Nsec3Chain, name: dns_name.Name) [20]u8 {
+    var out: [20]u8 = undefined;
+    dns_dnssec.nsec3Hash(name, chain.salt(), chain.iterations, &out);
+    return out;
+}
+
+/// The chain entry whose owner hash is `target` (RFC 5155 section 8.3).
+fn nsec3Match(chain: *const Nsec3Chain, target: [20]u8) ?usize {
+    const entries = chain.entries orelse return null;
+    for (entries, 0..) |entry, index| {
+        if (std.mem.eql(u8, &entry.owner_hash, &target)) return index;
+    }
+    return null;
+}
+
+/// The chain entry whose span covers `target` (RFC 5155 section 7.2.1).
+fn nsec3Cover(chain: *const Nsec3Chain, target: [20]u8) ?usize {
+    const entries = chain.entries orelse return null;
+    for (entries, 0..) |entry, index| {
+        if (dns_validate.nsec3Covers(entry.owner_hash, entry.next_hash, target)) return index;
+    }
+    return null;
+}
+
+/// True when the NSEC3 record's bitmap leaves the QTYPE and CNAME bits clear
+/// (RFC 5155 section 7.2.3, section 8.5).
+fn nsec3DeniesType(chain: *const Nsec3Chain, index: usize, qtype: u16) bool {
+    const entries = chain.entries orelse return false;
+    const raw = zone_parser.parseRData(entries[index].record.rrtype, entries[index].record.rdataText()) catch return false;
+    const bytes = switch (raw) {
+        .Unknown => |*unknown| unknown.bytes(),
+        else => return false,
+    };
+    const rdata = dns_validate.parseNsec3Rdata(bytes) orelse return false;
+    return dns_dnssec.bitmapDeniesTypeAndCname(rdata.bitmap, qtype) catch false;
+}
+
+/// The closest encloser the chain proves (RFC 5155 section 7.2.1): the
+/// longest ancestor with an NSEC3 that matches it, the "next closer" name one
+/// label longer, and the NSEC3 that covers the next closer.
+const ClosestEncloser = struct {
+    name: dns_name.Name,
+    match: usize,
+    cover: usize,
+};
+
+fn nsec3ClosestEncloser(chain: *const Nsec3Chain, qname: dns_name.Name, origin: dns_name.Name) ?ClosestEncloser {
+    var next_closer = qname;
+    var candidate = parentName(qname) orelse return null;
+    while (true) {
+        if (nsec3Match(chain, nsec3HashOf(chain, candidate))) |index| {
+            const cover = nsec3Cover(chain, nsec3HashOf(chain, next_closer)) orelse return null;
+            return .{ .name = candidate, .match = index, .cover = cover };
+        }
+        // The apex is the last ancestor the zone can prove.
+        if (candidate.asWire().len <= origin.asWire().len) return null;
+        next_closer = candidate;
+        candidate = parentName(candidate) orelse return null;
+    }
+}
+
+/// The parent of a name: the same name with its leftmost label removed.
+fn parentName(name: dns_name.Name) ?dns_name.Name {
+    const wire = name.asWire();
+    if (wire.len < 2) return null;
+    const label_len = wire[0];
+    if (label_len == 0 or (label_len & 0xc0) != 0) return null;
+    const rest = wire[1 + label_len ..];
+    if (rest.len == 0 or rest[rest.len - 1] != 0) return null;
+    const parsed = dns_name.Name.parse(rest, 0) catch return null;
+    return parsed.name;
+}
+
+/// The NSEC3 records that prove one denial (RFC 5155 sections 7.2.1 to
+/// 7.2.5), each with the RRSIG that covers it. False when the chain cannot
+/// prove the denial.
+fn appendNsec3Proofs(
+    response: *dns_message.Message,
+    zone: *const zone_index.Zone,
+    chain: *const Nsec3Chain,
+    qname: dns_name.Name,
+    qtype: dns_types.RecordType,
+    nxdomain: bool,
+) !bool {
+    const digest = nsec3HashOf(chain, qname);
+
+    // RFC 5155 section 7.2.3: a NODATA answer carries the NSEC3 that matches
+    // the QNAME, and that record leaves the QTYPE and CNAME bits clear.
+    if (nsec3Match(chain, digest)) |index| {
+        if (nxdomain) return false;
+        if (!nsec3DeniesType(chain, index, qtype.code())) return false;
+        return try appendNsec3(response, zone, chain, index);
+    }
+
+    // RFC 5155 section 7.2.4: a DS NODATA with no matching NSEC3 needs a
+    // closest provable encloser proof over an opt-out span, which this
+    // server does not build.
+    if (qtype.eql(.DS)) return false;
+
+    const origin = dns_name.Name.fromText(zone.originText()) catch return false;
+    const encloser = nsec3ClosestEncloser(chain, qname, origin) orelse return false;
+
+    // The wildcard at the closest encloser (RFC 5155 section 7.2.2).
+    var encloser_buffer: [256]u8 = undefined;
+    const encloser_text = encloser.name.toText(&encloser_buffer) catch return false;
+    var wildcard_buffer: [260]u8 = undefined;
+    const wildcard_text = std.fmt.bufPrint(&wildcard_buffer, "*.{s}", .{encloser_text}) catch return false;
+    const wildcard = dns_name.Name.fromText(wildcard_text) catch return false;
+    const wildcard_digest = nsec3HashOf(chain, wildcard);
+
+    var proof: [3]usize = undefined;
+    var proof_len: usize = 0;
+    if (nxdomain) {
+        // RFC 5155 section 7.2.2: the closest encloser proof plus the NSEC3
+        // that covers the wildcard at the closest encloser.
+        if (nsec3Match(chain, wildcard_digest) != null) return false;
+        const wildcard_cover = nsec3Cover(chain, wildcard_digest) orelse return false;
+        proof[proof_len] = encloser.match;
+        proof_len += 1;
+        proof[proof_len] = encloser.cover;
+        proof_len += 1;
+        proof[proof_len] = wildcard_cover;
+        proof_len += 1;
+    } else {
+        // RFC 5155 section 7.2.5: a wildcard NODATA carries the closest
+        // encloser proof and the NSEC3 that matches the wildcard.
+        if (!zone.hasOwner(wildcard_text)) return false;
+        const wildcard_match = nsec3Match(chain, wildcard_digest) orelse return false;
+        if (!nsec3DeniesType(chain, wildcard_match, qtype.code())) return false;
+        proof[proof_len] = encloser.match;
+        proof_len += 1;
+        proof[proof_len] = encloser.cover;
+        proof_len += 1;
+        proof[proof_len] = wildcard_match;
+        proof_len += 1;
+    }
+    return try appendNsec3Set(response, zone, chain, proof[0..proof_len]);
+}
+
+/// Append the NSEC3 records of a proof, each one once. False when a record
+/// of the proof carries no signature, so the proof is refused rather than
+/// sent half-signed.
+fn appendNsec3Set(
+    response: *dns_message.Message,
+    zone: *const zone_index.Zone,
+    chain: *const Nsec3Chain,
+    indices: []const usize,
+) !bool {
+    for (indices, 0..) |index, position| {
+        var repeated = false;
+        for (indices[0..position]) |earlier| {
+            if (earlier == index) repeated = true;
+        }
+        if (repeated) continue;
+        if (!try appendNsec3(response, zone, chain, index)) return false;
+    }
+    return true;
+}
+
+/// Append one NSEC3 record and the RRSIG that covers it: a proof RRset that
+/// carries no signature authenticates nothing (RFC 4035 section 5.4). False
+/// when the zone holds no RRSIG over the record: an unsigned proof is worse
+/// than no proof, so the caller answers server failure instead.
+fn appendNsec3(
+    response: *dns_message.Message,
+    zone: *const zone_index.Zone,
+    chain: *const Nsec3Chain,
+    index: usize,
+) !bool {
+    const entries = chain.entries orelse return false;
+    const record = entries[index].record;
+    const signature = nsec3Signature(zone, record.ownerText()) orelse return false;
+    const rr = try toResourceRecord(record, null);
+    try response.authorities.append(rr);
+    try response.authorities.append(signature);
+    return true;
+}
+
+/// The RRSIG that covers an NSEC3 RRset (RFC 4035 section 5.4).
+fn nsec3Signature(zone: *const zone_index.Zone, owner_text: []const u8) ?dns_record.ResourceRecord {
+    var index: usize = 0;
+    while (index < zone.records.len) : (index += 1) {
+        const candidate = zone.records.items[index];
+        if (!candidate.rrtype.eql(.RRSIG)) continue;
+        if (!std.ascii.eqlIgnoreCase(candidate.ownerText(), owner_text)) continue;
+        const rr = toResourceRecord(candidate, null) catch continue;
+        const raw = switch (rr.rdata) {
+            .Unknown => |*unknown| unknown.bytes(),
+            else => continue,
+        };
+        const covered = dns_dnssec.rrsigCovers(raw) catch continue;
+        if (covered != dns_types.RecordType.NSEC3.code()) continue;
+        return rr;
+    }
+    return null;
+}
+
 // The proof-record strip moved to src/dns/dnssec.zig (RFC 3225/RFC 3597);
 // the authoritative path calls dns_dnssec.stripProofRecords below.
 
@@ -502,19 +878,27 @@ fn ednsOptions(message: *const dns_message.Message) ?[]const u8 {
 }
 
 /// RFC 9660 section 3.2.1: OPTION-LENGTH must be zero in a query, and a query
-/// must not carry the option more than once.
-fn zoneversionIsMalformed(request: *const dns_message.Message) bool {
+/// must not carry the option more than once. RFC 7314 section 2 defines only
+/// the zero-length query form of the EXPIRE option, so any other length is
+/// malformed in the same way.
+fn ednsOptionIsMalformed(request: *const dns_message.Message) bool {
     const options = ednsOptions(request) orelse return false;
     var offset: usize = 0;
-    var seen: usize = 0;
+    var zoneversion_seen: usize = 0;
     while (offset + 4 <= options.len) {
         const code = std.mem.readInt(u16, options[offset..][0..2], .big);
         const option_len = std.mem.readInt(u16, options[offset + 2 ..][0..2], .big);
         offset += 4;
         if (option_len > options.len - offset) return false;
-        if (code == dns_rdata.EDNS_ZONEVERSION_OPTION_CODE) {
-            seen += 1;
-            if (seen > 1 or option_len != 0) return true;
+        switch (code) {
+            dns_rdata.EDNS_ZONEVERSION_OPTION_CODE => {
+                zoneversion_seen += 1;
+                if (zoneversion_seen > 1 or option_len != 0) return true;
+            },
+            dns_rdata.EDNS_EXPIRE_OPTION_CODE => {
+                if (option_len != 0) return true;
+            },
+            else => {},
         }
         offset += option_len;
     }
@@ -539,6 +923,19 @@ fn appendRequestedEdnsOptions(
             _ = optOf(response).appendOption(dns_rdata.EDNS_NSID_OPTION_CODE, nsid);
         }
     }
+    // RFC 7314 section 3.1: the primary answers the EXPIRE option with the
+    // zone's SOA EXPIRE field in seconds, network byte order. Section 3.3
+    // keeps the option out of every answer this server is not authoritative
+    // for, so a referral carries none.
+    if (response.header.authoritative and
+        dns_rdata.findOption(options, dns_rdata.EDNS_EXPIRE_OPTION_CODE) != null)
+    {
+        if (soaExpire(zone)) |expire| {
+            var data: [4]u8 = undefined;
+            std.mem.writeInt(u32, data[0..4], expire, .big);
+            _ = optOf(response).appendOption(dns_rdata.EDNS_EXPIRE_OPTION_CODE, &data);
+        }
+    }
     if (!policy.zoneversion) return;
     if (dns_rdata.findOption(options, dns_rdata.EDNS_ZONEVERSION_OPTION_CODE) == null) return;
     // RFC 9660 section 3.2 lists the responses that carry the option, including
@@ -560,6 +957,14 @@ fn optOf(message: *dns_message.Message) *dns_rdata.Opt {
         if (record.rrtype.eql(.OPT)) return &record.rdata.OPT;
     }
     unreachable; // appendOpt ran before any option is added.
+}
+
+/// RFC 7314 section 3.1: the zone's SOA EXPIRE field, in seconds.
+fn soaExpire(zone: *const zone_index.Zone) ?u32 {
+    const record = zone.soa orelse return null;
+    const rdata = zone_parser.parseRData(.SOA, record.rdataText()) catch return null;
+    if (rdata != .SOA) return null;
+    return rdata.SOA.expire;
 }
 
 /// RFC 9660 section 2.1 LABELCOUNT: the labels of the zone name, counted from
@@ -1018,6 +1423,282 @@ test "NODATA with DO carries an NSEC denial proof, without DO only SOA" {
     try std.testing.expect(plain_response.authorities.items[0].rrtype.eql(.SOA));
 }
 
+/// A zone that publishes an NSEC3 chain (RFC 5155 section 7.1). The chain
+/// holds the two owner names the zone has, and every hash is the one the
+/// python hashlib oracle produced: the iterated salted SHA-1 of the canonical
+/// wire name, with salt "salt" and 2 iterations.
+const nsec3_test_zone =
+    \\$ORIGIN example.
+    \\$TTL 3600
+    \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+    \\@ IN NS ns.example.
+    \\@ IN DNSKEY 257 3 8 QUJDRA==
+    \\@ IN NSEC3PARAM 1 0 2 73616c74
+    \\www IN A 192.0.2.1
+    \\65fkkv52vjbvs8mj22eis3lq4enpnpcf IN NSEC3 1 0 2 73616c74 ermpp7q2mj4h4amfotejjmbehlb6k56g A RRSIG
+    \\ermpp7q2mj4h4amfotejjmbehlb6k56g IN NSEC3 1 0 2 73616c74 65fkkv52vjbvs8mj22eis3lq4enpnpcf SOA NS DNSKEY RRSIG
+    \\65fkkv52vjbvs8mj22eis3lq4enpnpcf IN RRSIG NSEC3 8 2 3600 2000000000 1000000000 1234 example. QUJD
+    \\ermpp7q2mj4h4amfotejjmbehlb6k56g IN RRSIG NSEC3 8 1 3600 2000000000 1000000000 1234 example. QUJD
+    \\
+;
+
+/// The same zone without the NSEC3 of "www.example.": the chain no longer
+/// holds the name the query asks about.
+const nsec3_incomplete_test_zone =
+    \\$ORIGIN example.
+    \\$TTL 3600
+    \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+    \\@ IN NS ns.example.
+    \\@ IN NSEC3PARAM 1 0 2 73616c74
+    \\www IN A 192.0.2.1
+    \\ermpp7q2mj4h4amfotejjmbehlb6k56g IN NSEC3 1 0 2 73616c74 ermpp7q2mj4h4amfotejjmbehlb6k56g SOA NS DNSKEY RRSIG
+    \\
+;
+
+/// The same chain with no RRSIG over the NSEC3 records: a proof RRset that
+/// carries no signature authenticates nothing (RFC 4035 section 5.4).
+const nsec3_unsigned_test_zone =
+    \\$ORIGIN example.
+    \\$TTL 3600
+    \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+    \\@ IN NS ns.example.
+    \\@ IN DNSKEY 257 3 8 QUJDRA==
+    \\@ IN NSEC3PARAM 1 0 2 73616c74
+    \\www IN A 192.0.2.1
+    \\65fkkv52vjbvs8mj22eis3lq4enpnpcf IN NSEC3 1 0 2 73616c74 ermpp7q2mj4h4amfotejjmbehlb6k56g A RRSIG
+    \\ermpp7q2mj4h4amfotejjmbehlb6k56g IN NSEC3 1 0 2 73616c74 65fkkv52vjbvs8mj22eis3lq4enpnpcf SOA NS DNSKEY RRSIG
+    \\
+;
+
+/// The NSEC3 hashes of the zone above, as the hashlib oracle computed them.
+const nsec3_apex_hash = [_]u8{ 0x76, 0xed, 0x9c, 0x9f, 0x42, 0xb4, 0xc9, 0x12, 0x2a, 0xcf, 0xc7, 0x5d, 0x39, 0xd9, 0x6e, 0x8d, 0x56, 0x6a, 0x14, 0xd0 };
+const nsec3_www_hash = [_]u8{ 0x31, 0x5f, 0x4a, 0x7c, 0xa2, 0xfc, 0xd7, 0xfe, 0x22, 0xd3, 0x10, 0x9d, 0x2e, 0x0e, 0xba, 0x23, 0xaf, 0x9b, 0xe5, 0x8f };
+const nsec3_missing_hash = [_]u8{ 0x52, 0xda, 0xc1, 0x03, 0x1c, 0x8a, 0xc4, 0x10, 0x94, 0x25, 0x7e, 0x33, 0xd2, 0x97, 0xb3, 0x00, 0x63, 0x65, 0xfb, 0x50 };
+const nsec3_wildcard_hash = [_]u8{ 0xb4, 0xc5, 0x24, 0xc6, 0x3b, 0x0b, 0xb8, 0x29, 0x83, 0xc1, 0xc5, 0xd2, 0xb8, 0xc3, 0xed, 0xa3, 0xb3, 0x74, 0xf2, 0x14 };
+
+/// The next hashed owner name an NSEC3 record names.
+fn servedNextHash(record: dns_record.ResourceRecord) ?[20]u8 {
+    const raw = switch (record.rdata) {
+        .Unknown => |*unknown| unknown.bytes(),
+        else => return null,
+    };
+    const rdata = dns_validate.parseNsec3Rdata(raw) orelse return null;
+    if (rdata.next_hash.len != 20) return null;
+    return rdata.next_hash[0..20].*;
+}
+
+/// The NSEC3 record a response carries whose owner hash is `target`.
+fn servedNsec3Match(response: *const dns_message.Message, target: [20]u8) ?dns_record.ResourceRecord {
+    for (response.authorities.slice()) |record| {
+        if (!record.rrtype.eql(.NSEC3)) continue;
+        const owner = dns_validate.nsec3OwnerHash(record.owner) orelse continue;
+        if (!std.mem.eql(u8, &owner, &target)) continue;
+        return record;
+    }
+    return null;
+}
+
+/// The NSEC3 record a response carries whose span covers `target`.
+fn servedNsec3Cover(response: *const dns_message.Message, target: [20]u8) ?dns_record.ResourceRecord {
+    for (response.authorities.slice()) |record| {
+        if (!record.rrtype.eql(.NSEC3)) continue;
+        const owner = dns_validate.nsec3OwnerHash(record.owner) orelse continue;
+        const next = servedNextHash(record) orelse continue;
+        if (!dns_validate.nsec3Covers(owner, next, target)) continue;
+        return record;
+    }
+    return null;
+}
+
+/// The type bitmap an NSEC3 record carries.
+fn servedNsec3Bitmap(record: dns_record.ResourceRecord) ?[]const u8 {
+    const raw = switch (record.rdata) {
+        .Unknown => |*unknown| unknown.bytes(),
+        else => return null,
+    };
+    const rdata = dns_validate.parseNsec3Rdata(raw) orelse return null;
+    return rdata.bitmap;
+}
+
+test "an NSEC3 zone proves NODATA with the NSEC3 that matches the name (RFC 5155 7.2.3)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(nsec3_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    const response = try buildResponse(try testDoQuery(arena.allocator(), 0x4470, "www.example.", .MX, true), &zone);
+    try std.testing.expectEqual(header.Rcode.no_error, response.header.rcode);
+
+    // The proof is the NSEC3 whose owner hash is the hash of the queried name.
+    const proof = servedNsec3Match(&response, nsec3_www_hash) orelse return error.TestExpectedEqual;
+    const bitmap = servedNsec3Bitmap(proof) orelse return error.TestExpectedEqual;
+    // Its bitmap names the types the name has and leaves the queried type and
+    // CNAME clear, which is what makes it a denial (RFC 5155 section 7.2.3).
+    try std.testing.expect(dns_dnssec.nsecBitmapHasType(bitmap, dns_types.RecordType.A.code()));
+    try std.testing.expect(!dns_dnssec.nsecBitmapHasType(bitmap, dns_types.RecordType.MX.code()));
+    try std.testing.expect(!dns_dnssec.nsecBitmapHasType(bitmap, dns_types.RecordType.CNAME.code()));
+
+    // The proof RRset must be authenticated too (RFC 4035 section 5.4).
+    var saw_signature = false;
+    for (response.authorities.slice()) |record| {
+        if (!record.rrtype.eql(.RRSIG)) continue;
+        const raw = switch (record.rdata) {
+            .Unknown => |*unknown| unknown.bytes(),
+            else => continue,
+        };
+        const covered = dns_dnssec.rrsigCovers(raw) catch continue;
+        if (covered == dns_types.RecordType.NSEC3.code()) saw_signature = true;
+    }
+    try std.testing.expect(saw_signature);
+}
+
+test "an NSEC3 zone proves NXDOMAIN with the closest encloser proof (RFC 5155 7.2.1, 7.2.2)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(nsec3_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    const response = try buildResponse(try testDoQuery(arena.allocator(), 0x4471, "nothere.example.", .A, true), &zone);
+    try std.testing.expectEqual(header.Rcode.nxdomain, response.header.rcode);
+
+    // The closest encloser is "example.", proved by the NSEC3 that matches it.
+    const encloser = servedNsec3Match(&response, nsec3_apex_hash) orelse return error.TestExpectedEqual;
+    try std.testing.expect(encloser.rrtype.eql(.NSEC3));
+    // The next closer "nothere.example." and the wildcard at the closest
+    // encloser are covered by the NSEC3 that spans them.
+    const cover = servedNsec3Cover(&response, nsec3_missing_hash) orelse return error.TestExpectedEqual;
+    const cover_owner = dns_validate.nsec3OwnerHash(cover.owner) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualSlices(u8, &nsec3_www_hash, &cover_owner);
+    // The wildcard at the closest encloser is "*.example.", and RFC 5155
+    // section 7.2.2 proves the name with the hash of that unexpanded name.
+    var wildcard_digest: [20]u8 = undefined;
+    dns_dnssec.nsec3Hash(try dns_name.Name.fromText("*.example."), &[_]u8{ 0x73, 0x61, 0x6c, 0x74 }, 2, &wildcard_digest);
+    try std.testing.expectEqualSlices(u8, &nsec3_wildcard_hash, &wildcard_digest);
+    // The wildcard hash falls in the other arc of the chain than the hash of
+    // the expanded name, so the record that covers it names the apex: the
+    // proof carried the unexpanded wildcard, not the expanded one.
+    const wildcard_cover = servedNsec3Cover(&response, nsec3_wildcard_hash) orelse return error.TestExpectedEqual;
+    const wildcard_cover_owner = dns_validate.nsec3OwnerHash(wildcard_cover.owner) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualSlices(u8, &nsec3_apex_hash, &wildcard_cover_owner);
+    // The proof never claims the queried name exists.
+    try std.testing.expect(servedNsec3Match(&response, nsec3_missing_hash) == null);
+}
+
+test "an NSEC3 denial carries the apex NSEC3PARAM (RFC 5155 7.3)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(nsec3_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    const response = try buildResponse(try testDoQuery(arena.allocator(), 0x4476, "www.example.", .MX, true), &zone);
+    try std.testing.expectEqual(header.Rcode.no_error, response.header.rcode);
+    // The parameters of the chain travel with the proof, so a validator can
+    // check the hash the proof was built with.
+    var saw_param = false;
+    for (response.authorities.slice()) |record| {
+        if (!record.rrtype.eql(.NSEC3PARAM)) continue;
+        saw_param = true;
+        var owner: [256]u8 = undefined;
+        try std.testing.expectEqualStrings("example.", try record.owner.toText(&owner));
+    }
+    try std.testing.expect(saw_param);
+}
+
+test "an NSEC3 proof without a covering RRSIG is refused, not sent unsigned" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(nsec3_unsigned_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    const response = try buildResponse(try testDoQuery(arena.allocator(), 0x4477, "www.example.", .MX, true), &zone);
+    // RFC 4035 section 5.4: a proof RRset that carries no signature
+    // authenticates nothing, so the denial is refused rather than proved
+    // with an unsigned record.
+    try std.testing.expectEqual(header.Rcode.servfail, response.header.rcode);
+    try std.testing.expectEqual(@as(u16, 0), response.header.authority_count);
+    for (response.authorities.slice()) |record| {
+        try std.testing.expect(!record.rrtype.eql(.NSEC3));
+    }
+}
+
+test "the NSEC3 proof rides along only when the query sets DO" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(nsec3_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    const do_response = try buildResponse(try testDoQuery(arena.allocator(), 0x4472, "nothere.example.", .A, true), &zone);
+    try std.testing.expect(servedNsec3Match(&do_response, nsec3_apex_hash) != null);
+
+    const plain_response = try buildResponse(try testDoQuery(arena.allocator(), 0x4473, "nothere.example.", .A, false), &zone);
+    try std.testing.expectEqual(@as(u16, 1), plain_response.header.authority_count);
+    try std.testing.expect(plain_response.authorities.items[0].rrtype.eql(.SOA));
+    try std.testing.expect(servedNsec3Match(&plain_response, nsec3_apex_hash) == null);
+}
+
+test "an NSEC3 chain that does not cover the name is refused, not proved wrongly" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(nsec3_incomplete_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    const response = try buildResponse(try testDoQuery(arena.allocator(), 0x4474, "www.example.", .MX, true), &zone);
+    try std.testing.expectEqual(header.Rcode.servfail, response.header.rcode);
+    try std.testing.expectEqual(@as(u16, 0), response.header.authority_count);
+}
+
+test "a zone without an NSEC3 chain keeps its NSEC denial proof" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(dnssec_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    const response = try buildResponse(try testDoQuery(arena.allocator(), 0x4475, "www.example.", .AAAA, true), &zone);
+    try std.testing.expectEqual(header.Rcode.no_error, response.header.rcode);
+    var saw_nsec = false;
+    for (response.authorities.slice()) |record| {
+        if (record.rrtype.eql(.NSEC)) saw_nsec = true;
+        try std.testing.expect(!record.rrtype.eql(.NSEC3));
+    }
+    try std.testing.expect(saw_nsec);
+
+    // The bytes this zone has always answered with do not move.
+    var encoded: [512]u8 = undefined;
+    var writer = @import("../dns/writer.zig").Writer.init(&encoded);
+    try response.encode(&writer);
+    try std.testing.expectEqualSlices(u8, &nsec_zone_denial_bytes, writer.written());
+}
+
+/// The bytes the NSEC-only zone answered a NODATA query with before the
+/// NSEC3 denial path existed: the negative SOA and the NSEC proof.
+const nsec_zone_denial_bytes = [_]u8{
+    0x44, 0x75, 0x84, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01,
+    0x03, 0x77, 0x77, 0x77, 0x07, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65,
+    0x00, 0x00, 0x1c, 0x00, 0x01, 0xc0, 0x10, 0x00, 0x06, 0x00, 0x01, 0x00,
+    0x00, 0x01, 0x2c, 0x00, 0x26, 0x02, 0x6e, 0x73, 0xc0, 0x10, 0x0a, 0x68,
+    0x6f, 0x73, 0x74, 0x6d, 0x61, 0x73, 0x74, 0x65, 0x72, 0xc0, 0x10, 0x00,
+    0x00, 0x00, 0x01, 0x00, 0x00, 0x0e, 0x10, 0x00, 0x00, 0x03, 0x84, 0x00,
+    0x12, 0x75, 0x00, 0x00, 0x00, 0x01, 0x2c, 0xc0, 0x0c, 0x00, 0x2f, 0x00,
+    0x01, 0x00, 0x00, 0x0e, 0x10, 0x00, 0x15, 0x03, 0x77, 0x77, 0x77, 0x07,
+    0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x00, 0x00, 0x06, 0x40, 0x00,
+    0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x29, 0x04, 0xd0, 0x00, 0x00, 0x80,
+    0x00, 0x00, 0x00,
+};
+
 fn testQuery(allocator: std.mem.Allocator, name_text: []const u8, qtype: dns_types.RecordType) !dns_message.Message {
     return .{
         .allocator = allocator,
@@ -1324,7 +2005,7 @@ test "RFC 9660: a ZONEVERSION request is answered with the responding zone's SOA
     // 3.2 names them, and the referral reports the referring zone's version.
     for ([_][]const u8{ "www.example.com.", "missing.example.com.", "www.child.example.com." }) |name_text| {
         const request = try testOptionsQuery(arena.allocator(), name_text, .A, &request_options);
-        const response = try buildResponseWithPolicy(request, &zone, .{});
+        const response = try buildResponseWithPolicy(request, &zone, .{}, null);
         const option = ednsOptions(&response) orelse return error.TestExpectedEqual;
         try std.testing.expectEqualSlices(u8, &expected, dns_rdata.findOption(option, dns_rdata.EDNS_ZONEVERSION_OPTION_CODE).?);
     }
@@ -1348,7 +2029,7 @@ test "RFC 9660: a ZONEVERSION request is never answered unless it was asked for"
     const declined = try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &.{
         .{ .code = dns_rdata.EDNS_ZONEVERSION_OPTION_CODE, .data = &.{} },
     });
-    const declined_response = try buildResponseWithPolicy(declined, &zone, .{ .zoneversion = false });
+    const declined_response = try buildResponseWithPolicy(declined, &zone, .{ .zoneversion = false }, null);
     const declined_options = ednsOptions(&declined_response) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(usize, 0), declined_options.len);
 }
@@ -1378,6 +2059,85 @@ test "RFC 9660 section 3.2.1: a malformed ZONEVERSION query is answered FORMERR"
     try std.testing.expectEqual(header.Rcode.no_error, ok.header.rcode);
 }
 
+test "RFC 7314 section 3.1: an EXPIRE request is answered with the zone's SOA EXPIRE value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(zoneversion_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    const request_options = [_]TestOption{.{
+        .code = dns_rdata.EDNS_EXPIRE_OPTION_CODE,
+        .data = &.{},
+    }};
+    const request = try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &request_options);
+    const response = try buildResponse(request, &zone);
+    const options = ednsOptions(&response) orelse return error.TestExpectedEqual;
+    // Section 3.1: a length-4 option with the zone's SOA EXPIRE field, 1209600
+    // seconds, in network byte order.
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x12, 0x75, 0x00 }, dns_rdata.findOption(options, dns_rdata.EDNS_EXPIRE_OPTION_CODE).?);
+}
+
+test "RFC 7314 section 2: the EXPIRE option is answered only when it was asked for" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(zoneversion_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    // A query without the option is answered exactly as before: the OPT record
+    // carries no option at all.
+    const plain = try buildResponse(try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &.{}), &zone);
+    const plain_options = ednsOptions(&plain) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 0), plain_options.len);
+}
+
+test "RFC 7314 section 3.3: a non-authoritative answer carries no EXPIRE option" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(zoneversion_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    const request_options = [_]TestOption{.{
+        .code = dns_rdata.EDNS_EXPIRE_OPTION_CODE,
+        .data = &.{},
+    }};
+    // The delegation to child.example.com. is a referral: this server is not
+    // authoritative for that zone, so the option stays out of the answer.
+    const request = try testOptionsQuery(arena.allocator(), "www.child.example.com.", .A, &request_options);
+    const response = try buildResponse(request, &zone);
+    try std.testing.expect(!response.header.authoritative);
+    const options = ednsOptions(&response) orelse return error.TestExpectedEqual;
+    try std.testing.expect(dns_rdata.findOption(options, dns_rdata.EDNS_EXPIRE_OPTION_CODE) == null);
+}
+
+test "RFC 7314 section 2: a malformed EXPIRE query is answered FORMERR" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(zoneversion_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    const empty = TestOption{ .code = dns_rdata.EDNS_EXPIRE_OPTION_CODE, .data = &.{} };
+    const payload_in_query = [_]TestOption{.{
+        .code = dns_rdata.EDNS_EXPIRE_OPTION_CODE,
+        .data = &.{ 0x00, 0x12, 0x75, 0x00 },
+    }};
+    const response = try buildResponse(try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &payload_in_query), &zone);
+    try std.testing.expectEqual(header.Rcode.formerr, response.header.rcode);
+    try std.testing.expectEqual(@as(usize, 0), response.answers.len);
+
+    // The zero-length query form is the well-formed request and is answered
+    // normally.
+    const ok = try buildResponse(try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &.{empty}), &zone);
+    try std.testing.expectEqual(header.Rcode.no_error, ok.header.rcode);
+}
+
 test "RFC 5001: NSID is echoed only when configured and only when requested" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1389,12 +2149,12 @@ test "RFC 5001: NSID is echoed only when configured and only when requested" {
     const nsid = [_]TestOption{.{ .code = dns_rdata.EDNS_NSID_OPTION_CODE, .data = &.{} }};
     const policy = AnswerPolicy{ .nsid = "ns1.example.com." };
 
-    const answered = try buildResponseWithPolicy(try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &nsid), &zone, policy);
+    const answered = try buildResponseWithPolicy(try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &nsid), &zone, policy, null);
     const answered_options = ednsOptions(&answered) orelse return error.TestExpectedEqual;
     try std.testing.expectEqualSlices(u8, policy.nsid.?, dns_rdata.findOption(answered_options, dns_rdata.EDNS_NSID_OPTION_CODE).?);
 
     // Section 2.2: the option is never sent to a resolver that did not ask.
-    const unsolicited = try buildResponseWithPolicy(try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &.{}), &zone, policy);
+    const unsolicited = try buildResponseWithPolicy(try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &.{}), &zone, policy, null);
     const unsolicited_options = ednsOptions(&unsolicited) orelse return error.TestExpectedEqual;
     try std.testing.expect(dns_rdata.findOption(unsolicited_options, dns_rdata.EDNS_NSID_OPTION_CODE) == null);
 
@@ -1406,7 +2166,7 @@ test "RFC 5001: NSID is echoed only when configured and only when requested" {
     // Section 2.2: NSID payload data in a query is ignored, and answering with
     // the server's own identifier is what the option's presence asked for.
     const with_payload = [_]TestOption{.{ .code = dns_rdata.EDNS_NSID_OPTION_CODE, .data = &.{ 0xde, 0xad } }};
-    const ignored = try buildResponseWithPolicy(try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &with_payload), &zone, policy);
+    const ignored = try buildResponseWithPolicy(try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &with_payload), &zone, policy, null);
     const ignored_options = ednsOptions(&ignored) orelse return error.TestExpectedEqual;
     try std.testing.expectEqualSlices(u8, policy.nsid.?, dns_rdata.findOption(ignored_options, dns_rdata.EDNS_NSID_OPTION_CODE).?);
 }
@@ -1426,7 +2186,7 @@ test "RFC 5001: a repeated NSID request is answered with one identifier, not an 
         .{ .code = dns_rdata.EDNS_NSID_OPTION_CODE, .data = &.{} },
     };
     const policy = AnswerPolicy{ .nsid = "ns1.example.com." };
-    const response = try buildResponseWithPolicy(try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &repeated), &zone, policy);
+    const response = try buildResponseWithPolicy(try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &repeated), &zone, policy, null);
     try std.testing.expectEqual(header.Rcode.no_error, response.header.rcode);
     const options = ednsOptions(&response) orelse return error.TestExpectedEqual;
     try std.testing.expectEqualSlices(u8, policy.nsid.?, dns_rdata.findOption(options, dns_rdata.EDNS_NSID_OPTION_CODE).?);
@@ -1444,7 +2204,7 @@ test "RFC 8145 section 4.3: a responder never answers with the edns-key-tag opti
     defer zone.deinit();
 
     const key_tag = [_]TestOption{.{ .code = dns_rdata.EDNS_KEY_TAG_OPTION_CODE, .data = &.{ 0x4a, 0x4c } }};
-    const response = try buildResponseWithPolicy(try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &key_tag), &zone, .{ .nsid = "ns1" });
+    const response = try buildResponseWithPolicy(try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &key_tag), &zone, .{ .nsid = "ns1" }, null);
     const options = ednsOptions(&response) orelse return error.TestExpectedEqual;
     try std.testing.expect(dns_rdata.findOption(options, dns_rdata.EDNS_KEY_TAG_OPTION_CODE) == null);
     // Section 4.3 forbids the answer outright, and RFC 5001 section 2.2 means
@@ -1636,11 +2396,104 @@ test "RFC 8482: a configured TTL reaches the synthesized HINFO" {
     var zone = try zone_index.Zone.fromZoneFile(&zone_file);
     defer zone.deinit();
 
-    const configured = try buildResponseWithPolicy(try testQuery(arena.allocator(), "dns.home.arpa.", .ANY), &zone, .{ .minimal_any_ttl = 300 });
+    const configured = try buildResponseWithPolicy(try testQuery(arena.allocator(), "dns.home.arpa.", .ANY), &zone, .{ .minimal_any_ttl = 300 }, null);
     try std.testing.expectEqual(@as(u32, 300), configured.answers.items[0].ttl);
 
     const default = try buildResponse(try testQuery(arena.allocator(), "dns.home.arpa.", .ANY), &zone);
     try std.testing.expectEqual(@as(u32, 86400), default.answers.items[0].ttl);
+}
+
+test "RFC 8482: a DO=1 ANY query on a signed zone answers the HINFO with a valid RRSIG" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+        \\@ IN NS ns.example.
+        \\ns IN A 192.0.2.1
+        \\www IN A 192.0.2.2
+        \\
+    );
+    defer zone_file.deinit();
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    // The RFC 8080 section 6.1 Ed25519 key, so nothing secret enters the
+    // repository and the DNSKEY it derives is the one the RFC pins.
+    var key = try zone_signer.parseKey("ed25519 DSSF3o0s0f+ElWzj9E/Osxw8hLpk55chkmx0LYN5WiY=\n");
+    defer key.deinit();
+    const dnskey_rdata = try key.dnskeyRdata(arena.allocator());
+    const window = zone_signer.Options{ .inception = 1_000_000_000, .expiration = 2_000_000_000 };
+    try zone_signer.signZone(arena.allocator(), &zone, &key, window);
+    var session = zone_signer.Session.start(&key, window);
+    defer session.deinit();
+
+    const query = try testDoQuery(arena.allocator(), 0x4a02, "www.example.", .ANY, true);
+    const answer = try buildResponseWithPolicy(query, &zone, .{}, &session);
+
+    // Section 4.2: the synthesized HINFO, and -- because the zone is signed
+    // and the query set DO=1 -- a valid RRSIG for the RRsets in the answer.
+    try std.testing.expectEqual(@as(u16, 2), answer.header.answer_count);
+    try std.testing.expect(answer.answers.items[0].rrtype.eql(hinfo_type));
+    try std.testing.expect(answer.answers.items[1].rrtype.eql(.RRSIG));
+
+    const rrsig = switch (answer.answers.items[1].rdata) {
+        .Unknown => |*unknown| unknown.bytes(),
+        else => return error.TestUnexpectedResult,
+    };
+    // RFC 4034 section 3.1.1: the type covered is the HINFO.
+    try std.testing.expectEqual(hinfo_type.code(), std.mem.readInt(u16, rrsig[0..2], .big));
+    // RFC 4034 section 3.1.3: the Labels field counts the owner name's
+    // labels without the root label, so "www.example." is 2.
+    try std.testing.expectEqual(@as(u8, 2), rrsig[3]);
+    // RFC 4034 section 3.1.4: the original TTL is the TTL the answer carries.
+    try std.testing.expectEqual(answer.answers.items[0].ttl, std.mem.readInt(u32, rrsig[4..8], .big));
+    // RFC 4034 section 3.1.6 and Appendix B: the key tag is the one of the
+    // DNSKEY that validates the signature.
+    try std.testing.expectEqual(dns_dnssec.keyTag(dnskey_rdata), std.mem.readInt(u16, rrsig[16..18], .big));
+
+    // The signature itself is checked by the project's own validator, which
+    // rebuilds the canonical RR form from the answer and verifies it against
+    // the zone's own DNSKEY.
+    var anchors = dns_validate.Anchors{};
+    anchors.items[0] = .{ .owner = try dns_name.Name.fromText("example."), .rrtype = .DNSKEY, .rdata = dnskey_rdata };
+    anchors.len = 1;
+    const result = try dns_validate.validate(arena.allocator(), &anchors, query, answer, &.{}, 1_500_000_000);
+    try std.testing.expectEqual(dns_validate.Status.secure, result.status);
+
+    // Without DO the answer carries no RRSIG, the rule the rest of the
+    // authoritative path follows.
+    const plain_query = try testDoQuery(arena.allocator(), 0x4a03, "www.example.", .ANY, false);
+    const plain_answer = try buildResponseWithPolicy(plain_query, &zone, .{}, &session);
+    try std.testing.expectEqual(@as(u16, 1), plain_answer.header.answer_count);
+    try std.testing.expect(plain_answer.answers.items[0].rrtype.eql(hinfo_type));
+}
+
+test "RFC 8482: an unsigned zone answers the HINFO with no RRSIG" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+        \\@ IN NS ns.example.
+        \\ns IN A 192.0.2.1
+        \\www IN A 192.0.2.2
+        \\
+    );
+    defer zone_file.deinit();
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    // A zone that is not signed has no key to sign with, so the answer is the
+    // synthesized HINFO alone.
+    const query = try testDoQuery(arena.allocator(), 0x4a04, "www.example.", .ANY, true);
+    const answer = try buildResponseWithPolicy(query, &zone, .{}, null);
+    try std.testing.expectEqual(@as(u16, 1), answer.header.answer_count);
+    try std.testing.expect(answer.answers.items[0].rrtype.eql(hinfo_type));
 }
 
 test "RFC 9471: a referral carries in-domain and sibling-domain glue" {
