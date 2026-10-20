@@ -216,10 +216,14 @@ pub const Zone = struct {
             var matched = false;
             var cname: ?parser.ZoneRecord = null;
             var exact_match = false;
+            // The owner of an NSEC3 record names nothing in the zone, and
+            // neither does the signature over it (RFC 5155 section 7.2.8).
+            const hashed_owner = self.ownerIsHashed(current);
             var index: usize = 0;
             while (index < self.records.len) : (index += 1) {
                 const record = self.records.items[index];
                 if (!std.ascii.eqlIgnoreCase(record.ownerText(), current)) continue;
+                if (hashed_owner) continue;
                 owner_exists = true;
                 matched = true;
                 if (record.rrtype.eql(qtype)) {
@@ -349,7 +353,19 @@ pub const Zone = struct {
     /// True when any record in this zone has this exact owner name. An
     /// empty non-terminal has descendants but no record of its own.
     pub fn hasOwner(self: *const Zone, owner: []const u8) bool {
+        if (self.ownerIsHashed(owner)) return false;
         for (self.records.items[0..self.records.len]) |record| {
+            if (std.ascii.eqlIgnoreCase(record.ownerText(), owner)) return true;
+        }
+        return false;
+    }
+
+    /// True when the zone holds an NSEC3 record at this owner name. The owner
+    /// of an NSEC3 record is the hash of another name, so it names nothing in
+    /// the zone (RFC 5155 section 7.2.8).
+    fn ownerIsHashed(self: *const Zone, owner: []const u8) bool {
+        for (self.records.items[0..self.records.len]) |record| {
+            if (!record.rrtype.eql(.NSEC3)) continue;
             if (std.ascii.eqlIgnoreCase(record.ownerText(), owner)) return true;
         }
         return false;
@@ -357,7 +373,9 @@ pub const Zone = struct {
 
     fn nodeExists(self: *const Zone, name: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(name, self.originText())) return true;
+        if (self.ownerIsHashed(name)) return false;
         for (self.records.items[0..self.records.len]) |record| {
+            if (record.rrtype.eql(.NSEC3)) continue;
             if (std.ascii.eqlIgnoreCase(record.ownerText(), name) or isStrictSubdomain(record.ownerText(), name)) return true;
         }
         return false;

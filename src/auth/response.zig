@@ -697,14 +697,21 @@ fn appendNsec3Proofs(
     if (nxdomain) {
         // RFC 5155 section 7.2.2: the closest encloser proof plus the NSEC3
         // that covers the wildcard at the closest encloser.
-        if (nsec3Match(chain, wildcard_digest) != null) return false;
-        const wildcard_cover = nsec3Cover(chain, wildcard_digest) orelse return false;
         proof[proof_len] = encloser.match;
         proof_len += 1;
         proof[proof_len] = encloser.cover;
         proof_len += 1;
-        proof[proof_len] = wildcard_cover;
-        proof_len += 1;
+        if (nsec3Match(chain, wildcard_digest)) |wildcard_match| {
+            // RFC 5155 section 7.2.6: the wildcard at the closest encloser
+            // exists, so no NSEC3 covers it. The proof carries the NSEC3 that
+            // matches the wildcard, which states that it is there.
+            proof[proof_len] = wildcard_match;
+            proof_len += 1;
+        } else {
+            const wildcard_cover = nsec3Cover(chain, wildcard_digest) orelse return false;
+            proof[proof_len] = wildcard_cover;
+            proof_len += 1;
+        }
     } else {
         // RFC 5155 section 7.2.5: a wildcard NODATA carries the closest
         // encloser proof and the NSEC3 that matches the wildcard.
@@ -1470,6 +1477,24 @@ const nsec3_unsigned_test_zone =
     \\
 ;
 
+/// A zone with a wildcard at the apex whose chain holds the NSEC3 of the apex
+/// and of the wildcard, but not the NSEC3 of "b.example.": the chain's
+/// closest encloser is then the apex while the zone knows the deeper name.
+const nsec3_wildcard_test_zone =
+    \\$ORIGIN example.
+    \\$TTL 3600
+    \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+    \\@ IN NS ns.example.
+    \\@ IN NSEC3PARAM 1 0 2 73616c74
+    \\b IN A 192.0.2.5
+    \\*.example. IN A 192.0.2.9
+    \\ermpp7q2mj4h4amfotejjmbehlb6k56g IN NSEC3 1 0 2 73616c74 mj2i9hhr1es2j0u1on9bhgvdkepn9sgk SOA NS DNSKEY RRSIG
+    \\mj2i9hhr1es2j0u1on9bhgvdkepn9sgk IN NSEC3 1 0 2 73616c74 ermpp7q2mj4h4amfotejjmbehlb6k56g A RRSIG
+    \\ermpp7q2mj4h4amfotejjmbehlb6k56g IN RRSIG NSEC3 8 2 3600 2000000000 1000000000 1234 example. QUJD
+    \\mj2i9hhr1es2j0u1on9bhgvdkepn9sgk IN RRSIG NSEC3 8 1 3600 2000000000 1000000000 1234 example. QUJD
+    \\
+;
+
 /// The NSEC3 hashes of the zone above, as the hashlib oracle computed them.
 const nsec3_apex_hash = [_]u8{ 0x76, 0xed, 0x9c, 0x9f, 0x42, 0xb4, 0xc9, 0x12, 0x2a, 0xcf, 0xc7, 0x5d, 0x39, 0xd9, 0x6e, 0x8d, 0x56, 0x6a, 0x14, 0xd0 };
 const nsec3_www_hash = [_]u8{ 0x31, 0x5f, 0x4a, 0x7c, 0xa2, 0xfc, 0xd7, 0xfe, 0x22, 0xd3, 0x10, 0x9d, 0x2e, 0x0e, 0xba, 0x23, 0xaf, 0x9b, 0xe5, 0x8f };
@@ -1586,6 +1611,87 @@ test "an NSEC3 zone proves NXDOMAIN with the closest encloser proof (RFC 5155 7.
     try std.testing.expectEqualSlices(u8, &nsec3_apex_hash, &wildcard_cover_owner);
     // The proof never claims the queried name exists.
     try std.testing.expect(servedNsec3Match(&response, nsec3_missing_hash) == null);
+}
+
+/// Every NSEC3 record of a proof must ride with the RRSIG that covers it
+/// (RFC 4035 section 5.4): a proof that carries no signature authenticates
+/// nothing.
+fn expectNsec3ProofsSigned(response: *const dns_message.Message) !void {
+    for (response.authorities.slice()) |record| {
+        if (!record.rrtype.eql(.NSEC3)) continue;
+        var owner: [256]u8 = undefined;
+        const owner_text = try record.owner.toText(&owner);
+        var signed = false;
+        for (response.authorities.slice()) |candidate| {
+            if (!candidate.rrtype.eql(.RRSIG)) continue;
+            var candidate_owner: [256]u8 = undefined;
+            if (!std.ascii.eqlIgnoreCase(try candidate.owner.toText(&candidate_owner), owner_text)) continue;
+            const raw = switch (candidate.rdata) {
+                .Unknown => |*unknown| unknown.bytes(),
+                else => continue,
+            };
+            const covered = dns_dnssec.rrsigCovers(raw) catch continue;
+            if (covered == dns_types.RecordType.NSEC3.code()) signed = true;
+        }
+        try std.testing.expect(signed);
+    }
+}
+
+test "a query for an NSEC3 owner name is a name error (RFC 5155 7.2.8)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(nsec3_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    // The owner of an NSEC3 record is a hash of another name, so the name it
+    // names does not exist in the zone (RFC 5155 section 7.2.8).
+    const response = try buildResponse(try testDoQuery(arena.allocator(), 0x4478, "ermpp7q2mj4h4amfotejjmbehlb6k56g.example.", .A, true), &zone);
+    try std.testing.expectEqual(header.Rcode.nxdomain, response.header.rcode);
+
+    // The name error carries the closest encloser proof: the NSEC3 that
+    // matches the closest encloser and the NSEC3 that covers the next closer.
+    const encloser = servedNsec3Match(&response, nsec3_apex_hash) orelse return error.TestExpectedEqual;
+    try std.testing.expect(encloser.rrtype.eql(.NSEC3));
+    var next_closer: [20]u8 = undefined;
+    dns_dnssec.nsec3Hash(try dns_name.Name.fromText("ermpp7q2mj4h4amfotejjmbehlb6k56g.example."), &[_]u8{ 0x73, 0x61, 0x6c, 0x74 }, 2, &next_closer);
+    try std.testing.expect(servedNsec3Cover(&response, next_closer) != null);
+    // And the NSEC3 that covers the wildcard at the closest encloser.
+    const wildcard_cover = servedNsec3Cover(&response, nsec3_wildcard_hash) orelse return error.TestExpectedEqual;
+    const wildcard_cover_owner = dns_validate.nsec3OwnerHash(wildcard_cover.owner) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualSlices(u8, &nsec3_apex_hash, &wildcard_cover_owner);
+    // The proof never claims the hashed name exists.
+    try std.testing.expect(servedNsec3Match(&response, next_closer) == null);
+
+    // Every proof record rides with the RRSIG that covers it.
+    try expectNsec3ProofsSigned(&response);
+}
+
+test "an NXDOMAIN under a wildcard carries the wildcard proof (RFC 5155 7.2.6)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(nsec3_wildcard_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    // The chain's closest encloser is the apex, where the wildcard lives, and
+    // a wildcard matches only the name one label below it.
+    const response = try buildResponse(try testDoQuery(arena.allocator(), 0x4479, "x.b.example.", .A, true), &zone);
+    try std.testing.expectEqual(header.Rcode.nxdomain, response.header.rcode);
+
+    // The proof carries the NSEC3 that matches the wildcard at the closest
+    // encloser, which no other record can state (RFC 5155 section 7.2.6).
+    const wildcard = servedNsec3Match(&response, nsec3_wildcard_hash) orelse return error.TestExpectedEqual;
+    try std.testing.expect(wildcard.rrtype.eql(.NSEC3));
+    // And the NSEC3 that covers the next closer below the closest encloser.
+    var next_closer: [20]u8 = undefined;
+    dns_dnssec.nsec3Hash(try dns_name.Name.fromText("b.example."), &[_]u8{ 0x73, 0x61, 0x6c, 0x74 }, 2, &next_closer);
+    try std.testing.expect(servedNsec3Cover(&response, next_closer) != null);
+
+    // Every proof record rides with the RRSIG that covers it.
+    try expectNsec3ProofsSigned(&response);
 }
 
 test "an NSEC3 denial carries the apex NSEC3PARAM (RFC 5155 7.3)" {

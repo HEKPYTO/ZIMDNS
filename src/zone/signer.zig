@@ -12,7 +12,9 @@
 const std = @import("std");
 const Name = @import("../dns/name.zig").Name;
 const dns_dnssec = @import("../dns/dnssec.zig");
+const dns_message = @import("../dns/message.zig");
 const dns_types = @import("../dns/types.zig");
+const dns_validate = @import("../dns/validate.zig");
 const RecordType = dns_types.RecordType;
 const dns_rdata = @import("../dns/rdata.zig");
 const dns_writer = @import("../dns/writer.zig");
@@ -346,7 +348,14 @@ pub fn signZone(
     try appendSingle(work, origin_wire, RecordType.DS.code(), soa_ttl, try key.dsRdata(work, origin_wire, dnskey_rdata), &rrsets);
     std.mem.sort(Rrset, rrsets.items, {}, rrsetLessThan);
 
-    try appendNsecChain(work, &rrsets, soa_ttl);
+    // An apex NSEC3PARAM is the opt-in: the zone states the parameters of the
+    // chain it publishes, and the signer builds that chain (RFC 5155 section
+    // 7.1). A zone without one keeps the NSEC chain it always had.
+    if (try apexNsec3Param(work, zone)) |params| {
+        try appendNsec3Chain(work, &rrsets, origin_wire, soa_ttl, params);
+    } else {
+        try appendNsecChain(work, &rrsets, soa_ttl);
+    }
     try emit(work, allocator, zone, key, dns_dnssec.keyTag(dnskey_rdata), options, rrsets.items);
 }
 
@@ -406,12 +415,14 @@ fn soaMinimum(zone: *const zone_index.Zone) Error!u32 {
 }
 
 /// A zone that already carries its own DNSSEC records is left alone: signing it
-/// would append a second, conflicting RRSIG and NSEC RRset at every name.
+/// would append a second, conflicting RRSIG and NSEC RRset at every name. The
+/// apex NSEC3PARAM is the one exception: it states the parameters of the chain
+/// the signer is asked to build (RFC 5155 section 7.1), not a denial of its
+/// own.
 fn alreadySigned(zone: *const zone_index.Zone) bool {
     for (zone.records.items[0..zone.records.len]) |record| {
         if (record.rrtype.eql(.RRSIG) or record.rrtype.eql(.NSEC) or
-            record.rrtype.eql(.NSEC3) or record.rrtype.eql(.NSEC3PARAM) or
-            record.rrtype.eql(.DNSKEY)) return true;
+            record.rrtype.eql(.NSEC3) or record.rrtype.eql(.DNSKEY)) return true;
     }
     return false;
 }
@@ -604,6 +615,222 @@ fn appendNsecChain(allocator: std.mem.Allocator, rrsets: *std.ArrayList(Rrset), 
     }
 }
 
+// ------------------------------------------------------------------- NSEC3
+
+/// RFC 5155 section 4: the parameters the apex NSEC3PARAM states. The chain
+/// is built from them, so the record the operator writes is the record the
+/// zone publishes.
+const Nsec3Params = struct {
+    algorithm: u8,
+    flags: u8,
+    iterations: u16,
+    salt: []const u8,
+};
+
+/// The apex NSEC3PARAM of the zone, or null when the zone carries none. Only
+/// SHA-1 (RFC 5155 section 3.1.1) and the Opt-Out flag clear are implemented,
+/// so a record asking for anything else is refused rather than published with
+/// parameters this build cannot honour.
+fn apexNsec3Param(allocator: std.mem.Allocator, zone: *const zone_index.Zone) Error!?Nsec3Params {
+    var found: ?Nsec3Params = null;
+    for (zone.records.items[0..zone.records.len]) |record| {
+        if (!record.rrtype.eql(.NSEC3PARAM)) continue;
+        if (!std.ascii.eqlIgnoreCase(record.ownerText(), zone.originText())) return Error.BadZoneRecord;
+        const parsed = zone_parser.parseRData(.NSEC3PARAM, record.rdataText()) catch return Error.BadZoneRecord;
+        const bytes = switch (parsed) {
+            .Unknown => |*unknown| unknown.bytes(),
+            else => return Error.BadZoneRecord,
+        };
+        if (bytes.len < 5) return Error.BadZoneRecord;
+        if (bytes[0] != 1 or bytes[1] != 0) return Error.BadZoneRecord;
+        found = .{
+            .algorithm = bytes[0],
+            .flags = bytes[1],
+            .iterations = std.mem.readInt(u16, bytes[2..4], .big),
+            .salt = try allocator.dupe(u8, bytes[5..]),
+        };
+    }
+    return found;
+}
+
+/// RFC 5155 section 3: the owner name of an NSEC3 is the SHA-1 hash of the
+/// original owner name in unpadded base32hex (RFC 4648 section 7), so 20
+/// octets are exactly 32 characters.
+fn base32HexLabel(hash: [20]u8, out: *[32]u8) void {
+    const alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUV";
+    var written: usize = 0;
+    var index: usize = 0;
+    while (index < hash.len) : (index += 5) {
+        // Five octets are forty bits, which is exactly eight characters.
+        var chunk: u64 = 0;
+        for (hash[index..][0..5]) |byte| chunk = (chunk << 8) | byte;
+        var shift: u6 = 35;
+        while (true) {
+            out[written] = alphabet[@intCast((chunk >> shift) & 0x1f)];
+            written += 1;
+            if (shift == 0) break;
+            shift -= 5;
+        }
+    }
+}
+
+/// RFC 5155 section 5: the hash of the canonical owner name, the same hash
+/// the serving path and the validator compute.
+fn nsec3HashOf(owner_wire: []const u8, params: Nsec3Params) Error![20]u8 {
+    const parsed = Name.parse(owner_wire, 0) catch return Error.BadZoneRecord;
+    var out: [20]u8 = undefined;
+    dns_dnssec.nsec3Hash(parsed.name, params.salt, params.iterations, &out);
+    return out;
+}
+
+/// The parent of a wire name: the same name with its leftmost label removed.
+fn parentWire(wire: []const u8) ?[]const u8 {
+    if (wire.len < 2) return null;
+    const label_len = wire[0];
+    if (label_len == 0 or 1 + label_len >= wire.len) return null;
+    return wire[1 + label_len ..];
+}
+
+fn ownerNameLessThan(_: void, left: []const u8, right: []const u8) bool {
+    return zonemd.canonicalNameOrder(left, right) == .lt;
+}
+
+/// True when `name` is one of the zone's owner names, which arrive sorted in
+/// canonical order.
+fn isOwner(owners: []const []const u8, name: []const u8) bool {
+    var low: usize = 0;
+    var high: usize = owners.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        const order = zonemd.canonicalNameOrder(owners[mid], name);
+        if (order == .eq) return true;
+        if (order == .lt) low = mid + 1 else high = mid;
+    }
+    return false;
+}
+
+/// One owner name of the chain: the hash it stands for and the types present
+/// at the name itself.
+const Nsec3Entry = struct {
+    hash: [20]u8,
+    codes: []u16,
+};
+
+fn nsec3EntryLessThan(_: void, left: Nsec3Entry, right: Nsec3Entry) bool {
+    return std.mem.order(u8, &left.hash, &right.hash) == .lt;
+}
+
+/// RFC 5155 section 7.1: the NSEC3 chain a signed zone publishes. One NSEC3
+/// per owner name -- every authoritative owner and every empty non-terminal --
+/// sorted into hash order, each naming the next hash with the last wrapping to
+/// the first. The type bitmap names the types present at the original owner
+/// name, which per the same section never includes the NSEC3 type itself.
+fn appendNsec3Chain(
+    allocator: std.mem.Allocator,
+    rrsets: *std.ArrayList(Rrset),
+    origin_wire: []const u8,
+    ttl: u32,
+    params: Nsec3Params,
+) Error!void {
+    var owners: std.ArrayList([]const u8) = .empty;
+    defer owners.deinit(allocator);
+    for (rrsets.items) |rrset| {
+        if (owners.items.len != 0 and std.mem.eql(u8, owners.items[owners.items.len - 1], rrset.owner_wire)) continue;
+        try owners.append(allocator, rrset.owner_wire);
+    }
+
+    // RFC 5155 section 7.1: an empty non-terminal has an NSEC3 too, so the
+    // closest encloser of a name below one can be proved.
+    var ents: std.ArrayList([]const u8) = .empty;
+    defer ents.deinit(allocator);
+    for (owners.items) |owner_wire| {
+        var parent = parentWire(owner_wire) orelse continue;
+        while (parent.len > origin_wire.len) {
+            if (isOwner(owners.items, parent)) break;
+            try ents.append(allocator, parent);
+            parent = parentWire(parent) orelse break;
+        }
+    }
+    std.mem.sort([]const u8, ents.items, {}, ownerNameLessThan);
+    var unique: usize = 0;
+    for (ents.items) |name| {
+        if (unique != 0 and std.mem.eql(u8, ents.items[unique - 1], name)) continue;
+        ents.items[unique] = name;
+        unique += 1;
+    }
+    ents.items.len = unique;
+
+    var entries: std.ArrayList(Nsec3Entry) = .empty;
+    defer entries.deinit(allocator);
+    var codes: std.ArrayList(u16) = .empty;
+    defer codes.deinit(allocator);
+    var group: usize = 0;
+    for (owners.items) |owner_wire| {
+        while (group < rrsets.items.len and !std.mem.eql(u8, rrsets.items[group].owner_wire, owner_wire)) group += 1;
+        const start = group;
+        while (group < rrsets.items.len and std.mem.eql(u8, rrsets.items[group].owner_wire, owner_wire)) group += 1;
+        codes.clearRetainingCapacity();
+        for (rrsets.items[start..group]) |rrset| try codes.append(allocator, rrset.rrtype);
+        // The RRSIG over every RRset at the name is a type present at the name.
+        try codes.append(allocator, RecordType.RRSIG.code());
+        try entries.append(allocator, .{
+            .hash = try nsec3HashOf(owner_wire, params),
+            .codes = try allocator.dupe(u16, codes.items),
+        });
+    }
+    for (ents.items) |name| {
+        try entries.append(allocator, .{
+            .hash = try nsec3HashOf(name, params),
+            .codes = try allocator.alloc(u16, 0),
+        });
+    }
+
+    // RFC 5155 section 7.1: two owner names with one hash share one NSEC3
+    // whose bitmap names the types of both.
+    std.mem.sort(Nsec3Entry, entries.items, {}, nsec3EntryLessThan);
+    var merged: std.ArrayList(Nsec3Entry) = .empty;
+    defer merged.deinit(allocator);
+    for (entries.items) |entry| {
+        if (merged.items.len != 0 and std.mem.eql(u8, &merged.items[merged.items.len - 1].hash, &entry.hash)) {
+            const last = &merged.items[merged.items.len - 1];
+            const parts = [_][]const u16{ last.codes, entry.codes };
+            last.codes = try std.mem.concat(allocator, u16, &parts);
+            continue;
+        }
+        try merged.append(allocator, entry);
+    }
+
+    for (merged.items, 0..) |entry, index| {
+        const next = merged.items[(index + 1) % merged.items.len];
+        var label: [32]u8 = undefined;
+        base32HexLabel(entry.hash, &label);
+        const owner_wire = try allocator.alloc(u8, 1 + label.len + origin_wire.len);
+        owner_wire[0] = @intCast(label.len);
+        @memcpy(owner_wire[1..][0..label.len], &label);
+        @memcpy(owner_wire[1 + label.len ..], origin_wire);
+
+        const bitmap = try typeBitmap(allocator, entry.codes);
+        const rdata = try allocator.alloc(u8, 6 + params.salt.len + 20 + bitmap.len);
+        rdata[0] = params.algorithm;
+        rdata[1] = params.flags;
+        std.mem.writeInt(u16, rdata[2..4], params.iterations, .big);
+        rdata[4] = @intCast(params.salt.len);
+        @memcpy(rdata[5..][0..params.salt.len], params.salt);
+        rdata[5 + params.salt.len] = 20;
+        @memcpy(rdata[6 + params.salt.len ..][0..20], &next.hash);
+        @memcpy(rdata[6 + params.salt.len + 20 ..], bitmap);
+
+        const single = try allocator.alloc([]const u8, 1);
+        single[0] = rdata;
+        try rrsets.append(allocator, .{
+            .owner_wire = owner_wire,
+            .rrtype = RecordType.NSEC3.code(),
+            .ttl = ttl,
+            .rdata = single,
+        });
+    }
+}
+
 // ------------------------------------------------------------------ emission
 
 /// The Labels field counts neither the root label nor a wildcard label
@@ -707,7 +934,7 @@ fn emit(
         switch (rrset.rrtype) {
             // The RRsets the signer itself generated. Anything else came from
             // the zone file and is already published there.
-            RecordType.NSEC.code(), RecordType.DNSKEY.code(), RecordType.DS.code() => for (rrset.rdata) |rdata| {
+            RecordType.NSEC.code(), RecordType.NSEC3.code(), RecordType.DNSKEY.code(), RecordType.DS.code() => for (rrset.rdata) |rdata| {
                 try generated.append(scratch, try genericRecord(records, rrset.owner_wire, rrset.rrtype, rrset.ttl, rdata));
             },
             else => {},
@@ -1206,4 +1433,313 @@ test "RFC 4034 Appendix B: an odd-length DNSKEY RDATA pads its last octet on the
     // Three octets 0x01 0x02 0x03 sum as 0x0102 + 0x0300.
     try std.testing.expectEqual(@as(u16, 0x0402), dns_dnssec.keyTag(&.{ 1, 2, 3 }));
     try std.testing.expectEqual(@as(u16, 0x0102), dns_dnssec.keyTag(&.{ 1, 2 }));
+}
+
+// ------------------------------------------------------------------- NSEC3
+
+/// A zone that asks for an NSEC3 chain: the apex NSEC3PARAM states the
+/// parameters of the chain, and the signer builds that chain
+/// (RFC 5155 section 7.1).
+const nsec3_sign_zone =
+    \\$ORIGIN example.
+    \\$TTL 3600
+    \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+    \\@ IN NS ns.example.
+    \\@ IN NSEC3PARAM 1 0 2 73616c74
+    \\www IN A 192.0.2.1
+    \\
+;
+
+/// The same zone without the NSEC3PARAM: it keeps the NSEC chain.
+const nsec_sign_zone =
+    \\$ORIGIN example.
+    \\$TTL 3600
+    \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+    \\@ IN NS ns.example.
+    \\www IN A 192.0.2.1
+    \\
+;
+
+/// The NSEC3 hashes of that zone, as the python hashlib oracle computed them:
+/// the iterated salted SHA-1 of the canonical wire name, with the salt "salt"
+/// and 2 iterations.
+const nsec3_apex_hash = [_]u8{ 0x76, 0xed, 0x9c, 0x9f, 0x42, 0xb4, 0xc9, 0x12, 0x2a, 0xcf, 0xc7, 0x5d, 0x39, 0xd9, 0x6e, 0x8d, 0x56, 0x6a, 0x14, 0xd0 };
+const nsec3_www_hash = [_]u8{ 0x31, 0x5f, 0x4a, 0x7c, 0xa2, 0xfc, 0xd7, 0xfe, 0x22, 0xd3, 0x10, 0x9d, 0x2e, 0x0e, 0xba, 0x23, 0xaf, 0x9b, 0xe5, 0x8f };
+
+/// One NSEC3 record of a signed zone, as the zone holds it.
+const Nsec3Record = struct {
+    owner_text: []const u8,
+    next_hash: []const u8,
+    bitmap: []const u8,
+};
+
+/// The NSEC3 records of a zone, in the order the zone holds them.
+fn nsec3Records(allocator: std.mem.Allocator, zone: *const zone_index.Zone) ![]Nsec3Record {
+    var out: std.ArrayList(Nsec3Record) = .empty;
+    errdefer out.deinit(allocator);
+    for (zone.records.items[0..zone.records.len]) |record| {
+        if (!record.rrtype.eql(.NSEC3)) continue;
+        const parsed = try zone_parser.parseRData(.NSEC3, record.rdataText());
+        const bytes = switch (parsed) {
+            .Unknown => |*unknown| unknown.bytes(),
+            else => return error.TestUnexpectedResult,
+        };
+        // The parsed RDATA is a local, so the decoded fields are copied out of
+        // it before it goes out of scope.
+        const raw = try allocator.dupe(u8, bytes);
+        const decoded = dns_validate.parseNsec3Rdata(raw) orelse return error.TestUnexpectedResult;
+        try out.append(allocator, .{
+            .owner_text = record.ownerText(),
+            .next_hash = decoded.next_hash,
+            .bitmap = decoded.bitmap,
+        });
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// The DNSKEY of a signed zone, as a trust anchor for the validator.
+fn dnskeyAnchor(allocator: std.mem.Allocator, key: *const Key) ![]const u8 {
+    const rdata = try key.dnskeyRdata(allocator);
+    const encoded = try encodeBase64(allocator, rdata[4..]);
+    return std.fmt.allocPrint(allocator, "example. DNSKEY 257 3 15 {s}\n", .{encoded});
+}
+
+/// A DO-bit query for a name the zone does not have, so the answer is a denial.
+fn denialQuery(allocator: std.mem.Allocator, name_text: []const u8, qtype: dns_types.RecordType) !dns_message.Message {
+    var message = dns_message.Message{
+        .allocator = allocator,
+        .header = .{ .id = 0x4406 },
+        .question = .{
+            .name = try Name.fromText(name_text),
+            .qtype = qtype,
+            .qclass = dns_types.Class.IN,
+        },
+    };
+    message.edns = .{
+        .udp_payload_size = 1232,
+        .extended_rcode = 0,
+        .version = 0,
+        .dnssec_ok = true,
+    };
+    try message.additionals.append(.{
+        .owner = Name.root(),
+        .rrtype = .OPT,
+        .class = dns_types.Class.fromCode(1232),
+        .ttl = 0x8000,
+        .rdata = .{ .OPT = .{} },
+    });
+    message.header.additional_count = 1;
+    return message;
+}
+
+test "an apex NSEC3PARAM makes the signer publish the NSEC3 chain (RFC 5155 7.1)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var key = try parseKey(rfc8080_ed25519_key);
+    defer key.deinit();
+
+    var zone = try loadZone(nsec3_sign_zone);
+    defer zone.deinit();
+    try signZone(allocator, &zone, &key, rfc8080_window);
+
+    const records = try nsec3Records(allocator, &zone);
+    try std.testing.expectEqual(@as(usize, 2), records.len);
+    // The chain is in hash order: the hash of "www.example." sorts before the
+    // hash of the apex.
+    try std.testing.expectEqualStrings("65fkkv52vjbvs8mj22eis3lq4enpnpcf.example.", records[0].owner_text);
+    try std.testing.expectEqualStrings("ermpp7q2mj4h4amfotejjmbehlb6k56g.example.", records[1].owner_text);
+    // Each record names the next hash, and the last wraps to the first.
+    try std.testing.expectEqualSlices(u8, &nsec3_apex_hash, records[0].next_hash);
+    try std.testing.expectEqualSlices(u8, &nsec3_www_hash, records[1].next_hash);
+    // The zone publishes the NSEC3 chain, not an NSEC one.
+    try std.testing.expect(!hasRecord(&zone, "example.", .NSEC));
+    try std.testing.expect(!hasRecord(&zone, "www.example.", .NSEC));
+    // The apex keeps the NSEC3PARAM it was signed with.
+    try std.testing.expect(hasRecord(&zone, "example.", .NSEC3PARAM));
+}
+
+test "an empty non-terminal has an NSEC3 of its own (RFC 5155 7.1)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var key = try parseKey(rfc8080_ed25519_key);
+    defer key.deinit();
+
+    var zone = try loadZone(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+        \\@ IN NS ns.example.
+        \\@ IN NSEC3PARAM 1 0 0 -
+        \\a.b IN A 192.0.2.1
+        \\
+    );
+    defer zone.deinit();
+    try signZone(allocator, &zone, &key, rfc8080_window);
+
+    // "b.example." holds no RRset, but it is an owner name of the zone, so it
+    // has an NSEC3 like any other.
+    const records = try nsec3Records(allocator, &zone);
+    try std.testing.expectEqual(@as(usize, 3), records.len);
+    var out: [20]u8 = undefined;
+    dns_dnssec.nsec3Hash(try Name.fromText("b.example."), "", 0, &out);
+    var found = false;
+    for (records) |record| {
+        const owner = try Name.fromText(record.owner_text);
+        const hash = dns_validate.nsec3OwnerHash(owner) orelse return error.TestUnexpectedResult;
+        if (!std.mem.eql(u8, &hash, &out)) continue;
+        found = true;
+        // The name holds no type, so its bitmap is empty.
+        try std.testing.expectEqual(@as(usize, 0), record.bitmap.len);
+    }
+    try std.testing.expect(found);
+}
+
+test "the NSEC3 chain carries the hashes the hashlib oracle computed (RFC 5155 5)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var key = try parseKey(rfc8080_ed25519_key);
+    defer key.deinit();
+
+    var zone = try loadZone(nsec3_sign_zone);
+    defer zone.deinit();
+    try signZone(allocator, &zone, &key, rfc8080_window);
+
+    // The owner label of an NSEC3 decodes back to the hash of the name it
+    // was built from.
+    const records = try nsec3Records(allocator, &zone);
+    const www = try Name.fromText(records[0].owner_text);
+    const apex = try Name.fromText(records[1].owner_text);
+    try std.testing.expectEqualSlices(u8, &nsec3_www_hash, &dns_validate.nsec3OwnerHash(www).?);
+    try std.testing.expectEqualSlices(u8, &nsec3_apex_hash, &dns_validate.nsec3OwnerHash(apex).?);
+
+    // The project's own hash function computes the same two values, so the
+    // signer and the serving path agree on every hash.
+    var out: [20]u8 = undefined;
+    dns_dnssec.nsec3Hash(try Name.fromText("www.example."), "salt", 2, &out);
+    try std.testing.expectEqualSlices(u8, &nsec3_www_hash, &out);
+    dns_dnssec.nsec3Hash(try Name.fromText("example."), "salt", 2, &out);
+    try std.testing.expectEqualSlices(u8, &nsec3_apex_hash, &out);
+}
+
+test "the NSEC3 chain is signed, and the project's own validator accepts it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var key = try parseKey(rfc8080_ed25519_key);
+    defer key.deinit();
+
+    var zone = try loadZone(nsec3_sign_zone);
+    defer zone.deinit();
+    try signZone(allocator, &zone, &key, rfc8080_window);
+
+    // Every NSEC3 of the chain carries the RRSIG that covers it.
+    const records = try nsec3Records(allocator, &zone);
+    for (records) |record| {
+        const rrsig = (try findOpaque(&zone, record.owner_text, .RRSIG, RecordType.NSEC3.code())).?;
+        // RFC 4034 section 3.1.3: the label count is the one of the RRSIG's
+        // own owner name, which for an NSEC3 is the hashed name.
+        try std.testing.expectEqual(@as(u8, 2), rrsig[3]);
+    }
+
+    // The served denial is proved by the generated chain.
+    const request = try denialQuery(allocator, "missing.example.", .A);
+    const response = try (@import("../auth/response.zig")).buildResponse(request, &zone);
+    // The closest encloser proof (RFC 5155 section 7.2.2) and the apex
+    // NSEC3PARAM ride along, and no NSEC proof does.
+    var nsec3_count: usize = 0;
+    var param_count: usize = 0;
+    for (response.authorities.items) |record| {
+        if (record.rrtype.eql(.NSEC3)) nsec3_count += 1;
+        if (record.rrtype.eql(.NSEC3PARAM)) param_count += 1;
+        try std.testing.expect(!record.rrtype.eql(.NSEC));
+    }
+    try std.testing.expect(nsec3_count >= 1);
+    try std.testing.expectEqual(@as(usize, 1), param_count);
+}
+
+test "the project's own validator accepts the signatures over the NSEC3 chain" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var key = try parseKey(rfc8080_ed25519_key);
+    defer key.deinit();
+
+    var zone = try loadZone(nsec3_sign_zone);
+    defer zone.deinit();
+    try signZone(allocator, &zone, &key, rfc8080_window);
+
+    // The chain as the zone holds it, with the RRSIG that covers every record
+    // of it, is a response the validator accepts.
+    var response = dns_message.Message{
+        .allocator = allocator,
+        .header = .{ .id = 0x4406, .qr = true, .rcode = .nxdomain },
+        .question = .{
+            .name = try Name.fromText("missing.example."),
+            .qtype = .A,
+            .qclass = dns_types.Class.IN,
+        },
+    };
+    for (zone.records.items[0..zone.records.len]) |record| {
+        if (!record.rrtype.eql(.NSEC3) and !record.rrtype.eql(.RRSIG)) continue;
+        if (record.rrtype.eql(.RRSIG)) {
+            const rdata = try zone_parser.parseRData(.RRSIG, record.rdataText());
+            const bytes = switch (rdata) {
+                .Unknown => |*unknown| unknown.bytes(),
+                else => continue,
+            };
+            if (bytes.len < 2 or std.mem.readInt(u16, bytes[0..2], .big) != RecordType.NSEC3.code()) continue;
+        }
+        try response.authorities.append(try (@import("../auth/response.zig")).zoneRecordToResourceRecord(record, null));
+    }
+    response.header.authority_count = @intCast(response.authorities.len);
+    try std.testing.expectEqual(@as(usize, 4), response.authorities.len);
+
+    // The DNSKEY the zone publishes is the trust anchor, so the chain needs
+    // no DNSKEY of its own to verify.
+    var anchors = try dns_validate.Anchors.parse(allocator, try dnskeyAnchor(allocator, &key));
+    defer anchors.deinit(allocator);
+    const request = try denialQuery(allocator, "missing.example.", .A);
+    const result = try dns_validate.validate(allocator, &anchors, request, response, &.{}, rfc8080_window.inception + 1);
+    try std.testing.expectEqual(dns_validate.Status.secure, result.status);
+}
+
+test "a zone without an apex NSEC3PARAM keeps exactly its NSEC chain" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var key = try parseKey(rfc8080_ed25519_key);
+    defer key.deinit();
+
+    var zone = try loadZone(nsec_sign_zone);
+    defer zone.deinit();
+    try signZone(allocator, &zone, &key, rfc8080_window);
+
+    // The NSEC chain of the zone is unchanged: one NSEC per owner, in
+    // canonical order, and no NSEC3 record at all.
+    const apex = (try findOpaque(&zone, "example.", .NSEC, null)).?;
+    const next = try Name.fromText("www.example.");
+    try std.testing.expectEqualSlices(u8, next.asWire(), apex[0..next.asWire().len]);
+    // The bitmap names SOA, NS, DNSKEY, DS, NSEC, and RRSIG.
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x07, 0x22, 0x00, 0x00, 0x00, 0x00, 0x13, 0x80 }, apex[next.asWire().len..]);
+    try std.testing.expect(!hasRecord(&zone, "example.", .NSEC3));
+    try std.testing.expect(!hasRecord(&zone, "example.", .NSEC3PARAM));
+}
+
+/// The first record of a type at an owner name.
+fn findZoneRecord(zone: *const zone_index.Zone, owner_text: []const u8, rrtype: RecordType) !?zone_parser.ZoneRecord {
+    for (zone.records.items[0..zone.records.len]) |record| {
+        if (record.rrtype.code() != rrtype.code()) continue;
+        if (!std.ascii.eqlIgnoreCase(record.ownerText(), owner_text)) continue;
+        return record;
+    }
+    return null;
 }

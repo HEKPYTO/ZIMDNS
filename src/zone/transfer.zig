@@ -432,6 +432,9 @@ fn algorithmName(algorithm: dns_tsig.Algorithm) dns_name.Name {
         .hmac_sha256 => "hmac-sha256.",
         .hmac_sha384 => "hmac-sha384.",
         .hmac_sha512 => "hmac-sha512.",
+        .hmac_sha256_128 => "hmac-sha256-128.",
+        .hmac_sha384_192 => "hmac-sha384-192.",
+        .hmac_sha512_256 => "hmac-sha512-256.",
     }) catch unreachable;
 }
 

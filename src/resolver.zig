@@ -795,6 +795,11 @@ pub const Resolver = struct {
         // answered from the failure cache instead of a new upstream query. A
         // DNSSEC validation failure never reaches this point: it returned
         // above with its own RFC 8914 code.
+        //
+        // RFC 6147 section 5.1.2 runs before this: an error RCODE other than
+        // NXDOMAIN is treated as an empty answer, so a synthesis that
+        // answers the client with a record is not a resolution failure.
+        _ = try synthesizeDns64Answer(self, query, &response);
         switch (response.header.rcode) {
             .servfail => self.cache.failures.put(key, .{ .rcode = .servfail }, now),
             .refused => self.cache.failures.put(key, .{ .rcode = .refused }, now),
@@ -807,10 +812,6 @@ pub const Resolver = struct {
         // The harvest runs before the client copy is stripped, so it
         // still sees the full proofs.
         if (response.header.authenticated_data) self.harvestNsecProofs(response, now);
-        // RFC 6147: an empty AAAA answer is answered with an AAAA
-        // synthesized from the name's A records. The synthesis runs before
-        // the answer is cached, so a later query is answered the same way.
-        _ = try synthesizeDns64Answer(self, query, &response);
         self.cache.put(key, &response, now) catch {};
         // RFC 3225 section 3: a query with the DO bit clear must not be answered
         // with DNSSEC security RRs. The cached copy keeps them, so the removal
@@ -1042,11 +1043,12 @@ pub const Resolver = struct {
     }
 };
 
-/// RFC 6147 sections 5.1.1 and 5.1.6: a DNS64 answers an IN AAAA query
-/// whose answer came back empty with an AAAA synthesized from the A records
-/// of the same name. The A records come from one more upstream query.
-/// Returns false when nothing is synthesized, which leaves the answer as the
-/// upstream sent it.
+/// RFC 6147 sections 5.1.1, 5.1.2 and 5.1.6: a DNS64 answers an IN AAAA
+/// query whose answer came back empty with an AAAA synthesized from the A
+/// records of the same name. The A records come from one more upstream
+/// query. An RCODE other than 0 counts as an empty answer, so the query for
+/// the A records runs for an error answer too. Returns false when nothing is
+/// synthesized, which leaves the answer as the upstream sent it.
 fn synthesizeDns64Answer(self: *Resolver, query: dns_message.Message, response: *dns_message.Message) !bool {
     const prefix = self.policy.nat64_prefix orelse return false;
     if (!dns64Applies(query, response.*)) return false;
@@ -1061,16 +1063,24 @@ fn synthesizeDns64Answer(self: *Resolver, query: dns_message.Message, response: 
     return synthesizeDns64(prefix, question.name, response, a_response);
 }
 
-/// RFC 6147 sections 5.1.1 and 5.1.6: the trigger for synthesis is an IN
-/// AAAA query whose answer section is empty. A name with a real AAAA is
-/// never synthesized over (RFC 6147 section 5.1.1), and a client that set CD
-/// does the validation and the synthesis itself (RFC 6147 section 5.5).
+/// RFC 6147 sections 5.1.1, 5.1.2 and 5.1.6: the trigger for synthesis is
+/// an IN AAAA query whose answer section is empty. A name with a real AAAA
+/// is never synthesized over (RFC 6147 section 5.1.1), a client that set CD
+/// does the validation and the synthesis itself (RFC 6147 section 5.5),
+/// and an RCODE other than 0 counts as an empty answer (RFC 6147 section
+/// 5.1.2) with NXDOMAIN the one RCODE that is handled as the error it is.
 fn dns64Applies(query: dns_message.Message, response: dns_message.Message) bool {
     if (query.header.checking_disabled) return false;
     const question = query.question orelse return false;
     if (!question.qtype.eql(.AAAA) or !question.qclass.eql(.IN)) return false;
-    if (response.header.rcode != .no_error) return false;
-    return response.answers.len == 0;
+    // RFC 6147 section 5.1.2: "A result with RCODE=3 (Name Error) is
+    // handled according to normal DNS operation", so the name error is
+    // relayed and nothing is synthesized from it.
+    if (response.header.rcode == .nxdomain) return false;
+    // RFC 6147 section 5.1.2: any other RCODE "is treated as though the
+    // RCODE were 0 and the answer section were empty".
+    if (response.header.rcode == .no_error and response.answers.len != 0) return false;
+    return true;
 }
 
 /// RFC 6147 section 5.1.6: the A query for the same name. It carries the
@@ -1142,6 +1152,9 @@ fn synthesizeDns64(prefix: config.Nat64Prefix, name: dns_name.Name, response: *d
     response.header.authority_count = @intCast(response.authorities.len);
     response.header.authoritative = false;
     response.header.authenticated_data = false;
+    // RFC 6147 section 5.4: the header of a synthesized answer is set by the
+    // usual rules, so the answer the client gets carries no error.
+    response.header.rcode = .no_error;
     return true;
 }
 
@@ -2849,6 +2862,94 @@ test "a forwarder without a NAT64 prefix never synthesizes and asks the upstream
     try std.testing.expectEqual(@as(usize, 1), upstream.requests);
 }
 
+test "RFC 6147 section 5.1.2: an error RCODE counts as an empty answer and the synthesis answers the client" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    const a_records = [_]dns_record.ResourceRecord{dns64TestARecord("v4only.example.")};
+    var upstream = Dns64Upstream{
+        .io = io,
+        .udp = &upstream_socket,
+        .a = &a_records,
+        .rcode = .servfail,
+    };
+    const thread = try std.Thread.spawn(.{}, serveDns64Upstream, .{&upstream});
+
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = upstream_socket.address },
+        .nat64_prefix = try config.Nat64Prefix.parse("64:ff9b::/96"),
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2903, "v4only.example.", false);
+    defer query.deinit();
+    query.question.?.qtype = .AAAA;
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42703);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    thread.join();
+
+    // RFC 6147 section 5.1.2: the error RCODE is treated as though the
+    // answer were empty, so the A query followed and the client gets the
+    // synthesized answer, not the error.
+    const response = try dns_message.Message.parse(arena.allocator(), bytes);
+    try std.testing.expectEqual(dns_header.Rcode.no_error, response.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+    try std.testing.expect(response.answers.items[0].rrtype.eql(.AAAA));
+    try std.testing.expectEqualSlices(u8, &.{
+        0x00, 0x64, 0xff, 0x9b, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x02, 0x21,
+    }, &response.answers.items[0].rdata.AAAA);
+    // The upstream saw the AAAA query and the A query that followed it.
+    try std.testing.expectEqual(@as(usize, 2), upstream.requests);
+}
+
+test "RFC 6147 section 5.1.2: an NXDOMAIN is relayed as the error it is" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    const a_records = [_]dns_record.ResourceRecord{dns64TestARecord("v4only.example.")};
+    var upstream = Dns64Upstream{
+        .io = io,
+        .udp = &upstream_socket,
+        .a = &a_records,
+        .rcode = .nxdomain,
+    };
+    const thread = try std.Thread.spawn(.{}, serveDns64Upstream, .{&upstream});
+
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = upstream_socket.address },
+        .nat64_prefix = try config.Nat64Prefix.parse("64:ff9b::/96"),
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2904, "v4only.example.", false);
+    defer query.deinit();
+    query.question.?.qtype = .AAAA;
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42704);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    thread.join();
+
+    // The name error is the answer the client gets, and no A query follows.
+    const response = try dns_message.Message.parse(arena.allocator(), bytes);
+    try std.testing.expectEqual(dns_header.Rcode.nxdomain, response.header.rcode);
+    try std.testing.expectEqual(@as(u16, 0), response.header.answer_count);
+    try std.testing.expectEqual(@as(usize, 1), upstream.requests);
+}
+
 /// The fake upstream a DNS64 test forwards to. It answers the AAAA query and
 /// the A query that may follow it.
 const Dns64Upstream = struct {
@@ -2860,6 +2961,8 @@ const Dns64Upstream = struct {
     a: []const dns_record.ResourceRecord = &.{},
     /// The SOA the AAAA answer carries in its authority section.
     soa: []const dns_record.ResourceRecord = &.{},
+    /// The RCODE the AAAA answer carries (RFC 6147 section 5.1.2).
+    rcode: dns_header.Rcode = .no_error,
     requests: usize = 0,
 };
 
@@ -2885,8 +2988,9 @@ fn serveDns64Upstream(args: *Dns64Upstream) void {
             soa_slot[0] = args.soa[0];
             authority = soa_slot[0..1];
         }
+        const rcode = if (question.qtype.eql(.AAAA)) args.rcode else .no_error;
         var response_buffer: [2048]u8 = undefined;
-        const bytes = buildDns64UpstreamAnswer(&response_buffer, query, answers, authority) catch return;
+        const bytes = buildDns64UpstreamAnswer(&response_buffer, query, answers, authority, rcode) catch return;
         args.udp.send(args.io, &incoming.from, bytes) catch return;
     }
 }
@@ -2897,6 +3001,7 @@ fn buildDns64UpstreamAnswer(
     query: dns_message.Message,
     answers: []const dns_record.ResourceRecord,
     authority: []const dns_record.ResourceRecord,
+    rcode: dns_header.Rcode,
 ) ![]const u8 {
     var message = dns_message.Message{
         .allocator = query.allocator,
@@ -2905,6 +3010,7 @@ fn buildDns64UpstreamAnswer(
             .qr = true,
             .recursion_desired = query.header.recursion_desired,
             .recursion_available = true,
+            .rcode = rcode,
             .question_count = 1,
         },
         .question = query.question,

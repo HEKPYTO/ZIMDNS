@@ -27,15 +27,19 @@ pub const Error = error{
     InvalidOriginalId,
 };
 
-/// The HMAC-SHA family of RFC 8945 section 6. HMAC-MD5.SIG-ALG.REG.INT is
-/// listed there with a MUST NOT use, and gss-tsig delegates the cryptography
-/// to GSS, so neither is a DNS TSIG algorithm this server implements.
+/// The HMAC-SHA family of RFC 8945 section 6, with the three truncated
+/// names of the same table. HMAC-MD5.SIG-ALG.REG.INT is listed there with a
+/// MUST NOT use, and gss-tsig delegates the cryptography to GSS, so neither
+/// is a DNS TSIG algorithm this server implements.
 pub const Algorithm = enum {
     hmac_sha1,
     hmac_sha224,
     hmac_sha256,
     hmac_sha384,
     hmac_sha512,
+    hmac_sha256_128,
+    hmac_sha384_192,
+    hmac_sha512_256,
 };
 
 pub const Mac = struct {
@@ -98,13 +102,18 @@ pub fn parseFinalAdditional(packet: []const u8) Error!?FinalAdditional {
         if (found != null) return Error.TsigNotFinal;
 
         const parsed = RData.parse(RecordType.TSIG, packet, rdata_start, rdlength) catch return Error.MalformedTsig;
+        // The algorithm name keeps the spelling the peer used, so the reply
+        // carries it back unchanged; the MAC input folds it (section 4.3.3).
+        const algorithm = Name.parsePreservingCase(packet, rdata_start) catch return Error.MalformedTsig;
+        var value = parsed.TSIG;
+        value.algorithm = algorithm.name;
         found = .{
             .owner = owner.name,
             .record_start = record_start,
             .rdata_start = rdata_start,
             .rdata_end = rdata_end,
             .record_end = rdata_end,
-            .tsig = parsed.TSIG,
+            .tsig = value,
         };
     }
 
@@ -144,13 +153,21 @@ const hmac_sha224_wire = [_]u8{ 11, 'h', 'm', 'a', 'c', '-', 's', 'h', 'a', '2',
 const hmac_sha256_wire = [_]u8{ 11, 'h', 'm', 'a', 'c', '-', 's', 'h', 'a', '2', '5', '6', 0 };
 const hmac_sha384_wire = [_]u8{ 11, 'h', 'm', 'a', 'c', '-', 's', 'h', 'a', '3', '8', '4', 0 };
 const hmac_sha512_wire = [_]u8{ 11, 'h', 'm', 'a', 'c', '-', 's', 'h', 'a', '5', '1', '2', 0 };
+const hmac_sha256_128_wire = [_]u8{ 15, 'h', 'm', 'a', 'c', '-', 's', 'h', 'a', '2', '5', '6', '-', '1', '2', '8', 0 };
+const hmac_sha384_192_wire = [_]u8{ 15, 'h', 'm', 'a', 'c', '-', 's', 'h', 'a', '3', '8', '4', '-', '1', '9', '2', 0 };
+const hmac_sha512_256_wire = [_]u8{ 15, 'h', 'm', 'a', 'c', '-', 's', 'h', 'a', '5', '1', '2', '-', '2', '5', '6', 0 };
 
+/// The algorithm name is a domain name and is compared case-insensitively
+/// (RFC 8945 section 9), so a registry name matches in any case.
 pub fn algorithmForName(name: *const Name) Error!Algorithm {
-    if (std.mem.eql(u8, name.asWire(), &hmac_sha1_wire)) return .hmac_sha1;
-    if (std.mem.eql(u8, name.asWire(), &hmac_sha224_wire)) return .hmac_sha224;
-    if (std.mem.eql(u8, name.asWire(), &hmac_sha256_wire)) return .hmac_sha256;
-    if (std.mem.eql(u8, name.asWire(), &hmac_sha384_wire)) return .hmac_sha384;
-    if (std.mem.eql(u8, name.asWire(), &hmac_sha512_wire)) return .hmac_sha512;
+    if (std.ascii.eqlIgnoreCase(name.asWire(), &hmac_sha1_wire)) return .hmac_sha1;
+    if (std.ascii.eqlIgnoreCase(name.asWire(), &hmac_sha224_wire)) return .hmac_sha224;
+    if (std.ascii.eqlIgnoreCase(name.asWire(), &hmac_sha256_wire)) return .hmac_sha256;
+    if (std.ascii.eqlIgnoreCase(name.asWire(), &hmac_sha384_wire)) return .hmac_sha384;
+    if (std.ascii.eqlIgnoreCase(name.asWire(), &hmac_sha512_wire)) return .hmac_sha512;
+    if (std.ascii.eqlIgnoreCase(name.asWire(), &hmac_sha256_128_wire)) return .hmac_sha256_128;
+    if (std.ascii.eqlIgnoreCase(name.asWire(), &hmac_sha384_192_wire)) return .hmac_sha384_192;
+    if (std.ascii.eqlIgnoreCase(name.asWire(), &hmac_sha512_256_wire)) return .hmac_sha512_256;
     return Error.UnsupportedAlgorithm;
 }
 
@@ -180,13 +197,15 @@ pub fn verify(
 ) Error!Mac {
     const found = parseFinalAdditional(packet) catch return Error.Formerr;
     const final = found orelse return Error.Formerr;
+    const algorithm = try algorithmForName(&final.tsig.algorithm);
     const expected = try standardMac(packet, final, key, final.owner, final.tsig, prior_mac, true);
     const received = final.tsig.macBytes();
     // RFC 8945 section 5.2.2.1: a MAC longer than the keyed hash output, or
     // shorter than the larger of 10 octets and half the hash length, is a
-    // format error.
+    // format error. The output of the algorithm is its MAC length, which a
+    // truncated name shortens.
     if (received.len > expected.slice().len) return Error.Formerr;
-    const protocol_minimum = @max(@as(usize, 10), expected.slice().len / 2);
+    const protocol_minimum = @max(@as(usize, 10), hashLength(algorithm) / 2);
     if (received.len == 0 or received.len < protocol_minimum) return Error.Formerr;
     if (std.crypto.timing_safe.compare(u8, received, expected.slice()[0..received.len], .big) != .eq) {
         return Error.BadMac;
@@ -214,10 +233,11 @@ pub fn verifyChained(
     const packet = packets[packets.len - 1];
     const found = parseFinalAdditional(packet) catch return Error.Formerr;
     const final = found orelse return Error.Formerr;
+    const algorithm = try algorithmForName(&final.tsig.algorithm);
     const expected = try chainedMac(packets, final, key, final.tsig, prior_mac);
     const received = final.tsig.macBytes();
     if (received.len > expected.slice().len) return Error.Formerr;
-    const protocol_minimum = @max(@as(usize, 10), expected.slice().len / 2);
+    const protocol_minimum = @max(@as(usize, 10), hashLength(algorithm) / 2);
     if (received.len == 0 or received.len < protocol_minimum) return Error.Formerr;
     if (std.crypto.timing_safe.compare(u8, received, expected.slice()[0..received.len], .big) != .eq) {
         return Error.BadMac;
@@ -241,7 +261,8 @@ pub fn signChainedFinal(
     return chainedMac(&.{packet}, final, key, tsig, prior_mac);
 }
 
-/// The keyed hash output length of each algorithm (RFC 8945 section 6).
+/// The MAC length of each algorithm: the keyed hash output of the full
+/// HMAC-SHA family, and the RFC 4868 truncation of the truncated names.
 pub fn digestLength(algorithm: Algorithm) usize {
     return switch (algorithm) {
         .hmac_sha1 => 20,
@@ -249,6 +270,22 @@ pub fn digestLength(algorithm: Algorithm) usize {
         .hmac_sha256 => 32,
         .hmac_sha384 => 48,
         .hmac_sha512 => 64,
+        .hmac_sha256_128 => 16,
+        .hmac_sha384_192 => 24,
+        .hmac_sha512_256 => 32,
+    };
+}
+
+/// The keyed hash output length of the hash function behind each algorithm:
+/// the secret floor of RFC 8945 section 8, and the RFC 4868 section 2.6 key
+/// length, which the truncated names keep.
+pub fn hashLength(algorithm: Algorithm) usize {
+    return switch (algorithm) {
+        .hmac_sha1 => 20,
+        .hmac_sha224 => 28,
+        .hmac_sha256, .hmac_sha256_128 => 32,
+        .hmac_sha384, .hmac_sha384_192 => 48,
+        .hmac_sha512, .hmac_sha512_256 => 64,
     };
 }
 
@@ -258,14 +295,15 @@ pub fn digestLength(algorithm: Algorithm) usize {
 /// truncated to 96 bits) and SHA-256 takes 16 (the section 5.2.2.1 case 3
 /// floor, SHA-256-128). The other HMAC-SHA algorithms take the section
 /// 5.2.2.1 case 3 floor of half the keyed hash output, which is also the
-/// SHA-384-192 and SHA-512-256 truncation of RFC 4868.
+/// SHA-384-192 and SHA-512-256 truncation of RFC 4868. A truncated name takes
+/// the floor of the algorithm it truncates, which is its whole MAC.
 pub fn minimumMacLength(algorithm: Algorithm) usize {
     return switch (algorithm) {
         .hmac_sha1 => 12,
         .hmac_sha224 => 14,
-        .hmac_sha256 => 16,
-        .hmac_sha384 => 24,
-        .hmac_sha512 => 32,
+        .hmac_sha256, .hmac_sha256_128 => 16,
+        .hmac_sha384, .hmac_sha384_192 => 24,
+        .hmac_sha512, .hmac_sha512_256 => 32,
     };
 }
 
@@ -285,12 +323,14 @@ fn standardMac(
     prior_mac: ?[]const u8,
     replace_id: bool,
 ) Error!Mac {
-    return switch (try algorithmForName(&tsig.algorithm)) {
-        .hmac_sha1 => standardMacWith(std.crypto.auth.hmac.HmacSha1, packet, final, key, owner, tsig, prior_mac, replace_id),
-        .hmac_sha224 => standardMacWith(std.crypto.auth.hmac.sha2.HmacSha224, packet, final, key, owner, tsig, prior_mac, replace_id),
-        .hmac_sha256 => standardMacWith(std.crypto.auth.hmac.sha2.HmacSha256, packet, final, key, owner, tsig, prior_mac, replace_id),
-        .hmac_sha384 => standardMacWith(std.crypto.auth.hmac.sha2.HmacSha384, packet, final, key, owner, tsig, prior_mac, replace_id),
-        .hmac_sha512 => standardMacWith(std.crypto.auth.hmac.sha2.HmacSha512, packet, final, key, owner, tsig, prior_mac, replace_id),
+    const algorithm = try algorithmForName(&tsig.algorithm);
+    const mac_len = digestLength(algorithm);
+    return switch (algorithm) {
+        .hmac_sha1 => standardMacWith(std.crypto.auth.hmac.HmacSha1, packet, final, key, owner, tsig, prior_mac, replace_id, mac_len),
+        .hmac_sha224 => standardMacWith(std.crypto.auth.hmac.sha2.HmacSha224, packet, final, key, owner, tsig, prior_mac, replace_id, mac_len),
+        .hmac_sha256, .hmac_sha256_128 => standardMacWith(std.crypto.auth.hmac.sha2.HmacSha256, packet, final, key, owner, tsig, prior_mac, replace_id, mac_len),
+        .hmac_sha384, .hmac_sha384_192 => standardMacWith(std.crypto.auth.hmac.sha2.HmacSha384, packet, final, key, owner, tsig, prior_mac, replace_id, mac_len),
+        .hmac_sha512, .hmac_sha512_256 => standardMacWith(std.crypto.auth.hmac.sha2.HmacSha512, packet, final, key, owner, tsig, prior_mac, replace_id, mac_len),
     };
 }
 
@@ -303,6 +343,7 @@ fn standardMacWith(
     tsig: Tsig,
     prior_mac: ?[]const u8,
     replace_id: bool,
+    mac_len: usize,
 ) Error!Mac {
     var hmac = Hmac.init(key);
     try updatePrior(&hmac, prior_mac);
@@ -311,8 +352,10 @@ fn standardMacWith(
 
     var digest: [Hmac.mac_length]u8 = undefined;
     hmac.final(&digest);
-    var result = Mac{ .len = @intCast(digest.len) };
-    @memcpy(result.bytes[0..digest.len], &digest);
+    // RFC 4868 section 2.3: a truncated name keeps the first octets of the
+    // keyed hash and discards the trailing ones.
+    var result = Mac{ .len = @intCast(mac_len) };
+    @memcpy(result.bytes[0..mac_len], digest[0..mac_len]);
     return result;
 }
 
@@ -323,12 +366,14 @@ fn chainedMac(
     tsig: Tsig,
     prior_mac: []const u8,
 ) Error!Mac {
-    return switch (try algorithmForName(&tsig.algorithm)) {
-        .hmac_sha1 => chainedMacWith(std.crypto.auth.hmac.HmacSha1, packets, final, key, tsig, prior_mac),
-        .hmac_sha224 => chainedMacWith(std.crypto.auth.hmac.sha2.HmacSha224, packets, final, key, tsig, prior_mac),
-        .hmac_sha256 => chainedMacWith(std.crypto.auth.hmac.sha2.HmacSha256, packets, final, key, tsig, prior_mac),
-        .hmac_sha384 => chainedMacWith(std.crypto.auth.hmac.sha2.HmacSha384, packets, final, key, tsig, prior_mac),
-        .hmac_sha512 => chainedMacWith(std.crypto.auth.hmac.sha2.HmacSha512, packets, final, key, tsig, prior_mac),
+    const algorithm = try algorithmForName(&tsig.algorithm);
+    const mac_len = digestLength(algorithm);
+    return switch (algorithm) {
+        .hmac_sha1 => chainedMacWith(std.crypto.auth.hmac.HmacSha1, packets, final, key, tsig, prior_mac, mac_len),
+        .hmac_sha224 => chainedMacWith(std.crypto.auth.hmac.sha2.HmacSha224, packets, final, key, tsig, prior_mac, mac_len),
+        .hmac_sha256, .hmac_sha256_128 => chainedMacWith(std.crypto.auth.hmac.sha2.HmacSha256, packets, final, key, tsig, prior_mac, mac_len),
+        .hmac_sha384, .hmac_sha384_192 => chainedMacWith(std.crypto.auth.hmac.sha2.HmacSha384, packets, final, key, tsig, prior_mac, mac_len),
+        .hmac_sha512, .hmac_sha512_256 => chainedMacWith(std.crypto.auth.hmac.sha2.HmacSha512, packets, final, key, tsig, prior_mac, mac_len),
     };
 }
 
@@ -339,6 +384,7 @@ fn chainedMacWith(
     key: []const u8,
     tsig: Tsig,
     prior_mac: []const u8,
+    mac_len: usize,
 ) Error!Mac {
     var hmac = Hmac.init(key);
     try updatePrior(&hmac, prior_mac);
@@ -353,8 +399,8 @@ fn chainedMacWith(
 
     var digest: [Hmac.mac_length]u8 = undefined;
     hmac.final(&digest);
-    var result = Mac{ .len = @intCast(digest.len) };
-    @memcpy(result.bytes[0..digest.len], &digest);
+    var result = Mac{ .len = @intCast(mac_len) };
+    @memcpy(result.bytes[0..mac_len], digest[0..mac_len]);
     return result;
 }
 
@@ -406,7 +452,10 @@ fn updateVariables(hmac: anytype, owner: Name, tsig: Tsig) void {
     std.mem.writeInt(u16, class_and_ttl[0..2], Class.ANY.code(), .big);
     std.mem.writeInt(u32, class_and_ttl[2..6], 0, .big);
     hmac.update(&class_and_ttl);
-    hmac.update(tsig.algorithm.asWire());
+    // RFC 8945 section 4.3.3: the algorithm name enters the digest in
+    // canonical wire format, whatever case the peer sent it in.
+    const algorithm = tsig.algorithm.folded();
+    hmac.update(algorithm.asWire());
     updateTimers(hmac, tsig);
     var error_and_other_len: [4]u8 = undefined;
     std.mem.writeInt(u16, error_and_other_len[0..2], tsig.error_code, .big);
@@ -897,24 +946,133 @@ test "tsig algorithm names cover the RFC 8945 section 6 HMAC-SHA family" {
         .{ .name = "hmac-sha256.", .algorithm = .hmac_sha256 },
         .{ .name = "hmac-sha384.", .algorithm = .hmac_sha384 },
         .{ .name = "hmac-sha512.", .algorithm = .hmac_sha512 },
+        .{ .name = "hmac-sha256-128.", .algorithm = .hmac_sha256_128 },
+        .{ .name = "hmac-sha384-192.", .algorithm = .hmac_sha384_192 },
+        .{ .name = "hmac-sha512-256.", .algorithm = .hmac_sha512_256 },
     };
     for (cases) |case| {
         const name = try Name.fromText(case.name);
         try std.testing.expectEqual(case.algorithm, try algorithmForName(&name));
     }
-    // HMAC-MD5.SIG-ALG.REG.INT is a MUST NOT use in section 6, gss-tsig
-    // delegates the cryptography to GSS, and the truncated variants are a
-    // different family this server does not implement.
+    // HMAC-MD5.SIG-ALG.REG.INT is a MUST NOT use in section 6, and gss-tsig
+    // delegates the cryptography to GSS.
     for ([_][]const u8{
         "hmac-md5.sig-alg.reg.int.",
         "gss-tsig.",
-        "hmac-sha256-128.",
-        "hmac-sha384-192.",
-        "hmac-sha512-256.",
     }) |refused| {
         const name = try Name.fromText(refused);
         try std.testing.expectError(Error.UnsupportedAlgorithm, algorithmForName(&name));
     }
+}
+
+test "tsig verifies a request signed with a truncated algorithm name" {
+    const cases = [_]struct { name: []const u8, algorithm: Algorithm, mac_len: usize }{
+        .{ .name = "hmac-sha256-128.", .algorithm = .hmac_sha256_128, .mac_len = 16 },
+        .{ .name = "hmac-sha384-192.", .algorithm = .hmac_sha384_192, .mac_len = 24 },
+        .{ .name = "hmac-sha512-256.", .algorithm = .hmac_sha512_256, .mac_len = 32 },
+    };
+    for (cases) |case| {
+        var packet: [512]u8 = undefined;
+        var writer = Writer.init(&packet);
+        try writeRequest(&writer, case.name, case.mac_len);
+        const final = (try parseFinalAdditional(writer.written())).?;
+        const mac = try sign(writer.written(), "topsecret", final.owner, final.tsig, null);
+        try std.testing.expectEqual(case.mac_len, mac.slice().len);
+        try std.testing.expectEqual(case.mac_len, digestLength(case.algorithm));
+
+        var signed: [512]u8 = undefined;
+        requestWithMacPrefix(writer.written(), final, mac.slice(), case.mac_len, &signed);
+        const verified = try verify(signed[0..writer.len()], "topsecret", null, minimumMacLength(case.algorithm));
+        try std.testing.expectEqualSlices(u8, mac.slice(), verified.slice());
+
+        // RFC 8945 section 5.2.2.1: a MAC longer than the output of the
+        // algorithm, or shorter than half the hash length, is a format error.
+        var longer: [512]u8 = undefined;
+        var longer_writer = Writer.init(&longer);
+        try writeRequest(&longer_writer, case.name, case.mac_len + 1);
+        try std.testing.expectError(Error.Formerr, verify(
+            longer_writer.written(),
+            "topsecret",
+            null,
+            minimumMacLength(case.algorithm),
+        ));
+
+        var shorter: [512]u8 = undefined;
+        var shorter_writer = Writer.init(&shorter);
+        try writeRequest(&shorter_writer, case.name, case.mac_len - 1);
+        try std.testing.expectError(Error.Formerr, verify(
+            shorter_writer.written(),
+            "topsecret",
+            null,
+            minimumMacLength(case.algorithm),
+        ));
+    }
+}
+
+test "tsig keeps the truncated algorithm names apart from the full family" {
+    const cases = [_]struct { truncated: []const u8, full: []const u8 }{
+        .{ .truncated = "hmac-sha256-128.", .full = "hmac-sha256." },
+        .{ .truncated = "hmac-sha384-192.", .full = "hmac-sha384." },
+        .{ .truncated = "hmac-sha512-256.", .full = "hmac-sha512." },
+    };
+    for (cases) |case| {
+        const truncated_name = try Name.fromText(case.truncated);
+        const full_name = try Name.fromText(case.full);
+        const truncated = try algorithmForName(&truncated_name);
+        const full = try algorithmForName(&full_name);
+        // A key of the full algorithm never authenticates a request that
+        // names the truncated one, and the other way round.
+        try std.testing.expect(truncated != full);
+        // RFC 4868 section 2.6: the truncated name keeps the key length of
+        // the algorithm it truncates and halves the output.
+        try std.testing.expectEqual(hashLength(full), hashLength(truncated));
+        try std.testing.expectEqual(digestLength(full) / 2, digestLength(truncated));
+    }
+}
+
+test "tsig matches the algorithm name case-insensitively and answers with the peer's spelling" {
+    const packet = [_]u8{
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x07, 0x65, 0x78, 0x61,
+        0x6d, 0x70, 0x6c, 0x65, 0x03, 0x63, 0x6f, 0x6d, 0x00, 0x00, 0x01, 0x00, 0x01, 0x03, 0x6b, 0x65,
+        0x79, 0x00, 0x00, 0xfa, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3d, 0x0b, 0x68, 0x6d, 0x61,
+        0x63, 0x2d, 0x73, 0x68, 0x61, 0x32, 0x35, 0x36, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01,
+        0x2c, 0x00, 0x20, 0x2b, 0xcb, 0xce, 0x33, 0x18, 0xfb, 0x82, 0x4c, 0x9e, 0x99, 0x95, 0x2a, 0x71,
+        0x02, 0x45, 0x24, 0x0e, 0x8e, 0x49, 0xfb, 0x98, 0x17, 0x8e, 0xc6, 0x32, 0xd2, 0x05, 0x9f, 0xd7,
+        0xab, 0xac, 0x45, 0x12, 0x34, 0x00, 0x00, 0x00, 0x00,
+    };
+    const final = (try parseFinalAdditional(&packet)).?;
+    // The peer spelled the algorithm name in another case. The MAC still
+    // covers the canonical form (RFC 8945 section 4.3.3), so the request
+    // authenticates, and the reply carries the spelling back.
+    var upper = packet;
+    @memcpy(upper[final.rdata_start + 1 ..][0..11], "HMAC-SHA256");
+
+    const mac = try verify(&upper, "topsecret", null, 16);
+    try std.testing.expectEqualSlices(u8, &.{
+        0x2b, 0xcb, 0xce, 0x33, 0x18, 0xfb, 0x82, 0x4c,
+        0x9e, 0x99, 0x95, 0x2a, 0x71, 0x02, 0x45, 0x24,
+        0x0e, 0x8e, 0x49, 0xfb, 0x98, 0x17, 0x8e, 0xc6,
+        0x32, 0xd2, 0x05, 0x9f, 0xd7, 0xab, 0xac, 0x45,
+    }, mac.slice());
+
+    const upper_final = (try parseFinalAdditional(&upper)).?;
+    try std.testing.expectEqualSlices(u8, "HMAC-SHA256", upper_final.tsig.algorithm.asWire()[1..12]);
+    try std.testing.expectEqual(Algorithm.hmac_sha256, try algorithmForName(&upper_final.tsig.algorithm));
+
+    var response = upper;
+    response[2] = 0x81;
+    response[3] = 0x80;
+    @memset(response[67..99], 0);
+    const response_final = (try parseFinalAdditional(&response)).?;
+    const response_mac = try sign(&response, "topsecret", response_final.owner, response_final.tsig, mac.slice());
+    @memcpy(response[67..99], response_mac.slice());
+    try std.testing.expectEqualSlices(
+        u8,
+        response_mac.slice(),
+        (try verify(&response, "topsecret", mac.slice(), 16)).slice(),
+    );
+    const reply_final = (try parseFinalAdditional(&response)).?;
+    try std.testing.expectEqualSlices(u8, "HMAC-SHA256", reply_final.tsig.algorithm.asWire()[1..12]);
 }
 
 test "tsig digest length is the keyed hash output of each algorithm" {
