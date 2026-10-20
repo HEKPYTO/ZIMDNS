@@ -320,6 +320,13 @@ fn coversOwner(rrsig_owner: []const u8, answer_owner: dns_name.Name) bool {
     if (!std.ascii.eqlIgnoreCase(answer[answer.len - parent.len ..], parent)) return false;
     return answer[answer.len - parent.len - 1] == '.';
 }
+fn wildcardOwnerIsAnswer(owner: []const u8, answers: []const dns_record.ResourceRecord) bool {
+    const wildcard = dns_name.Name.fromText(owner) catch return false;
+    for (answers) |answer| {
+        if (answer.owner.eql(&wildcard)) return true;
+    }
+    return false;
+}
 
 fn appendCoveringRrsigs(response: *dns_message.Message, zone: *const zone_index.Zone, qtype: dns_types.RecordType, answer_owner: ?[]const u8) !void {
     _ = qtype;
@@ -335,10 +342,11 @@ fn appendCoveringRrsigs(response: *dns_message.Message, zone: *const zone_index.
         if (!candidate.rrtype.eql(.RRSIG)) continue;
         const is_wildcard = candidate.ownerText().len > 2 and candidate.ownerText()[0] == '*' and candidate.ownerText()[1] == '.';
         // A wildcard RRSIG is emitted under the expanded answer owner (RFC
-        // 4035 §3.1.3.3), never as `*.example.`. Only a wildcard expansion
-        // sets answer_owner, so an exact answer never matches a wildcard
-        // RRSIG here — even if the zone holds one for the same type.
-        if (is_wildcard and answer_owner == null) continue;
+        // 4035 §3.1.3.3). Without an expansion the answer can still be the
+        // wildcard owner itself (RFC 4592 §2.3: no special processing when
+        // the QNAME is the wildcard), and its RRSIG keeps that owner.
+        if (is_wildcard and answer_owner == null and
+            !wildcardOwnerIsAnswer(candidate.ownerText(), response.answers.items[0..original_len])) continue;
         const owner_override = if (is_wildcard) answer_owner else null;
         const rr = toResourceRecord(candidate, owner_override) catch continue;
         const raw = switch (rr.rdata) {
@@ -936,6 +944,29 @@ test "wildcard RRSIGs are emitted under the expanded owner, never as wildcard" {
     var exact_rrsig: [256]u8 = undefined;
     try std.testing.expectEqualStrings("www.example.", try exact.answers.items[1].owner.toText(&exact_rrsig));
 }
+test "a query for the wildcard owner itself keeps its RRSIG (RFC 4592 §2.3)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+        \\@ IN NS ns.example.
+        \\* IN A 192.0.2.9
+        \\* IN RRSIG A 8 2 3600 2000000000 1000000000 1234 example. QUJD
+        \\
+    );
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    // No expansion: the QNAME is the wildcard, so answer_owner is null and
+    // the RRSIG keeps its wildcard owner instead of being dropped.
+    const response = try buildResponse(try testDoQuery(arena.allocator(), 0x4452, "*.example.", .A, true), &zone);
+    try std.testing.expectEqual(@as(u16, 2), response.header.answer_count);
+    var owner_text: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("*.example.", try response.answers.items[1].owner.toText(&owner_text));
+}
 
 test "covering RRSIGs are capped so packed zones cannot amplify" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1022,6 +1053,35 @@ fn testQuery(allocator: std.mem.Allocator, name_text: []const u8, qtype: dns_typ
             .qclass = dns_types.Class.IN,
         },
     };
+}
+
+test "RFC 4343 4.1: the response echoes the question in the case the client sent" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+        \\@ IN NS ns.example.
+        \\ns IN A 192.0.2.1
+        \\www IN A 192.0.2.2
+        \\
+    );
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    var query = try testQuery(arena.allocator(), "www.example.", .A);
+    query.question.?.name = (try dns_name.Name.parsePreservingCase(
+        &.{ 3, 'W', 'w', 'w', 7, 'E', 'x', 'a', 'm', 'p', 'l', 'e', 0 },
+        0,
+    )).name;
+
+    const response = try buildResponse(query, &zone);
+    var text: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("Www.Example.", try response.question.?.name.toText(&text));
+    // The answer still carries the owner the zone file holds.
+    try std.testing.expectEqualSlices(u8, &.{ 192, 0, 2, 2 }, &response.answers.items[0].rdata.A);
 }
 
 test "authoritative response rewrites wildcard owners and preserves negative SOA TTL" {

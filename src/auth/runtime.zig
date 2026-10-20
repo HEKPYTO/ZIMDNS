@@ -240,6 +240,7 @@ pub const Runtime = struct {
                     error.MultipleOptRecords,
                     error.InvalidOptOwner,
                     error.MalformedEdnsOption,
+                    error.EdnsOptionsTooLong,
                     => return .{ .failure = .{ .code = .formerr } },
                     error.OutOfMemory => return parse_err,
                     else => {
@@ -263,6 +264,7 @@ pub const Runtime = struct {
                 error.MultipleOptRecords,
                 error.InvalidOptOwner,
                 error.MalformedEdnsOption,
+                error.EdnsOptionsTooLong,
                 => return .{ .failure = .{ .code = .formerr } },
                 error.OutOfMemory => return err,
                 else => {
@@ -1257,6 +1259,35 @@ test "RFC 6891: a query carrying two OPT records is answered FORMERR" {
     try std.testing.expectEqual(@as(u16, 0), parsed.header.additional_count);
     try std.testing.expect(parsed.edns == null);
 }
+test "RFC 6891: an OPT whose option overruns RDLENGTH is answered FORMERR" {
+    var runtime = try Runtime.fromZoneText(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\
+    );
+    defer runtime.deinit();
+
+    // One OPT, ARCOUNT 1, RDLENGTH 4, but the option header claims 10 data
+    // octets that are not there: EdnsOptionsTooLong, a format error.
+    const overrun_query = [_]u8{
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        7,    'e',  'x',  'a',  'm',  'p',  'l',  'e',  3,    'c',  'o',  'm',
+        0,    0x00, 0x01, 0x00, 0x01, 0,    0x00, 0x29, 0x04, 0xd0, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x04, 0x00, 0x01, 0x00, 0x0a,
+    };
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 53114);
+    var output: [512]u8 = undefined;
+    const response_bytes = try runtime.answerFrom(&overrun_query, &output, &client);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expect(parsed.header.qr);
+    try std.testing.expectEqual(@as(@TypeOf(parsed.header.rcode), .formerr), parsed.header.rcode);
+}
+
 
 test "RFC 9619: an OPCODE 0 query with QDCOUNT 2 is answered FORMERR" {
     var runtime = try Runtime.fromZoneText(

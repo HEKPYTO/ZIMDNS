@@ -306,7 +306,10 @@ pub fn nsecCovers(owner: Name, next: Name, qname: Name) bool {
 pub fn nsec3Hash(owner: Name, salt: []const u8, iterations: u16, out: *[20]u8) void {
     var digest: [20]u8 = undefined;
     var hasher = std.crypto.hash.Sha1.init(.{});
-    hasher.update(owner.asWire());
+    // RFC 5155 section 7.1 hashes the canonical owner name, so the case the
+    // name arrived with never reaches the digest.
+    const canonical = owner.folded();
+    hasher.update(canonical.asWire());
     hasher.update(salt);
     hasher.final(&digest);
     var i: usize = 0;
@@ -722,6 +725,16 @@ test "NSEC3 hash matches an independent SHA-1 recomputation (RFC 5155 7.1)" {
     var different: [20]u8 = undefined;
     nsec3Hash(owner, &[_]u8{}, 0, &different);
     try std.testing.expect(!std.mem.eql(u8, &hashed, &different));
+}
+
+test "RFC 5155 7.1: the NSEC3 hash covers the canonical owner name, not the case it arrived in" {
+    const mixed = (try Name.parsePreservingCase(&.{ 7, 'E', 'x', 'a', 'm', 'p', 'l', 'e', 0 }, 0)).name;
+    const canonical = (try Name.parse(&.{ 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0 }, 0)).name;
+    var mixed_hash: [20]u8 = undefined;
+    var canonical_hash: [20]u8 = undefined;
+    nsec3Hash(mixed, &.{}, 0, &mixed_hash);
+    nsec3Hash(canonical, &.{}, 0, &canonical_hash);
+    try std.testing.expectEqualSlices(u8, &canonical_hash, &mixed_hash);
 }
 
 test "NSEC3 hash matches external RFC 5155 vectors (python hashlib oracle)" {

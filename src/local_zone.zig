@@ -118,10 +118,12 @@ pub const Zone = struct {
     is_apex: bool,
 };
 
-/// Returns the innermost locally served zone containing `qname`, which must be
-/// lowercase and carry its trailing dot. Suffixes are tried longest first on
-/// label boundaries only, so `1.2.0.192.in-addr.arpa.` reports the enclosing
-/// `2.0.192.in-addr.arpa.` and never the non-zone `0.192.in-addr.arpa.`.
+/// Returns the innermost locally served zone containing `qname`, which must
+/// carry its trailing dot. The zone table is lowercase and the comparison
+/// ignores case (RFC 1035 section 2.3.2), so a name in upper case still
+/// matches. Suffixes are tried longest first on label boundaries only, so
+/// `1.2.0.192.in-addr.arpa.` reports the enclosing `2.0.192.in-addr.arpa.` and
+/// never the non-zone `0.192.in-addr.arpa.`.
 pub fn match(qname: []const u8) ?Zone {
     var start: usize = 0;
     while (start < qname.len) {
@@ -148,7 +150,7 @@ fn kindOf(suffix: []const u8) ?Kind {
 /// so every other question is answered locally.
 pub fn forwardsUpstream(zone: Zone, qtype: dns_types.RecordType, dnssec_ok: bool) bool {
     return zone.kind == .empty_zone and
-        std.mem.eql(u8, zone.apex, HOME_ARPA) and
+        std.ascii.eqlIgnoreCase(zone.apex, HOME_ARPA) and
         qtype.eql(.DS) and
         dnssec_ok;
 }
@@ -303,14 +305,13 @@ fn setHeaderCounts(response: *dns_message.Message) !void {
 }
 
 /// Exact token match: `token` counts only where it is delimited by spaces, so
-/// `0.in-addr.arpa.` never matches inside `10.in-addr.arpa.`.
+/// `0.in-addr.arpa.` never matches inside `10.in-addr.arpa.`. The comparison
+/// ignores case (RFC 1035 section 2.3.2), so a client that spelled the apex
+/// in upper case still lands in the locally served zone.
 fn contains(haystack: []const u8, token: []const u8) bool {
-    var rest = haystack;
-    while (std.mem.indexOf(u8, rest, token)) |at| {
-        const opens = at == 0 or rest[at - 1] == ' ';
-        const closes = at + token.len == rest.len or rest[at + token.len] == ' ';
-        if (opens and closes) return true;
-        rest = rest[at + 1 ..];
+    var tokens = std.mem.tokenizeAny(u8, haystack, " ");
+    while (tokens.next()) |candidate| {
+        if (std.ascii.eqlIgnoreCase(candidate, token)) return true;
     }
     return false;
 }
@@ -479,6 +480,15 @@ test "RFC 6303 section 3 empty zone: NXDOMAIN below the apex, SOA/NS/NODATA at i
     try std.testing.expectEqual(@as(u16, 2), apex_a.header.authority_count);
     try expectZoneSoa(apex_a.authorities.items[0], "10.in-addr.arpa.");
     try expectZoneNs(apex_a.authorities.items[1], "10.in-addr.arpa.");
+}
+
+test "RFC 1035 2.3.2: the local zone table matches a name regardless of case" {
+    const upper = match("1.0.0.127.IN-ADDR.ARPA.") orelse return error.TestUnexpectedResult;
+    const lower = match("1.0.0.127.in-addr.arpa.") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(lower.kind, upper.kind);
+    // The apex is the caller's own text, so the answer names the zone the
+    // client asked for.
+    try std.testing.expectEqualStrings("127.IN-ADDR.ARPA.", upper.apex);
 }
 
 test "RFC 6761 test. and invalid. are NXDOMAIN even at the zone name" {

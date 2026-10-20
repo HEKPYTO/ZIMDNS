@@ -288,12 +288,14 @@ fn wildcardName(encloser: Name) Error!Name {
 
 /// True when `name` is `ancestor` or sits below it. A canonical wire name ends
 /// at the root label, so a suffix match on whole labels is exact: `example.`
-/// is never a suffix-match of `notexample.com.`.
+/// is never a suffix-match of `notexample.com.`. The comparison ignores case
+/// (RFC 1035 section 2.3.2), so a name that arrived in upper case still
+/// matches the zone it sits under.
 fn isSuffix(ancestor: Name, name: Name) bool {
     const outer = ancestor.asWire();
     const inner = name.asWire();
     if (outer.len > inner.len) return false;
-    return std.mem.eql(u8, inner[inner.len - outer.len ..], outer);
+    return std.ascii.eqlIgnoreCase(inner[inner.len - outer.len ..], outer);
 }
 
 /// RFC 4034 section 6.3: RDATA compares as left-justified unsigned octet
@@ -770,12 +772,9 @@ const Validator = struct {
         return false;
     }
 
+    // Called only when keySet found zero keys, which already covers every
+    // DNSKEY anchor for the signer — so only the response RRsets are live.
     fn hasDnskey(self: *const Validator, signer: Name) bool {
-        var index: usize = 0;
-        while (index < self.anchors.len) : (index += 1) {
-            const anchor = &self.anchors.items[index];
-            if (anchor.rrtype.eql(.DNSKEY) and anchor.owner.eql(&signer)) return true;
-        }
         for (self.rrsets.items) |*rrset| {
             if (rrset.rrtype != RecordType.DNSKEY.code()) continue;
             if (rrset.owner.eql(&signer)) return true;
@@ -1845,6 +1844,24 @@ test "RFC 5155 section 8.6: a DS NODATA needs the Opt-Out bit or it is bogus" {
 }
 
 // ------------------------------------------------------------ anchor file
+
+test "RFC 1035 2.3.2: a trust anchor covers a name that arrived in upper case" {
+    var anchors = try Anchors.parse(std.testing.allocator,
+        \\example.com. 3600 IN DS 35217 15 2 401781b934e392de492ec77ae2e15d70f6575a1c0bc59c5275c04ebe80c6614c
+        \\
+    );
+    defer anchors.deinit(std.testing.allocator);
+
+    const mixed = (try Name.parsePreservingCase(
+        &.{ 7, 'E', 'X', 'A', 'M', 'P', 'L', 'E', 3, 'C', 'O', 'M', 0 },
+        0,
+    )).name;
+    try std.testing.expect(anchors.covers(mixed));
+
+    var tags: [2]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), anchors.keyTags(mixed, &tags));
+    try std.testing.expectEqual(@as(u16, 35217), std.mem.readInt(u16, tags[0..2], .big));
+}
 
 test "the anchor file takes DS and DNSKEY lines and rejects every other shape" {
     // RFC 8080 section 6.1's published Ed25519 DNSKEY and its SHA-256 DS, so

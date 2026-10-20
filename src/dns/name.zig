@@ -68,7 +68,32 @@ pub const Name = struct {
         return std.ascii.eqlIgnoreCase(a.asWire(), b.asWire());
     }
 
+    /// The canonical lowercase form of this name. RFC 4034 section 6.2 signs
+    /// and RFC 5155 section 5 hashes a name in that form, so both paths fold
+    /// the name they are given instead of assuming it arrived folded.
+    pub fn folded(self: *const Name) Name {
+        var out = self.*;
+        for (out.wire[0..out.wire_len]) |*byte| byte.* = std.ascii.toLower(byte.*);
+        return out;
+    }
+
+    /// Parses a name in the canonical lowercase form. Every label byte is
+    /// folded, so the name compares equal to any other spelling of itself and
+    /// re-encodes to the lowercase form RFC 4034 section 6.2 and RFC 5155
+    /// section 5 require.
     pub fn parse(message: []const u8, offset: usize) Error!ParseResult {
+        return parseWithCase(message, offset, true);
+    }
+
+    /// Parses a name and keeps every label byte exactly as it arrived.
+    /// RFC 4343 section 4.1 requires the case of a name to be preserved on
+    /// output, so the question's name keeps the case the client used; the
+    /// canonical form above stays the default everywhere else.
+    pub fn parsePreservingCase(message: []const u8, offset: usize) Error!ParseResult {
+        return parseWithCase(message, offset, false);
+    }
+
+    fn parseWithCase(message: []const u8, offset: usize, fold_case: bool) Error!ParseResult {
         if (offset >= message.len) return Error.EndOfInput;
 
         var out = Name{ .wire_len = 0 };
@@ -114,7 +139,7 @@ pub const Name = struct {
             try out.pushByte(len);
             const label = message[current + 1 .. current + 1 + len];
             for (label) |byte| {
-                try out.pushByte(std.ascii.toLower(byte));
+                try out.pushByte(if (fold_case) std.ascii.toLower(byte) else byte);
             }
             current += 1 + len;
             if (!jumped) next_offset = current;
@@ -177,6 +202,23 @@ test "name parses root and normal names" {
 
     var text: [32]u8 = undefined;
     try std.testing.expectEqualStrings("example.com.", try parsed.name.toText(&text));
+}
+
+test "RFC 4343 4.1: the received case is kept, the canonical form folds it" {
+    const bytes = [_]u8{ 7, 'E', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'C', 'O', 'M', 0 };
+
+    const received = try Name.parsePreservingCase(&bytes, 0);
+    try std.testing.expectEqualSlices(u8, &bytes, received.name.asWire());
+
+    // The canonical parse is the lowercase form RFC 4034 section 6.2 signs
+    // and RFC 5155 section 5 hashes.
+    const canonical = try Name.parse(&bytes, 0);
+    try std.testing.expectEqualSlices(u8, &.{ 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0 }, canonical.name.asWire());
+
+    // RFC 1035 section 2.3.2: one name, two spellings.
+    try std.testing.expect(received.name.eql(&canonical.name));
+    const folded = received.name.folded();
+    try std.testing.expectEqualSlices(u8, canonical.name.asWire(), folded.asWire());
 }
 
 test "name decodes compression pointer and nested pointer" {

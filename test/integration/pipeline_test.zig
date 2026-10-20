@@ -15,7 +15,7 @@ const dns_record = zimdns.dns_record;
 const dns_name = zimdns.dns_name;
 const auth_keyring = zimdns.auth_keyring;
 
-const UpstreamMode = enum { valid, nxdomain, wrong_source, wrong_id, wrong_question, truncated_tcp, trickle_tcp };
+const UpstreamMode = enum { valid, valid_rrsig, valid_nsec, nxdomain, wrong_source, wrong_id, wrong_question, truncated_tcp, trickle_tcp };
 const TestTimeout = std.Io.Timeout{ .duration = .{
     .raw = .fromSeconds(2),
     .clock = .awake,
@@ -77,6 +77,40 @@ test "UDP request pipeline answers A query and records metrics" {
     try expectAResponse(response);
     try std.testing.expectEqual(@as(u16, 0x4242), response.header.id);
     try expectMetrics(counters);
+}
+
+test "UDP pipeline echoes the question in the case the client sent" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(fixture_zone);
+    defer runtime.deinit();
+
+    var server_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server_socket = try std.Io.net.IpAddress.bind(&server_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer server_socket.close(io);
+
+    var client_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var client_socket = try std.Io.net.IpAddress.bind(&client_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer client_socket.close(io);
+
+    var counters = metrics.Counters{};
+    // "Dns.Home.Arpa." as the client spelled it. RFC 4343 section 4.1 requires
+    // the answer to carry the same question, so the response keeps the case.
+    const query = [_]u8{
+        0x42, 0x42, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        3,    'D',  'n',  's',  4,    'H',  'o',  'm',  'e',  4,    'A',  'r',
+        'p',  'a',  0,    0x00, 0x01, 0x00, 0x01,
+    };
+    try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, &query);
+    try listener.serveUdpOnceWithMetrics(&server_socket, io, &runtime, &counters);
+
+    var response_buffer: [512]u8 = undefined;
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, &query);
+    var text: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("Dns.Home.Arpa.", try response.question.?.name.toText(&text));
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
 }
 
 test "UDP signed query pipeline authenticates and returns signed success and unsigned BADKEY" {
@@ -2037,6 +2071,41 @@ test "resolver caches a live upstream NXDOMAIN response" {
     try std.testing.expectEqual(@as(@TypeOf(second.header.rcode), .nxdomain), second.header.rcode);
     try std.testing.expect(second.authorities.items[0].ttl > 0 and second.authorities.items[0].ttl <= 60);
 }
+test "unvalidated upstream NSEC never feeds the aggressive cache (RFC 8198 §5/§9)" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+    // Two requests: the mock answers every query, so a second upstream hit
+    // proves the first answer's NSEC was not harvested into the denial cache.
+    var upstream_args = UpstreamArgs{ .io = io, .udp = &upstream_socket, .mode = .valid_nsec };
+    const upstream_thread = try std.Thread.spawn(.{}, serveUpstream, .{&upstream_args});
+    const policy = resolver.Policy{ .forwarder = .{ .address = upstream_socket.address } };
+    var upstream = try Resolver.init(std.testing.allocator, io, policy);
+    defer upstream.deinit();
+
+    // No trust anchors: the upstream answer is never validated, so its NSEC
+    // must not become an aggressive denial proof.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 41007);
+    var output: [resolver.MAX_UPSTREAM_MESSAGE]u8 = undefined;
+
+    var first_buffer: [512]u8 = undefined;
+    const first_bytes = try cli_query.buildQueryPacket(&first_buffer, 0x7010, "example.com.", .A, true);
+    const first_query = try dns_message.Message.parseQuery(arena.allocator(), first_bytes);
+    const first_response = try dns_message.Message.parse(arena.allocator(), try upstream.answer(first_bytes, first_query, &client, &output));
+    try std.testing.expectEqual(@as(u16, 2), first_response.header.answer_count);
+
+    // `mail.example.com.` falls inside the NSEC span example.→www.example.;
+    // a harvested proof would answer this denial without upstream I/O.
+    var second_buffer: [512]u8 = undefined;
+    const second_bytes = try cli_query.buildQueryPacket(&second_buffer, 0x7011, "mail.example.com.", .A, true);
+    const second_query = try dns_message.Message.parseQuery(arena.allocator(), second_bytes);
+    _ = try upstream.answer(second_bytes, second_query, &client, &output);
+    upstream_thread.join();
+    try std.testing.expectEqual(@as(usize, 2), upstream_args.requests);
+}
 
 test "non-query opcode returns NOTIMP before cache or upstream reuse" {
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -2259,6 +2328,117 @@ test "forwarder signals anchor key tags on upstream DNSKEY query" {
     try std.testing.expectEqualSlices(u8, &.{ 0x88, 0x8f }, capture.tags[0..capture.tags_len]);
 }
 
+const DoCaptureArgs = struct {
+    io: std.Io,
+    udp: *const std.Io.net.Socket,
+    do_bit: bool = false,
+    ok: bool = false,
+};
+
+/// Records the DO bit of the upstream query and answers it.
+fn serveDoCapture(args: *DoCaptureArgs) void {
+    var request_buffer: [resolver.MAX_UPSTREAM_MESSAGE]u8 = undefined;
+    const incoming = args.udp.receiveTimeout(args.io, &request_buffer, TestTimeout) catch return;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = dns_message.Message.parse(arena.allocator(), incoming.data) catch return;
+    args.do_bit = parsed.edns != null and parsed.edns.?.dnssec_ok;
+    const valid = makeAResponse(incoming.data, false, false, false);
+    args.udp.send(args.io, &incoming.from, valid.bytes[0..valid.len]) catch return;
+    args.ok = true;
+}
+
+test "forwarder asks upstream with DO=1 for a client query without EDNS" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+    var capture = DoCaptureArgs{ .io = io, .udp = &upstream_socket };
+    const capture_thread = try std.Thread.spawn(.{}, serveDoCapture, .{&capture});
+
+    const policy = resolver.Policy{ .forwarder = .{ .address = upstream_socket.address } };
+    var upstream = try Resolver.init(std.testing.allocator, io, policy);
+    defer upstream.deinit();
+
+    // A client query without EDNS still reaches the upstream with the DO bit
+    // set (RFC 3225 section 3), and the answer comes back to the client.
+    var query_buffer: [512]u8 = undefined;
+    const query_bytes = try cli_query.buildQueryPacket(&query_buffer, 0x7030, "example.com.", .A, false);
+    var query_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer query_arena.deinit();
+    const query = try dns_message.Message.parseQuery(query_arena.allocator(), query_bytes);
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 41030);
+    var output: [resolver.MAX_UPSTREAM_MESSAGE]u8 = undefined;
+    const response_bytes = try upstream.answer(query_bytes, query, &client, &output);
+    capture_thread.join();
+    try std.testing.expect(capture.ok);
+    try std.testing.expect(capture.do_bit);
+    const response = try dns_message.Message.parse(query_arena.allocator(), response_bytes);
+    try expectForwardedAResponse(response, 0x7030);
+}
+
+// RFC 3225 section 3: an answer to a client that did not ask for proofs
+// carries no security RRs, while the same answer to a DO=1 client does.
+test "a forwarded answer reaches a DO=0 client without the security RRs" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    // --- a client that asked for no proofs: the RRSIG does not reach it.
+    {
+        var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+        defer upstream_socket.close(io);
+        var args = UpstreamArgs{ .io = io, .udp = &upstream_socket, .mode = .valid_rrsig };
+        const thread = try std.Thread.spawn(.{}, serveUpstream, .{&args});
+
+        const policy = resolver.Policy{ .forwarder = .{ .address = upstream_socket.address } };
+        var forwarder = try Resolver.init(std.testing.allocator, io, policy);
+        defer forwarder.deinit();
+
+        var query_buffer: [512]u8 = undefined;
+        const query_bytes = try cli_query.buildQueryPacket(&query_buffer, 0x7040, "example.com.", .A, false);
+        var query_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer query_arena.deinit();
+        const query = try dns_message.Message.parseQuery(query_arena.allocator(), query_bytes);
+        const client = try std.Io.net.IpAddress.parse("127.0.0.1", 41040);
+        var output: [resolver.MAX_UPSTREAM_MESSAGE]u8 = undefined;
+        const response_bytes = try forwarder.answer(query_bytes, query, &client, &output);
+        thread.join();
+        try std.testing.expect(args.ok);
+
+        const response = try dns_message.Message.parse(query_arena.allocator(), response_bytes);
+        try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+        try std.testing.expect(response.answers.items[0].rrtype.eql(.A));
+    }
+
+    // --- a client that asked for the proofs: the RRSIG rides along.
+    {
+        var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+        defer upstream_socket.close(io);
+        var args = UpstreamArgs{ .io = io, .udp = &upstream_socket, .mode = .valid_rrsig };
+        const thread = try std.Thread.spawn(.{}, serveUpstream, .{&args});
+
+        const policy = resolver.Policy{ .forwarder = .{ .address = upstream_socket.address } };
+        var forwarder = try Resolver.init(std.testing.allocator, io, policy);
+        defer forwarder.deinit();
+
+        var query_buffer: [512]u8 = undefined;
+        const query_bytes = try cli_query.buildQueryPacket(&query_buffer, 0x7041, "example.com.", .A, true);
+        var query_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer query_arena.deinit();
+        const query = try dns_message.Message.parseQuery(query_arena.allocator(), query_bytes);
+        const client = try std.Io.net.IpAddress.parse("127.0.0.1", 41041);
+        var output: [resolver.MAX_UPSTREAM_MESSAGE]u8 = undefined;
+        const response_bytes = try forwarder.answer(query_bytes, query, &client, &output);
+        thread.join();
+        try std.testing.expect(args.ok);
+
+        const response = try dns_message.Message.parse(query_arena.allocator(), response_bytes);
+        try std.testing.expectEqual(@as(u16, 2), response.header.answer_count);
+        try std.testing.expect(response.answers.items[1].rrtype.eql(.RRSIG));
+    }
+}
+
 const QminCaptureArgs = struct {
     io: std.Io,
     udp: *const std.Io.net.Socket,
@@ -2406,6 +2586,20 @@ fn buildIntegrationSignedQuery(time_signed: u64) !IntegrationSignedQuery {
     return .{ .bytes = packet, .len = writer.len(), .owner_start = owner_start };
 }
 
+/// The wire length of an OPT record: root owner, type, class, TTL, RDLENGTH.
+const opt_record_len: usize = 11;
+
+/// True when the query ends in an empty OPT record (root owner, type 41,
+/// RDLENGTH 0): the client's EDNS record. A real server answers the question
+/// and never echoes that record into its own answer section.
+fn endsWithEmptyOpt(query: []const u8) bool {
+    if (query.len < 12 + opt_record_len) return false;
+    const tail = query[query.len - opt_record_len ..];
+    return tail[0] == 0 and
+        std.mem.readInt(u16, tail[1..3], .big) == 41 and
+        std.mem.readInt(u16, tail[9..11], .big) == 0;
+}
+
 fn serveUpstream(args: *UpstreamArgs) void {
     var request_buffer: [resolver.MAX_UPSTREAM_MESSAGE]u8 = undefined;
     const incoming = args.udp.receiveTimeout(args.io, &request_buffer, TestTimeout) catch return;
@@ -2413,6 +2607,28 @@ fn serveUpstream(args: *UpstreamArgs) void {
     var valid = makeAResponse(incoming.data, false, false, false);
     switch (args.mode) {
         .valid => args.udp.send(args.io, &incoming.from, valid.bytes[0..valid.len]) catch return,
+        .valid_rrsig => {
+            // The answer carries the A record and its RRSIG, as a signed
+            // zone's server sends them.
+            var rrsig_response = makeAResponse(incoming.data, false, false, false);
+            appendMockRrsig(&rrsig_response);
+            args.udp.send(args.io, &incoming.from, rrsig_response.bytes[0..rrsig_response.len]) catch return;
+        },
+        .valid_nsec => {
+            // The mock drops the client's OPT record before it builds the
+            // answer (see makeAResponse), so the A + NSEC land in the answer
+            // section.
+            var nsec_response = makeAResponse(incoming.data, false, false, false);
+            appendMockNsec(&nsec_response);
+            args.udp.send(args.io, &incoming.from, nsec_response.bytes[0..nsec_response.len]) catch return;
+            // A second query follows: it must reach upstream too, proving
+            // the first answer's NSEC was not harvested.
+            const second = args.udp.receiveTimeout(args.io, &request_buffer, TestTimeout) catch return;
+            args.requests += 1;
+            var second_response = makeAResponse(second.data, false, false, false);
+            appendMockNsec(&second_response);
+            args.udp.send(args.io, &second.from, second_response.bytes[0..second_response.len]) catch return;
+        },
         .nxdomain => {
             const response = makeNxDomainResponse(incoming.data);
             args.udp.send(args.io, &incoming.from, response.bytes[0..response.len]) catch return;
@@ -2508,8 +2724,18 @@ fn buildEdnsQuery(buffer: []u8, id: u16) ![]const u8 {
 
 fn makeAResponse(query: []const u8, truncated: bool, wrong_id: bool, wrong_question: bool) ResponseBytes {
     var response = ResponseBytes{};
-    @memcpy(response.bytes[0..query.len], query);
-    response.len = query.len;
+    // A real server answers the question and never echoes the client's OPT
+    // record into its own answer section. The forwarder asks upstream with an
+    // OPT (RFC 3225 section 3), so the mock drops that trailing record and
+    // the record count that carried it.
+    const dropped = endsWithEmptyOpt(query);
+    const echoed = if (dropped) query[0 .. query.len - opt_record_len] else query;
+    @memcpy(response.bytes[0..echoed.len], echoed);
+    response.len = echoed.len;
+    if (dropped) {
+        const additional_count = std.mem.readInt(u16, response.bytes[10..12], .big);
+        std.mem.writeInt(u16, response.bytes[10..12], additional_count -| 1, .big);
+    }
     response.bytes[2] = if (truncated) 0x83 else 0x81;
     response.bytes[3] = 0x80;
     std.mem.writeInt(u16, response.bytes[6..8], if (truncated) 0 else 1, .big);
@@ -2522,11 +2748,54 @@ fn makeAResponse(query: []const u8, truncated: bool, wrong_id: bool, wrong_quest
     }
     return response;
 }
+/// Appends an RRSIG to a mock A response, bumping ANCOUNT. The RDATA is the
+/// RFC 4034 section 3.2 shape the resolver reads as an opaque proof record:
+/// the covered type, the algorithm, the label count, the TTL, the validity
+/// window, the key tag, the signer's name, and the signature.
+fn appendMockRrsig(response: *ResponseBytes) void {
+    const rrsig = [_]u8{
+        0xc0, 0x0c, 0x00, 0x2e, 0x00, 0x01, 0x00, 0x00, 0x0e, 0x10, 0x00, 0x1f,
+        0x00, 0x01, 0x08, 0x00, 0x00, 0x00, 0x0e, 0x10, 0x7f, 0xff, 0xff, 0xff,
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x07, 'e',  'x',  'a',  'm',  'p',
+        'l',  'e',  0x00, 0x00, 0x00, 0x00, 0x00,
+    };
+    @memcpy(response.bytes[response.len .. response.len + rrsig.len], &rrsig);
+    response.len += rrsig.len;
+    const ancount = std.mem.readInt(u16, response.bytes[6..8], .big);
+    std.mem.writeInt(u16, response.bytes[6..8], ancount + 1, .big);
+}
+
+/// Appends an NSEC denying everything between the question owner and
+/// `www.<owner>` (bitmap: A + NSEC) to a mock A response, bumping ANCOUNT.
+/// The forwarder must not feed this proof to its aggressive cache without
+/// DNSSEC validation (RFC 8198 §5/§9: harvest gated on AD=secure).
+fn appendMockNsec(response: *ResponseBytes) void {
+    // Owner = question pointer; next = www.<qname>; bitmap window 0 carries
+    // A(1) and NSEC(47) — deny() rejects bitmaps lacking the NSEC bit.
+    const nsec = [_]u8{
+        0xc0, 0x0c, 0x00, 0x2f, 0x00, 0x01, 0x00, 0x00, 0x0e, 0x10, 0x00, 0x19,
+        0x03, 'w',  'w',  'w',  0x07, 'e',  'x',  'a',  'm',  'p',  'l',  'e',
+        0x03, 'c',  'o',  'm',  0x00, 0x00, 0x06, 0x40, 0x00, 0x00, 0x00, 0x00,
+        0x01,
+    };
+    @memcpy(response.bytes[response.len .. response.len + nsec.len], &nsec);
+    response.len += nsec.len;
+    const ancount = std.mem.readInt(u16, response.bytes[6..8], .big);
+    std.mem.writeInt(u16, response.bytes[6..8], ancount + 1, .big);
+}
 
 fn makeNxDomainResponse(query: []const u8) ResponseBytes {
     var response = ResponseBytes{};
-    @memcpy(response.bytes[0..query.len], query);
-    response.len = query.len;
+    // The client's OPT record is not echoed into the answer, as in
+    // makeAResponse.
+    const dropped = endsWithEmptyOpt(query);
+    const echoed = if (dropped) query[0 .. query.len - opt_record_len] else query;
+    @memcpy(response.bytes[0..echoed.len], echoed);
+    response.len = echoed.len;
+    if (dropped) {
+        const additional_count = std.mem.readInt(u16, response.bytes[10..12], .big);
+        std.mem.writeInt(u16, response.bytes[10..12], additional_count -| 1, .big);
+    }
     response.bytes[2] = 0x81;
     response.bytes[3] = 0x83;
     std.mem.writeInt(u16, response.bytes[6..8], 0, .big);

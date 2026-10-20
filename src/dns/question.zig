@@ -18,7 +18,9 @@ pub const Question = struct {
     qclass: types.Class,
 
     pub fn parse(message: []const u8, offset: usize) !struct { question: Question, next_offset: usize } {
-        const name_result = Name.parse(message, offset) catch return Error.BadName;
+        // RFC 4343 section 4.1: the case of the name must be preserved on
+        // output, so the question keeps the bytes the client sent.
+        const name_result = Name.parsePreservingCase(message, offset) catch return Error.BadName;
         var reader = Reader.init(message[name_result.next_offset..]);
         const qtype_code = reader.readU16() catch return Error.EndOfInput;
         const qclass_code = reader.readU16() catch return Error.EndOfInput;
@@ -38,6 +40,19 @@ pub const Question = struct {
         try writer.writeU16(self.qclass.code());
     }
 };
+
+test "RFC 4343 4.1: the question keeps the case the client sent" {
+    const bytes = [_]u8{
+        3,    'W',  'w',  'w',
+        7,    'E',  'x',  'a',
+        'm',  'p',  'l',  'e',
+        0,    0x00, 0x01, 0x00,
+        0x01,
+    };
+    const parsed = try Question.parse(&bytes, 0);
+    var text: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("Www.Example.", try parsed.question.name.toText(&text));
+}
 
 test "question parses and encodes example.com A IN" {
     const bytes = [_]u8{

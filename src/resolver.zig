@@ -29,6 +29,10 @@ pub const UDP_TIMEOUT: std.Io.Timeout = .{ .duration = .{
 /// One-second upstream TCP connection and I/O budget.
 pub const TCP_TIMEOUT: std.Io.Timeout = UDP_TIMEOUT;
 pub const MAX_UPSTREAM_MESSAGE = std.math.maxInt(u16);
+/// A DNS header is twelve octets; its ARCOUNT field is the last two.
+const dns_header_len: usize = 12;
+/// Root name, type, class, TTL, RDLENGTH: the wire length of an OPT record.
+const opt_record_len: usize = 11;
 pub const UPSTREAM_TCP_DEADLINES_SUPPORTED = switch (builtin.os.tag) {
     .linux, .macos => true,
     else => false,
@@ -569,11 +573,12 @@ pub const Resolver = struct {
             }
         }
         self.cache.put(key, &response, now) catch {};
-        // RFC 8198 section 3: the NSEC proofs in the upstream answer feed the
-        // aggressive cache, so a later denial query is answered without an
-        // upstream round trip. The harvest runs before the client copy is
-        // stripped, so it still sees the full proofs.
-        self.harvestNsecProofs(response, now);
+        // RFC 8198 sections 5 and 9: only a proof that DNSSEC validation
+        // has made trustworthy may be used aggressively. AD is set above
+        // only on a validated-secure answer, so it is the verdict here.
+        // The harvest runs before the client copy is stripped, so it
+        // still sees the full proofs.
+        if (response.header.authenticated_data) self.harvestNsecProofs(response, now);
         // RFC 3225 section 3: a query with the DO bit clear must not be answered
         // with DNSSEC security RRs. The cached copy keeps them, so the removal
         // happens on the way out only.
@@ -631,7 +636,12 @@ pub const Resolver = struct {
         return errorResponse(query, .servfail, ede_code);
     }
 
+    // RFC 8198 sections 5 and 9: only a proof that DNSSEC validation has
+    // made trustworthy may be used aggressively. The call site sets AD only
+    // on a validated-secure answer; the gate lives here too so no future
+    // caller can bypass it.
     fn harvestNsecProofs(self: *Resolver, response: dns_message.Message, now: i64) void {
+        if (!response.header.authenticated_data) return;
         harvestSectionNsec(&self.dnssec_aggressive, response.answers.slice(), now);
         harvestSectionNsec(&self.dnssec_aggressive, response.authorities.slice(), now);
     }
@@ -804,6 +814,18 @@ fn classifyUpstreamPacket(allocator: std.mem.Allocator, query: dns_message.Messa
     return .{ .ready = cloneMessage(allocator, response) catch return .ignore };
 }
 
+/// One EDNS(0) OPT record for an upstream request: root owner, type 41, the
+/// classic 512-octet payload, the DO bit set, and no option data. RFC 3225
+/// section 3 wants the DO bit on every recursive request, so a client query
+/// that carried no OPT still gets one upstream.
+fn writeDoOptRecord(buffer: []u8) void {
+    buffer[0] = 0;
+    std.mem.writeInt(u16, buffer[1..3], 41, .big);
+    std.mem.writeInt(u16, buffer[3..5], dns_message.CLASSIC_UDP_PAYLOAD_SIZE, .big);
+    std.mem.writeInt(u32, buffer[5..9], 0x00008000, .big);
+    std.mem.writeInt(u16, buffer[9..11], 0, .big);
+}
+
 fn buildUpstreamQuery(
     original: []const u8,
     query: dns_message.Message,
@@ -811,14 +833,24 @@ fn buildUpstreamQuery(
     anchors: *const validate.Anchors,
 ) ![]const u8 {
     if (query.edns == null) {
-        if (original.len > output.len) return Error.UpstreamFailure;
+        // RFC 3225 section 3: a recursive DNSSEC-aware server MUST set the DO
+        // bit on its recursive requests whatever the client asked for, so the
+        // upstream answer carries the records this server validates and feeds
+        // (RFC 8198) proofs from. A client that sent no OPT gets one OPT
+        // record with DO=1 appended to the forwarded bytes, so the question
+        // keeps the client's own octets and its QNAME case survives the hop.
+        if (original.len < dns_header_len or original.len + opt_record_len > output.len) return Error.UpstreamFailure;
         @memcpy(output[0..original.len], original);
         // RFC 4035 section 4.6: a security-aware resolver MUST clear the AD
         // bit when composing a query message, so a client's claim that an
         // answer was authenticated never reaches the upstream. The bit is
         // 0x0020 in the header flags word, whose low octet is octet 3.
-        if (original.len >= 4) output[3] &= ~@as(u8, 0x20);
-        return output[0..original.len];
+        output[3] &= ~@as(u8, 0x20);
+        const additional_count = std.mem.readInt(u16, output[10..12], .big);
+        if (additional_count == std.math.maxInt(u16)) return Error.UpstreamFailure;
+        std.mem.writeInt(u16, output[10..12], additional_count + 1, .big);
+        writeDoOptRecord(output[original.len..][0..opt_record_len]);
+        return output[0 .. original.len + opt_record_len];
     }
 
     var sanitized = dns_message.Message{
@@ -1493,6 +1525,27 @@ test "RFC 3225: buildUpstreamQuery sets DO=1 when the client cleared DO" {
     try std.testing.expect(upstream.edns.?.dnssec_ok);
 }
 
+test "RFC 4343 4.1: the upstream query keeps the case the client sent" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var query = try makeTestQuery(arena.allocator(), 0x2715, "example.com.", true);
+    defer query.deinit();
+    query.question.?.name = (try dns_name.Name.parsePreservingCase(
+        &.{ 7, 'E', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'C', 'O', 'M', 0 },
+        0,
+    )).name;
+
+    var output: [512]u8 = undefined;
+    const encoded = try buildUpstreamQuery(&.{ 0xde, 0xad }, query, &output, &.{});
+
+    var parsed_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer parsed_arena.deinit();
+    const upstream = try dns_message.Message.parse(parsed_arena.allocator(), encoded);
+    var text: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("Example.COM.", try upstream.question.?.name.toText(&text));
+}
+
 test "RFC 4035 section 4.6: buildUpstreamQuery clears the client's AD bit" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1507,11 +1560,20 @@ test "RFC 4035 section 4.6: buildUpstreamQuery clears the client's AD bit" {
     var output: [512]u8 = undefined;
     const composed = try buildUpstreamQuery(original, plain, &output, &.{});
 
-    // Byte for byte with the client's query, except that the AD bit is cleared.
+    // The client's own octets head the upstream query with the AD bit
+    // cleared, and one OPT record with DO=1 follows them (RFC 3225 section 3):
+    // the query goes upstream with the DO bit set even though the client sent
+    // no OPT. Only ARCOUNT grows, to carry that record.
     var expected = try std.testing.allocator.dupe(u8, original);
     defer std.testing.allocator.free(expected);
     expected[3] &= ~@as(u8, 0x20);
-    try std.testing.expectEqualSlices(u8, expected, composed);
+    try std.testing.expectEqualSlices(u8, expected[0..10], composed[0..10]);
+    try std.testing.expectEqualSlices(u8, expected[12..], composed[12..original.len]);
+    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, composed[10..12], .big));
+    try std.testing.expectEqual(@as(usize, original.len + opt_record_len), composed.len);
+    try std.testing.expectEqual(@as(u8, 0), composed[original.len]);
+    try std.testing.expectEqual(@as(u16, 41), std.mem.readInt(u16, composed[original.len + 1 ..][0..2], .big));
+    try std.testing.expectEqual(@as(u32, 0x8000), std.mem.readInt(u32, composed[original.len + 5 ..][0..4], .big));
 
     // The EDNS-aware path re-encodes the message; the AD claim must not
     // travel there either, and the upstream query semantics stay intact.
@@ -1531,6 +1593,33 @@ test "RFC 4035 section 4.6: buildUpstreamQuery clears the client's AD bit" {
     try std.testing.expect(!upstream.header.authenticated_data);
     try std.testing.expect(upstream.edns.?.dnssec_ok);
     try std.testing.expectEqual(@as(u16, 1200), upstream.edns.?.udp_payload_size);
+}
+
+test "RFC 3225 section 3: a client query without EDNS still asks the upstream with DO=1" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var plain = try makeTestQuery(arena.allocator(), 0x2716, "example.com.", false);
+    defer plain.deinit();
+
+    var original_bytes: [512]u8 = undefined;
+    const original = try encodeTestMessage(plain, &original_bytes);
+
+    var output: [512]u8 = undefined;
+    const composed = try buildUpstreamQuery(original, plain, &output, &.{});
+
+    // The question the client sent is the question that goes upstream: only
+    // the header's ARCOUNT grows, to carry the record appended to it.
+    try std.testing.expectEqualSlices(u8, original[0..10], composed[0..10]);
+    try std.testing.expectEqualSlices(u8, original[12..], composed[12..original.len]);
+    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, composed[10..12], .big));
+    const opt = composed[original.len..];
+    try std.testing.expectEqual(@as(usize, opt_record_len), opt.len);
+    try std.testing.expectEqual(@as(u8, 0), opt[0]);
+    try std.testing.expectEqual(@as(u16, 41), std.mem.readInt(u16, opt[1..3], .big));
+    try std.testing.expectEqual(@as(u16, dns_message.CLASSIC_UDP_PAYLOAD_SIZE), std.mem.readInt(u16, opt[3..5], .big));
+    try std.testing.expectEqual(@as(u32, 0x8000), std.mem.readInt(u32, opt[5..9], .big));
+    try std.testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, opt[9..11], .big));
 }
 
 test "RFC 3225: stripProofsForClient drops RRSIG unless the query named it" {
