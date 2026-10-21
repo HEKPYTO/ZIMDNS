@@ -96,7 +96,8 @@ const StoredDelta = struct {
     to_serial: u32 = 0,
     text: [max_delta_bytes]u8 = undefined,
     text_len: usize = 0,
-    /// The wire size of the records the difference carries.
+    /// The wire size of the records the difference carries besides its own
+    /// SOA records.
     wire_bytes: usize = 0,
 };
 
@@ -106,6 +107,49 @@ const StoredDelta = struct {
 var stored: [max_stored_deltas]StoredDelta = undefined;
 var stored_len: usize = 0;
 
+/// The zones the server serves, by apex. The zone index registers a zone
+/// here when it loads the zone, so the RFC 1995 section 5 comparison has the
+/// full transfer of the zone to measure the incremental answer against.
+const max_zones = 64;
+
+const ZoneSize = struct {
+    origin: [max_origin_len]u8 = undefined,
+    origin_len: usize = 0,
+    /// The wire size of the records a full transfer of the zone carries.
+    bytes: usize = 0,
+};
+
+var zone_sizes: [max_zones]ZoneSize = undefined;
+var zone_sizes_len: usize = 0;
+
+/// Records the wire size of the full transfer of the zone with the given
+/// apex. A zone the table does not hold is not recorded: the server then
+/// knows no full transfer, and the incremental answer is the one it serves.
+pub fn registerZoneSize(origin: []const u8, bytes: usize) void {
+    if (origin.len == 0 or origin.len > max_origin_len) return;
+    for (zone_sizes[0..zone_sizes_len]) |*entry| {
+        if (!std.ascii.eqlIgnoreCase(entry.origin[0..entry.origin_len], origin)) continue;
+        entry.bytes = bytes;
+        return;
+    }
+    if (zone_sizes_len == max_zones) return;
+    const entry = &zone_sizes[zone_sizes_len];
+    @memcpy(entry.origin[0..origin.len], origin);
+    entry.origin_len = origin.len;
+    entry.bytes = bytes;
+    zone_sizes_len += 1;
+}
+
+/// The wire size of the full transfer of the zone with the given apex, or
+/// zero when the server does not know it.
+pub fn zoneSize(origin: []const u8) usize {
+    for (zone_sizes[0..zone_sizes_len]) |entry| {
+        if (!std.ascii.eqlIgnoreCase(entry.origin[0..entry.origin_len], origin)) continue;
+        return entry.bytes;
+    }
+    return 0;
+}
+
 /// One difference on the way from a client's serial to the current one.
 pub const Delta = struct {
     from_serial: u32,
@@ -113,7 +157,8 @@ pub const Delta = struct {
     /// The records the transition removed and added, in the journal's
     /// encoding.
     text: []const u8,
-    /// The wire size of the records the difference carries.
+    /// The wire size of the records the difference carries besides its own
+    /// SOA records.
     wire_bytes: usize,
 };
 
@@ -129,6 +174,10 @@ fn storeDelta(origin: []const u8, from_serial: u32, to_serial: u32, text: []cons
     // client at that serial gets the full transfer, never an incremental
     // answer built from records that are not records.
     if (!differenceIsUsable(text)) return;
+    // A difference that does not open with the two SOA records of its
+    // transition is not the transition it claims to be, so it is dropped
+    // the same way.
+    if (!differenceMatchesTransition(text, from_serial, to_serial)) return;
     const wire_bytes = differenceBytes(text);
     // A transition the store already holds keeps its place: the difference
     // that comes later is the one the answer is built from.
@@ -169,14 +218,20 @@ pub fn recordBytes(record: dns_record.ResourceRecord) usize {
 /// The longest a record can be on the wire.
 const max_record_bytes = 65535;
 
-/// The wire size of the records a difference carries: the bytes the
-/// difference takes in an incremental answer.
+/// The wire size of the records a difference carries besides its own two SOA
+/// records: the bytes the incremental answer adds to the two current SOA
+/// records it shares with the full transfer. Both answers carry those two
+/// records, so only the other records are compared (RFC 1995 section 5).
 fn differenceBytes(text: []const u8) usize {
     var total: usize = 0;
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
         if (line.len == 0) continue;
         const record = parseDeltaRecord(line) orelse continue;
+        // The difference carries the older SOA and the newer SOA; the answer
+        // carries the current SOA twice, so the difference's own SOA records
+        // are not part of the comparison.
+        if (record.rrtype_code == dns_types.RecordType.SOA.code()) continue;
         const converted = toResourceRecord(record) catch continue;
         total += recordBytes(converted);
     }
@@ -366,6 +421,39 @@ fn differenceIsUsable(text: []const u8) bool {
         _ = toResourceRecord(record) catch return false;
     }
     return true;
+}
+
+/// True when the difference is the transition it claims to be: RFC 1995
+/// section 4 puts the older SOA first among the deleted records and the
+/// newer SOA first among the added ones. A difference whose records all
+/// parse but do not open that way is not the transition, so it is dropped
+/// and the client at that serial gets the full transfer.
+fn differenceMatchesTransition(text: []const u8, from_serial: u32, to_serial: u32) bool {
+    var deleted_seen = false;
+    var added_seen = false;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const record = parseDeltaRecord(line) orelse return false;
+        if (record.deleted) {
+            if (deleted_seen) continue;
+            deleted_seen = true;
+            if (!soaHasSerial(record, from_serial)) return false;
+            continue;
+        }
+        if (added_seen) continue;
+        added_seen = true;
+        if (!soaHasSerial(record, to_serial)) return false;
+    }
+    return deleted_seen and added_seen;
+}
+
+/// True when the record is an SOA whose serial is `serial`.
+fn soaHasSerial(record: DeltaRecord, serial: u32) bool {
+    if (record.rrtype_code != dns_types.RecordType.SOA.code()) return false;
+    const parsed = zone_parser.parseRData(.SOA, record.rdata) catch return false;
+    if (parsed != .SOA) return false;
+    return parsed.SOA.serial == serial;
 }
 
 /// The durable RFC 1995 delta journal: the file that keeps a zone's serial
@@ -596,7 +684,8 @@ pub const DeltaLog = struct {
     origin: [max_origin_len]u8 = undefined,
     origin_len: usize = 0,
     /// The wire size of the records a full transfer of the zone carries, or
-    /// zero when the server does not know it yet.
+    /// zero when the server does not know it yet. A zero takes the size the
+    /// zone index registered when it loaded the zone.
     full_transfer_bytes: usize = 0,
 
     /// Names the zone this log belongs to, so a transition can be written to
@@ -688,9 +777,13 @@ pub const DeltaLog = struct {
     /// shorter than the full transfer of the zone. Both answers carry the
     /// two current SOA records, so only the other records are compared.
     fn incrementalIsShorter(self: *const DeltaLog, client_serial: u32, current_serial: u32) bool {
-        if (self.full_transfer_bytes == 0) return true;
+        const full = if (self.full_transfer_bytes != 0)
+            self.full_transfer_bytes
+        else
+            zoneSize(self.originText());
+        if (full == 0) return true;
         const chain = differenceChainBytes(self.originText(), client_serial, current_serial);
-        if (chain < self.full_transfer_bytes) return true;
+        if (chain < full) return true;
         // RFC 1995 section 5: the information about the older version goes,
         // so the storage stays bounded and the client gets the full
         // transfer.
@@ -718,15 +811,32 @@ pub const DeltaLog = struct {
     }
 };
 
-/// A difference one transition carries: the journal only keeps the text, the
-/// transfer reads it.
-const test_difference = "D a.chain.example. 3600 1 192.0.2.1\nA a.chain.example. 3600 1 192.0.2.2\n";
+/// The difference one transition carries: the journal only keeps the text, the
+/// transfer reads it. The difference of the transition from `from_serial` to
+/// `to_serial` opens with the older SOA and the added records open with the
+/// newer one (RFC 1995 section 4).
+fn testDifference(allocator: std.mem.Allocator, from_serial: u32, to_serial: u32) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var buffer: [128]u8 = undefined;
+    const older = try std.fmt.bufPrint(&buffer, "ns.chain.example. hostmaster.chain.example. {d} 3600 900 1209600 3600", .{from_serial});
+    try encodeRecord(&out, allocator, true, "chain.example.", 3600, dns_types.RecordType.SOA.code(), older);
+    try encodeRecord(&out, allocator, true, "a.chain.example.", 3600, dns_types.RecordType.A.code(), "192.0.2.1");
+    const newer = try std.fmt.bufPrint(&buffer, "ns.chain.example. hostmaster.chain.example. {d} 3600 900 1209600 3600", .{to_serial});
+    try encodeRecord(&out, allocator, false, "chain.example.", 3600, dns_types.RecordType.SOA.code(), newer);
+    try encodeRecord(&out, allocator, false, "a.chain.example.", 3600, dns_types.RecordType.A.code(), "192.0.2.2");
+    return out.toOwnedSlice(allocator);
+}
 
 test "delta log serves incremental answers only across recorded transitions" {
     var log = DeltaLog{};
     log.setOrigin("chain.example.");
-    try log.record(10, 11, test_difference);
-    try log.record(11, 12, test_difference);
+    const first = try testDifference(std.testing.allocator, 10, 11);
+    defer std.testing.allocator.free(first);
+    const second = try testDifference(std.testing.allocator, 11, 12);
+    defer std.testing.allocator.free(second);
+    try log.record(10, 11, first);
+    try log.record(11, 12, second);
     try std.testing.expect(log.hasSerial(10));
     try std.testing.expect(log.hasSerial(12));
     try std.testing.expect(!log.hasSerial(9));
@@ -740,7 +850,9 @@ test "delta log serves incremental answers only across recorded transitions" {
 test "a difference that is not shorter than the full transfer is purged" {
     var log = DeltaLog{};
     log.setOrigin("purge.example.");
-    try log.record(10, 11, test_difference);
+    const difference = try testDifference(std.testing.allocator, 10, 11);
+    defer std.testing.allocator.free(difference);
+    try log.record(10, 11, difference);
     try std.testing.expect(differenceFor("purge.example.", 10, 11) != null);
 
     // The server knows the size of the full transfer of the zone, and the
@@ -755,9 +867,11 @@ test "a difference that is not shorter than the full transfer is purged" {
 
 test "delta log rejects transitions that are not RFC 1982 newer" {
     var log = DeltaLog{};
-    try std.testing.expectError(DeltaError.SerialEqual, log.record(10, 10, test_difference));
-    try std.testing.expectError(DeltaError.SerialOlder, log.record(11, 10, test_difference));
-    try std.testing.expectError(DeltaError.SerialUndefined, log.record(0, 0x8000_0000, test_difference));
+    const difference = try testDifference(std.testing.allocator, 10, 11);
+    defer std.testing.allocator.free(difference);
+    try std.testing.expectError(DeltaError.SerialEqual, log.record(10, 10, difference));
+    try std.testing.expectError(DeltaError.SerialOlder, log.record(11, 10, difference));
+    try std.testing.expectError(DeltaError.SerialUndefined, log.record(0, 0x8000_0000, difference));
     try std.testing.expectEqual(@as(usize, 0), log.len);
 }
 
@@ -766,7 +880,9 @@ test "delta log evicts the oldest transition once bounded" {
     log.setOrigin("bounded.example.");
     var serial: u32 = 1;
     while (serial <= max_deltas + 1) : (serial += 1) {
-        try log.record(serial, serial + 1, test_difference);
+        const difference = try testDifference(std.testing.allocator, serial, serial + 1);
+        defer std.testing.allocator.free(difference);
+        try log.record(serial, serial + 1, difference);
     }
     try std.testing.expectEqual(max_deltas, log.len);
     try std.testing.expect(!log.hasSerial(1));
@@ -786,7 +902,9 @@ test "the journal file carries a transition across a restart" {
 
     var log = DeltaLog{};
     log.setOrigin("one.example.");
-    try log.record(10, 11, test_difference);
+    const difference = try testDifference(std.testing.allocator, 10, 11);
+    defer std.testing.allocator.free(difference);
+    try log.record(10, 11, difference);
     journal.close();
 
     // A server that comes back reads the file and finds the transition.
@@ -939,6 +1057,33 @@ test "a journal difference that cannot be turned into records is dropped" {
     try std.testing.expectEqual(transfer.IxfrDecision.fallback_axfr, transfer.decideIxfr(21, 20, &log));
 }
 
+test "a difference that does not open with the two SOA records is dropped" {
+    // RFC 1995 section 4: the first deleted record is the older SOA and the
+    // first added record the newer one. A difference whose records all parse
+    // but do not open that way is not the transition it claims to be.
+    var log = DeltaLog{};
+    log.setOrigin("mismatch.example.");
+    const damaged = "D a.chain.example. 3600 1 192.0.2.1\nA a.chain.example. 3600 1 192.0.2.2\n";
+    try log.record(10, 11, damaged);
+    // The transition is recorded, but its difference is not: the client at
+    // that serial gets the full transfer.
+    try std.testing.expect(log.hasSerial(10));
+    try std.testing.expect(differenceFor("mismatch.example.", 10, 11) == null);
+    try std.testing.expect(!log.canServeIncremental(10, 11));
+    const transfer = @import("transfer.zig");
+    try std.testing.expectEqual(transfer.IxfrDecision.fallback_axfr, transfer.decideIxfr(11, 10, &log));
+
+    // The SOA records of the difference must carry the serials of the
+    // transition: a difference of another transition is dropped the same way.
+    var other = DeltaLog{};
+    other.setOrigin("wrong-serial.example.");
+    const wrong = try testDifference(std.testing.allocator, 9, 10);
+    defer std.testing.allocator.free(wrong);
+    try other.record(10, 11, wrong);
+    try std.testing.expect(differenceFor("wrong-serial.example.", 10, 11) == null);
+    try std.testing.expect(!other.canServeIncremental(10, 11));
+}
+
 test "the difference carries the class of the record" {
     // A record of a class other than the default IN class carries the class
     // with it, and the record keeps that class when it is turned back into
@@ -974,7 +1119,9 @@ test "the journal stops growing at its bound and drops the transitions past it" 
     var serial: u32 = 1;
     var dropped: u32 = 0;
     while (journal.dropped == 0 and serial < 100_000) : (serial += 1) {
-        journal.append(origin, serial, serial + 1, test_difference);
+        const difference = try testDifference(std.testing.allocator, serial, serial + 1);
+        defer std.testing.allocator.free(difference);
+        journal.append(origin, serial, serial + 1, difference);
         if (journal.dropped > 0) dropped = serial;
     }
 
@@ -1003,7 +1150,9 @@ test "a journal at its bound leaves the dropped transition to the full transfer 
     var serial: u32 = 1;
     var dropped: u32 = 0;
     while (journal.dropped == 0 and serial < 100_000) : (serial += 1) {
-        journal.append(origin, serial, serial + 1, test_difference);
+        const difference = try testDifference(std.testing.allocator, serial, serial + 1);
+        defer std.testing.allocator.free(difference);
+        journal.append(origin, serial, serial + 1, difference);
         if (journal.dropped > 0) dropped = serial;
     }
     journal.close();

@@ -602,6 +602,41 @@ fn loadTransferTestWideOldZone() !zone_index.Zone {
     return zone_index.Zone.fromZoneFile(&zone_file);
 }
 
+/// A zone with two address records, so the difference of a change to one of
+/// them is shorter than the zone's full transfer once the SOA records are
+/// left out of the comparison.
+const transfer_test_zone_pair =
+    \\$ORIGIN pair.example.
+    \\$TTL 3600
+    \\@ IN SOA ns.pair.example. hostmaster.pair.example. 10 3600 900 1209600 3600
+    \\@ IN NS ns.pair.example.
+    \\www IN A 192.0.2.1
+    \\mail IN A 192.0.2.2
+    \\
+;
+
+/// The same zone before the change: the address of www is the one the change
+/// replaces.
+const transfer_test_zone_pair_old =
+    \\$ORIGIN pair.example.
+    \\$TTL 3600
+    \\@ IN SOA ns.pair.example. hostmaster.pair.example. 9 3600 900 1209600 3600
+    \\@ IN NS ns.pair.example.
+    \\www IN A 192.0.2.9
+    \\mail IN A 192.0.2.2
+    \\
+;
+
+fn loadTransferTestPairZone() !zone_index.Zone {
+    var zone_file = try zone_parser.ZoneFile.parse(transfer_test_zone_pair);
+    return zone_index.Zone.fromZoneFile(&zone_file);
+}
+
+fn loadTransferTestPairOldZone() !zone_index.Zone {
+    var zone_file = try zone_parser.ZoneFile.parse(transfer_test_zone_pair_old);
+    return zone_index.Zone.fromZoneFile(&zone_file);
+}
+
 /// The difference the change from the old zone to the new one makes, in the
 /// journal's encoding: the older SOA and the records it removed, then the
 /// newer SOA and the records it added.
@@ -807,7 +842,6 @@ test "transfer answers IXFR from the authority SOA serial" {
     var log = journal_mod.DeltaLog{};
     log.setOrigin("example.");
     try log.record(9, 10, transfer_test_difference);
-    try std.testing.expectEqual(IxfrDecision.incremental, decideIxfr(10, clientSerialFromMessage(&parsed), &log));
 
     var up_to_date = try buildIxfrUpToDateMessage(arena.allocator(), &parsed, &zone);
     defer up_to_date.deinit();
@@ -820,6 +854,11 @@ test "transfer answers IXFR from the authority SOA serial" {
     try std.testing.expectEqual(@as(u32, 10), incremental.answers.items[0].rdata.SOA.serial);
     try std.testing.expectEqual(@as(u32, 9), incremental.answers.items[1].rdata.SOA.serial);
     try std.testing.expectEqual(@as(u32, 10), incremental.answers.items[incremental.answers.len - 1].rdata.SOA.serial);
+
+    // RFC 1995 section 5: the difference of this small zone is longer than
+    // the zone's full transfer, so the client at the old serial gets the
+    // full transfer instead of the incremental answer.
+    try std.testing.expectEqual(IxfrDecision.fallback_axfr, decideIxfr(10, clientSerialFromMessage(&parsed), &log));
 }
 
 /// An IXFR request for `origin` from `serial`: the question plus the
@@ -856,9 +895,9 @@ test "an IXFR for the old serial carries the difference sequence" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    var old_zone = try loadTransferTestOldZone();
+    var old_zone = try loadTransferTestWideOldZone();
     defer old_zone.deinit();
-    var new_zone = try loadTransferTestZone();
+    var new_zone = try loadTransferTestWideZone();
     defer new_zone.deinit();
 
     // The difference the reload computes: the two zones side by side.
@@ -866,26 +905,26 @@ test "an IXFR for the old serial carries the difference sequence" {
     defer allocator.free(difference);
 
     var log = journal_mod.DeltaLog{};
-    log.setOrigin("example.");
+    log.setOrigin("wide.example.");
     try log.record(9, 10, difference);
     try std.testing.expectEqual(IxfrDecision.incremental, decideIxfr(10, 9, &log));
 
-    const request = try ixfrRequest(arena.allocator(), "example.", 9);
+    const request = try ixfrRequest(arena.allocator(), "wide.example.", 9);
     var message = try buildIxfrIncrementalMessages(arena.allocator(), &request, &new_zone, 9);
     defer message.deinit();
 
     // RFC 1995 section 4: the current SOA, the deleted records with the
     // older SOA first, the added records with the newer SOA first, and the
     // current SOA again.
-    try std.testing.expectEqual(@as(usize, 8), message.answers.len);
+    try std.testing.expectEqual(@as(usize, 6), message.answers.len);
     try std.testing.expectEqual(@as(u32, 10), message.answers.items[0].rdata.SOA.serial);
     try std.testing.expectEqual(@as(u32, 9), message.answers.items[1].rdata.SOA.serial);
-    try std.testing.expectEqual(@as(u32, 10), message.answers.items[4].rdata.SOA.serial);
-    try std.testing.expectEqual(@as(u32, 10), message.answers.items[7].rdata.SOA.serial);
-    // The deleted record is the address www had before the change, and the
-    // added record is the address it has now.
-    try std.testing.expectEqual([4]u8{ 192, 0, 2, 9 }, message.answers.items[2].rdata.A);
-    try std.testing.expectEqual([4]u8{ 192, 0, 2, 1 }, message.answers.items[5].rdata.A);
+    try std.testing.expectEqual(@as(u32, 10), message.answers.items[3].rdata.SOA.serial);
+    try std.testing.expectEqual(@as(u32, 10), message.answers.items[5].rdata.SOA.serial);
+    // The deleted record is the address the host had before the change, and
+    // the added record is the address it has now.
+    try std.testing.expectEqual([4]u8{ 192, 0, 2, 99 }, message.answers.items[2].rdata.A);
+    try std.testing.expectEqual([4]u8{ 192, 0, 2, 1 }, message.answers.items[4].rdata.A);
 }
 
 /// Reports whether two zone records are the same record.
@@ -1050,6 +1089,71 @@ test "a difference shorter than the full transfer is answered incrementally" {
     try std.testing.expectEqual(@as(u32, 10), message.answers.items[0].rdata.SOA.serial);
     try std.testing.expectEqual(@as(u32, 9), message.answers.items[1].rdata.SOA.serial);
     try std.testing.expectEqual(@as(u32, 10), message.answers.items[message.answers.len - 1].rdata.SOA.serial);
+}
+
+test "the size comparison leaves the difference's own SOA records out" {
+    // RFC 1995 section 5: the incremental answer and the full transfer both
+    // carry the two current SOA records, so only the other records are
+    // compared. The older and the newer SOA the difference carries are not
+    // part of the comparison.
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var old_zone = try loadTransferTestPairOldZone();
+    defer old_zone.deinit();
+    var new_zone = try loadTransferTestPairZone();
+    defer new_zone.deinit();
+
+    const difference = try zone_index.difference(allocator, &old_zone, &new_zone);
+    defer allocator.free(difference);
+
+    var log = journal_mod.DeltaLog{};
+    log.setOrigin("pair.example.");
+    try log.record(9, 10, difference);
+    log.setFullTransferBytes(zone_index.fullTransferBytes(&new_zone));
+
+    // The difference carries two address records and the full transfer
+    // carries the zone's three other records, so the incremental answer is
+    // the shorter one and the client gets it.
+    try std.testing.expectEqual(IxfrDecision.incremental, decideIxfr(10, 9, &log));
+}
+
+test "the zone's full transfer size reaches the delta log" {
+    // RFC 1995 section 5: the incremental answer is measured against the
+    // full transfer it replaces. The zone index registers the size of a
+    // zone's full transfer when it loads the zone, so the rule applies to a
+    // live answer and not only to a caller that knows the size.
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var old_zone = try loadTransferTestOldZone();
+    defer old_zone.deinit();
+    var new_zone = try loadTransferTestZone();
+    defer new_zone.deinit();
+
+    const difference = try zone_index.difference(allocator, &old_zone, &new_zone);
+    defer allocator.free(difference);
+
+    var log = journal_mod.DeltaLog{};
+    log.setOrigin("example.");
+    try log.record(9, 10, difference);
+
+    // The zone was loaded, so the server knows the size of its full
+    // transfer, and the difference of this small zone is longer than it.
+    try std.testing.expect(journal_mod.zoneSize("example.") > 0);
+    try std.testing.expectEqual(IxfrDecision.fallback_axfr, decideIxfr(10, 9, &log));
+
+    // The client is not left without an answer: the difference of the
+    // oldest version is purged, so the client gets the full transfer.
+    try std.testing.expect(journal_mod.differenceFor("example.", 9, 10) == null);
+    const request = try ixfrRequest(arena.allocator(), "example.", 9);
+    const messages = try buildAxfrMessages(arena.allocator(), &request, &new_zone, 64);
+    defer {
+        for (messages) |*message| message.deinit();
+        arena.allocator().free(messages);
+    }
+    try std.testing.expectEqual(@as(usize, 1), messages.len);
+    try std.testing.expectEqual(new_zone.records.len + 1, messages[0].answers.len);
 }
 
 /// A NOTIFY request for example. whose answer section hints at an SOA with

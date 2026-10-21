@@ -505,6 +505,9 @@ const FailureEntry = struct {
     key: CacheKey = .{},
     expires_at: i64 = 0,
     failure: Failure = .{},
+    /// RFC 9520 section 3.2: the consecutive failures of this question. The
+    /// count drives the backoff and is forgotten when the question resolves.
+    streak: u32 = 0,
 };
 
 /// RFC 9520 section 3.2: the cache of resolution failures. It is a table of
@@ -514,19 +517,34 @@ const FailureCache = struct {
     entries: [MAX_FAILURE_CACHE_ENTRIES]FailureEntry = @splat(FailureEntry{}),
     len: usize = 0,
     replacement: usize = 0,
-    /// The time a failure stays cached, in seconds.
-    ttl: u32 = DEFAULT_FAILURE_CACHE_SECONDS,
+    /// The operator's minimum cache time, in seconds.
+    minimum_ttl: u32 = DEFAULT_FAILURE_CACHE_SECONDS,
 
-    fn init(ttl: u32) FailureCache {
+    fn init(minimum_ttl: u32) FailureCache {
         // RFC 9520 section 3.2: a failure is cached for at least one second
         // and never for longer than five minutes.
-        return .{ .ttl = @min(@max(ttl, config.FAILURE_CACHE_MIN_SECONDS), config.FAILURE_CACHE_MAX_SECONDS) };
+        return .{ .minimum_ttl = @min(@max(minimum_ttl, config.FAILURE_CACHE_MIN_SECONDS), config.FAILURE_CACHE_MAX_SECONDS) };
+    }
+
+    /// RFC 9520 section 3.2: a failure that keeps repeating is held longer.
+    /// The time doubles with every consecutive failure of the question and
+    /// never passes the RFC's five-minute ceiling.
+    fn ttlFor(self: *const FailureCache, streak: u32) u32 {
+        var seconds = self.minimum_ttl;
+        var step: u32 = 1;
+        while (step < streak) : (step += 1) {
+            if (seconds >= config.FAILURE_CACHE_MAX_SECONDS) return config.FAILURE_CACHE_MAX_SECONDS;
+            seconds = @min(seconds * 2, config.FAILURE_CACHE_MAX_SECONDS);
+        }
+        return seconds;
     }
 
     /// Records the failure of one question. A failure for the same question
-    /// is replaced, and a full table recycles its oldest slot.
+    /// is replaced and its count grows, and a full table recycles its oldest
+    /// slot.
     fn put(self: *FailureCache, key: CacheKey, failure: Failure, now: i64) void {
         var slot: usize = 0;
+        var streak: u32 = 1;
         var index: usize = 0;
         var empty: ?usize = null;
         while (index < self.len) : (index += 1) {
@@ -536,6 +554,7 @@ const FailureCache = struct {
             }
             if (self.entries[index].key.sameQuestion(&key)) {
                 slot = index;
+                streak = self.entries[index].streak +| 1;
                 break;
             }
         } else {
@@ -551,26 +570,37 @@ const FailureCache = struct {
         }
         self.entries[slot] = .{
             .key = key,
-            .expires_at = now + @as(i64, self.ttl),
+            .expires_at = now + @as(i64, self.ttlFor(streak)),
             .failure = failure,
+            .streak = streak,
         };
     }
 
     /// The failure of this question, or null when it has no live failure.
-    /// An expired entry is dropped where it is found.
+    /// An expired entry is not served, but its count is kept until the
+    /// question resolves, so a failure that keeps repeating is held longer.
     fn lookup(self: *FailureCache, key: *const CacheKey, now: i64) ?Failure {
         var index: usize = 0;
         while (index < self.len) : (index += 1) {
             const entry = &self.entries[index];
             if (entry.key.name_len == 0) continue;
             if (!entry.key.sameQuestion(key)) continue;
-            if (now >= entry.expires_at) {
-                entry.* = .{};
-                return null;
-            }
+            if (now >= entry.expires_at) return null;
             return entry.failure;
         }
         return null;
+    }
+
+    /// RFC 9520 section 3.2: a question that resolves again forgets its
+    /// failure count, so the next failure is held for the minimum again.
+    fn forget(self: *FailureCache, key: *const CacheKey) void {
+        var index: usize = 0;
+        while (index < self.len) : (index += 1) {
+            if (self.entries[index].key.name_len == 0) continue;
+            if (!self.entries[index].key.sameQuestion(key)) continue;
+            self.entries[index] = .{};
+            return;
+        }
     }
 };
 
@@ -1098,7 +1128,7 @@ pub const Resolver = struct {
         // upstream reported, so it is read before the options are stripped.
         // The scope of the query that fetched it bounds it, so an answer
         // fetched without an ADDRESS never reports a scope of its own.
-        const upstream_scope = upstreamEcsScope(response, exchange.scope orelse EcsScope{});
+        var upstream_scope = upstreamEcsScope(response, exchange.scope orelse EcsScope{});
         stripOptions(&response);
         // RFC 5452 section 6: only data in the domain of the query may be
         // accepted, so the authority and the additional section keep the
@@ -1156,8 +1186,9 @@ pub const Resolver = struct {
         // RFC 6147 section 5.1.2 runs before this: an error RCODE other than
         // NXDOMAIN is treated as an empty answer, so a synthesis that
         // answers the client with a record is not a resolution failure.
-        switch (try synthesizeDns64Answer(self, query, &response, now)) {
-            .none, .synthesized => {},
+        switch (try synthesizeDns64Answer(self, query, &response, exchange.scope, now)) {
+            .none => {},
+            .synthesized => |answer_scope| upstream_scope = answer_scope,
             .bogus => |ede| {
                 // RFC 9520 section 3.4: the validation failure is cached, so
                 // the next client for the same question is answered with the
@@ -1170,6 +1201,10 @@ pub const Resolver = struct {
             .servfail => self.cache.failures.put(key, .{ .rcode = .servfail }, now),
             .refused => self.cache.failures.put(key, .{ .rcode = .refused }, now),
             .formerr => self.cache.failures.put(key, .{ .rcode = .formerr }, now),
+            // RFC 9520 section 3.2: the question resolved, so its failure
+            // count is forgotten and the next failure for it is held for the
+            // operator's minimum again.
+            .no_error, .nxdomain => self.cache.failures.forget(&key),
             else => {},
         }
         // RFC 8198 sections 5 and 9: only a proof that DNSSEC validation
@@ -1532,7 +1567,8 @@ pub const Resolver = struct {
 /// rests on did not validate and the client must see that failure instead.
 const Dns64Outcome = union(enum) {
     none,
-    synthesized,
+    /// The scope the A answer covered: the scope the synthesis rests on.
+    synthesized: u8,
     /// RFC 8914 INFO-CODE of the validation failure.
     bogus: u16,
 };
@@ -1543,9 +1579,11 @@ const Dns64Outcome = union(enum) {
 /// chain is followed to the owner that holds the A records, and the A
 /// records come from one more upstream query. An RCODE other than 0 counts as
 /// an empty answer, so the query for the A records runs for an error answer
-/// too. Returns `.none` when nothing is synthesized, which leaves the answer
-/// as the upstream sent it.
-fn synthesizeDns64Answer(self: *Resolver, query: dns_message.Message, response: *dns_message.Message, now: i64) !Dns64Outcome {
+/// too. The scope is the one the AAAA answer was fetched for, so the A query
+/// is fetched for that same scope (RFC 7871 section 7.3.1). Returns `.none`
+/// when nothing is synthesized, which leaves the answer as the upstream sent
+/// it.
+fn synthesizeDns64Answer(self: *Resolver, query: dns_message.Message, response: *dns_message.Message, scope: ?EcsScope, now: i64) !Dns64Outcome {
     if (self.policy.nat64_prefixes.len == 0) return .none;
     if (!dns64Applies(query, response.*)) return .none;
     // RFC 6147 section 5.1.4: an AAAA record inside the excluded ranges is
@@ -1570,12 +1608,12 @@ fn synthesizeDns64Answer(self: *Resolver, query: dns_message.Message, response: 
     const validating = self.validating(query);
     var hops: usize = 0;
     while (true) {
-        var a_query = try buildAQuery(self, query, target);
+        var a_query = try buildAQuery(self, query, target, scope);
         defer a_query.deinit();
         var a_query_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
         var a_writer = dns_writer.Writer.init(&a_query_buffer);
         a_query.encode(&a_writer) catch return .none;
-        var a_response = self.queryUdp(a_writer.written(), a_query, null) catch return .none;
+        var a_response = self.queryUdp(a_writer.written(), a_query, scope) catch return .none;
         defer a_response.deinit();
         if (validating) {
             // RFC 6147 section 5.5: "If the data does not validate, the
@@ -1585,7 +1623,11 @@ fn synthesizeDns64Answer(self: *Resolver, query: dns_message.Message, response: 
         }
         // The A answer may carry a further chain, which is followed too.
         const owner = followAliasChain(a_response, target, zone_name, &chain) orelse return .none;
-        if (try synthesizeDns64(&self.policy, owner, response, a_response, &chain)) return .synthesized;
+        if (try synthesizeDns64(&self.policy, owner, response, a_response, &chain)) {
+            // RFC 7871 section 7.3.1: the records the client gets come from
+            // the A answer, so the answer reports the scope of that answer.
+            return .{ .synthesized = upstreamEcsScope(a_response, scope orelse EcsScope{}) };
+        }
         // No A records at the owner: the chain goes on, if it goes on at all.
         if (owner.eql(&target) or hops >= zone.MaxAliasHops) return .none;
         target = owner;
@@ -1817,7 +1859,9 @@ fn prefixForRecord(policy: *const Policy, record: dns_record.ResourceRecord) ?co
 /// RFC 6147 section 5.1.6: the A query for the owner that holds the A
 /// records. It carries the question the client asked apart from the type,
 /// and the client's AD claim does not travel upstream (RFC 4035 section 4.6).
-fn buildAQuery(self: *Resolver, query: dns_message.Message, name: dns_name.Name) !dns_message.Message {
+/// RFC 7871 section 7.1.1: it carries the scope the AAAA query carried, so
+/// both answers are fetched for one scope.
+fn buildAQuery(self: *Resolver, query: dns_message.Message, name: dns_name.Name, scope: ?EcsScope) !dns_message.Message {
     const question = query.question orelse return Error.BadUpstreamResponse;
     var a_query = dns_message.Message{
         .allocator = self.allocator,
@@ -1835,6 +1879,11 @@ fn buildAQuery(self: *Resolver, query: dns_message.Message, name: dns_name.Name)
     // composed the way a client query without EDNS is.
     a_query.header.additional_count = 0;
     a_query.edns = null;
+    if (scope != null) {
+        // The client subnet option rides in an OPT record, so the query
+        // needs one of its own for the option to travel upstream.
+        a_query.edns = query.edns;
+    }
     return a_query;
 }
 
@@ -1985,6 +2034,7 @@ fn buildUpstreamQuery(
         .authorities = try dns_message.RecordSection.init(query.allocator, 0),
         .additionals = try dns_message.RecordSection.init(query.allocator, 0),
     };
+    defer sanitized.deinit();
     // RFC 4035 section 4.6: as in the verbatim path above, the client's AD
     // claim does not travel with the composed upstream query.
     sanitized.header.authenticated_data = false;
@@ -4584,6 +4634,144 @@ test "RFC 6052 section 3.1: the well-known prefix does not represent a non-globa
     try std.testing.expectEqual(@as(usize, 2), upstream.requests);
 }
 
+test "RFC 7871 section 7.1.1: the DNS64 A query is fetched for the scope the AAAA query carried" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    const a_records = [_]dns_record.ResourceRecord{dns64TestARecord("v4only.example.")};
+    const soa_records = [_]dns_record.ResourceRecord{dns64TestSoaRecord("example.")};
+    var upstream = Dns64Upstream{
+        .io = io,
+        .udp = &upstream_socket,
+        .a = &a_records,
+        .soa = &soa_records,
+    };
+    const thread = try std.Thread.spawn(.{}, serveDns64Upstream, .{&upstream});
+
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = upstream_socket.address },
+        .nat64_prefixes = .init(&.{try config.Nat64Prefix.parse("64:ff9b::/96")}),
+        .max_cacheable_prefix = 16,
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2920, "v4only.example.", true);
+    defer query.deinit();
+    query.question.?.qtype = .AAAA;
+    try appendOption(&query, dns_rdata.EDNS_ECS_OPTION_CODE, &.{ 0, 1, 24, 0, 192, 0, 2 });
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42740);
+    _ = try resolver.answer(encoded, query, &client, &output);
+    thread.join();
+
+    // The AAAA query and the A query that followed it were fetched for one
+    // scope: the client's prefix trimmed to the maximum cacheable prefix
+    // length.
+    try std.testing.expectEqual(@as(usize, 2), upstream.requests);
+    try std.testing.expectEqual(@as(usize, 6), upstream.seen_len[0]);
+    try std.testing.expectEqual(@as(u8, 16), upstream.seen[0][2]);
+    try std.testing.expectEqual(@as(usize, 6), upstream.seen_len[1]);
+    try std.testing.expectEqual(@as(u8, 16), upstream.seen[1][2]);
+    try std.testing.expectEqualSlices(u8, upstream.seen[0][0..6], upstream.seen[1][0..6]);
+}
+
+test "RFC 7871 section 7.1.1: the DNS64 A query of a client without a client subnet carries no option" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    const a_records = [_]dns_record.ResourceRecord{dns64TestARecord("v4only.example.")};
+    const soa_records = [_]dns_record.ResourceRecord{dns64TestSoaRecord("example.")};
+    var upstream = Dns64Upstream{
+        .io = io,
+        .udp = &upstream_socket,
+        .a = &a_records,
+        .soa = &soa_records,
+    };
+    const thread = try std.Thread.spawn(.{}, serveDns64Upstream, .{&upstream});
+
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = upstream_socket.address },
+        .nat64_prefixes = .init(&.{try config.Nat64Prefix.parse("64:ff9b::/96")}),
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2921, "v4only.example.", true);
+    defer query.deinit();
+    query.question.?.qtype = .AAAA;
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42741);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    thread.join();
+
+    // Neither query carried a scope, so neither asked for one.
+    try std.testing.expectEqual(@as(usize, 2), upstream.requests);
+    try std.testing.expectEqual(@as(usize, 0), upstream.seen_len[0]);
+    try std.testing.expectEqual(@as(usize, 0), upstream.seen_len[1]);
+    // RFC 7871 section 7.2.2: a client that sent no option gets none.
+    const response = try dns_message.Message.parse(arena.allocator(), bytes);
+    try std.testing.expect(findOption(response, dns_rdata.EDNS_ECS_OPTION_CODE) == null);
+}
+
+test "RFC 7871 section 7.3.1: the DNS64 answer reports the scope the synthesis rests on" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    const a_records = [_]dns_record.ResourceRecord{dns64TestARecord("v4only.example.")};
+    const soa_records = [_]dns_record.ResourceRecord{dns64TestSoaRecord("example.")};
+    // The upstream answers the AAAA query for the whole /24 the client asked
+    // for and the A query for the /16 the address was fetched for.
+    var upstream = Dns64Upstream{
+        .io = io,
+        .udp = &upstream_socket,
+        .a = &a_records,
+        .soa = &soa_records,
+        .aaaa_scope = 24,
+        .a_scope = 16,
+    };
+    const thread = try std.Thread.spawn(.{}, serveDns64Upstream, .{&upstream});
+
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = upstream_socket.address },
+        .nat64_prefixes = .init(&.{try config.Nat64Prefix.parse("64:ff9b::/96")}),
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2922, "v4only.example.", true);
+    defer query.deinit();
+    query.question.?.qtype = .AAAA;
+    try appendOption(&query, dns_rdata.EDNS_ECS_OPTION_CODE, &.{ 0, 1, 24, 0, 192, 0, 2 });
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42742);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    thread.join();
+
+    // The answer holds the address the A answer was fetched for, so it
+    // reports the scope of that answer and not the one of the AAAA answer.
+    const response = try dns_message.Message.parse(arena.allocator(), bytes);
+    const ecs = findOption(response, dns_rdata.EDNS_ECS_OPTION_CODE).?;
+    try std.testing.expectEqual(@as(usize, 7), ecs.len);
+    try std.testing.expectEqual(@as(u8, 24), ecs[2]);
+    try std.testing.expectEqual(@as(u8, 16), ecs[3]);
+}
+
 test "RFC 6147 section 5.1.5: an answer without an SOA is chased under the hop limit" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
@@ -5569,6 +5757,14 @@ const Dns64Upstream = struct {
     /// The RCODE the AAAA answer carries (RFC 6147 section 5.1.2).
     rcode: dns_header.Rcode = .no_error,
     requests: usize = 0,
+    /// The client subnet option each query carried, so a test can tell which
+    /// scope every query was fetched for.
+    seen: [2][4 + 16]u8 = .{ @splat(0), @splat(0) },
+    seen_len: [2]usize = .{ 0, 0 },
+    /// The scope the upstream answers the AAAA query with, and the scope it
+    /// answers the A query with. Null means the answer carries no option.
+    aaaa_scope: ?u8 = null,
+    a_scope: ?u8 = null,
 };
 
 const Dns64Timeout: std.Io.Timeout = .{ .duration = .{
@@ -5586,6 +5782,13 @@ fn serveDns64Upstream(args: *Dns64Upstream) void {
         defer arena.deinit();
         const query = dns_message.Message.parseQuery(arena.allocator(), incoming.data) catch return;
         const question = query.question orelse return;
+        if (index < args.seen.len) {
+            if (findOption(query, dns_rdata.EDNS_ECS_OPTION_CODE)) |option| {
+                const len = @min(option.len, args.seen[index].len);
+                @memcpy(args.seen[index][0..len], option[0..len]);
+                args.seen_len[index] = len;
+            }
+        }
         const answers = if (question.qtype.eql(.AAAA)) args.aaaa else args.a;
         var soa_slot: [1]dns_record.ResourceRecord = undefined;
         var authority: []const dns_record.ResourceRecord = &.{};
@@ -5594,8 +5797,21 @@ fn serveDns64Upstream(args: *Dns64Upstream) void {
             authority = soa_slot[0..1];
         }
         const rcode = if (question.qtype.eql(.AAAA)) args.rcode else .no_error;
+        // RFC 7871 section 6: an answer that carries the client subnet
+        // option states the scope it covers in its SCOPE PREFIX-LENGTH.
+        var echoed: [4 + 16]u8 = @splat(0);
+        var ecs: ?[]const u8 = null;
+        const scope = if (question.qtype.eql(.AAAA)) args.aaaa_scope else args.a_scope;
+        if (scope) |value| {
+            if (findOption(query, dns_rdata.EDNS_ECS_OPTION_CODE)) |option| {
+                const len = @min(option.len, echoed.len);
+                @memcpy(echoed[0..len], option[0..len]);
+                echoed[3] = value;
+                ecs = echoed[0..len];
+            }
+        }
         var response_buffer: [2048]u8 = undefined;
-        const bytes = buildDns64UpstreamAnswer(&response_buffer, query, answers, authority, rcode, null) catch return;
+        const bytes = buildDns64UpstreamAnswer(&response_buffer, query, answers, authority, rcode, ecs) catch return;
         args.udp.send(args.io, &incoming.from, bytes) catch return;
     }
 }
@@ -5954,6 +6170,90 @@ test "RFC 9520 section 3.2: a cached failure expires at the maximum cache time" 
     // The failure lives exactly as long as the RFC's five minutes allow.
     try std.testing.expect(cache.failures.lookup(&key, 1000 + config.FAILURE_CACHE_MAX_SECONDS - 1) != null);
     try std.testing.expect(cache.failures.lookup(&key, 1000 + config.FAILURE_CACHE_MAX_SECONDS) == null);
+}
+
+test "RFC 9520 section 3.2: a failure that keeps repeating is held longer" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2914, "fail.example.", false);
+    defer query.deinit();
+    const key = try CacheKey.fromQuestion(query);
+    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    defer cache.deinit();
+
+    // The first failure of the question is held for the operator's minimum.
+    cache.failures.put(key, .{ .rcode = .servfail }, 1000);
+    try std.testing.expect(cache.failures.lookup(&key, 1000 + @as(i64, DEFAULT_FAILURE_CACHE_SECONDS) - 1) != null);
+    try std.testing.expect(cache.failures.lookup(&key, 1000 + @as(i64, DEFAULT_FAILURE_CACHE_SECONDS)) == null);
+
+    // The second failure of the same question is held twice as long.
+    cache.failures.put(key, .{ .rcode = .servfail }, 2000);
+    try std.testing.expect(cache.failures.lookup(&key, 2000 + 2 * @as(i64, DEFAULT_FAILURE_CACHE_SECONDS) - 1) != null);
+    try std.testing.expect(cache.failures.lookup(&key, 2000 + 2 * @as(i64, DEFAULT_FAILURE_CACHE_SECONDS)) == null);
+}
+
+test "RFC 9520 section 3.2: the backoff never holds a failure past the five-minute ceiling" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2915, "fail.example.", false);
+    defer query.deinit();
+    const key = try CacheKey.fromQuestion(query);
+    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    defer cache.deinit();
+    const ceiling: i64 = config.FAILURE_CACHE_MAX_SECONDS;
+
+    var now: i64 = 1000;
+    var index: usize = 0;
+    while (index < 10) : (index += 1) {
+        cache.failures.put(key, .{ .rcode = .servfail }, now);
+        // No failure is ever held past the RFC's five-minute ceiling.
+        try std.testing.expect(cache.failures.lookup(&key, now + ceiling) == null);
+        now += ceiling;
+    }
+    // The ceiling is reached: the last failure is held for all of it.
+    try std.testing.expect(cache.failures.lookup(&key, now - 1) != null);
+}
+
+test "RFC 9520 section 3.2: a question that resolves again forgets its failure count" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    var upstream = UnsignedUpstream{ .io = io, .udp = &upstream_socket };
+    const thread = try std.Thread.spawn(.{}, serveUnsignedUpstream, .{&upstream});
+
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = upstream_socket.address },
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2916, "fail.example.", false);
+    defer query.deinit();
+    const key = try CacheKey.fromQuestion(query);
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42714);
+
+    // A failure of the question that has already expired.
+    resolver.cache.failures.put(key, .{ .rcode = .servfail }, -100);
+
+    // The exchange succeeds now, so the failure count is forgotten.
+    const answer = try resolver.answer(encoded, query, &client, &output);
+    const message = try dns_message.Message.parse(arena.allocator(), answer);
+    try std.testing.expectEqual(dns_header.Rcode.no_error, message.header.rcode);
+
+    // The next failure of the question is held for the operator's minimum
+    // again, not for the longer time a repeated failure is held.
+    const now: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+    resolver.cache.failures.put(key, .{ .rcode = .servfail }, now);
+    try std.testing.expect(resolver.cache.failures.lookup(&key, now + @as(i64, DEFAULT_FAILURE_CACHE_SECONDS) - 1) != null);
+    try std.testing.expect(resolver.cache.failures.lookup(&key, now + @as(i64, DEFAULT_FAILURE_CACHE_SECONDS)) == null);
+
+    thread.join();
 }
 
 test "RFC 9520 section 3.2: the failure cache keeps the answer cache's own bounds" {

@@ -87,6 +87,7 @@ pub const Zone = struct {
         for (zone.records.items[0..zone.records.len]) |record| {
             if (record.rrtype.eql(.SOA)) zone.soa = record;
         }
+        registerZoneSize(&zone);
         return zone;
     }
 
@@ -420,6 +421,15 @@ pub fn fullTransferBytes(zone: *const Zone) usize {
         total += journal_mod.recordBytes(converted);
     }
     return total;
+}
+
+/// Records the wire size of the zone's full transfer, so the delta log of
+/// the zone measures an incremental answer against the full transfer it
+/// replaces (RFC 1995 section 5). The zone index calls this when it loads
+/// the zone, and the signer calls it again once the zone carries the records
+/// it generated.
+pub fn registerZoneSize(zone: *const Zone) void {
+    journal_mod.registerZoneSize(zone.originText(), fullTransferBytes(zone));
 }
 
 /// Turns one zone record into the DNS record the transfer answers carry.

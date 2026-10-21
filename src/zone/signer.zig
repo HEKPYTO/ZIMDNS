@@ -370,6 +370,13 @@ pub fn signZone(
     defer scratch.deinit();
     const work = scratch.allocator();
 
+    // The chain the zone publishes is settled before the zone's records are
+    // collected: an apex NSEC3PARAM states the parameters of the chain the
+    // zone publishes (RFC 5155 section 7.3), so a zone that publishes the
+    // NSEC chain must not keep one.
+    const chain = try selectChain(work, zone, options.chain);
+    if (chain.kind == .nsec) dropApexNsec3Param(zone);
+
     var entries: std.ArrayList(Entry) = .empty;
     try collectEntries(work, zone, &entries);
 
@@ -395,7 +402,6 @@ pub fn signZone(
     // chain it publishes, and the signer builds that chain (RFC 5155 section
     // 7.1). A zone without one keeps the NSEC chain it always had. The
     // operator's choice, when there is one, replaces that opt-in.
-    const chain = try selectChain(work, zone, options.chain);
     switch (chain.kind) {
         .nsec => try appendNsecChain(work, &rrsets, soa_ttl),
         .nsec3 => {
@@ -410,13 +416,18 @@ pub fn signZone(
         },
     }
     try emit(work, allocator, zone, key, dns_dnssec.keyTag(dnskey_rdata), options, rrsets.items, chain.publish_param);
+    // The signed zone carries the records the signer generated, so the full
+    // transfer of the zone is larger than the one the zone file holds.
+    zone_index.registerZoneSize(zone);
 }
 
 /// The chain the zone publishes. Without the operator's choice the zone's own
 /// apex NSEC3PARAM is the opt-in, as it always was. With it the operator's
 /// chain wins, and an NSEC3 chain takes its parameters from the zone's own
 /// NSEC3PARAM when the zone states one, because that record states the
-/// parameters of the chain (RFC 5155 section 4.1).
+/// parameters of the chain (RFC 5155 section 4.1). The operator's NSEC choice
+/// drops the zone's own apex NSEC3PARAM, because that record states the chain
+/// the zone publishes (RFC 5155 section 7.3).
 fn selectChain(
     allocator: std.mem.Allocator,
     zone: *const zone_index.Zone,
@@ -451,6 +462,27 @@ const ChainChoice = struct {
     /// zone states none.
     publish_param: bool = false,
 };
+
+/// Removes the apex NSEC3PARAM from the zone. The record states the
+/// parameters of the chain the zone publishes (RFC 5155 section 7.3), so a
+/// zone that publishes the NSEC chain must not carry one: a validator that
+/// reads the record looks for NSEC3 records and finds none. The record is
+/// dropped before the zone is signed, so it is neither published nor signed.
+fn dropApexNsec3Param(zone: *zone_index.Zone) void {
+    var index: usize = 0;
+    while (index < zone.records.len) : (index += 1) {
+        const record = zone.records.items[index];
+        if (!record.rrtype.eql(.NSEC3PARAM)) continue;
+        if (!std.ascii.eqlIgnoreCase(record.ownerText(), zone.originText())) continue;
+        std.mem.copyForwards(
+            zone_parser.ZoneRecord,
+            zone.records.items[index .. zone.records.len - 1],
+            zone.records.items[index + 1 .. zone.records.len],
+        );
+        zone.records.len -= 1;
+        return;
+    }
+}
 
 /// Sign one RRset the caller already holds and return the RRSIG RDATA to
 /// publish beside it (RFC 4034 section 3.1). `signZone` deliberately refuses a
@@ -1938,7 +1970,7 @@ fn findZoneRecord(zone: *const zone_index.Zone, owner_text: []const u8, rrtype: 
     return null;
 }
 
-test "the operator's NSEC choice publishes the NSEC chain in a zone that states an NSEC3PARAM" {
+test "the operator's NSEC choice drops the zone's own NSEC3PARAM" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -1961,9 +1993,11 @@ test "the operator's NSEC choice publishes the NSEC chain in a zone that states 
     const apex = (try findOpaque(&zone, "example.", .NSEC, null)).?;
     const next = try Name.fromText("www.example.");
     try std.testing.expectEqualSlices(u8, next.asWire(), apex[0..next.asWire().len]);
-    // The zone's own apex NSEC3PARAM stays published: it is zone data, and the
-    // ZONEMD digest of RFC 8976 section 3.3.1 covers it.
-    try std.testing.expect(hasRecord(&zone, "example.", .NSEC3PARAM));
+    // RFC 5155 section 7.3: the apex NSEC3PARAM states the parameters of the
+    // chain the zone publishes, so a zone that publishes the NSEC chain does
+    // not carry one. It is dropped before the zone is signed, so no
+    // signature covers it either.
+    try std.testing.expect(!hasRecord(&zone, "example.", .NSEC3PARAM));
 }
 
 test "the operator's NSEC3 choice builds the chain in a zone that states no NSEC3PARAM" {
