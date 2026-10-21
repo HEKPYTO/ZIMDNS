@@ -1123,8 +1123,13 @@ pub const Runtime = struct {
         }
         if (try self.localZoneAnswer(query)) |local| return self.encodeMessage(local, output);
         if (self.blocklist.blocks(qname_text)) return self.encodeMessage(try response.buildBlockedResponse(query), output);
-        if (!q.qclass.eql(@import("../dns/types.zig").Class.IN) or !query.header.recursion_desired) {
+        if (!q.qclass.eql(@import("../dns/types.zig").Class.IN)) {
             return self.encodeMessage(try response.buildRefusedResponse(query), output);
+        }
+        // RFC 8914 section 4.21: a REFUSED answer to a query with the RD bit
+        // clear says the server is not authoritative for the name.
+        if (!query.header.recursion_desired) {
+            return self.encodeMessage(try response.buildNotAuthoritativeResponse(query), output);
         }
         if (self.resolver) |*resolver| {
             if (!resolver.policy.allows(client)) return self.encodeMessage(try response.buildProhibitedResponse(query), output);
@@ -1132,13 +1137,15 @@ pub const Runtime = struct {
                 resolver_mod.Error.UpstreamFailure,
                 resolver_mod.Error.BadUpstreamResponse,
                 => self.encodeMessage(try resolver_mod.buildNetworkErrorResponse(query), output),
-                resolver_mod.Error.NoForwarder => self.encodeMessage(try response.buildRefusedResponse(query), output),
+                resolver_mod.Error.NoForwarder => self.encodeMessage(try response.buildNotAuthoritativeResponse(query), output),
                 resolver_mod.Error.EcsRefused => self.encodeMessage(try response.buildRefusedResponse(query), output),
                 resolver_mod.Error.ResponseTooLarge => return Error.EncodeFailed,
                 else => return err,
             };
         }
-        return self.encodeMessage(try response.buildRefusedResponse(query), output);
+        // RFC 8914 section 4.21: the server holds no zone for the name and is
+        // not configured to recurse for it.
+        return self.encodeMessage(try response.buildNotAuthoritativeResponse(query), output);
     }
 
     /// Answers the locally served zones of RFC 6303, RFC 7793, RFC 6761, and
@@ -1256,7 +1263,9 @@ pub const Runtime = struct {
         // encodeTransferFrames. The single-message path refuses them so a
         // partial zone can never leak through one datagram or frame.
         if (transfer.classify(q.qtype, q.qclass) != .none) return response.buildRefusedResponse(query);
-        const selected = self.selectZone(qname_text) orelse return response.buildRefusedResponse(query);
+        // RFC 8914 section 4.21: the server holds no zone for the name and is
+        // not configured to recurse for it.
+        const selected = self.selectZone(qname_text) orelse return response.buildNotAuthoritativeResponse(query);
         return response.buildResponseWithPolicy(query, selected, self.answer_policy, self.signingSession(), over_tcp);
     }
 
@@ -2343,7 +2352,7 @@ test "a blocklisted name without EDNS is refused without an EDE option" {
     try std.testing.expect(parsed.edns == null);
 }
 
-test "a refusal that is not a blocklist refusal carries no EDE option" {
+test "a query the server is not authoritative for is refused with the RFC 8914 Not Authoritative EDE code" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -2357,20 +2366,130 @@ test "a refusal that is not a blocklist refusal carries no EDE option" {
     );
     defer runtime.deinit();
 
+    // The query carries an OPT pseudo-RR, so RFC 8914 section 2 allows the
+    // EDE option in the answer.
     var output: [512]u8 = undefined;
-    const response_bytes = try runtime.answer(&.{
+    const client = try std.Io.net.IpAddress.parse("198.51.100.7", 41002);
+    const response_bytes = try runtime.answerFrom(&.{
         0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
         7,    'o',  'u',  't',  's',  'i',  'd',  'e',  7,    'e',  'x',  'a',
         'm',  'p',  'l',  'e',  0,    0x00, 0x01, 0x00, 0x01, 0,    0x00, 0x29,
         0x04, 0xd0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    }, &output);
+    }, &output, &client);
+
+    const parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@import("../dns/header.zig").Rcode.refused, parsed.header.rcode);
+    try std.testing.expectEqual(@as(u16, 0), parsed.header.answer_count);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.additional_count);
+    const opt = parsed.additionals.items[0];
+    try std.testing.expect(opt.rrtype.eql(.OPT));
+    // RFC 8914 section 4.21: INFO-CODE 20 is "Not Authoritative", and the
+    // EXTRA-TEXT says why: the server holds no zone for the name and is not
+    // configured to recurse for it.
+    const ede = dns_rdata.findOption(opt.rdata.OPT.bytes(), 15);
+    try std.testing.expect(ede != null);
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x14 }, ede.?[0..2]);
+    try std.testing.expectEqualStrings("not authoritative for this name", ede.?[2..]);
+}
+
+test "a query the server is not authoritative for without EDNS is refused without an EDE option" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
+        \\
+    );
+    defer runtime.deinit();
+
+    // RFC 8914 section 2 allows the EDE option only in a response to a query
+    // that includes an OPT pseudo-RR, and this query carries none.
+    var output: [512]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("198.51.100.7", 41002);
+    const response_bytes = try runtime.answerFrom(&.{
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        7,    'o',  'u',  't',  's',  'i',  'd',  'e',  7,    'e',  'x',  'a',
+        'm',  'p',  'l',  'e',  0,    0x00, 0x01, 0x00, 0x01,
+    }, &output, &client);
+
+    const parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@import("../dns/header.zig").Rcode.refused, parsed.header.rcode);
+    try std.testing.expectEqual(@as(u16, 0), parsed.header.additional_count);
+    try std.testing.expect(parsed.edns == null);
+}
+
+test "a query with the RD bit clear is refused with the RFC 8914 Not Authoritative EDE code" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
+        \\
+    );
+    defer runtime.deinit();
+
+    // The RD bit is clear and the query carries an OPT pseudo-RR, so RFC 8914
+    // section 4.21 asks for the Not Authoritative code in the refusal.
+    var output: [512]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("198.51.100.7", 41002);
+    const response_bytes = try runtime.answerFrom(&.{
+        0x12, 0x34, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        7,    'o',  'u',  't',  's',  'i',  'd',  'e',  7,    'e',  'x',  'a',
+        'm',  'p',  'l',  'e',  0,    0x00, 0x01, 0x00, 0x01, 0,    0x00, 0x29,
+        0x04, 0xd0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    }, &output, &client);
 
     const parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
     try std.testing.expectEqual(@import("../dns/header.zig").Rcode.refused, parsed.header.rcode);
     try std.testing.expectEqual(@as(u16, 1), parsed.header.additional_count);
     const opt = parsed.additionals.items[0];
     try std.testing.expect(opt.rrtype.eql(.OPT));
-    try std.testing.expectEqual(@as(usize, 0), opt.rdata.OPT.bytes().len);
+    const ede = dns_rdata.findOption(opt.rdata.OPT.bytes(), 15);
+    try std.testing.expect(ede != null);
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x14 }, ede.?[0..2]);
+    try std.testing.expectEqualStrings("not authoritative for this name", ede.?[2..]);
+}
+
+test "the Not Authoritative EDE option rides on a query that asked for the DO bit" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
+        \\
+    );
+    defer runtime.deinit();
+
+    // The OPT record asks for the DO bit, and the EDE option rides on it: the
+    // two are independent, and the refusal carries the code either way.
+    var output: [512]u8 = undefined;
+    const response_bytes = try runtime.answer(&.{
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        7,    'o',  'u',  't',  's',  'i',  'd',  'e',  7,    'e',  'x',  'a',
+        'm',  'p',  'l',  'e',  0,    0x00, 0x01, 0x00, 0x01, 0,    0x00, 0x29,
+        0x04, 0xd0, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00,
+    }, &output);
+
+    const parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@import("../dns/header.zig").Rcode.refused, parsed.header.rcode);
+    const opt = parsed.additionals.items[0];
+    try std.testing.expect(opt.rrtype.eql(.OPT));
+    const ede = dns_rdata.findOption(opt.rdata.OPT.bytes(), 15);
+    try std.testing.expect(ede != null);
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x14 }, ede.?[0..2]);
+    try std.testing.expectEqualStrings("not authoritative for this name", ede.?[2..]);
 }
 
 test "a client outside the recursion ACL is refused with the RFC 8914 Prohibited EDE code" {

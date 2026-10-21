@@ -289,8 +289,7 @@ fn responsePayloadLimit(response_bytes: []const u8) usize {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const parsed = dns_message.Message.parse(arena.allocator(), response_bytes) catch return CLASSIC_UDP_MESSAGE_SIZE;
-    if (parsed.edns) |edns| return @max(CLASSIC_UDP_MESSAGE_SIZE, @as(usize, edns.udp_payload_size));
-    return CLASSIC_UDP_MESSAGE_SIZE;
+    return payloadLimitFor(parsed.edns);
 }
 
 fn findEdnsOpt(response_bytes: []const u8) ?dns_record.ResourceRecord {
@@ -377,6 +376,11 @@ pub fn buildResponseWithPolicy(
     // forwarding path in `src/dns/validate.zig`).
     const dnssec_ok = if (request.edns) |edns| edns.dnssec_ok else false;
 
+    // The minimal ANY answer is built after the DNSSEC records, so the
+    // payload it has to fit carries them too.
+    var any_answer = false;
+    var any_ttl: u32 = policy.minimal_any_ttl;
+
     switch (lookup.kind) {
         .answer, .cname, .dname, .yxdomain => {
             var index: usize = 0;
@@ -411,29 +415,8 @@ pub fn buildResponseWithPolicy(
                 // RFC 8482 section 4.4: the operator may answer an ANY query
                 // differently per transport. The TCP TTL applies to a query
                 // that arrived over TCP, the base TTL everywhere else.
-                const any_ttl = if (over_tcp) (policy.minimal_any_ttl_tcp orelse policy.minimal_any_ttl) else policy.minimal_any_ttl;
-                const answer = anyMinimalAnswer(q.name, any_ttl);
-                try response.answers.append(answer);
-                // RFC 8482 section 4.1: the answer may carry a subset of the
-                // owner's RRsets. The RRset that joins the HINFO is the
-                // zone's own and keeps the zone's own TTL.
-                if (anySubsetType(zone, qname_text)) |subset_type| {
-                    var index: usize = 0;
-                    while (index < zone.records.len) : (index += 1) {
-                        const record = zone.records.items[index];
-                        if (!record.rrtype.eql(subset_type)) continue;
-                        if (!std.ascii.eqlIgnoreCase(record.ownerText(), qname_text)) continue;
-                        try response.answers.append(try toResourceRecord(record, null));
-                    }
-                }
-                // RFC 8482 section 4.2: a signed zone must return a valid
-                // RRSIG for the RRsets in the answer when the query sets DO=1.
-                // The HINFO is synthesized, so no signature over it exists in
-                // the zone and one is made here; the RRset that joined it is
-                // the zone's own, and its RRSIG rides along with the answer.
-                if (dnssec_ok) {
-                    if (session) |signing| try appendMinimalAnyRrsig(&response, zone, signing, answer);
-                }
+                any_ttl = if (over_tcp) (policy.minimal_any_ttl_tcp orelse policy.minimal_any_ttl) else policy.minimal_any_ttl;
+                any_answer = true;
             } else {
                 // RFC 8020 section 2 Warning: a denial reached through a CNAME
                 // or DNAME chain is for the last name of the chain, so the
@@ -458,7 +441,9 @@ pub fn buildResponseWithPolicy(
     // authoritative path does not validate (validation lives on the
     // forwarding path in `src/dns/validate.zig`).
     if (dnssec_ok) {
-        appendCoveringRrsigs(&response, zone, q.qtype, lookup.answer_owner) catch {};
+        // The minimal ANY answer signs its own RRsets, so the covering
+        // signatures are attached with it.
+        if (!any_answer) appendCoveringRrsigs(&response, zone, q.qtype, lookup.answer_owner) catch {};
         if (lookup.kind == .nodata or lookup.kind == .nxdomain) {
             const proved = appendDenialProofs(&response, zone, qname_text, q.qtype, lookup.kind) catch false;
             if (!proved) refuseUnprovenDenial(&response);
@@ -469,8 +454,91 @@ pub fn buildResponseWithPolicy(
         dns_dnssec.stripProofRecords(&response, q.qtype);
     }
 
+    // RFC 8482 section 4.2: the minimal ANY answer, built after the DNSSEC
+    // records so the payload it has to fit carries them too. A denial the
+    // zone cannot prove keeps the server failure it was given.
+    if (any_answer and response.header.rcode != .servfail) {
+        try buildMinimalAnyAnswer(&response, zone, qname_text, q.name, any_ttl, dnssec_ok, session, lookup.answer_owner);
+    }
+
     try setHeaderCounts(&response);
     return response;
+}
+
+/// RFC 8482 section 4.2 minimal ANY answer: the synthesized HINFO, and
+/// section 4.3's best guess beside it -- every RRset of the types the RFC
+/// names that the owner holds, in the order the RFC lists them, and no other
+/// type. Section 7: the answer carries no TC bit, so an RRset that does not
+/// fit the payload the client advertised is dropped instead of the answer
+/// being truncated.
+fn buildMinimalAnyAnswer(
+    response: *dns_message.Message,
+    zone: *const zone_index.Zone,
+    owner_text: []const u8,
+    owner: dns_name.Name,
+    ttl: u32,
+    dnssec_ok: bool,
+    session: ?*const zone_signer.Session,
+    answer_owner: ?[]const u8,
+) !void {
+    const answer = anyMinimalAnswer(owner, ttl);
+    try response.answers.append(answer);
+    // RFC 8482 section 4.2: a signed zone must return a valid RRSIG for the
+    // RRsets in the answer when the query sets DO=1. The HINFO is
+    // synthesized, so no signature over it exists in the zone and one is
+    // made here.
+    if (dnssec_ok) {
+        if (session) |signing| try appendMinimalAnyRrsig(response, zone, signing, answer);
+    }
+    const mask = anySubsetMask(zone, owner_text) orelse return;
+    const limit = payloadLimitFor(response.edns);
+    for (any_subset_types, 0..) |rrtype, position| {
+        if ((mask & (@as(u8, 1) << @intCast(position))) == 0) continue;
+        const before = response.answers.len;
+        try appendOwnerRecords(response, zone, owner_text, rrtype);
+        // RFC 8482 section 4.1: the zone's own signature over the RRset
+        // rides along with the answer.
+        if (dnssec_ok) appendCoveringRrsigs(response, zone, .ANY, answer_owner) catch {};
+        if (!anyAnswerFits(response, limit)) {
+            // The RRset and its signature do not fit the payload the client
+            // advertised, and the answer carries no TC bit (section 7), so
+            // the RRset goes and the ones that fit stay.
+            response.answers.len = before;
+        }
+    }
+}
+
+/// The zone's own records of one type at the owner, in the zone's order.
+fn appendOwnerRecords(
+    response: *dns_message.Message,
+    zone: *const zone_index.Zone,
+    owner_text: []const u8,
+    rrtype: dns_types.RecordType,
+) !void {
+    var index: usize = 0;
+    while (index < zone.records.len) : (index += 1) {
+        const record = zone.records.items[index];
+        if (!record.rrtype.eql(rrtype)) continue;
+        if (!std.ascii.eqlIgnoreCase(record.ownerText(), owner_text)) continue;
+        try response.answers.append(try toResourceRecord(record, null));
+    }
+}
+
+/// Whether the answer fits the payload the client advertised. RFC 8482
+/// section 7: the answer to an ANY query carries no TC bit, so the RRsets
+/// that do not fit are dropped instead.
+fn anyAnswerFits(response: *const dns_message.Message, limit: usize) bool {
+    var buffer: [DEFAULT_EDNS_UDP_PAYLOAD_SIZE]u8 = undefined;
+    var writer = dns_writer.Writer.init(&buffer);
+    response.encode(&writer) catch return false;
+    return writer.len() <= limit;
+}
+
+/// The payload a reply may take: the size the client advertised, and never
+/// less than the classic 512 octets.
+fn payloadLimitFor(edns: ?dns_message.EdnsState) usize {
+    if (edns) |state| return @max(CLASSIC_UDP_MESSAGE_SIZE, @as(usize, state.udp_payload_size));
+    return CLASSIC_UDP_MESSAGE_SIZE;
 }
 
 /// Synthesized CNAME that a DNAME substitution adds after the DNAME itself.
@@ -502,36 +570,40 @@ fn anyMinimalAnswer(owner: dns_name.Name, ttl: u32) dns_record.ResourceRecord {
     };
 }
 
-/// The RRset that joins the HINFO in a minimal ANY answer, or null when the
-/// owner holds a single RRset and the HINFO answers alone. RFC 8482 section
-/// 4.1 lets the answer carry a subset of the owner's RRsets and leaves the
-/// choice to the responder; section 4.3 names the types an initiator most
-/// often wants (CNAME, MX, A, AAAA), and the order it lists them in is the
-/// project's preference order. Every other type follows, in type-code order.
-fn anySubsetType(zone: *const zone_index.Zone, owner_text: []const u8) ?dns_types.RecordType {
-    var selected: ?dns_types.RecordType = null;
-    var selected_rank: u32 = std.math.maxInt(u32);
-    var selected_records: usize = 0;
+/// RFC 8482 section 4.3 names the types a best-guess answer keeps, in the
+/// order the RFC lists them, and every other type is suppressed. The CNAME
+/// never reaches the subset: an owner that carries one is answered with that
+/// RRset alone (section 4.1).
+const any_subset_types = [_]dns_types.RecordType{ .CNAME, .MX, .A, .AAAA };
+
+/// The types of the RRsets that join the HINFO in a minimal ANY answer: the
+/// RFC 8482 section 4.3 types the owner holds, and no other. An owner that
+/// holds a single RRset has no subset to offer, so the HINFO answers alone.
+fn anySubsetMask(zone: *const zone_index.Zone, owner_text: []const u8) ?u8 {
     var total: usize = 0;
+    var first_type: ?dns_types.RecordType = null;
+    var first_type_records: usize = 0;
+    var mask: u8 = 0;
     var index: usize = 0;
     while (index < zone.records.len) : (index += 1) {
         const record = zone.records.items[index];
         if (!std.ascii.eqlIgnoreCase(record.ownerText(), owner_text)) continue;
         if (!isAnySubsetCandidate(record.rrtype)) continue;
         total += 1;
-        const rank = anySubsetRank(record.rrtype);
-        if (rank < selected_rank) {
-            selected_rank = rank;
-            selected = record.rrtype;
-            selected_records = 1;
-        } else if (rank == selected_rank) {
-            selected_records += 1;
+        if (first_type) |held| {
+            if (record.rrtype.eql(held)) first_type_records += 1;
+        } else {
+            first_type = record.rrtype;
+            first_type_records = 1;
+        }
+        for (any_subset_types, 0..) |rrtype, position| {
+            if (record.rrtype.eql(rrtype)) mask |= @as(u8, 1) << @intCast(position);
         }
     }
-    // Only the selected type's own records share its rank, so a total above
-    // the selected count means the owner holds more than one RRset.
-    if (total <= selected_records) return null;
-    return selected;
+    // Only the records of the first type share its count, so a total above
+    // that count means the owner holds more than one RRset.
+    if (total <= first_type_records) return null;
+    return mask;
 }
 
 /// The DNSSEC proof records are not data the owner publishes, and the answer
@@ -539,16 +611,6 @@ fn anySubsetType(zone: *const zone_index.Zone, owner_text: []const u8) ?dns_type
 fn isAnySubsetCandidate(rrtype: dns_types.RecordType) bool {
     return !rrtype.eql(.RRSIG) and !rrtype.eql(.NSEC) and
         !rrtype.eql(.NSEC3) and !rrtype.eql(.HINFO);
-}
-
-/// RFC 8482 section 4.3 lists the types it keeps in the order the project
-/// prefers them; every other type follows, in type-code order.
-fn anySubsetRank(rrtype: dns_types.RecordType) u32 {
-    if (rrtype.eql(.CNAME)) return 0;
-    if (rrtype.eql(.MX)) return 1;
-    if (rrtype.eql(.A)) return 2;
-    if (rrtype.eql(.AAAA)) return 3;
-    return 4 + @as(u32, rrtype.code());
 }
 
 /// RFC 8482 section 4.2: the minimal ANY answer is synthesized, so it is not
@@ -652,19 +714,39 @@ fn appendCoveringRrsigs(response: *dns_message.Message, zone: *const zone_index.
         const covers = @import("../dns/dnssec.zig").rrsigCovers(raw) catch continue;
         var answer_index: usize = 0;
         var covers_answer = false;
+        var covered_owner: dns_name.Name = undefined;
         while (answer_index < original_len) : (answer_index += 1) {
             const answer = response.answers.items[answer_index];
             if (answer.rrtype.eql(.RRSIG)) continue;
             if (covers != answer.rrtype.code()) continue;
             if (!coversOwner(candidate.ownerText(), answer.owner)) continue;
             covers_answer = true;
+            covered_owner = answer.owner;
             break;
         }
         if (!covers_answer) continue;
+        // A signature the answer already carries is not attached twice.
+        if (answerHoldsSignature(response, covered_owner, raw)) continue;
         if (response.answers.len >= std.math.maxInt(u16)) return Error.TooManyRecords;
         try response.answers.append(rr);
         appended += 1;
     }
+}
+
+/// Whether the answer already carries this signature over this owner.
+fn answerHoldsSignature(response: *const dns_message.Message, owner: dns_name.Name, raw: []const u8) bool {
+    var index: usize = 0;
+    while (index < response.answers.len) : (index += 1) {
+        const record = response.answers.items[index];
+        if (!record.rrtype.eql(.RRSIG)) continue;
+        if (!record.owner.eql(&owner)) continue;
+        const held = switch (record.rdata) {
+            .Unknown => |*unknown| unknown.bytes(),
+            else => continue,
+        };
+        if (std.mem.eql(u8, held, raw)) return true;
+    }
+    return false;
 }
 
 /// Authenticated denial for NODATA/NXDOMAIN when DO=1. A zone that
@@ -1122,6 +1204,25 @@ pub fn buildProhibitedResponse(request: dns_message.Message) !dns_message.Messag
     var response = try buildRefusedResponse(request);
     errdefer response.deinit();
     appendEde(&response, EDE_PROHIBITED, ede_prohibited_text);
+    return response;
+}
+
+/// RFC 8914 section 4.21: "An authoritative server that receives a query with
+/// the Recursion Desired (RD) bit clear, or when it is not configured for
+/// recursion for a domain for which it is not authoritative, SHOULD include
+/// this EDE code in the REFUSED response."
+pub const EDE_NOT_AUTHORITATIVE: u16 = 20;
+/// RFC 8914 section 3: the EXTRA-TEXT says why the answer is what it is.
+/// The server holds no zone for the name and is not configured to recurse
+/// for it, which is a fact about the server and not about a policy.
+const ede_not_authoritative_text: []const u8 = "not authoritative for this name";
+
+/// A refusal that says why: the server is not authoritative for the name and
+/// is not configured to recurse for it.
+pub fn buildNotAuthoritativeResponse(request: dns_message.Message) !dns_message.Message {
+    var response = try buildRefusedResponse(request);
+    errdefer response.deinit();
+    appendEde(&response, EDE_NOT_AUTHORITATIVE, ede_not_authoritative_text);
     return response;
 }
 
@@ -3996,7 +4097,7 @@ test "RFC 8482 section 4.1: an ANY query at an owner with more than one RRset an
     const response = try buildResponse(try testQuery(arena.allocator(), "multi.home.arpa.", .ANY), &zone);
     try std.testing.expectEqual(header.Rcode.no_error, response.header.rcode);
     try std.testing.expect(!response.header.truncated);
-    try std.testing.expectEqual(@as(u16, 2), response.header.answer_count);
+    try std.testing.expectEqual(@as(u16, 3), response.header.answer_count);
     try std.testing.expectEqual(@as(u16, 0), response.header.authority_count);
 
     // The HINFO is the first RRset of the answer and keeps its own TTL.
@@ -4006,11 +4107,74 @@ test "RFC 8482 section 4.1: an ANY query at an owner with more than one RRset an
     try std.testing.expectEqualStrings("RFC8482", hinfo.cpuText());
     try std.testing.expectEqualStrings("", hinfo.osText());
 
-    // The second RRset is the one the rule selects: section 4.3's list puts A
-    // ahead of AAAA, and the TXT is not in it. No other RRset comes with it.
+    // Section 4.3: the subset is every RRset of the types the RFC names that
+    // the owner holds, so the A and the AAAA join the HINFO. The TXT is not
+    // one of them and is suppressed.
     try std.testing.expect(response.answers.items[1].rrtype.eql(.A));
     try std.testing.expectEqual(@as(u32, 3600), response.answers.items[1].ttl);
     try std.testing.expectEqualSlices(u8, &.{ 192, 0, 2, 1 }, &response.answers.items[1].rdata.A);
+    try std.testing.expect(response.answers.items[2].rrtype.eql(.AAAA));
+    try std.testing.expectEqual(@as(u32, 3600), response.answers.items[2].ttl);
+    for (response.answers.slice()) |answer| {
+        try std.testing.expect(!answer.rrtype.eql(.TXT));
+    }
+}
+
+test "RFC 8482 section 4.3: the subset keeps the order the RFC lists the types in" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\multi IN AAAA 2001:db8::1
+        \\multi IN A 192.0.2.1
+        \\multi IN MX 10 mail.home.arpa.
+        \\alias IN CNAME multi
+        \\
+    );
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    // Section 4.3 names CNAME, MX, A, and AAAA, and the answer carries them
+    // in that order whatever order the zone file wrote them in.
+    const response = try buildResponse(try testQuery(arena.allocator(), "multi.home.arpa.", .ANY), &zone);
+    try std.testing.expectEqual(@as(u16, 4), response.header.answer_count);
+    try std.testing.expect(response.answers.items[0].rrtype.eql(hinfo_type));
+    try std.testing.expect(response.answers.items[1].rrtype.eql(.MX));
+    try std.testing.expect(response.answers.items[2].rrtype.eql(.A));
+    try std.testing.expect(response.answers.items[3].rrtype.eql(.AAAA));
+
+    // A CNAME at the owner is answered with that RRset alone (section 4.1),
+    // so the CNAME of the list never joins the HINFO.
+    const aliased = try buildResponse(try testQuery(arena.allocator(), "alias.home.arpa.", .ANY), &zone);
+    try std.testing.expectEqual(@as(u16, 1), aliased.header.answer_count);
+    try std.testing.expect(aliased.answers.items[0].rrtype.eql(.CNAME));
+}
+
+test "RFC 8482 section 4.3: an owner with none of the listed types is answered with the HINFO alone" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\multi IN TXT "hello"
+        \\multi IN SRV 0 0 80 target.home.arpa.
+        \\
+    );
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    // The section 4.3 set is empty at this owner, so the HINFO answers alone
+    // and the types the RFC does not name are suppressed.
+    const response = try buildResponse(try testQuery(arena.allocator(), "multi.home.arpa.", .ANY), &zone);
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+    try std.testing.expect(response.answers.items[0].rrtype.eql(hinfo_type));
 }
 
 test "RFC 8482 section 4.1: the RRset that joins the HINFO keeps the zone's own TTL" {
@@ -4054,6 +4218,7 @@ test "RFC 8482 section 4.1: a DO=1 ANY query on a signed zone signs every RRset 
         \\@ IN NS ns.example.
         \\ns IN A 192.0.2.1
         \\www IN A 192.0.2.2
+        \\www IN AAAA 2001:db8::2
         \\www IN TXT "hello"
         \\
     );
@@ -4074,14 +4239,14 @@ test "RFC 8482 section 4.1: a DO=1 ANY query on a signed zone signs every RRset 
     const query = try testDoQuery(arena.allocator(), 0x4a05, "www.example.", .ANY, true);
     const answer = try buildResponseWithPolicy(query, &zone, .{}, &session, false);
 
-    // The HINFO, the RRset that joined it, and an RRSIG over each of them:
-    // section 4.2 asks for a valid RRSIG for the RRsets in the answer.
-    try std.testing.expectEqual(@as(u16, 4), answer.header.answer_count);
+    // The HINFO, the RRsets that joined it, and an RRSIG over each of them:
+    // section 4.1 asks for a valid RRSIG for every RRset in the answer.
+    try std.testing.expectEqual(@as(u16, 6), answer.header.answer_count);
     try std.testing.expect(answer.answers.items[0].rrtype.eql(hinfo_type));
-    try std.testing.expect(answer.answers.items[1].rrtype.eql(.A));
 
     var hinfo_rrsig: ?[]const u8 = null;
     var a_rrsig: ?[]const u8 = null;
+    var aaaa_rrsig: ?[]const u8 = null;
     for (answer.answers.items) |record| {
         if (!record.rrtype.eql(.RRSIG)) continue;
         const raw = switch (record.rdata) {
@@ -4092,9 +4257,11 @@ test "RFC 8482 section 4.1: a DO=1 ANY query on a signed zone signs every RRset 
         const covered = std.mem.readInt(u16, raw[0..2], .big);
         if (covered == hinfo_type.code()) hinfo_rrsig = raw;
         if (covered == dns_types.RecordType.A.code()) a_rrsig = raw;
+        if (covered == dns_types.RecordType.AAAA.code()) aaaa_rrsig = raw;
     }
     try std.testing.expect(hinfo_rrsig != null);
     try std.testing.expect(a_rrsig != null);
+    try std.testing.expect(aaaa_rrsig != null);
 
     // The signatures are checked by the project's own validator, which
     // rebuilds the canonical RR form from the answer and verifies it against
@@ -4153,6 +4320,52 @@ fn expectAnswerHex(expected_hex: []const u8, response: dns_message.Message) !voi
     var expected: [512]u8 = undefined;
     const decoded = try std.fmt.hexToBytes(&expected, expected_hex);
     try std.testing.expectEqualSlices(u8, decoded, writer.written());
+}
+
+test "RFC 8482 section 7: the answer carries no TC bit and keeps the RRsets that fit" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_text: std.Io.Writer.Allocating = .init(arena.allocator());
+    defer zone_text.deinit();
+    const writer = &zone_text.writer;
+    try writer.writeAll(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\
+    );
+    var index: usize = 0;
+    while (index < 40) : (index += 1) {
+        try writer.print("multi IN A 192.0.2.{d}\n", .{index + 1});
+    }
+    try writer.writeAll("multi IN AAAA 2001:db8::1\n");
+
+    var zone_file = try zone_parser.ZoneFile.parse(zone_text.written());
+    defer zone_file.deinit();
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    // The A RRset does not fit the classic payload, so it goes and the AAAA
+    // that does fit stays: section 7 says the answer carries no TC bit, so
+    // the answer is never truncated.
+    const response = try buildResponse(try testQuery(arena.allocator(), "multi.home.arpa.", .ANY), &zone);
+    try std.testing.expect(!response.header.truncated);
+    try std.testing.expectEqual(@as(u16, 2), response.header.answer_count);
+    try std.testing.expect(response.answers.items[0].rrtype.eql(hinfo_type));
+    try std.testing.expect(response.answers.items[1].rrtype.eql(.AAAA));
+
+    // The answer fits the classic limit, so the datagram path sends it whole
+    // and sets no TC bit.
+    var encoded: [2048]u8 = undefined;
+    var message_writer = dns_writer.Writer.init(&encoded);
+    try response.encode(&message_writer);
+    try std.testing.expect(message_writer.len() <= CLASSIC_UDP_MESSAGE_SIZE);
+    var truncated: [2048]u8 = undefined;
+    const reply = try truncateClassicUdpResponse(message_writer.written(), &truncated);
+    try std.testing.expectEqualSlices(u8, message_writer.written(), reply);
+    try std.testing.expect((std.mem.readInt(u16, reply[2..4], .big) & header.Flags.tc) == 0);
 }
 
 test "RFC 9471: a referral carries in-domain and sibling-domain glue" {
@@ -4664,4 +4877,94 @@ test "RFC 8914: a plain refusal carries no EDE option" {
     const options = ednsOptions(&refused).?;
     try std.testing.expectEqualSlices(u8, &.{}, options);
     try std.testing.expect(dns_rdata.findOption(options, ede_option_code) == null);
+}
+
+test "RFC 8914: a not-authoritative refusal differs from a plain refusal only by the EDE option" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var request = try testQuery(arena.allocator(), "outside.example.", .A);
+    request.edns = .{ .udp_payload_size = 1232, .extended_rcode = 0, .version = 0, .dnssec_ok = false };
+    try request.additionals.append(.{
+        .owner = dns_name.Name.root(),
+        .rrtype = .OPT,
+        .class = dns_types.Class.fromCode(1232),
+        .ttl = 0,
+        .rdata = .{ .OPT = .{} },
+    });
+
+    const plain = try buildRefusedResponse(request);
+    const not_authoritative = try buildNotAuthoritativeResponse(request);
+    try std.testing.expectEqual(header.Rcode.refused, plain.header.rcode);
+    try std.testing.expectEqual(header.Rcode.refused, not_authoritative.header.rcode);
+
+    var plain_bytes: [512]u8 = undefined;
+    var plain_writer = dns_writer.Writer.init(&plain_bytes);
+    try plain.encode(&plain_writer);
+    var answer_bytes: [512]u8 = undefined;
+    var answer_writer = dns_writer.Writer.init(&answer_bytes);
+    try not_authoritative.encode(&answer_writer);
+
+    // The OPT record ends the answer, so its RDLENGTH is the last two octets:
+    // the refusal is the plain one with the thirty-seven octets of the EDE
+    // option and the RDLENGTH that counts them. Every other octet is the plain
+    // refusal's, so the question, the header flags, and the RCODE are the
+    // ones the plain refusal carries.
+    const plain_wire = plain_writer.written();
+    const answer_wire = answer_writer.written();
+    try std.testing.expectEqual(plain_wire.len + 37, answer_wire.len);
+    try std.testing.expectEqualSlices(u8, plain_wire[0 .. plain_wire.len - 2], answer_wire[0 .. plain_wire.len - 2]);
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x25 }, answer_wire[plain_wire.len - 2 ..][0..2]);
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x0f, 0x00, 0x21, 0x00, 0x14 }, answer_wire[plain_wire.len..][0..6]);
+    try std.testing.expectEqualStrings("not authoritative for this name", answer_wire[plain_wire.len + 6 ..]);
+}
+
+test "RFC 8914: a not-authoritative refusal without EDNS is the plain refusal byte for byte" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const request = try testQuery(arena.allocator(), "outside.example.", .A);
+    const plain = try buildRefusedResponse(request);
+    const not_authoritative = try buildNotAuthoritativeResponse(request);
+
+    var plain_bytes: [512]u8 = undefined;
+    var plain_writer = dns_writer.Writer.init(&plain_bytes);
+    try plain.encode(&plain_writer);
+    var answer_bytes: [512]u8 = undefined;
+    var answer_writer = dns_writer.Writer.init(&answer_bytes);
+    try not_authoritative.encode(&answer_writer);
+
+    // RFC 8914 section 2: the option rides only on a query that carried an OPT
+    // pseudo-RR, so a query without one is refused exactly as before.
+    try std.testing.expectEqualSlices(u8, plain_writer.written(), answer_writer.written());
+}
+
+test "RFC 8914: the refusals that already carried a code keep it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var request = try testQuery(arena.allocator(), "ads.home.arpa.", .A);
+    request.edns = .{ .udp_payload_size = 1232, .extended_rcode = 0, .version = 0, .dnssec_ok = false };
+    try request.additionals.append(.{
+        .owner = dns_name.Name.root(),
+        .rrtype = .OPT,
+        .class = dns_types.Class.fromCode(1232),
+        .ttl = 0,
+        .rdata = .{ .OPT = .{} },
+    });
+
+    // The Blocked and the Prohibited refusals keep their own codes and their
+    // own texts, and the plain refusal still carries no EDE option at all.
+    const blocked = try buildBlockedResponse(request);
+    const blocked_ede = dns_rdata.findOption(ednsOptions(&blocked).?, ede_option_code).?;
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x0f }, blocked_ede[0..2]);
+    try std.testing.expectEqualStrings("blocked by policy", blocked_ede[2..]);
+
+    const prohibited = try buildProhibitedResponse(request);
+    const prohibited_ede = dns_rdata.findOption(ednsOptions(&prohibited).?, ede_option_code).?;
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x12 }, prohibited_ede[0..2]);
+    try std.testing.expectEqualStrings("prohibited by policy", prohibited_ede[2..]);
+
+    const plain = try buildRefusedResponse(request);
+    try std.testing.expect(dns_rdata.findOption(ednsOptions(&plain).?, ede_option_code) == null);
 }

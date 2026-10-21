@@ -644,7 +644,6 @@ pub fn signRrset(
     const work = scratch.allocator();
 
     const order = try work.dupe([]const u8, rdatas);
-    std.mem.sort([]const u8, order, {}, rdataLessThan);
     const dnskey_rdata = try zoneSigningDnskey(key, work);
     const signed = try signedData(
         work,
@@ -973,27 +972,6 @@ fn nsec3paramRdata(allocator: std.mem.Allocator, params: Nsec3Params) Error![]co
     return rdata;
 }
 
-/// RFC 5155 section 3: the owner name of an NSEC3 is the SHA-1 hash of the
-/// original owner name in unpadded base32hex (RFC 4648 section 7), so 20
-/// octets are exactly 32 characters.
-fn base32HexLabel(hash: [20]u8, out: *[32]u8) void {
-    const alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUV";
-    var written: usize = 0;
-    var index: usize = 0;
-    while (index < hash.len) : (index += 5) {
-        // Five octets are forty bits, which is exactly eight characters.
-        var chunk: u64 = 0;
-        for (hash[index..][0..5]) |byte| chunk = (chunk << 8) | byte;
-        var shift: u6 = 35;
-        while (true) {
-            out[written] = alphabet[@intCast((chunk >> shift) & 0x1f)];
-            written += 1;
-            if (shift == 0) break;
-            shift -= 5;
-        }
-    }
-}
-
 /// RFC 5155 section 5: the hash of the canonical owner name, the same hash
 /// the serving path and the validator compute.
 fn nsec3HashOf(owner_wire: []const u8, params: Nsec3Params) Error![20]u8 {
@@ -1134,7 +1112,7 @@ fn appendNsec3Chain(
     for (merged.items, 0..) |entry, index| {
         const next = merged.items[(index + 1) % merged.items.len];
         var label: [32]u8 = undefined;
-        base32HexLabel(entry.hash, &label);
+        dns_dnssec.base32Hex(entry.hash, &label);
         const owner_wire = try allocator.alloc(u8, 1 + label.len + origin_wire.len);
         owner_wire[0] = @intCast(label.len);
         @memcpy(owner_wire[1..][0..label.len], &label);
@@ -1225,13 +1203,24 @@ fn signedData(
     var header: [18 + 255]u8 = undefined;
     const header_len = try rrsigHeader(rrset, algorithm, key_tag, signer_wire, options, &header);
 
+    // RFC 4034 section 6.2: the signature covers the RDATA in its canonical
+    // form, and RFC 4034 section 6.3 puts the RRset in the order of that
+    // form. The rule lives in `dnssec`, so the signer signs exactly what the
+    // validator verifies.
+    var rdata: std.ArrayList([]const u8) = .empty;
+    for (rrset.rdata) |bytes| {
+        const canonical = dns_dnssec.canonicalRdata(allocator, rrset.rrtype, bytes) catch return Error.OutOfMemory;
+        try rdata.append(allocator, canonical);
+    }
+    std.mem.sort([]const u8, rdata.items, {}, rdataLessThan);
+
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(allocator, header[0..header_len]);
-    for (rrset.rdata) |rdata| {
+    for (rdata.items) |bytes| {
         try out.appendSlice(allocator, rrset.owner_wire);
-        const rr_header = zonemd.rrHeader(rrset.rrtype, dns_types.Class.IN.code(), rrset.ttl, rdata.len);
+        const rr_header = zonemd.rrHeader(rrset.rrtype, dns_types.Class.IN.code(), rrset.ttl, bytes.len);
         try out.appendSlice(allocator, &rr_header);
-        try out.appendSlice(allocator, rdata);
+        try out.appendSlice(allocator, bytes);
     }
     return .{ .bytes = try out.toOwnedSlice(allocator), .header_len = header_len };
 }

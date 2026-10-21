@@ -152,6 +152,66 @@ pub fn rrsigCovers(rrsig_rdata: []const u8) Error!u16 {
     return std.mem.readInt(u16, rrsig_rdata[0..2], .big);
 }
 
+// ------------------------------------------------------- canonical form
+
+/// The names an opaque RDATA of a rule-3 type holds: the octets before the
+/// first name and how many names follow.
+const OpaqueNames = struct {
+    prefix: usize,
+    count: usize,
+};
+
+/// RFC 4034 section 6.2 rule 3: the names inside the RDATA of these types are
+/// signed in lowercase. RFC 6840 section 5.1 corrects the list: the NSEC's
+/// next domain name is not folded, and HINFO holds no name at all.
+fn opaqueNames(code: u16, raw: []const u8) ?OpaqueNames {
+    return switch (code) {
+        3, 4, 7, 8, 9 => .{ .prefix = 0, .count = 1 }, // MD MF MB MG MR
+        14 => .{ .prefix = 0, .count = 2 }, // MINFO
+        24 => .{ .prefix = 18, .count = 1 }, // SIG
+        26 => .{ .prefix = 2, .count = 2 }, // PX
+        30 => .{ .prefix = 0, .count = 1 }, // NXT
+        36 => .{ .prefix = 2, .count = 1 }, // KX
+        38 => a6Names(raw), // A6
+        else => null,
+    };
+}
+
+/// RFC 2874 section 3.1.1: the A6 RDATA is the prefix length, the address
+/// suffix the prefix length leaves over, and the prefix name. The name is
+/// absent when the prefix length is zero or 128.
+fn a6Names(raw: []const u8) ?OpaqueNames {
+    if (raw.len < 1) return null;
+    const length = raw[0];
+    if (length > 128) return null;
+    const suffix: usize = if (length == 128) 0 else (128 - length + 7) / 8;
+    const count: usize = if (length == 0 or length == 128) 0 else 1;
+    return .{ .prefix = 1 + suffix, .count = count };
+}
+
+/// The canonical RDATA of a record: the names it holds are folded to
+/// lowercase (RFC 4034 section 6.2 rule 3) and every other octet is left as
+/// it arrived. The NSEC's next domain name is the one exception: RFC 6840
+/// section 5.1 keeps it as the publisher wrote it, because the proof is
+/// authenticated over the octets it published. A name the RDATA does not hold
+/// where the type's RFC puts it is left alone, and the signature over it then
+/// fails to verify.
+pub fn canonicalRdata(allocator: std.mem.Allocator, rrtype: u16, rdata: []const u8) std.mem.Allocator.Error![]const u8 {
+    const layout = opaqueNames(rrtype, rdata) orelse return allocator.dupe(u8, rdata);
+    const out = try allocator.dupe(u8, rdata);
+    var offset = layout.prefix;
+    var index: usize = 0;
+    while (index < layout.count) : (index += 1) {
+        if (offset > out.len) break;
+        const parsed = Name.parse(out, offset) catch break;
+        // A compressed name is not the canonical form, so it is left as it is.
+        if (parsed.name.asWire().len != parsed.next_offset - offset) break;
+        @memcpy(out[offset..parsed.next_offset], parsed.name.asWire());
+        offset = parsed.next_offset;
+    }
+    return out;
+}
+
 const NsecBitmap = struct {
     windows: []const u8,
 };
@@ -332,6 +392,27 @@ pub fn nsec3Hash(owner: Name, salt: []const u8, iterations: u16, out: *[20]u8) v
         hasher.final(&digest);
     }
     @memcpy(out, &digest);
+}
+
+/// base32hex (RFC 4648 section 7) of a hash, the form an NSEC3 owner name
+/// takes (RFC 5155 section 3). The canonical form is lowercase, so the label
+/// is written that way.
+pub fn base32Hex(hash: [20]u8, out: *[32]u8) void {
+    const alphabet = "0123456789abcdefghijklmnopqrstuv";
+    var written: usize = 0;
+    var index: usize = 0;
+    while (index < hash.len) : (index += 5) {
+        // Five octets are forty bits, which is exactly eight characters.
+        var chunk: u64 = 0;
+        for (hash[index..][0..5]) |byte| chunk = (chunk << 8) | byte;
+        var shift: u6 = 35;
+        while (true) {
+            out[written] = alphabet[@intCast((chunk >> shift) & 0x1f)];
+            written += 1;
+            if (shift == 0) break;
+            shift -= 5;
+        }
+    }
 }
 
 pub const Denial = enum {
