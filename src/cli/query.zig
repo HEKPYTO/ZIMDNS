@@ -81,6 +81,10 @@ pub fn buildQueryPacketForName(
     qtype: dns_types.RecordType,
     edns: EdnsRequest,
 ) ![]const u8 {
+    // RFC 1123 section 2.1 keeps the RFC 952 host name syntax, so a label
+    // may neither begin nor end with a hyphen; the zone side refuses such a
+    // label, so the query must not ask about a name no zone can hold.
+    if (qname.hasHyphenEdgeLabel()) return Error.BadName;
     var writer = dns_writer.Writer.init(buffer);
     const want_opt = edns.dnssec_ok or edns.zoneversion or edns.nsid;
     const message = dns_message.Message{

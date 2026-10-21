@@ -86,6 +86,20 @@ pub const Name = struct {
         return std.ascii.eqlIgnoreCase(a.asWire(), b.asWire());
     }
 
+    /// RFC 1123 section 2.1 keeps the RFC 952 host name syntax, so a label
+    /// may neither begin nor end with a hyphen; the rest of the character set
+    /// stays open because underscore labels are legal DNS names.
+    pub fn hasHyphenEdgeLabel(self: *const Name) bool {
+        var index: usize = 0;
+        while (index < self.wire_len) {
+            const len: usize = self.wire[index];
+            if (len == 0) break;
+            if (self.wire[index + 1] == '-' or self.wire[index + len] == '-') return true;
+            index += 1 + len;
+        }
+        return false;
+    }
+
     /// The canonical lowercase form of this name. RFC 4034 section 6.2 signs
     /// and RFC 5155 section 5 hashes a name in that form, so both paths fold
     /// the name they are given instead of assuming it arrived folded.
@@ -351,4 +365,11 @@ test "RFC 1123 2.1: host names accept a leading digit and the 63 and 255 octet b
     buffer[253] = 'a';
     buffer[254] = '.';
     try std.testing.expectError(Error.NameTooLong, Name.fromText(buffer[0..255]));
+}
+
+test "RFC 1123 2.1: a label may neither begin nor end with a hyphen" {
+    try std.testing.expect((try Name.fromText("-bad.example.")).hasHyphenEdgeLabel());
+    try std.testing.expect((try Name.fromText("bad-.example.")).hasHyphenEdgeLabel());
+    try std.testing.expect(!(try Name.fromText("sri-nic.example.")).hasHyphenEdgeLabel());
+    try std.testing.expect(!(try Name.fromText("_443._tcp.example.")).hasHyphenEdgeLabel());
 }

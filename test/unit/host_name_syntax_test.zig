@@ -65,6 +65,30 @@ test "RFC 1123 2.1: the query command's name argument refuses an over-long label
     try std.testing.expectError(zimdns.cli_query.Error.BadName, zimdns.cli_query.buildQueryPacket(&buffer, 0x1234, name[0..255], qtype, false));
 }
 
+test "RFC 1123 2.1: the query command's name argument refuses a leading or trailing hyphen" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const qtype = (try zimdns.dns_message.Message.parseQuery(arena.allocator(), &a_query)).question.?.qtype;
+    var buffer: [512]u8 = undefined;
+
+    try std.testing.expectError(zimdns.cli_query.Error.BadName, zimdns.cli_query.buildQueryPacket(&buffer, 0x1234, "-bad.example.", qtype, false));
+    try std.testing.expectError(zimdns.cli_query.Error.BadName, zimdns.cli_query.buildQueryPacket(&buffer, 0x1234, "bad-.example.", qtype, false));
+}
+
+test "RFC 1123 2.1: the query command's name argument accepts an underscore label and an interior hyphen" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const qtype = (try zimdns.dns_message.Message.parseQuery(arena.allocator(), &a_query)).question.?.qtype;
+    var buffer: [512]u8 = undefined;
+    const packet = try zimdns.cli_query.buildQueryPacket(&buffer, 0x1234, "_443._tcp.example.", qtype, false);
+
+    const parsed = try zimdns.dns_message.Message.parseQuery(arena.allocator(), packet);
+    var text: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("_443._tcp.example.", try parsed.question.?.name.toText(&text));
+}
+
 test "RFC 1123 2.1: a zone-file owner label accepts a leading digit" {
     var zone = try zimdns.zone_parser.ZoneFile.parse(
         \\$ORIGIN example.

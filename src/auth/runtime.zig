@@ -6,6 +6,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const dns_message = @import("../dns/message.zig");
+const dns_rdata = @import("../dns/rdata.zig");
 const dns_types = @import("../dns/types.zig");
 const dns_writer = @import("../dns/writer.zig");
 const response = @import("response.zig");
@@ -743,6 +744,7 @@ pub const Runtime = struct {
         output: []u8,
         client: ?*const std.Io.net.IpAddress,
         counters: ?*metrics.Counters,
+        over_tcp: bool,
     ) ![]const u8 {
         const parsed = try self.parseIncoming(allocator, query_bytes);
         switch (parsed) {
@@ -750,10 +752,10 @@ pub const Runtime = struct {
             .incoming => |incoming| {
                 if (counters) |value| countInboundBits(value, incoming.query);
                 if (incoming.auth) |auth| {
-                    return self.encodeSignedMessage(try self.buildMessage(incoming.query), output, auth, 0, &.{}, null);
+                    return self.encodeSignedMessage(try self.buildMessage(incoming.query, over_tcp), output, auth, 0, &.{}, null);
                 }
-                if (client) |address| return self.answerFromUnlocked(query_bytes, output, address, incoming.query);
-                return self.encodeMessage(try self.buildMessage(incoming.query), output);
+                if (client) |address| return self.answerFromUnlocked(query_bytes, output, address, incoming.query, over_tcp);
+                return self.encodeMessage(try self.buildMessage(incoming.query, over_tcp), output);
             },
         }
     }
@@ -768,10 +770,10 @@ pub const Runtime = struct {
             .failure => |failure| return self.encodeFailure(arena.allocator(), query_bytes, output, failure),
             .incoming => |incoming| {
                 if (incoming.auth) |auth| {
-                    return self.encodeSignedMessage(try self.buildMessage(incoming.query), output, auth, 0, &.{}, null);
+                    return self.encodeSignedMessage(try self.buildMessage(incoming.query, true), output, auth, 0, &.{}, null);
                 }
                 if (try self.localZoneAnswer(incoming.query)) |local| return self.encodeMessage(local, output);
-                return self.encodeMessage(try self.buildMessage(incoming.query), output);
+                return self.encodeMessage(try self.buildMessage(incoming.query, true), output);
             },
         }
     }
@@ -781,7 +783,24 @@ pub const Runtime = struct {
         defer arena.deinit();
         self.lock();
         defer self.unlock();
-        return self.answerIncoming(arena.allocator(), query_bytes, output, client, null);
+        return self.answerIncoming(arena.allocator(), query_bytes, output, client, null, false);
+    }
+
+    /// Answers a request that arrived on a TCP session. RFC 7828 section 3.3.2
+    /// lets the server answer the edns-tcp-keepalive option on a TCP session
+    /// only, so the transport of the request is part of the answer.
+    pub fn answerFromTcp(
+        self: *Runtime,
+        query_bytes: []const u8,
+        output: []u8,
+        client: *const std.Io.net.IpAddress,
+        counters: ?*metrics.Counters,
+    ) ![]const u8 {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        self.lock();
+        defer self.unlock();
+        return self.answerIncoming(arena.allocator(), query_bytes, output, client, counters, true);
     }
 
     pub fn truncateUdpResponse(self: *Runtime, query_bytes: []const u8, response_bytes: []const u8, output: []u8) ![]const u8 {
@@ -838,7 +857,7 @@ pub const Runtime = struct {
                     var output: [transfer.tcp_max_frame_size]u8 = undefined;
                     const single = if (incoming.auth) |auth|
                         try self.encodeSignedMessage(
-                            try self.buildMessage(incoming.query),
+                            try self.buildMessage(incoming.query, false),
                             &output,
                             auth,
                             0,
@@ -846,7 +865,7 @@ pub const Runtime = struct {
                             null,
                         )
                     else
-                        try self.encodeMessage(try self.buildMessage(incoming.query), &output);
+                        try self.encodeMessage(try self.buildMessage(incoming.query, false), &output);
                     return frameSingle(allocator, single);
                 }
                 var qname_text_buffer: [256]u8 = undefined;
@@ -976,7 +995,14 @@ pub const Runtime = struct {
         return blob.toOwnedSlice(allocator) catch return Error.EncodeFailed;
     }
 
-    fn answerFromUnlocked(self: *Runtime, query_bytes: []const u8, output: []u8, client: *const std.Io.net.IpAddress, query: dns_message.Message) ![]const u8 {
+    fn answerFromUnlocked(
+        self: *Runtime,
+        query_bytes: []const u8,
+        output: []u8,
+        client: *const std.Io.net.IpAddress,
+        query: dns_message.Message,
+        over_tcp: bool,
+    ) ![]const u8 {
         const q = query.question orelse return Error.BadQuery;
         if (query.header.opcode != .query) {
             return self.encodeMessage(try response.buildNotImplementedResponse(query), output);
@@ -993,12 +1019,12 @@ pub const Runtime = struct {
                     resolver_mod.Error.BadCookie => return self.encodeMessage(try resolver.badCookieResponse(query, client), output),
                     else => return err,
                 };
-                var message = try self.buildMessage(query);
+                var message = try self.buildMessage(query, over_tcp);
                 errdefer message.deinit();
                 if (server_cookie) |cookie| try resolver_mod.appendCookie(&message, cookie);
                 return self.encodeMessage(message, output);
             }
-            return self.encodeMessage(try self.buildMessage(query), output);
+            return self.encodeMessage(try self.buildMessage(query, over_tcp), output);
         }
         if (try self.localZoneAnswer(query)) |local| return self.encodeMessage(local, output);
         if (self.blocklist.blocks(qname_text)) return self.encodeMessage(try response.buildBlockedResponse(query), output);
@@ -1064,7 +1090,7 @@ pub const Runtime = struct {
         defer self.unlock();
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
-        const result = self.answerIncoming(arena.allocator(), query_bytes, output, client, counters) catch |err| {
+        const result = self.answerIncoming(arena.allocator(), query_bytes, output, client, counters, false) catch |err| {
             if (err == Error.BadQuery) counters.bad_queries_total += 1;
             if (err == Error.EncodeFailed) counters.encode_failures_total += 1;
             return err;
@@ -1088,9 +1114,9 @@ pub const Runtime = struct {
             .incoming => |incoming| answer: {
                 countInboundBits(counters, incoming.query);
                 break :answer if (incoming.auth) |auth|
-                    self.encodeSignedMessage(try self.buildMessage(incoming.query), output, auth, 0, &.{}, null)
+                    self.encodeSignedMessage(try self.buildMessage(incoming.query, true), output, auth, 0, &.{}, null)
                 else
-                    self.encodeMessage(try self.buildMessage(incoming.query), output);
+                    self.encodeMessage(try self.buildMessage(incoming.query, true), output);
             },
         } catch |err| {
             if (err == Error.BadQuery) counters.bad_queries_total += 1;
@@ -1110,7 +1136,7 @@ pub const Runtime = struct {
         return writer.written();
     }
 
-    fn buildMessage(self: *const Runtime, query: dns_message.Message) !dns_message.Message {
+    fn buildMessage(self: *const Runtime, query: dns_message.Message, over_tcp: bool) !dns_message.Message {
         // RFC 2136 section 3 answers an unimplemented UPDATE with NOTIMP,
         // and section 3.4.1.3 lets it carry no zone section, so the
         // refusal is built before a question is required.
@@ -1143,7 +1169,7 @@ pub const Runtime = struct {
         // partial zone can never leak through one datagram or frame.
         if (transfer.classify(q.qtype, q.qclass) != .none) return response.buildRefusedResponse(query);
         const selected = self.selectZone(qname_text) orelse return response.buildRefusedResponse(query);
-        return response.buildResponseWithPolicy(query, selected, self.answer_policy, self.signingSession());
+        return response.buildResponseWithPolicy(query, selected, self.answer_policy, self.signingSession(), over_tcp);
     }
 
     /// The signing material of a signed zone, when there is one.
@@ -2489,6 +2515,51 @@ fn findCookieOption(message: dns_message.Message) ?[]const u8 {
         return bytes[4 .. 4 + length];
     }
     return null;
+}
+
+fn findKeepaliveOption(message: dns_message.Message) ?[]const u8 {
+    for (message.additionals.items[0..message.additionals.len]) |*record| {
+        if (!record.rrtype.eql(.OPT)) continue;
+        return dns_rdata.findOption(record.rdata.OPT.bytes(), dns_rdata.EDNS_TCP_KEEPALIVE_OPTION_CODE);
+    }
+    return null;
+}
+
+test "RFC 7828: a TCP query with the keepalive option is answered with it, the same query over UDP is not" {
+    var runtime = try Runtime.fromZoneText(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\www IN A 192.168.1.1
+        \\
+    );
+    defer runtime.deinit();
+
+    // A query whose OPT record carries the empty edns-tcp-keepalive option of
+    // RFC 7828 section 3.2.1.
+    const keepalive_query = [_]u8{
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        3,    'w',  'w',  'w',  4,    'h',  'o',  'm',  'e',  4,    'a',  'r',
+        'p',  'a',  0,    0x00, 0x01, 0x00, 0x01, 0,    0x00, 0x29, 0x04, 0xd0,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x0b, 0x00, 0x00,
+    };
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 53004);
+    var output: [512]u8 = undefined;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // Section 3.3.2: the answer carries the idle timeout the server applies,
+    // counted in units of 100 milliseconds.
+    const tcp_bytes = try runtime.answerFromTcp(&keepalive_query, &output, &client, null);
+    const tcp_response = try dns_message.Message.parse(arena.allocator(), tcp_bytes);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 50 }, findKeepaliveOption(tcp_response).?);
+
+    // Section 3.3.1: the option in a UDP query is ignored.
+    const udp_bytes = try runtime.answerFrom(&keepalive_query, &output, &client);
+    const udp_response = try dns_message.Message.parse(arena.allocator(), udp_bytes);
+    try std.testing.expect(findKeepaliveOption(udp_response) == null);
 }
 
 test "authoritative runtime dispatches to the longest matching zone" {

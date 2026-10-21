@@ -18,6 +18,13 @@ const dns_dnssec = @import("../dns/dnssec.zig");
 
 pub const CLASSIC_UDP_MESSAGE_SIZE: usize = 512;
 pub const DEFAULT_EDNS_UDP_PAYLOAD_SIZE: u16 = 1232;
+/// RFC 7828 section 3.1: the option's TIMEOUT is an idle timeout counted in
+/// units of 100 milliseconds.
+pub const TCP_KEEPALIVE_UNITS_PER_SECOND: u16 = 10;
+/// The idle timeout this server applies to a TCP session, in the units of
+/// RFC 7828 section 3.1: the listener closes an idle connection when its
+/// five-second per-frame deadline expires.
+pub const TCP_IDLE_TIMEOUT_UNITS: u16 = 5 * TCP_KEEPALIVE_UNITS_PER_SECOND;
 
 pub const Error = error{
     MissingQuestion,
@@ -43,6 +50,9 @@ pub const AnswerPolicy = struct {
     /// RFC 8482 section 4.2: the TTL of the synthesized HINFO in a minimal
     /// ANY answer. The RFC leaves it to the operator; a day is the default.
     minimal_any_ttl: u32 = 86400,
+    /// RFC 7828 section 3.3.2: the idle timeout signalled in the option, in
+    /// units of 100 milliseconds. Zero asks the client to close the session.
+    tcp_keepalive_timeout: u16 = TCP_IDLE_TIMEOUT_UNITS,
 };
 
 pub fn truncateClassicUdpResponse(response_bytes: []const u8, output: []u8) Error![]const u8 {
@@ -239,17 +249,20 @@ fn findEdnsOpt(response_bytes: []const u8) ?dns_record.ResourceRecord {
 /// Answer from the shipping default EDNS policy: no NSID identifier to give
 /// and ZONEVERSION answered whenever a query asks for it.
 pub fn buildResponse(request: dns_message.Message, zone: *const zone_index.Zone) !dns_message.Message {
-    return buildResponseWithPolicy(request, zone, .{}, null);
+    return buildResponseWithPolicy(request, zone, .{}, null, false);
 }
 
 /// `policy` is the operator's EDNS answer policy, from the `nsid` and
 /// `zoneversion` directives. `session` is the signing material of a signed
-/// zone, and is null when the zone carries no key to sign with.
+/// zone, and is null when the zone carries no key to sign with. `over_tcp`
+/// says the request arrived on a TCP session, which is the only transport
+/// RFC 7828 section 3.3.2 lets the keepalive option answer on.
 pub fn buildResponseWithPolicy(
     request: dns_message.Message,
     zone: *const zone_index.Zone,
     policy: AnswerPolicy,
     session: ?*const zone_signer.Session,
+    over_tcp: bool,
 ) !dns_message.Message {
     const q = request.question orelse return Error.MissingQuestion;
     if (request.header.opcode != .query) return buildNotImplementedResponse(request);
@@ -296,7 +309,7 @@ pub fn buildResponseWithPolicy(
 
     if (response.edns != null) {
         try appendOpt(&response);
-        appendRequestedEdnsOptions(&response, &request, zone, policy);
+        appendRequestedEdnsOptions(&response, &request, zone, policy, over_tcp);
     }
 
     // DNSSEC minimum (RFC 4035 section 3.1, RFC 5155): RRSIGs covering the
@@ -614,6 +627,9 @@ const Nsec3Entry = struct {
     owner_hash: [20]u8,
     /// The next hashed owner name the record points at.
     next_hash: [20]u8,
+    /// True when the record carries the Opt-Out flag (RFC 5155 section
+    /// 3.1.2.1): it may cover an unsigned delegation.
+    opt_out: bool,
     /// The zone record, so the proof can carry the record itself.
     record: zone_parser.ZoneRecord,
 };
@@ -671,6 +687,7 @@ fn nsec3Chain(allocator: std.mem.Allocator, zone: *const zone_index.Zone) !Nsec3
         try entries.append(allocator, .{
             .owner_hash = owner_hash,
             .next_hash = rdata.next_hash[0..20].*,
+            .opt_out = (rdata.flags & dns_validate.nsec3_opt_out) != 0,
             .record = record,
         });
     }
@@ -774,12 +791,20 @@ fn appendNsec3Proofs(
         return try appendNsec3(response, zone, chain, index);
     }
 
-    // RFC 5155 section 7.2.4: a DS NODATA with no matching NSEC3 needs a
-    // closest provable encloser proof over an opt-out span, which this
-    // server does not build.
-    if (qtype.eql(.DS)) return false;
-
     const origin = dns_name.Name.fromText(zone.originText()) catch return false;
+
+    // RFC 5155 section 7.2.4: a DS NODATA with no matching NSEC3 is proved
+    // by the closest provable encloser proof, and the NSEC3 that covers the
+    // next closer name must carry the Opt-Out flag (RFC 5155 section 6).
+    if (qtype.eql(.DS)) {
+        if (nxdomain) return false;
+        const encloser = nsec3ClosestEncloser(chain, qname, origin) orelse return false;
+        const entries = chain.entries orelse return false;
+        if (!entries[encloser.cover].opt_out) return false;
+        const proof = [_]usize{ encloser.match, encloser.cover };
+        return try appendNsec3Set(response, zone, chain, proof[0..]);
+    }
+
     const encloser = nsec3ClosestEncloser(chain, qname, origin) orelse return false;
 
     // The wildcard at the closest encloser (RFC 5155 section 7.2.2).
@@ -1037,6 +1062,11 @@ fn ednsOptionIsMalformed(request: *const dns_message.Message) bool {
             dns_rdata.EDNS_EXPIRE_OPTION_CODE => {
                 if (option_len != 0) return true;
             },
+            dns_rdata.EDNS_TCP_KEEPALIVE_OPTION_CODE => {
+                // RFC 7828 section 3.2.1: the query form of the option is
+                // empty, so any other length is malformed in the same way.
+                if (option_len != 0) return true;
+            },
             else => {},
         }
         offset += option_len;
@@ -1053,6 +1083,7 @@ fn appendRequestedEdnsOptions(
     request: *const dns_message.Message,
     zone: *const zone_index.Zone,
     policy: AnswerPolicy,
+    over_tcp: bool,
 ) void {
     const options = ednsOptions(request) orelse return;
     if (policy.nsid) |nsid| {
@@ -1074,6 +1105,15 @@ fn appendRequestedEdnsOptions(
             std.mem.writeInt(u32, data[0..4], expire, .big);
             _ = optOf(response).appendOption(dns_rdata.EDNS_EXPIRE_OPTION_CODE, &data);
         }
+    }
+    // RFC 7828 section 3.3.2: a server that received the option on a TCP
+    // session answers it with the idle timeout it applies to that session,
+    // counted in units of 100 milliseconds. Section 3.3.1 says the option in
+    // a UDP query is ignored, so only a TCP session is answered.
+    if (over_tcp and dns_rdata.findOption(options, dns_rdata.EDNS_TCP_KEEPALIVE_OPTION_CODE) != null) {
+        var data: [2]u8 = undefined;
+        std.mem.writeInt(u16, data[0..2], policy.tcp_keepalive_timeout, .big);
+        _ = optOf(response).appendOption(dns_rdata.EDNS_TCP_KEEPALIVE_OPTION_CODE, &data);
     }
     if (!policy.zoneversion) return;
     if (dns_rdata.findOption(options, dns_rdata.EDNS_ZONEVERSION_OPTION_CODE) == null) return;
@@ -1627,11 +1667,52 @@ const nsec3_wildcard_test_zone =
     \\
 ;
 
+/// A zone whose NSEC3 chain carries the Opt-Out flag (RFC 5155 section 6):
+/// the unsigned delegation "unsigned-sub.example." has no NSEC3 of its own,
+/// and the chain covers its hash with the Opt-Out NSEC3 of "www.example.".
+/// Every hash is the one the python hashlib oracle produced.
+const nsec3_optout_test_zone =
+    \\$ORIGIN example.
+    \\$TTL 3600
+    \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+    \\@ IN NS ns.example.
+    \\@ IN DNSKEY 257 3 8 QUJDRA==
+    \\@ IN NSEC3PARAM 1 0 2 73616c74
+    \\www IN A 192.0.2.1
+    \\unsigned-sub IN NS ns.unsigned-sub.example.
+    \\65fkkv52vjbvs8mj22eis3lq4enpnpcf IN NSEC3 1 1 2 73616c74 ermpp7q2mj4h4amfotejjmbehlb6k56g A RRSIG
+    \\ermpp7q2mj4h4amfotejjmbehlb6k56g IN NSEC3 1 1 2 73616c74 65fkkv52vjbvs8mj22eis3lq4enpnpcf SOA NS DNSKEY RRSIG
+    \\65fkkv52vjbvs8mj22eis3lq4enpnpcf IN RRSIG NSEC3 8 2 3600 2000000000 1000000000 1234 example. QUJD
+    \\ermpp7q2mj4h4amfotejjmbehlb6k56g IN RRSIG NSEC3 8 1 3600 2000000000 1000000000 1234 example. QUJD
+    \\
+;
+
+/// The same chain with the Opt-Out flag clear: an NSEC3 without the flag
+/// covers no unsigned delegation (RFC 5155 section 3.1.2.1), so the chain
+/// denies the delegation instead of covering it and cannot prove the DS
+/// NODATA (RFC 5155 section 6).
+const nsec3_optout_clear_test_zone =
+    \\$ORIGIN example.
+    \\$TTL 3600
+    \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+    \\@ IN NS ns.example.
+    \\@ IN DNSKEY 257 3 8 QUJDRA==
+    \\@ IN NSEC3PARAM 1 0 2 73616c74
+    \\www IN A 192.0.2.1
+    \\unsigned-sub IN NS ns.unsigned-sub.example.
+    \\65fkkv52vjbvs8mj22eis3lq4enpnpcf IN NSEC3 1 0 2 73616c74 ermpp7q2mj4h4amfotejjmbehlb6k56g A RRSIG
+    \\ermpp7q2mj4h4amfotejjmbehlb6k56g IN NSEC3 1 0 2 73616c74 65fkkv52vjbvs8mj22eis3lq4enpnpcf SOA NS DNSKEY RRSIG
+    \\65fkkv52vjbvs8mj22eis3lq4enpnpcf IN RRSIG NSEC3 8 2 3600 2000000000 1000000000 1234 example. QUJD
+    \\ermpp7q2mj4h4amfotejjmbehlb6k56g IN RRSIG NSEC3 8 1 3600 2000000000 1000000000 1234 example. QUJD
+    \\
+;
+
 /// The NSEC3 hashes of the zone above, as the hashlib oracle computed them.
 const nsec3_apex_hash = [_]u8{ 0x76, 0xed, 0x9c, 0x9f, 0x42, 0xb4, 0xc9, 0x12, 0x2a, 0xcf, 0xc7, 0x5d, 0x39, 0xd9, 0x6e, 0x8d, 0x56, 0x6a, 0x14, 0xd0 };
 const nsec3_www_hash = [_]u8{ 0x31, 0x5f, 0x4a, 0x7c, 0xa2, 0xfc, 0xd7, 0xfe, 0x22, 0xd3, 0x10, 0x9d, 0x2e, 0x0e, 0xba, 0x23, 0xaf, 0x9b, 0xe5, 0x8f };
 const nsec3_missing_hash = [_]u8{ 0x52, 0xda, 0xc1, 0x03, 0x1c, 0x8a, 0xc4, 0x10, 0x94, 0x25, 0x7e, 0x33, 0xd2, 0x97, 0xb3, 0x00, 0x63, 0x65, 0xfb, 0x50 };
 const nsec3_wildcard_hash = [_]u8{ 0xb4, 0xc5, 0x24, 0xc6, 0x3b, 0x0b, 0xb8, 0x29, 0x83, 0xc1, 0xc5, 0xd2, 0xb8, 0xc3, 0xed, 0xa3, 0xb3, 0x74, 0xf2, 0x14 };
+const nsec3_unsigned_sub_hash = [_]u8{ 0x61, 0xb9, 0xf0, 0x9a, 0xcd, 0x45, 0x1c, 0x93, 0x07, 0xf7, 0x77, 0xb1, 0xb8, 0x67, 0x9a, 0xc1, 0x58, 0x83, 0xe0, 0xc4 };
 
 /// The next hashed owner name an NSEC3 record names.
 fn servedNextHash(record: dns_record.ResourceRecord) ?[20]u8 {
@@ -1675,6 +1756,16 @@ fn servedNsec3Bitmap(record: dns_record.ResourceRecord) ?[]const u8 {
     };
     const rdata = dns_validate.parseNsec3Rdata(raw) orelse return null;
     return rdata.bitmap;
+}
+
+/// The Opt-Out flag of a served NSEC3 record (RFC 5155 section 3.1.2.1).
+fn servedNsec3OptOut(record: dns_record.ResourceRecord) bool {
+    const raw = switch (record.rdata) {
+        .Unknown => |*unknown| unknown.bytes(),
+        else => return false,
+    };
+    const rdata = dns_validate.parseNsec3Rdata(raw) orelse return false;
+    return (rdata.flags & dns_validate.nsec3_opt_out) != 0;
 }
 
 test "an NSEC3 zone proves NODATA with the NSEC3 that matches the name (RFC 5155 7.2.3)" {
@@ -1895,6 +1986,67 @@ test "an NSEC3 chain that does not cover the name is refused, not proved wrongly
     const response = try buildResponse(try testDoQuery(arena.allocator(), 0x4474, "www.example.", .MX, true), &zone);
     try std.testing.expectEqual(header.Rcode.servfail, response.header.rcode);
     try std.testing.expectEqual(@as(u16, 0), response.header.authority_count);
+}
+
+test "a DS query against an Opt-Out chain is answered with the closest provable encloser proof (RFC 5155 7.2.4)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(nsec3_optout_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    // The delegation is unsigned and the chain holds no NSEC3 for it, so the
+    // answer is a NODATA proved by the Opt-Out span that covers it.
+    const response = try buildResponse(try testDoQuery(arena.allocator(), 0x4480, "unsigned-sub.example.", .DS, true), &zone);
+    try std.testing.expectEqual(header.Rcode.no_error, response.header.rcode);
+
+    // The closest provable encloser is the apex, proved by the NSEC3 that
+    // matches it (RFC 5155 section 7.2.1).
+    const encloser = servedNsec3Match(&response, nsec3_apex_hash) orelse return error.TestExpectedEqual;
+    try std.testing.expect(encloser.rrtype.eql(.NSEC3));
+    // The next closer "unsigned-sub.example." is covered by the NSEC3 whose
+    // Opt-Out flag the section 7.2.4 proof requires.
+    const cover = servedNsec3Cover(&response, nsec3_unsigned_sub_hash) orelse return error.TestExpectedEqual;
+    try std.testing.expect(servedNsec3OptOut(cover));
+    // The chain never claims the delegation itself exists.
+    try std.testing.expect(servedNsec3Match(&response, nsec3_unsigned_sub_hash) == null);
+
+    // Every proof record rides with the RRSIG that covers it.
+    try expectNsec3ProofsSigned(&response);
+}
+
+test "a DS NODATA in a chain without the Opt-Out flag is refused, not proved wrongly" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(nsec3_optout_clear_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    const response = try buildResponse(try testDoQuery(arena.allocator(), 0x4481, "unsigned-sub.example.", .DS, true), &zone);
+    // RFC 5155 section 7.2.4: the proof needs the NSEC3 that covers the next
+    // closer to carry the Opt-Out flag, so a chain without one proves nothing.
+    try std.testing.expectEqual(header.Rcode.servfail, response.header.rcode);
+    try std.testing.expectEqual(@as(u16, 0), response.header.authority_count);
+}
+
+test "a DS NODATA at a name the chain holds keeps the matching NSEC3 proof (RFC 5155 7.2.4)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(nsec3_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    const response = try buildResponse(try testDoQuery(arena.allocator(), 0x4482, "www.example.", .DS, true), &zone);
+    try std.testing.expectEqual(header.Rcode.no_error, response.header.rcode);
+    // The chain holds the name, so the proof is the NSEC3 that matches it.
+    const proof = servedNsec3Match(&response, nsec3_www_hash) orelse return error.TestExpectedEqual;
+    try std.testing.expect(proof.rrtype.eql(.NSEC3));
+
+    // Every proof record rides with the RRSIG that covers it.
+    try expectNsec3ProofsSigned(&response);
 }
 
 test "a zone without an NSEC3 chain keeps its NSEC denial proof" {
@@ -2475,7 +2627,7 @@ test "RFC 9660: a ZONEVERSION request is answered with the responding zone's SOA
     // 3.2 names them, and the referral reports the referring zone's version.
     for ([_][]const u8{ "www.example.com.", "missing.example.com.", "www.child.example.com." }) |name_text| {
         const request = try testOptionsQuery(arena.allocator(), name_text, .A, &request_options);
-        const response = try buildResponseWithPolicy(request, &zone, .{}, null);
+        const response = try buildResponseWithPolicy(request, &zone, .{}, null, false);
         const option = ednsOptions(&response) orelse return error.TestExpectedEqual;
         try std.testing.expectEqualSlices(u8, &expected, dns_rdata.findOption(option, dns_rdata.EDNS_ZONEVERSION_OPTION_CODE).?);
     }
@@ -2499,7 +2651,7 @@ test "RFC 9660: a ZONEVERSION request is never answered unless it was asked for"
     const declined = try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &.{
         .{ .code = dns_rdata.EDNS_ZONEVERSION_OPTION_CODE, .data = &.{} },
     });
-    const declined_response = try buildResponseWithPolicy(declined, &zone, .{ .zoneversion = false }, null);
+    const declined_response = try buildResponseWithPolicy(declined, &zone, .{ .zoneversion = false }, null, false);
     const declined_options = ednsOptions(&declined_response) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(usize, 0), declined_options.len);
 }
@@ -2608,6 +2760,81 @@ test "RFC 7314 section 2: a malformed EXPIRE query is answered FORMERR" {
     try std.testing.expectEqual(header.Rcode.no_error, ok.header.rcode);
 }
 
+test "RFC 7828 section 3.3.2: a TCP query with the keepalive option is answered with the server's idle timeout" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(zoneversion_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    const request_options = [_]TestOption{.{
+        .code = dns_rdata.EDNS_TCP_KEEPALIVE_OPTION_CODE,
+        .data = &.{},
+    }};
+    const request = try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &request_options);
+    const response = try buildResponseWithPolicy(request, &zone, .{}, null, true);
+    const options = ednsOptions(&response) orelse return error.TestExpectedEqual;
+    // Section 3.1: the option carries the idle timeout in units of 100
+    // milliseconds, so five seconds is 50, in network byte order.
+    try std.testing.expectEqualSlices(u8, &.{ 0, 50 }, dns_rdata.findOption(options, dns_rdata.EDNS_TCP_KEEPALIVE_OPTION_CODE).?);
+    // The framing is the code, the length, and the timeout, and nothing else.
+    try std.testing.expectEqualSlices(u8, &.{ 0, 11, 0, 2, 0, 50 }, options);
+}
+
+test "RFC 7828 section 3.3.1: the keepalive option is answered only on a TCP session" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(zoneversion_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    const request_options = [_]TestOption{.{
+        .code = dns_rdata.EDNS_TCP_KEEPALIVE_OPTION_CODE,
+        .data = &.{},
+    }};
+    // Section 3.3.1: a server that receives the option in a UDP query ignores
+    // it, so the answer carries no such option.
+    const request = try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &request_options);
+    const response = try buildResponseWithPolicy(request, &zone, .{}, null, false);
+    const options = ednsOptions(&response) orelse return error.TestExpectedEqual;
+    try std.testing.expect(dns_rdata.findOption(options, dns_rdata.EDNS_TCP_KEEPALIVE_OPTION_CODE) == null);
+}
+
+test "RFC 7828 section 3.3.2: a query without the keepalive option is answered with none" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(zoneversion_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    const request = try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &.{});
+    const response = try buildResponseWithPolicy(request, &zone, .{}, null, true);
+    const options = ednsOptions(&response) orelse return error.TestExpectedEqual;
+    try std.testing.expect(dns_rdata.findOption(options, dns_rdata.EDNS_TCP_KEEPALIVE_OPTION_CODE) == null);
+}
+
+test "RFC 7828 section 3.2.1: a malformed keepalive query is answered FORMERR" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(zoneversion_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    // Section 3.2.1: the query form of the option is empty, so a query that
+    // carries a timeout in it is malformed and is answered FORMERR.
+    const payload_in_query = [_]TestOption{.{
+        .code = dns_rdata.EDNS_TCP_KEEPALIVE_OPTION_CODE,
+        .data = &.{ 0x00, 0x32 },
+    }};
+    const response = try buildResponseWithPolicy(try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &payload_in_query), &zone, .{}, null, true);
+    try std.testing.expectEqual(header.Rcode.formerr, response.header.rcode);
+    try std.testing.expectEqual(@as(usize, 0), response.answers.len);
+}
+
 test "RFC 5001: NSID is echoed only when configured and only when requested" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2619,12 +2846,12 @@ test "RFC 5001: NSID is echoed only when configured and only when requested" {
     const nsid = [_]TestOption{.{ .code = dns_rdata.EDNS_NSID_OPTION_CODE, .data = &.{} }};
     const policy = AnswerPolicy{ .nsid = "ns1.example.com." };
 
-    const answered = try buildResponseWithPolicy(try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &nsid), &zone, policy, null);
+    const answered = try buildResponseWithPolicy(try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &nsid), &zone, policy, null, false);
     const answered_options = ednsOptions(&answered) orelse return error.TestExpectedEqual;
     try std.testing.expectEqualSlices(u8, policy.nsid.?, dns_rdata.findOption(answered_options, dns_rdata.EDNS_NSID_OPTION_CODE).?);
 
     // Section 2.2: the option is never sent to a resolver that did not ask.
-    const unsolicited = try buildResponseWithPolicy(try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &.{}), &zone, policy, null);
+    const unsolicited = try buildResponseWithPolicy(try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &.{}), &zone, policy, null, false);
     const unsolicited_options = ednsOptions(&unsolicited) orelse return error.TestExpectedEqual;
     try std.testing.expect(dns_rdata.findOption(unsolicited_options, dns_rdata.EDNS_NSID_OPTION_CODE) == null);
 
@@ -2636,7 +2863,7 @@ test "RFC 5001: NSID is echoed only when configured and only when requested" {
     // Section 2.2: NSID payload data in a query is ignored, and answering with
     // the server's own identifier is what the option's presence asked for.
     const with_payload = [_]TestOption{.{ .code = dns_rdata.EDNS_NSID_OPTION_CODE, .data = &.{ 0xde, 0xad } }};
-    const ignored = try buildResponseWithPolicy(try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &with_payload), &zone, policy, null);
+    const ignored = try buildResponseWithPolicy(try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &with_payload), &zone, policy, null, false);
     const ignored_options = ednsOptions(&ignored) orelse return error.TestExpectedEqual;
     try std.testing.expectEqualSlices(u8, policy.nsid.?, dns_rdata.findOption(ignored_options, dns_rdata.EDNS_NSID_OPTION_CODE).?);
 }
@@ -2656,7 +2883,7 @@ test "RFC 5001: a repeated NSID request is answered with one identifier, not an 
         .{ .code = dns_rdata.EDNS_NSID_OPTION_CODE, .data = &.{} },
     };
     const policy = AnswerPolicy{ .nsid = "ns1.example.com." };
-    const response = try buildResponseWithPolicy(try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &repeated), &zone, policy, null);
+    const response = try buildResponseWithPolicy(try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &repeated), &zone, policy, null, false);
     try std.testing.expectEqual(header.Rcode.no_error, response.header.rcode);
     const options = ednsOptions(&response) orelse return error.TestExpectedEqual;
     try std.testing.expectEqualSlices(u8, policy.nsid.?, dns_rdata.findOption(options, dns_rdata.EDNS_NSID_OPTION_CODE).?);
@@ -2674,7 +2901,7 @@ test "RFC 8145 section 4.3: a responder never answers with the edns-key-tag opti
     defer zone.deinit();
 
     const key_tag = [_]TestOption{.{ .code = dns_rdata.EDNS_KEY_TAG_OPTION_CODE, .data = &.{ 0x4a, 0x4c } }};
-    const response = try buildResponseWithPolicy(try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &key_tag), &zone, .{ .nsid = "ns1" }, null);
+    const response = try buildResponseWithPolicy(try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &key_tag), &zone, .{ .nsid = "ns1" }, null, false);
     const options = ednsOptions(&response) orelse return error.TestExpectedEqual;
     try std.testing.expect(dns_rdata.findOption(options, dns_rdata.EDNS_KEY_TAG_OPTION_CODE) == null);
     // Section 4.3 forbids the answer outright, and RFC 5001 section 2.2 means
@@ -2866,7 +3093,7 @@ test "RFC 8482: a configured TTL reaches the synthesized HINFO" {
     var zone = try zone_index.Zone.fromZoneFile(&zone_file);
     defer zone.deinit();
 
-    const configured = try buildResponseWithPolicy(try testQuery(arena.allocator(), "dns.home.arpa.", .ANY), &zone, .{ .minimal_any_ttl = 300 }, null);
+    const configured = try buildResponseWithPolicy(try testQuery(arena.allocator(), "dns.home.arpa.", .ANY), &zone, .{ .minimal_any_ttl = 300 }, null, false);
     try std.testing.expectEqual(@as(u32, 300), configured.answers.items[0].ttl);
 
     const default = try buildResponse(try testQuery(arena.allocator(), "dns.home.arpa.", .ANY), &zone);
@@ -2901,7 +3128,7 @@ test "RFC 8482: a DO=1 ANY query on a signed zone answers the HINFO with a valid
     defer session.deinit();
 
     const query = try testDoQuery(arena.allocator(), 0x4a02, "www.example.", .ANY, true);
-    const answer = try buildResponseWithPolicy(query, &zone, .{}, &session);
+    const answer = try buildResponseWithPolicy(query, &zone, .{}, &session, false);
 
     // Section 4.2: the synthesized HINFO, and -- because the zone is signed
     // and the query set DO=1 -- a valid RRSIG for the RRsets in the answer.
@@ -2936,7 +3163,7 @@ test "RFC 8482: a DO=1 ANY query on a signed zone answers the HINFO with a valid
     // Without DO the answer carries no RRSIG, the rule the rest of the
     // authoritative path follows.
     const plain_query = try testDoQuery(arena.allocator(), 0x4a03, "www.example.", .ANY, false);
-    const plain_answer = try buildResponseWithPolicy(plain_query, &zone, .{}, &session);
+    const plain_answer = try buildResponseWithPolicy(plain_query, &zone, .{}, &session, false);
     try std.testing.expectEqual(@as(u16, 1), plain_answer.header.answer_count);
     try std.testing.expect(plain_answer.answers.items[0].rrtype.eql(hinfo_type));
 }
@@ -2961,7 +3188,7 @@ test "RFC 8482: an unsigned zone answers the HINFO with no RRSIG" {
     // A zone that is not signed has no key to sign with, so the answer is the
     // synthesized HINFO alone.
     const query = try testDoQuery(arena.allocator(), 0x4a04, "www.example.", .ANY, true);
-    const answer = try buildResponseWithPolicy(query, &zone, .{}, null);
+    const answer = try buildResponseWithPolicy(query, &zone, .{}, null, false);
     try std.testing.expectEqual(@as(u16, 1), answer.header.answer_count);
     try std.testing.expect(answer.answers.items[0].rrtype.eql(hinfo_type));
 }

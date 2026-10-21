@@ -532,14 +532,6 @@ pub const AggressiveCache = struct {
         return null;
     }
 
-    fn spanCovers(self: *const AggressiveCache, name: Name) bool {
-        for (&self.entries) |*entry| {
-            if (!entry.valid or entry.is_nsec3) continue;
-            if (nsecCovers(entry.owner, entry.next, name)) return true;
-        }
-        return false;
-    }
-
     /// The cached NSEC whose span covers the name, which is the proof that
     /// the name does not exist.
     fn findCovering(self: *const AggressiveCache, name: Name) ?*const Entry {

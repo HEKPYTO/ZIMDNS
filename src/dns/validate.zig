@@ -1195,7 +1195,7 @@ const Validator = struct {
 };
 
 /// RFC 5155 section 3, Flags: the Opt-Out bit on an NSEC3 RR.
-const nsec3_opt_out: u8 = 0x01;
+pub const nsec3_opt_out: u8 = 0x01;
 
 /// True when the Authority section holds a delegation: an NS RRset with no
 /// SOA, which is what distinguishes a referral from a name error.
