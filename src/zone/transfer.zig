@@ -358,7 +358,7 @@ pub fn buildIxfrIncrementalMessages(
         const records = journal_mod.decodeRecords(allocator, delta.text) catch return Error.BadTransferQuery;
         defer allocator.free(records);
         for (records) |record| {
-            const converted = toDeltaResourceRecord(record) catch return Error.BadZoneRecord;
+            const converted = journal_mod.toResourceRecord(record) catch return Error.BadZoneRecord;
             message.answers.append(converted) catch return Error.BadTransferQuery;
         }
         next = delta.to_serial;
@@ -367,18 +367,6 @@ pub fn buildIxfrIncrementalMessages(
     message.answers.append(closing_soa) catch return Error.BadTransferQuery;
     try setHeaderCounts(&message);
     return message;
-}
-
-/// Builds one record of a difference sequence into the answer.
-fn toDeltaResourceRecord(record: journal_mod.DeltaRecord) Error!dns_record.ResourceRecord {
-    const rrtype = dns_types.RecordType.fromCode(record.rrtype_code);
-    return .{
-        .owner = dns_name.Name.fromText(record.owner) catch return Error.BadZoneRecord,
-        .rrtype = rrtype,
-        .class = dns_types.Class.IN,
-        .ttl = record.ttl,
-        .rdata = zone_parser.parseRData(rrtype, record.rdata) catch return Error.BadZoneRecord,
-    };
 }
 
 /// Extracts the sender's serial from a NOTIFY request: the SOA the master

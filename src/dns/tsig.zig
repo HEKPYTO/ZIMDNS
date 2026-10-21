@@ -182,11 +182,14 @@ pub fn sign(
     if (found == null and std.mem.readInt(u16, packet[0..2], .big) != tsig.original_id) {
         return Error.InvalidOriginalId;
     }
-    return standardMac(packet, found, key, owner, tsig, prior_mac, true);
+    const full = try standardMac(packet, found, key, owner, tsig, prior_mac, true);
+    // RFC 8945 section 4.2: the MAC field holds the keyed hash truncated to
+    // the MAC Size of the record.
+    return truncate(full, @min(@as(usize, tsig.mac_len), full.slice().len));
 }
 
 /// Verifies the final TSIG record of a request. The MAC is compared against
-/// the truncated prefix of the computed digest in constant time, and
+/// the truncated prefix of the computed keyed hash in constant time, and
 /// `minimum_mac_len` is the local truncation policy floor: a shorter MAC is
 /// rejected with BadTrunc (RFC 8945 sections 4.2, 5.2.2.1, and 5.2.4).
 pub fn verify(
@@ -198,20 +201,23 @@ pub fn verify(
     const found = parseFinalAdditional(packet) catch return Error.Formerr;
     const final = found orelse return Error.Formerr;
     const algorithm = try algorithmForName(&final.tsig.algorithm);
-    const expected = try standardMac(packet, final, key, final.owner, final.tsig, prior_mac, true);
+    const full = try standardMac(packet, final, key, final.owner, final.tsig, prior_mac, true);
     const received = final.tsig.macBytes();
-    // RFC 8945 section 5.2.2.1: a MAC longer than the keyed hash output, or
-    // shorter than the larger of 10 octets and half the hash length, is a
-    // format error. The output of the algorithm is its MAC length, which a
-    // truncated name shortens.
-    if (received.len > expected.slice().len) return Error.Formerr;
+    // RFC 8945 section 5.2.2.1 case 1: a MAC longer than the keyed hash
+    // output is a format error. The bound is the output of the hash function
+    // in use, which the truncated names of RFC 4868 section 2.6 keep.
+    if (received.len > full.slice().len) return Error.Formerr;
+    // Case 3: a MAC shorter than the larger of 10 octets and half the hash
+    // length is a format error.
     const protocol_minimum = @max(@as(usize, 10), hashLength(algorithm) / 2);
     if (received.len == 0 or received.len < protocol_minimum) return Error.Formerr;
-    if (std.crypto.timing_safe.compare(u8, received, expected.slice()[0..received.len], .big) != .eq) {
+    // Case 4: the computed MAC is truncated to the size the peer sent and
+    // only the truncated values are compared.
+    if (std.crypto.timing_safe.compare(u8, received, full.slice()[0..received.len], .big) != .eq) {
         return Error.BadMac;
     }
     if (received.len < minimum_mac_len) return Error.BadTrunc;
-    return expected;
+    return truncate(full, digestLength(algorithm));
 }
 
 pub fn signChained(
@@ -220,7 +226,8 @@ pub fn signChained(
     tsig: Tsig,
     prior_mac: []const u8,
 ) Error!Mac {
-    return chainedMac(packets, null, key, tsig, prior_mac);
+    const full = try chainedMac(packets, null, key, tsig, prior_mac);
+    return truncate(full, @min(@as(usize, tsig.mac_len), full.slice().len));
 }
 
 pub fn verifyChained(
@@ -234,16 +241,18 @@ pub fn verifyChained(
     const found = parseFinalAdditional(packet) catch return Error.Formerr;
     const final = found orelse return Error.Formerr;
     const algorithm = try algorithmForName(&final.tsig.algorithm);
-    const expected = try chainedMac(packets, final, key, final.tsig, prior_mac);
+    const full = try chainedMac(packets, final, key, final.tsig, prior_mac);
     const received = final.tsig.macBytes();
-    if (received.len > expected.slice().len) return Error.Formerr;
+    // RFC 8945 section 5.2.2.1 case 1: a MAC longer than the keyed hash
+    // output is a format error.
+    if (received.len > full.slice().len) return Error.Formerr;
     const protocol_minimum = @max(@as(usize, 10), hashLength(algorithm) / 2);
     if (received.len == 0 or received.len < protocol_minimum) return Error.Formerr;
-    if (std.crypto.timing_safe.compare(u8, received, expected.slice()[0..received.len], .big) != .eq) {
+    if (std.crypto.timing_safe.compare(u8, received, full.slice()[0..received.len], .big) != .eq) {
         return Error.BadMac;
     }
     if (received.len < minimum_mac_len) return Error.BadTrunc;
-    return expected;
+    return truncate(full, digestLength(algorithm));
 }
 
 /// Signs one already-encoded transfer message that carries its own zeroed
@@ -258,7 +267,13 @@ pub fn signChainedFinal(
     tsig: Tsig,
     prior_mac: []const u8,
 ) Error!Mac {
-    return chainedMac(&.{packet}, final, key, tsig, prior_mac);
+    const full = try chainedMac(&.{packet}, final, key, tsig, prior_mac);
+    return truncate(full, @min(@as(usize, tsig.mac_len), full.slice().len));
+}
+
+/// The first `len` octets of a keyed hash.
+fn truncate(mac: Mac, len: usize) Mac {
+    return .{ .bytes = mac.bytes, .len = @intCast(len) };
 }
 
 /// The MAC length of each algorithm: the keyed hash output of the full
@@ -277,8 +292,9 @@ pub fn digestLength(algorithm: Algorithm) usize {
 }
 
 /// The keyed hash output length of the hash function behind each algorithm:
-/// the secret floor of RFC 8945 section 8, and the RFC 4868 section 2.6 key
-/// length, which the truncated names keep.
+/// the secret floor of RFC 8945 section 8, the RFC 4868 section 2.6 key
+/// length, which the truncated names keep, and the bound of the MAC size
+/// (RFC 8945 section 5.2.2.1 case 1).
 pub fn hashLength(algorithm: Algorithm) usize {
     return switch (algorithm) {
         .hmac_sha1 => 20,
@@ -296,7 +312,8 @@ pub fn hashLength(algorithm: Algorithm) usize {
 /// floor, SHA-256-128). The other HMAC-SHA algorithms take the section
 /// 5.2.2.1 case 3 floor of half the keyed hash output, which is also the
 /// SHA-384-192 and SHA-512-256 truncation of RFC 4868. A truncated name takes
-/// the floor of the algorithm it truncates, which is its whole MAC.
+/// the floor of the algorithm it truncates, which is the length of its own
+/// MAC.
 pub fn minimumMacLength(algorithm: Algorithm) usize {
     return switch (algorithm) {
         .hmac_sha1 => 12,
@@ -324,13 +341,12 @@ fn standardMac(
     replace_id: bool,
 ) Error!Mac {
     const algorithm = try algorithmForName(&tsig.algorithm);
-    const mac_len = digestLength(algorithm);
     return switch (algorithm) {
-        .hmac_sha1 => standardMacWith(std.crypto.auth.hmac.HmacSha1, packet, final, key, owner, tsig, prior_mac, replace_id, mac_len),
-        .hmac_sha224 => standardMacWith(std.crypto.auth.hmac.sha2.HmacSha224, packet, final, key, owner, tsig, prior_mac, replace_id, mac_len),
-        .hmac_sha256, .hmac_sha256_128 => standardMacWith(std.crypto.auth.hmac.sha2.HmacSha256, packet, final, key, owner, tsig, prior_mac, replace_id, mac_len),
-        .hmac_sha384, .hmac_sha384_192 => standardMacWith(std.crypto.auth.hmac.sha2.HmacSha384, packet, final, key, owner, tsig, prior_mac, replace_id, mac_len),
-        .hmac_sha512, .hmac_sha512_256 => standardMacWith(std.crypto.auth.hmac.sha2.HmacSha512, packet, final, key, owner, tsig, prior_mac, replace_id, mac_len),
+        .hmac_sha1 => standardMacWith(std.crypto.auth.hmac.HmacSha1, packet, final, key, owner, tsig, prior_mac, replace_id),
+        .hmac_sha224 => standardMacWith(std.crypto.auth.hmac.sha2.HmacSha224, packet, final, key, owner, tsig, prior_mac, replace_id),
+        .hmac_sha256, .hmac_sha256_128 => standardMacWith(std.crypto.auth.hmac.sha2.HmacSha256, packet, final, key, owner, tsig, prior_mac, replace_id),
+        .hmac_sha384, .hmac_sha384_192 => standardMacWith(std.crypto.auth.hmac.sha2.HmacSha384, packet, final, key, owner, tsig, prior_mac, replace_id),
+        .hmac_sha512, .hmac_sha512_256 => standardMacWith(std.crypto.auth.hmac.sha2.HmacSha512, packet, final, key, owner, tsig, prior_mac, replace_id),
     };
 }
 
@@ -343,7 +359,6 @@ fn standardMacWith(
     tsig: Tsig,
     prior_mac: ?[]const u8,
     replace_id: bool,
-    mac_len: usize,
 ) Error!Mac {
     var hmac = Hmac.init(key);
     try updatePrior(&hmac, prior_mac);
@@ -352,10 +367,8 @@ fn standardMacWith(
 
     var digest: [Hmac.mac_length]u8 = undefined;
     hmac.final(&digest);
-    // RFC 4868 section 2.3: a truncated name keeps the first octets of the
-    // keyed hash and discards the trailing ones.
-    var result = Mac{ .len = @intCast(mac_len) };
-    @memcpy(result.bytes[0..mac_len], digest[0..mac_len]);
+    var result = Mac{ .len = @intCast(Hmac.mac_length) };
+    @memcpy(result.bytes[0..Hmac.mac_length], &digest);
     return result;
 }
 
@@ -367,13 +380,12 @@ fn chainedMac(
     prior_mac: []const u8,
 ) Error!Mac {
     const algorithm = try algorithmForName(&tsig.algorithm);
-    const mac_len = digestLength(algorithm);
     return switch (algorithm) {
-        .hmac_sha1 => chainedMacWith(std.crypto.auth.hmac.HmacSha1, packets, final, key, tsig, prior_mac, mac_len),
-        .hmac_sha224 => chainedMacWith(std.crypto.auth.hmac.sha2.HmacSha224, packets, final, key, tsig, prior_mac, mac_len),
-        .hmac_sha256, .hmac_sha256_128 => chainedMacWith(std.crypto.auth.hmac.sha2.HmacSha256, packets, final, key, tsig, prior_mac, mac_len),
-        .hmac_sha384, .hmac_sha384_192 => chainedMacWith(std.crypto.auth.hmac.sha2.HmacSha384, packets, final, key, tsig, prior_mac, mac_len),
-        .hmac_sha512, .hmac_sha512_256 => chainedMacWith(std.crypto.auth.hmac.sha2.HmacSha512, packets, final, key, tsig, prior_mac, mac_len),
+        .hmac_sha1 => chainedMacWith(std.crypto.auth.hmac.HmacSha1, packets, final, key, tsig, prior_mac),
+        .hmac_sha224 => chainedMacWith(std.crypto.auth.hmac.sha2.HmacSha224, packets, final, key, tsig, prior_mac),
+        .hmac_sha256, .hmac_sha256_128 => chainedMacWith(std.crypto.auth.hmac.sha2.HmacSha256, packets, final, key, tsig, prior_mac),
+        .hmac_sha384, .hmac_sha384_192 => chainedMacWith(std.crypto.auth.hmac.sha2.HmacSha384, packets, final, key, tsig, prior_mac),
+        .hmac_sha512, .hmac_sha512_256 => chainedMacWith(std.crypto.auth.hmac.sha2.HmacSha512, packets, final, key, tsig, prior_mac),
     };
 }
 
@@ -384,7 +396,6 @@ fn chainedMacWith(
     key: []const u8,
     tsig: Tsig,
     prior_mac: []const u8,
-    mac_len: usize,
 ) Error!Mac {
     var hmac = Hmac.init(key);
     try updatePrior(&hmac, prior_mac);
@@ -399,8 +410,8 @@ fn chainedMacWith(
 
     var digest: [Hmac.mac_length]u8 = undefined;
     hmac.final(&digest);
-    var result = Mac{ .len = @intCast(mac_len) };
-    @memcpy(result.bytes[0..mac_len], digest[0..mac_len]);
+    var result = Mac{ .len = @intCast(Hmac.mac_length) };
+    @memcpy(result.bytes[0..Hmac.mac_length], &digest);
     return result;
 }
 
@@ -985,23 +996,56 @@ test "tsig verifies a request signed with a truncated algorithm name" {
         const verified = try verify(signed[0..writer.len()], "topsecret", null, minimumMacLength(case.algorithm));
         try std.testing.expectEqualSlices(u8, mac.slice(), verified.slice());
 
-        // RFC 8945 section 5.2.2.1: a MAC longer than the output of the
-        // algorithm, or shorter than half the hash length, is a format error.
-        var longer: [512]u8 = undefined;
-        var longer_writer = Writer.init(&longer);
-        try writeRequest(&longer_writer, case.name, case.mac_len + 1);
-        try std.testing.expectError(Error.Formerr, verify(
-            longer_writer.written(),
-            "topsecret",
-            null,
-            minimumMacLength(case.algorithm),
-        ));
-
+        // RFC 8945 section 5.2.2.1 case 3: a MAC shorter than half the hash
+        // length is a format error.
         var shorter: [512]u8 = undefined;
         var shorter_writer = Writer.init(&shorter);
         try writeRequest(&shorter_writer, case.name, case.mac_len - 1);
         try std.testing.expectError(Error.Formerr, verify(
             shorter_writer.written(),
+            "topsecret",
+            null,
+            minimumMacLength(case.algorithm),
+        ));
+    }
+}
+
+test "tsig verifies a truncated name whose MAC is longer than the algorithm's own length" {
+    const cases = [_]struct { name: []const u8, algorithm: Algorithm, mac_len: usize }{
+        .{ .name = "hmac-sha256-128.", .algorithm = .hmac_sha256_128, .mac_len = 20 },
+        .{ .name = "hmac-sha384-192.", .algorithm = .hmac_sha384_192, .mac_len = 28 },
+        .{ .name = "hmac-sha512-256.", .algorithm = .hmac_sha512_256, .mac_len = 36 },
+    };
+    for (cases) |case| {
+        var packet: [512]u8 = undefined;
+        var writer = Writer.init(&packet);
+        try writeRequest(&writer, case.name, case.mac_len);
+        const final = (try parseFinalAdditional(writer.written())).?;
+        const mac = try sign(writer.written(), "topsecret", final.owner, final.tsig, null);
+        try std.testing.expectEqual(case.mac_len, mac.slice().len);
+        try patchMac(packet[0..writer.len()], final, mac.slice());
+        // RFC 8945 section 5.2.2.1 case 4: the computed MAC is truncated to
+        // the size the peer sent and only the truncated values are compared.
+        // The truncated name names the hash function and its truncation, so
+        // the bound is the keyed hash output and not the truncation.
+        const verified = try verify(writer.written(), "topsecret", null, minimumMacLength(case.algorithm));
+        try std.testing.expectEqualSlices(u8, mac.slice()[0..verified.slice().len], verified.slice());
+    }
+}
+
+test "tsig refuses a MAC longer than the keyed hash output of a truncated name" {
+    const cases = [_]struct { name: []const u8, algorithm: Algorithm, mac_len: usize }{
+        .{ .name = "hmac-sha256-128.", .algorithm = .hmac_sha256_128, .mac_len = 33 },
+        .{ .name = "hmac-sha384-192.", .algorithm = .hmac_sha384_192, .mac_len = 49 },
+    };
+    for (cases) |case| {
+        var packet: [512]u8 = undefined;
+        var writer = Writer.init(&packet);
+        try writeRequest(&writer, case.name, case.mac_len);
+        // RFC 8945 section 5.2.2.1 case 1: a MAC longer than the keyed hash
+        // output is a format error.
+        try std.testing.expectError(Error.Formerr, verify(
+            writer.written(),
             "topsecret",
             null,
             minimumMacLength(case.algorithm),

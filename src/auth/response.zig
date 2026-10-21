@@ -64,9 +64,13 @@ pub fn truncateClassicUdpResponse(response_bytes: []const u8, output: []u8) Erro
     }
     if (response_bytes.len < 12 or output.len < 12) return Error.BadResponse;
 
+    // RFC 8914 section 3: a message that must be shortened drops its EDE
+    // option before any other data.
+    const shortened = shortenedOpt(response_bytes);
+
     // RFC 2181 section 9: data that is not required in the reply is omitted
     // when it does not fit, and the reply then carries no TC bit.
-    if (replyWithoutAdditionalSection(response_bytes, output, payload_limit, null)) |reply| return reply;
+    if (replyWithoutAdditionalSection(response_bytes, output, payload_limit, null, shortened)) |reply| return reply;
 
     var reader = @import("../dns/reader.zig").Reader.init(response_bytes);
     const parsed_header = header.Header.parse(&reader) catch return Error.BadResponse;
@@ -87,7 +91,7 @@ pub fn truncateClassicUdpResponse(response_bytes: []const u8, output: []u8) Erro
     std.mem.writeInt(u16, output[8..10], 0, .big);
     var writer = @import("../dns/writer.zig").Writer.init(output);
     writer.rewind(question_end);
-    if (findEdnsOpt(response_bytes)) |opt| {
+    if (shortened.record) |opt| {
         std.mem.writeInt(u16, output[10..12], 1, .big);
         opt.encode(&writer) catch return Error.ResponseTooLarge;
     } else {
@@ -109,10 +113,14 @@ pub fn truncateSignedClassicUdpResponse(response_bytes: []const u8, output: []u8
 
     const final = (@import("../dns/tsig.zig").parseFinalAdditional(response_bytes) catch return Error.BadResponse) orelse return Error.BadResponse;
 
+    // RFC 8914 section 3: a message that must be shortened drops its EDE
+    // option before any other data.
+    const shortened = shortenedOpt(response_bytes);
+
     // RFC 2181 section 9: data that is not required in the reply is omitted
     // when it does not fit, and the reply then carries no TC bit. The TSIG
     // stays: a signed message ends with it.
-    if (replyWithoutAdditionalSection(response_bytes, output, payload_limit, response_bytes[final.record_start..final.record_end])) |reply| return reply;
+    if (replyWithoutAdditionalSection(response_bytes, output, payload_limit, response_bytes[final.record_start..final.record_end], shortened)) |reply| return reply;
 
     var reader = @import("../dns/reader.zig").Reader.init(response_bytes);
     const parsed_header = header.Header.parse(&reader) catch return Error.BadResponse;
@@ -146,12 +154,13 @@ pub fn truncateSignedClassicUdpResponse(response_bytes: []const u8, output: []u8
 /// omitted and no TC bit. A referral keeps TC: RFC 9471 section 3.1 asks
 /// for it when the glue of an in-domain name server does not fit.
 /// `final_tsig` is the TSIG record a signed message ends with, which the
-/// signed path keeps.
+/// signed path keeps. `shortened` is the OPT record without its EDE option.
 fn replyWithoutAdditionalSection(
     response_bytes: []const u8,
     output: []u8,
     payload_limit: usize,
     final_tsig: ?[]const u8,
+    shortened: ShortenedOpt,
 ) ?[]const u8 {
     if (response_bytes.len < 12) return null;
     const flags = std.mem.readInt(u16, response_bytes[2..4], .big);
@@ -160,7 +169,7 @@ fn replyWithoutAdditionalSection(
     // RFC 6891 section 6.1.1: a response to a request that carried an OPT
     // record must carry one too, so the OPT stays and only the data records
     // of the additional section are dropped.
-    const opt = findEdnsOpt(response_bytes);
+    const opt = shortened.record;
     const opt_len: usize = if (opt) |record| ednsOptWireLength(record) else 0;
     const tsig_len: usize = if (final_tsig) |record| record.len else 0;
     const kept = opt_len + tsig_len;
@@ -179,7 +188,10 @@ fn replyWithoutAdditionalSection(
         @memcpy(output[offset..][0..record.len], record);
         offset += record.len;
     }
-    const reply_flags = std.mem.readInt(u16, output[2..4], .big) & ~header.Flags.tc;
+    var reply_flags = std.mem.readInt(u16, output[2..4], .big) & ~header.Flags.tc;
+    // RFC 8914 section 3: the truncation bit is set when an EDE option is
+    // dropped, so the client knows the message it holds is not the whole one.
+    if (shortened.dropped_ede) reply_flags |= header.Flags.tc;
     std.mem.writeInt(u16, output[2..4], reply_flags, .big);
     const additional_count: u16 = @intCast((if (opt != null) @as(u16, 1) else 0) +
         (if (final_tsig != null) @as(u16, 1) else 0));
@@ -195,6 +207,40 @@ fn ednsOptWireLength(record: dns_record.ResourceRecord) usize {
         else => 0,
     };
     return 11 + rdata_len;
+}
+
+/// The OPT record of a message that has to be shortened, without its EDE
+/// option, and whether the record carried one at all.
+const ShortenedOpt = struct {
+    record: ?dns_record.ResourceRecord,
+    dropped_ede: bool,
+};
+
+/// RFC 8914 section 3: "servers SHOULD truncate messages by dropping EDE
+/// options before dropping other data from packets". The OPT record itself
+/// stays: its extended RCODE, its DO bit, and its payload size are header
+/// fields of the record, not the option.
+fn shortenedOpt(response_bytes: []const u8) ShortenedOpt {
+    const record = findEdnsOpt(response_bytes) orelse return .{ .record = null, .dropped_ede = false };
+    const options = switch (record.rdata) {
+        .OPT => |*opt| opt.bytes(),
+        else => return .{ .record = record, .dropped_ede = false },
+    };
+    var kept = dns_rdata.Opt{};
+    var offset: usize = 0;
+    while (offset + 4 <= options.len) {
+        const code = std.mem.readInt(u16, options[offset..][0..2], .big);
+        const length = std.mem.readInt(u16, options[offset + 2 ..][0..2], .big);
+        if (length > options.len - offset - 4) break;
+        if (code != ede_option_code) _ = kept.appendOption(code, options[offset + 4 ..][0..length]);
+        offset += 4 + length;
+    }
+    var shortened = record;
+    shortened.rdata = .{ .OPT = kept };
+    return .{
+        .record = shortened,
+        .dropped_ede = ednsOptWireLength(shortened) != ednsOptWireLength(record),
+    };
 }
 
 /// The wire length of the header, the question, and the answer and authority
@@ -2505,6 +2551,218 @@ test "RFC 2181 section 9: the signed path omits the additional section the same 
     const resigned = try tsig.sign(reply, secret, reply_final.owner, reply_final.tsig, null);
     try tsig.patchMac(@constCast(reply), reply_final, resigned.slice());
     _ = try tsig.verify(reply, secret, null, tsig.minimumMacLength(.hmac_sha256));
+}
+
+/// The EDE option a message carries, or null when it carries none.
+fn edeOptionOf(message: *const dns_message.Message) ?[]const u8 {
+    const options = ednsOptions(message) orelse return null;
+    return dns_rdata.findOption(options, ede_option_code);
+}
+
+test "RFC 8914 section 3: a truncated answer drops its EDE option and sets TC" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var message = try truncationTestMessage(arena.allocator(), true, 40, 0, 0);
+    defer message.deinit();
+    message.edns = .{ .udp_payload_size = 512, .extended_rcode = 0, .version = 0, .dnssec_ok = true };
+    try appendOpt(&message);
+    appendEde(&message, EDE_BLOCKED, ede_blocked_text);
+    try setHeaderCounts(&message);
+
+    var encoded: [2048]u8 = undefined;
+    var writer = @import("../dns/writer.zig").Writer.init(&encoded);
+    try message.encode(&writer);
+    try std.testing.expect(writer.len() > CLASSIC_UDP_MESSAGE_SIZE);
+
+    var output: [2048]u8 = undefined;
+    const reply = try truncateClassicUdpResponse(writer.written(), &output);
+    const parsed = try dns_message.Message.parse(arena.allocator(), reply);
+
+    // The EDE option is the first thing a shortened message drops, and the
+    // TC bit says the message is not the whole one.
+    try std.testing.expect(parsed.header.truncated);
+    try std.testing.expect(edeOptionOf(&parsed) == null);
+    // The OPT record stays: the DO bit and the payload size are header
+    // fields of the record, not the option.
+    try std.testing.expect(parsed.edns != null);
+    try std.testing.expect(parsed.edns.?.dnssec_ok);
+    try std.testing.expectEqual(@as(u16, 512), parsed.edns.?.udp_payload_size);
+}
+
+test "RFC 8914 section 3: the answer and authority section survive the EDE drop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var message = try truncationTestMessage(arena.allocator(), true, 1, 1, 40);
+    defer message.deinit();
+    message.edns = .{ .udp_payload_size = 512, .extended_rcode = 0, .version = 0, .dnssec_ok = true };
+    try appendOpt(&message);
+    appendEde(&message, EDE_BLOCKED, ede_blocked_text);
+    try setHeaderCounts(&message);
+
+    var encoded: [2048]u8 = undefined;
+    var writer = @import("../dns/writer.zig").Writer.init(&encoded);
+    try message.encode(&writer);
+    try std.testing.expect(writer.len() > CLASSIC_UDP_MESSAGE_SIZE);
+
+    var output: [2048]u8 = undefined;
+    const reply = try truncateClassicUdpResponse(writer.written(), &output);
+    const parsed = try dns_message.Message.parse(arena.allocator(), reply);
+
+    // The answer and the authority section stay, the EDE option goes, and
+    // the TC bit says the message was shortened.
+    try std.testing.expect(parsed.header.truncated);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.answer_count);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.authority_count);
+    try std.testing.expect(edeOptionOf(&parsed) == null);
+    try std.testing.expect(parsed.edns.?.dnssec_ok);
+}
+
+test "RFC 8914 section 3: an answer that fits keeps its EDE option" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var message = try truncationTestMessage(arena.allocator(), true, 1, 1, 0);
+    defer message.deinit();
+    message.edns = .{ .udp_payload_size = 512, .extended_rcode = 0, .version = 0, .dnssec_ok = true };
+    try appendOpt(&message);
+    appendEde(&message, EDE_BLOCKED, ede_blocked_text);
+    try setHeaderCounts(&message);
+
+    var encoded: [512]u8 = undefined;
+    var writer = @import("../dns/writer.zig").Writer.init(&encoded);
+    try message.encode(&writer);
+
+    var output: [512]u8 = undefined;
+    const reply = try truncateClassicUdpResponse(writer.written(), &output);
+
+    // A message that fits goes out byte for byte, the EDE option and all.
+    try std.testing.expectEqualSlices(u8, writer.written(), reply);
+    const parsed = try dns_message.Message.parse(arena.allocator(), reply);
+    try std.testing.expect(!parsed.header.truncated);
+    try std.testing.expect(edeOptionOf(&parsed) != null);
+}
+
+test "RFC 8914 section 3: the signed path drops the EDE option the same way" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const tsig = @import("../dns/tsig.zig");
+
+    var message = try truncationTestMessage(arena.allocator(), true, 1, 1, 40);
+    defer message.deinit();
+    message.edns = .{ .udp_payload_size = 512, .extended_rcode = 0, .version = 0, .dnssec_ok = true };
+    try appendOpt(&message);
+    appendEde(&message, EDE_BLOCKED, ede_blocked_text);
+    var mac_bytes: [32]u8 = undefined;
+    @memset(&mac_bytes, 0);
+    try message.additionals.append(.{
+        .owner = try dns_name.Name.fromText("key."),
+        .rrtype = .TSIG,
+        .class = .ANY,
+        .ttl = 0,
+        .rdata = .{ .TSIG = try dns_rdata.Tsig.init(
+            try dns_name.Name.fromText("hmac-sha256."),
+            1_700_000_000,
+            300,
+            &mac_bytes,
+            0x1234,
+            0,
+            &.{},
+        ) },
+    });
+    try setHeaderCounts(&message);
+
+    var encoded: [2048]u8 = undefined;
+    var writer = @import("../dns/writer.zig").Writer.init(&encoded);
+    try message.encode(&writer);
+    const final = (try tsig.parseFinalAdditional(writer.written())).?;
+    const secret = "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=";
+    const signed = try tsig.sign(writer.written(), secret, final.owner, final.tsig, null);
+    try tsig.patchMac(encoded[0..writer.len()], final, signed.slice());
+
+    var output: [2048]u8 = undefined;
+    const reply = try truncateSignedClassicUdpResponse(writer.written(), &output);
+    const parsed = try dns_message.Message.parse(arena.allocator(), reply);
+
+    // The EDE option goes, the answer and the authority section stay, and
+    // the TSIG a signed message ends with stays.
+    try std.testing.expect(parsed.header.truncated);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.answer_count);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.authority_count);
+    try std.testing.expect(edeOptionOf(&parsed) == null);
+    try std.testing.expectEqual(@as(usize, 2), parsed.additionals.len);
+    try std.testing.expect(parsed.additionals.items[0].rrtype.eql(.OPT));
+    try std.testing.expect(parsed.additionals.items[1].rrtype.eql(.TSIG));
+
+    // The MAC is computed over the reply as it goes on the wire, so the
+    // caller recomputes it and the message still authenticates.
+    const reply_final = (try tsig.parseFinalAdditional(reply)).?;
+    const resigned = try tsig.sign(reply, secret, reply_final.owner, reply_final.tsig, null);
+    try tsig.patchMac(@constCast(reply), reply_final, resigned.slice());
+    _ = try tsig.verify(reply, secret, null, tsig.minimumMacLength(.hmac_sha256));
+}
+
+test "RFC 8914 section 3: the RRSIGs over the records that remain still verify" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+        \\@ IN NS ns.example.
+        \\ns IN A 192.0.2.1
+        \\www IN A 192.0.2.2
+        \\
+    );
+    defer zone_file.deinit();
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    var key = try zone_signer.parseKey("ed25519 DSSF3o0s0f+ElWzj9E/Osxw8hLpk55chkmx0LYN5WiY=\n");
+    defer key.deinit();
+    const dnskey_rdata = try key.dnskeyRdata(arena.allocator());
+    try zone_signer.signZone(arena.allocator(), &zone, &key, .{ .inception = 1_000_000_000, .expiration = 2_000_000_000 });
+
+    const query = try testDoQuery(arena.allocator(), 0x4a10, "www.example.", .A, true);
+    var answer = try buildResponse(query, &zone);
+    defer answer.deinit();
+    appendEde(&answer, EDE_BLOCKED, ede_blocked_text);
+    // The extra data of the additional section is what does not fit.
+    var index: usize = 0;
+    while (index < 100) : (index += 1) {
+        try answer.additionals.append(.{
+            .owner = try dns_name.Name.fromText("www.example."),
+            .rrtype = .A,
+            .class = .IN,
+            .ttl = 60,
+            .rdata = .{ .A = .{ 192, 0, 2, 3 } },
+        });
+    }
+    try setHeaderCounts(&answer);
+
+    var encoded: [4096]u8 = undefined;
+    var writer = @import("../dns/writer.zig").Writer.init(&encoded);
+    try answer.encode(&writer);
+    try std.testing.expect(writer.len() > answer.edns.?.udp_payload_size);
+
+    var output: [4096]u8 = undefined;
+    const reply = try truncateClassicUdpResponse(writer.written(), &output);
+    const truncated = try dns_message.Message.parse(arena.allocator(), reply);
+
+    // The answer keeps its A record and the RRSIG over it, and the EDE
+    // option is gone.
+    try std.testing.expectEqual(@as(u16, 2), truncated.header.answer_count);
+    try std.testing.expect(truncated.answers.items[1].rrtype.eql(.RRSIG));
+    try std.testing.expect(edeOptionOf(&truncated) == null);
+
+    // The signature over the record that remains still verifies: the
+    // truncation dropped an option, not a record.
+    var anchors = dns_validate.Anchors{};
+    anchors.items[0] = .{ .owner = try dns_name.Name.fromText("example."), .rrtype = .DNSKEY, .rdata = dnskey_rdata };
+    anchors.len = 1;
+    try std.testing.expectEqual(dns_validate.Status.secure, (try dns_validate.validate(arena.allocator(), &anchors, query, truncated, &.{}, 1_500_000_000)).status);
 }
 
 test "authoritative response ignores unknown EDNS options" {

@@ -805,15 +805,15 @@ fn dropOutOfDomainAdditionals(message: *dns_message.Message, query_name: []const
 /// RFC 5452 section 6: a referral's additional section is filtered too. The
 /// records a client needs from a referral are the glue of the delegation's
 /// own name servers (RFC 9471 section 3.1), so a record survives only when
-/// its owner is the target of an NS record of the authority section and that
-/// target sits inside the zone the delegation names. Every other record the
+/// the delegation the query is about names it as a target and that target
+/// sits inside the zone the delegation names. Every other record the
 /// upstream put there is dropped.
-fn filterReferralAdditionals(message: *dns_message.Message) void {
+fn filterReferralAdditionals(message: *dns_message.Message, query_name: []const u8) void {
     var write_index: usize = 0;
     var read_index: usize = 0;
     while (read_index < message.additionals.len) : (read_index += 1) {
         const record = message.additionals.items[read_index];
-        if (!isDelegationGlue(message, record)) continue;
+        if (!isDelegationGlue(message, record, query_name)) continue;
         message.additionals.items[write_index] = record;
         write_index += 1;
     }
@@ -821,12 +821,16 @@ fn filterReferralAdditionals(message: *dns_message.Message) void {
     message.header.additional_count = @intCast(write_index);
 }
 
-/// True when the record is the address of a name server the delegation
-/// names: its owner is the target of an NS record of the authority section,
-/// and that target is inside the zone the delegation names.
-fn isDelegationGlue(message: *const dns_message.Message, record: dns_record.ResourceRecord) bool {
+/// True when the record is the address of a name server the delegation the
+/// query is about names: its owner is the target of an NS record of the
+/// authority section, that NS record is in the domain of the query, and
+/// that target is inside the zone the delegation names.
+fn isDelegationGlue(message: *const dns_message.Message, record: dns_record.ResourceRecord, query_name: []const u8) bool {
     for (message.authorities.slice()) |authority| {
         if (!authority.rrtype.eql(dns_types.RecordType.NS)) continue;
+        // RFC 5452 section 6: only data in the domain of the query may be
+        // accepted, so a delegation the query is not about relays no glue.
+        if (!inDomainOf(authority.owner.asWire(), query_name)) continue;
         const target = authority.rdata.NS;
         if (!target.eql(&record.owner)) continue;
         if (!nameInZone(target, authority.owner)) continue;
@@ -1056,7 +1060,7 @@ pub const Resolver = struct {
         // loses everything else.
         if (query.question) |question| {
             if (isReferral(&response)) {
-                filterReferralAdditionals(&response);
+                filterReferralAdditionals(&response, question.name.asWire());
             } else {
                 dropOutOfDomainAdditionals(&response, question.name.asWire());
             }
@@ -1068,7 +1072,13 @@ pub const Resolver = struct {
         if (validated) {
             const result = try self.checkDnssec(query, response, @intCast(@max(now, 0)));
             switch (result.status) {
-                .secure => response.header.authenticated_data = true,
+                .secure => {
+                    // RFC 6147 section 5.5 item 1: with CD clear and DO
+                    // clear the vDNS64 must not set the AD bit, so only a
+                    // client that asked for the proofs is told the answer
+                    // is authentic.
+                    if (wantsDnssecProofs(query)) response.header.authenticated_data = true;
+                },
                 // RFC 4035 section 5.5: a response that fails validation MUST
                 // not be returned, and the client gets SERVFAIL carrying the
                 // RFC 8914 INFO-CODE that says why. `wantsDnssecProofs` is
@@ -1149,13 +1159,14 @@ pub const Resolver = struct {
     }
 
     /// True when this response is one this server validates itself: a
-    /// configured trust anchor, a client that asked for the proofs (DO=1), and
-    /// no CD. DO gates validation because the forwarder relays the client's
-    /// DO bit upstream unchanged, so a query without DO never carries RRSIGs
-    /// back and there would be nothing to check. Failing closed there is what
-    /// keeps a plain query from being answered SERVFAIL: AD is simply not set.
+    /// configured trust anchor and no CD. The DO bit does not gate
+    /// validation: the upstream request always carries DO=1 (RFC 3225
+    /// section 3), so the answer holds the records to check whatever the
+    /// client asked for. RFC 6147 section 5.5 wants the validation done
+    /// with or without DO, because skipping it would let an attacker use
+    /// DNS64 to circumvent DNSSEC.
     fn validating(self: *const Resolver, query: dns_message.Message) bool {
-        return self.policy.anchors.len != 0 and wantsDnssecProofs(query);
+        return self.policy.anchors.len != 0 and !query.header.checking_disabled;
     }
 
     fn checkDnssec(self: *Resolver, query: dns_message.Message, response: dns_message.Message, now: u32) validate.Error!validate.Result {
@@ -1705,6 +1716,9 @@ fn selectPrefix(policy: *const Policy, address: [4]u8) ?config.Nat64Prefix {
     var chosen_len: u8 = 0;
     for (policy.nat64_prefixes.items[0..policy.nat64_prefixes.len]) |candidate| {
         if (!candidate.range.containsIpv4(address)) continue;
+        // RFC 6052 section 3.1: the Well-Known Prefix must not represent a
+        // non-global IPv4 address, so it never serves one.
+        if (!candidate.represents(address)) continue;
         if (chosen == null or candidate.range.prefix > chosen_len) {
             chosen = candidate;
             chosen_len = candidate.range.prefix;
@@ -4427,7 +4441,7 @@ test "RFC 6147: an empty AAAA answer is answered with an AAAA synthesized from t
     // the /96 prefix.
     try std.testing.expectEqualSlices(u8, &.{
         0x00, 0x64, 0xff, 0x9b, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x02, 0x21,
+        0x00, 0x00, 0x00, 0x00, 0x5d, 0xb8, 0xd8, 0x22,
     }, &response.answers.items[0].rdata.AAAA);
     // RFC 6147 section 5.1.7: the TTL is the A record's TTL.
     try std.testing.expectEqual(@as(u32, 300), response.answers.items[0].ttl);
@@ -4440,6 +4454,51 @@ test "RFC 6147: an empty AAAA answer is answered with an AAAA synthesized from t
     // nor DNSSEC-secure.
     try std.testing.expect(!response.header.authoritative);
     try std.testing.expect(!response.header.authenticated_data);
+    // The upstream saw the AAAA query and the A query that followed it.
+    try std.testing.expectEqual(@as(usize, 2), upstream.requests);
+}
+
+test "RFC 6052 section 3.1: the well-known prefix does not represent a non-global address" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    // The A record holds an address of the RFC 1918 private range, which the
+    // Well-Known Prefix must not represent.
+    const a_records = [_]dns_record.ResourceRecord{dns64TestPrivateARecord("private.example.")};
+    const soa_records = [_]dns_record.ResourceRecord{dns64TestSoaRecord("example.")};
+    var upstream = Dns64Upstream{
+        .io = io,
+        .udp = &upstream_socket,
+        .a = &a_records,
+        .soa = &soa_records,
+    };
+    const thread = try std.Thread.spawn(.{}, serveDns64Upstream, .{&upstream});
+
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = upstream_socket.address },
+        .nat64_prefixes = .init(&.{try config.Nat64Prefix.parse("64:ff9b::/96")}),
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x290f, "private.example.", false);
+    defer query.deinit();
+    query.question.?.qtype = .AAAA;
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42730);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    thread.join();
+
+    // The client gets the empty answer the upstream sent: no address is
+    // built in the Well-Known Prefix for a non-global IPv4 address.
+    const response = try dns_message.Message.parse(arena.allocator(), bytes);
+    try std.testing.expectEqual(dns_header.Rcode.no_error, response.header.rcode);
+    try std.testing.expectEqual(@as(u16, 0), response.header.answer_count);
     // The upstream saw the AAAA query and the A query that followed it.
     try std.testing.expectEqual(@as(usize, 2), upstream.requests);
 }
@@ -4588,7 +4647,7 @@ test "RFC 6147 section 5.1.4: an AAAA in an excluded range is not a real AAAA an
     // AAAA the upstream sent.
     try std.testing.expectEqualSlices(u8, &.{
         0x00, 0x64, 0xff, 0x9b, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x02, 0x21,
+        0x00, 0x00, 0x00, 0x00, 0x5d, 0xb8, 0xd8, 0x22,
     }, &response.answers.items[0].rdata.AAAA);
     // The upstream saw the AAAA query and the A query that followed it.
     try std.testing.expectEqual(@as(usize, 2), upstream.requests);
@@ -4648,7 +4707,7 @@ test "RFC 6147 section 5.1.4: the site's own prefix and the well-known prefix ar
     try std.testing.expect(response.answers.items[0].rrtype.eql(.AAAA));
     try std.testing.expectEqualSlices(u8, &.{
         0x20, 0x01, 0x0d, 0xb8, 0x00, 0x64, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x02, 0x21,
+        0x00, 0x00, 0x00, 0x00, 0x5d, 0xb8, 0xd8, 0x22,
     }, &response.answers.items[0].rdata.AAAA);
     try std.testing.expectEqual(@as(usize, 2), upstream.requests);
 }
@@ -4796,7 +4855,7 @@ test "RFC 6147 section 5.1.4: an AAAA in a range the operator excluded is not a 
     try std.testing.expect(response.answers.items[0].rrtype.eql(.AAAA));
     try std.testing.expectEqualSlices(u8, &.{
         0x00, 0x64, 0xff, 0x9b, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x02, 0x21,
+        0x00, 0x00, 0x00, 0x00, 0x5d, 0xb8, 0xd8, 0x22,
     }, &response.answers.items[0].rdata.AAAA);
     try std.testing.expectEqual(@as(usize, 2), upstream.requests);
 }
@@ -4868,9 +4927,9 @@ test "RFC 6147 section 5.1.7: the prefix that serves the IPv4 address builds the
     const thread = try std.Thread.spawn(.{}, serveDns64Upstream, .{&upstream});
 
     // The well-known prefix serves every IPv4 address, the other prefix
-    // serves the range 192.0.2.0/24, which holds the A record's address.
+    // serves the range 93.184.216.0/24, which holds the A record's address.
     var bound = try config.Nat64Prefix.parse("2001:db8:100::/96");
-    bound.range = try config.Cidr.parse("192.0.2.0/24");
+    bound.range = try config.Cidr.parse("93.184.216.0/24");
     var resolver = try Resolver.init(std.testing.allocator, io, .{
         .forwarder = .{ .address = upstream_socket.address },
         .nat64_prefixes = .init(&.{ try config.Nat64Prefix.parse("64:ff9b::/96"), bound }),
@@ -4894,7 +4953,7 @@ test "RFC 6147 section 5.1.7: the prefix that serves the IPv4 address builds the
     try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
     try std.testing.expectEqualSlices(u8, &.{
         0x20, 0x01, 0x0d, 0xb8, 0x01, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x02, 0x21,
+        0x00, 0x00, 0x00, 0x00, 0x5d, 0xb8, 0xd8, 0x22,
     }, &response.answers.items[0].rdata.AAAA);
 }
 
@@ -4942,7 +5001,7 @@ test "RFC 6147 section 5.1.2: an error RCODE counts as an empty answer and the s
     try std.testing.expect(response.answers.items[0].rrtype.eql(.AAAA));
     try std.testing.expectEqualSlices(u8, &.{
         0x00, 0x64, 0xff, 0x9b, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x02, 0x21,
+        0x00, 0x00, 0x00, 0x00, 0x5d, 0xb8, 0xd8, 0x22,
     }, &response.answers.items[0].rdata.AAAA);
     // The upstream saw the AAAA query and the A query that followed it.
     try std.testing.expectEqual(@as(usize, 2), upstream.requests);
@@ -5039,7 +5098,7 @@ test "RFC 6147 section 5.1.5: the synthesis follows a CNAME to the owner that ho
     try std.testing.expectEqualStrings("target.example.", try response.answers.items[1].owner.toText(&text_buffer));
     try std.testing.expectEqualSlices(u8, &.{
         0x00, 0x64, 0xff, 0x9b, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x02, 0x21,
+        0x00, 0x00, 0x00, 0x00, 0x5d, 0xb8, 0xd8, 0x22,
     }, &response.answers.items[1].rdata.AAAA);
     // The upstream saw the AAAA query and the A query for the final owner.
     try std.testing.expectEqual(@as(usize, 2), upstream.requests);
@@ -5100,7 +5159,7 @@ test "RFC 6147 section 5.1.5: the synthesis follows a DNAME to the substituted o
     try std.testing.expectEqualStrings("www.new.example.", try response.answers.items[2].owner.toText(&text_buffer));
     try std.testing.expectEqualSlices(u8, &.{
         0x00, 0x64, 0xff, 0x9b, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x02, 0x21,
+        0x00, 0x00, 0x00, 0x00, 0x5d, 0xb8, 0xd8, 0x22,
     }, &response.answers.items[2].rdata.AAAA);
     // The upstream saw the AAAA query and the A query for the substituted
     // owner.
@@ -5364,6 +5423,57 @@ test "RFC 6147 section 5.5: a bogus negative AAAA answer is not synthesized over
     try std.testing.expectEqual(@as(usize, 1), upstream.requests);
 }
 
+test "RFC 6147 section 5.5: the negative answer is validated without the client's DO bit" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    const a_records = [_]dns_record.ResourceRecord{dns64TestARecord("v4only.example.com.")};
+    const soa_records = [_]dns_record.ResourceRecord{dns64TestSoaRecord("example.com.")};
+    var upstream = Dns64Upstream{
+        .io = io,
+        .udp = &upstream_socket,
+        .a = &a_records,
+        .soa = &soa_records,
+    };
+    const thread = try std.Thread.spawn(.{}, serveDns64Upstream, .{&upstream});
+
+    const anchors = try validate.Anchors.parse(std.testing.allocator,
+        \\example.com. DS 60485 8 2 aabbccdd
+        \\
+    );
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = upstream_socket.address },
+        .nat64_prefixes = .init(&.{try config.Nat64Prefix.parse("64:ff9b::/96")}),
+        .anchors = anchors,
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2944, "v4only.example.com.", true);
+    defer query.deinit();
+    query.question.?.qtype = .AAAA;
+    // The client did not ask for the proofs. The DO bit decides what the
+    // client gets back, not whether the answer is validated.
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42744);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    thread.join();
+
+    const response = try dns_message.Message.parse(arena.allocator(), bytes);
+    // RFC 6147 section 5.5: the negative AAAA answer does not validate, so
+    // the client gets SERVFAIL and no synthesized record.
+    try std.testing.expectEqual(dns_header.Rcode.servfail, response.header.rcode);
+    try std.testing.expectEqual(@as(u16, 0), response.header.answer_count);
+    try expectEde(response, EDE_RRSIGS_MISSING, "rrsigs missing");
+    // The upstream saw the AAAA query and no A query behind it.
+    try std.testing.expectEqual(@as(usize, 1), upstream.requests);
+}
+
 /// The fake upstream a DNS64 test forwards to. It answers the AAAA query and
 /// the A query that may follow it.
 const Dns64Upstream = struct {
@@ -5504,7 +5614,21 @@ fn dns64TestARecord(name_text: []const u8) dns_record.ResourceRecord {
         .rrtype = .A,
         .class = .IN,
         .ttl = 300,
-        .rdata = .{ .A = .{ 192, 0, 2, 33 } },
+        // The address is a global one: RFC 6052 section 3.1 keeps the
+        // non-global ranges out of the Well-Known Prefix.
+        .rdata = .{ .A = .{ 93, 184, 216, 34 } },
+    };
+}
+
+/// An A record of an address of the RFC 1918 private range, which the
+/// Well-Known Prefix must not represent.
+fn dns64TestPrivateARecord(name_text: []const u8) dns_record.ResourceRecord {
+    return .{
+        .owner = dns_name.Name.fromText(name_text) catch unreachable,
+        .rrtype = .A,
+        .class = .IN,
+        .ttl = 300,
+        .rdata = .{ .A = .{ 10, 0, 0, 1 } },
     };
 }
 
@@ -5981,6 +6105,8 @@ const UpstreamShape = enum {
     referral,
     /// A referral whose glue names a name server outside that zone.
     referral_out_of_zone,
+    /// A referral for a zone the query is not about.
+    referral_out_of_domain,
 };
 
 /// The fake upstream the in-domain tests forward to. Its answer carries an
@@ -6035,9 +6161,21 @@ fn buildAdditionalUpstreamAnswer(buffer: []u8, query: dns_message.Message, shape
     };
     defer message.deinit();
     if (shape != .answer) {
-        const server = try dns_name.Name.fromText(if (shape == .referral) "ns.child.example." else "ns.other.example.");
+        // The delegation the query is about names the zone the query sits
+        // in; the out-of-domain shape delegates a zone of its own.
+        const zone_text = switch (shape) {
+            .referral_out_of_domain => "elsewhere.example.",
+            else => "example.com.",
+        };
+        const server_text = switch (shape) {
+            .referral => "ns.example.com.",
+            .referral_out_of_zone => "ns.other.example.",
+            .referral_out_of_domain => "ns.elsewhere.example.",
+            .answer => unreachable,
+        };
+        const server = try dns_name.Name.fromText(server_text);
         try message.authorities.append(.{
-            .owner = try dns_name.Name.fromText("child.example."),
+            .owner = try dns_name.Name.fromText(zone_text),
             .rrtype = .NS,
             .class = .IN,
             .ttl = 60,
@@ -6213,7 +6351,7 @@ test "RFC 5452 section 6: a referral keeps only the glue of the delegation it na
     try std.testing.expectEqual(@as(u16, 1), message.header.authority_count);
     try std.testing.expectEqual(@as(u16, 1), message.header.additional_count);
     var text: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("ns.child.example.", try message.additionals.items[0].owner.toText(&text));
+    try std.testing.expectEqualStrings("ns.example.com.", try message.additionals.items[0].owner.toText(&text));
 }
 
 test "RFC 5452 section 6: a referral whose glue is out of the zone keeps none of it" {
@@ -6228,6 +6366,23 @@ test "RFC 5452 section 6: a referral whose glue is out of the zone keeps none of
 
     // The delegation names a name server outside the zone it delegates, so
     // its glue is not the delegation's own data and none of it is relayed.
+    try std.testing.expectEqual(@as(u16, 1), message.header.authority_count);
+    try std.testing.expectEqual(@as(u16, 0), message.header.additional_count);
+}
+
+test "RFC 5452 section 6: a referral for another domain keeps none of its glue" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const fixture = try AdditionalFixture.create(io, .referral_out_of_domain);
+    defer fixture.destroy();
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42718);
+
+    const bytes = try fixture.resolver.answer(fixture.encoded, fixture.query, &client, &output);
+    const message = try dns_message.Message.parse(fixture.arena.allocator(), bytes);
+
+    // The delegation the authority section names is not in the domain of
+    // the query, so its glue is not the query's data and none of it is
+    // relayed.
     try std.testing.expectEqual(@as(u16, 1), message.header.authority_count);
     try std.testing.expectEqual(@as(u16, 0), message.header.additional_count);
 }

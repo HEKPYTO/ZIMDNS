@@ -101,6 +101,35 @@ pub const Cidr = struct {
     }
 };
 
+/// RFC 6052 section 3.1: the IPv4 addresses the Well-Known Prefix must not
+/// represent. The set is the blocks RFC 5735 section 3 lists, the private
+/// ranges of RFC 1918 among them.
+const non_global_ipv4 = [_]struct { bytes: [4]u8, prefix: u8 }{
+    .{ .bytes = .{ 0, 0, 0, 0 }, .prefix = 8 },
+    .{ .bytes = .{ 10, 0, 0, 0 }, .prefix = 8 },
+    .{ .bytes = .{ 127, 0, 0, 0 }, .prefix = 8 },
+    .{ .bytes = .{ 169, 254, 0, 0 }, .prefix = 16 },
+    .{ .bytes = .{ 172, 16, 0, 0 }, .prefix = 12 },
+    .{ .bytes = .{ 192, 0, 0, 0 }, .prefix = 24 },
+    .{ .bytes = .{ 192, 0, 2, 0 }, .prefix = 24 },
+    .{ .bytes = .{ 192, 88, 99, 0 }, .prefix = 24 },
+    .{ .bytes = .{ 192, 168, 0, 0 }, .prefix = 16 },
+    .{ .bytes = .{ 198, 18, 0, 0 }, .prefix = 15 },
+    .{ .bytes = .{ 198, 51, 100, 0 }, .prefix = 24 },
+    .{ .bytes = .{ 203, 0, 113, 0 }, .prefix = 24 },
+    .{ .bytes = .{ 224, 0, 0, 0 }, .prefix = 4 },
+    .{ .bytes = .{ 240, 0, 0, 0 }, .prefix = 4 },
+};
+
+/// RFC 6052 section 3.1: the address is one the Well-Known Prefix must not
+/// represent.
+fn nonGlobalIpv4(address: [4]u8) bool {
+    for (non_global_ipv4) |range| {
+        if (maskedEqual(&range.bytes, &address, range.prefix)) return true;
+    }
+    return false;
+}
+
 fn maskedEqual(left: []const u8, right: []const u8, prefix: u8) bool {
     const whole = @as(usize, prefix) / 8;
     const remainder = prefix % 8;
@@ -138,6 +167,20 @@ pub const Nat64Prefix = struct {
         // must be zero, which for a /96 prefix lies inside the prefix itself.
         if (ip6.bytes[8] != 0) return Error.BadNat64Prefix;
         return .{ .bytes = ip6.bytes, .length = length };
+    }
+
+    /// RFC 6052 section 2.1: the Well-Known Prefix, the prefix the RFC
+    /// reserves for an algorithmic mapping.
+    pub fn isWellKnown(self: *const Nat64Prefix) bool {
+        return self.length == 96 and
+            std.mem.eql(u8, self.bytes[0..12], &.{ 0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0 });
+    }
+
+    /// RFC 6052 section 3.1: the prefix may represent the address. The
+    /// Well-Known Prefix must not represent a non-global IPv4 address.
+    pub fn represents(self: *const Nat64Prefix, address: [4]u8) bool {
+        if (self.isWellKnown() and nonGlobalIpv4(address)) return false;
+        return true;
     }
 };
 
@@ -981,6 +1024,25 @@ test "config parser takes RFC 6052 NAT64 prefixes with their IPv4 ranges" {
     try std.testing.expectError(error.BadCidr, Config.parse("nat64-prefix 64:ff9b::/96 2001:db8::/32\n"));
     try std.testing.expectError(error.BadCidr, Config.parse("nat64-prefix 64:ff9b::/96 192.0.2.0\n"));
     try std.testing.expectError(error.BadCidr, Config.parse("nat64-prefix 64:ff9b::/96 192.0.2.0/33\n"));
+}
+
+test "RFC 6052 section 3.1: the well-known prefix does not represent a non-global address" {
+    const well_known = try Nat64Prefix.parse("64:ff9b::/96");
+    try std.testing.expect(well_known.isWellKnown());
+    // The private ranges of RFC 1918 and the documentation ranges of RFC
+    // 5735 section 3 are not represented.
+    try std.testing.expect(!well_known.represents(.{ 10, 0, 0, 1 }));
+    try std.testing.expect(!well_known.represents(.{ 172, 16, 0, 1 }));
+    try std.testing.expect(!well_known.represents(.{ 192, 168, 0, 1 }));
+    try std.testing.expect(!well_known.represents(.{ 192, 0, 2, 33 }));
+    try std.testing.expect(!well_known.represents(.{ 198, 51, 100, 1 }));
+    try std.testing.expect(!well_known.represents(.{ 203, 0, 113, 1 }));
+    // A global address is represented.
+    try std.testing.expect(well_known.represents(.{ 93, 184, 216, 34 }));
+    // A network-specific prefix represents every address.
+    const specific = try Nat64Prefix.parse("2001:db8:100::/96");
+    try std.testing.expect(!specific.isWellKnown());
+    try std.testing.expect(specific.represents(.{ 10, 0, 0, 1 }));
 }
 
 test "config parser takes the DNS64 excluded ranges and refuses malformed ones" {

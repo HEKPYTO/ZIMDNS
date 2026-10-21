@@ -1,5 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const dns_name = @import("../dns/name.zig");
+const dns_record = @import("../dns/record.zig");
+const dns_types = @import("../dns/types.zig");
+const zone_parser = @import("parser.zig");
 
 pub const SerialOrder = enum {
     equal,
@@ -109,12 +113,17 @@ pub const Delta = struct {
 };
 
 /// Keeps the difference of one transition. A difference that does not fit the
-/// bound, or a transition that is not RFC 1982 newer, is not kept: the
-/// client at its serial then gets the full transfer.
+/// bound, a difference that cannot be turned into records, or a transition
+/// that is not RFC 1982 newer, is not kept: the client at its serial then
+/// gets the full transfer.
 fn storeDelta(origin: []const u8, from_serial: u32, to_serial: u32, text: []const u8) void {
     if (origin.len == 0 or origin.len > max_origin_len) return;
     if (text.len == 0 or text.len > max_delta_bytes) return;
     if (compareSerial(to_serial, from_serial) != .newer) return;
+    // A difference that cannot be turned into records is dropped: the
+    // client at that serial gets the full transfer, never an incremental
+    // answer built from records that are not records.
+    if (!differenceIsUsable(text)) return;
     // A transition the store already holds keeps its place: the difference
     // that comes later is the one the answer is built from.
     for (stored[0..stored_len]) |*entry| {
@@ -183,13 +192,17 @@ pub const DeltaRecord = struct {
     deleted: bool,
     owner: []const u8,
     ttl: u32,
+    /// The class the record carries, so the difference keeps it.
+    class_code: u16,
     rrtype_code: u16,
     rdata: []const u8,
 };
 
 /// Appends one record to a difference, in the journal's encoding: the flag
 /// ('D' for a deleted record, 'A' for an added one), the owner, the TTL, the
-/// type code, and the rdata, which is the rest of the line.
+/// type code, and the rdata, which is the rest of the line. A record of a
+/// class other than the default IN class carries the class with it, as a
+/// "C<class>" marker in the class place of a zone file line.
 pub fn encodeRecord(
     out: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
@@ -232,16 +245,55 @@ fn parseDeltaRecord(line: []const u8) ?DeltaRecord {
     var tokens = std.mem.tokenizeAny(u8, line[1..], " ");
     const owner = tokens.next() orelse return null;
     const ttl_text = tokens.next() orelse return null;
-    const type_text = tokens.next() orelse return null;
     const ttl = std.fmt.parseInt(u32, ttl_text, 10) catch return null;
+    // The class travels with the record: it is written as a "C<class>"
+    // marker, and a record without one is of the default IN class.
+    var class_code: u16 = dns_types.Class.IN.code();
+    var type_text = tokens.next() orelse return null;
+    if (type_text.len > 1 and type_text[0] == 'C') {
+        class_code = std.fmt.parseInt(u16, type_text[1..], 10) catch return null;
+        type_text = tokens.next() orelse return null;
+    }
     const rrtype_code = std.fmt.parseInt(u16, type_text, 10) catch return null;
     return .{
         .deleted = flag == 'D',
         .owner = owner,
         .ttl = ttl,
+        .class_code = class_code,
         .rrtype_code = rrtype_code,
         .rdata = tokens.rest(),
     };
+}
+
+/// A record of a difference that cannot be turned into a DNS record.
+pub const RecordError = error{BadRecord};
+
+/// Turns one record of a difference into a DNS record. The record's owner
+/// and rdata are the zone's own text, so the record is refused when either
+/// of them does not parse.
+pub fn toResourceRecord(record: DeltaRecord) RecordError!dns_record.ResourceRecord {
+    const rrtype = dns_types.RecordType.fromCode(record.rrtype_code);
+    return .{
+        .owner = dns_name.Name.fromText(record.owner) catch return error.BadRecord,
+        .rrtype = rrtype,
+        .class = dns_types.Class.fromCode(record.class_code),
+        .ttl = record.ttl,
+        .rdata = zone_parser.parseRData(rrtype, record.rdata) catch return error.BadRecord,
+    };
+}
+
+/// True when every record of the difference can be turned into a DNS
+/// record. A difference that cannot is not kept: the client at that serial
+/// gets the full transfer (RFC 1995 section 4) instead of an incremental
+/// answer built from records that are not records.
+fn differenceIsUsable(text: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const record = parseDeltaRecord(line) orelse return false;
+        _ = toResourceRecord(record) catch return false;
+    }
+    return true;
 }
 
 /// The durable RFC 1995 delta journal: the file that keeps a zone's serial
@@ -727,6 +779,68 @@ test "the journal skips a torn record that has no closing newline" {
     restored.setOrigin("torn.example.");
     try std.testing.expectError(DeltaError.NoDifference, restored.restore(transitions[0].from_serial, transitions[0].to_serial));
     try std.testing.expect(!restored.canServeIncremental(20, 21));
+}
+
+test "a journal difference that cannot be turned into records is dropped" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The difference holds a record whose rdata is not an address, so it
+    // cannot be turned into records.
+    const corrupt = "D a.chain.example. 3600 1 999.999.999.999\n";
+    var hex: [2 * max_delta_bytes]u8 = undefined;
+    for (corrupt, 0..) |byte, index| {
+        hex[index * 2] = hexDigits[byte >> 4];
+        hex[index * 2 + 1] = hexDigits[byte & 0x0f];
+    }
+    var line_buffer: [512]u8 = undefined;
+    const line = try std.fmt.bufPrint(&line_buffer, "corrupt.example. 20 21 {s}\n", .{hex[0 .. corrupt.len * 2]});
+    try tmp.dir.writeFile(io, .{ .sub_path = "journal.log", .data = line });
+
+    var journal = try Journal.open(io, tmp.dir, "journal.log");
+    defer journal.close();
+    const transitions = try journal.read(std.testing.allocator);
+    defer std.testing.allocator.free(transitions);
+
+    // The line is read, so the transition is there, but its difference is
+    // dropped: the client at that serial gets the full transfer.
+    try std.testing.expectEqual(@as(usize, 1), transitions.len);
+    try std.testing.expectEqual(@as(u32, 20), transitions[0].from_serial);
+    try std.testing.expectEqual(@as(u32, 21), transitions[0].to_serial);
+    try std.testing.expect(differenceFor("corrupt.example.", 20, 21) == null);
+
+    var restored = DeltaLog{};
+    restored.setOrigin("corrupt.example.");
+    try std.testing.expectError(DeltaError.NoDifference, restored.restore(transitions[0].from_serial, transitions[0].to_serial));
+    const transfer = @import("transfer.zig");
+    try std.testing.expectEqual(transfer.IxfrDecision.fallback_axfr, transfer.decideIxfr(21, 20, &restored));
+
+    // The same difference recorded in memory is dropped the same way.
+    var log = DeltaLog{};
+    log.setOrigin("corrupt-memory.example.");
+    try log.record(20, 21, corrupt);
+    try std.testing.expect(!log.canServeIncremental(20, 21));
+    try std.testing.expectEqual(transfer.IxfrDecision.fallback_axfr, transfer.decideIxfr(21, 20, &log));
+}
+
+test "the difference carries the class of the record" {
+    // A record of a class other than the default IN class carries the class
+    // with it, and the record keeps that class when it is turned back into
+    // a DNS record.
+    const records = try decodeRecords(std.testing.allocator, "A a.chain.example. 3600 C3 1 192.0.2.1\n");
+    defer std.testing.allocator.free(records);
+    try std.testing.expectEqual(@as(usize, 1), records.len);
+    try std.testing.expectEqual(@as(u16, 3), records[0].class_code);
+    const record = try toResourceRecord(records[0]);
+    try std.testing.expectEqual(@as(u16, 3), record.class.code());
+
+    // A record of the default class keeps the short form and the class.
+    const plain = try decodeRecords(std.testing.allocator, "A a.chain.example. 3600 1 192.0.2.1\n");
+    defer std.testing.allocator.free(plain);
+    try std.testing.expectEqual(dns_types.Class.IN.code(), plain[0].class_code);
+    const plain_record = try toResourceRecord(plain[0]);
+    try std.testing.expect(plain_record.class.eql(dns_types.Class.IN));
 }
 
 test "the journal stops growing at its bound and drops the transitions past it" {
