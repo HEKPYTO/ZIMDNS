@@ -14,6 +14,7 @@ const Name = @import("../dns/name.zig").Name;
 const dns_dnssec = @import("../dns/dnssec.zig");
 const dns_message = @import("../dns/message.zig");
 const dns_types = @import("../dns/types.zig");
+const dns_header = @import("../dns/header.zig");
 const dns_validate = @import("../dns/validate.zig");
 const RecordType = dns_types.RecordType;
 const dns_rdata = @import("../dns/rdata.zig");
@@ -305,8 +306,8 @@ pub const Chain = enum { nsec, nsec3 };
 
 /// The operator's chain, with the parameters of an NSEC3 chain
 /// (RFC 5155 section 4.1): the iteration count and the salt. The hash
-/// algorithm is SHA-1 and the Opt-Out flag is clear, the only ones this build
-/// implements.
+/// algorithm is SHA-1. The Opt-Out flag is not the operator's to name: the
+/// zone's own apex NSEC3PARAM states it (RFC 5155 section 3.1.2.1).
 pub const ChainPolicy = struct {
     chain: Chain,
     iterations: u16 = 0,
@@ -419,6 +420,41 @@ pub fn signZone(
     // The signed zone carries the records the signer generated, so the full
     // transfer of the zone is larger than the one the zone file holds.
     zone_index.registerZoneSize(zone);
+}
+
+/// Signs `zone` again with the chain `served` publishes, so a zone that is
+/// reloaded keeps the chain the validators have already seen. The key is the
+/// one the server holds, so the key tag (RFC 4034 section 5.3.1) and the DS
+/// that states it do not move.
+pub fn resignZone(
+    allocator: std.mem.Allocator,
+    zone: *zone_index.Zone,
+    key: *Key,
+    options: Options,
+    served: *const zone_index.Zone,
+) Error!void {
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    var effective = options;
+    effective.chain = try chainPolicyOf(scratch.allocator(), served);
+    try signZone(allocator, zone, key, effective);
+}
+
+/// The chain a signed zone publishes. The NSEC3 parameters come from the apex
+/// NSEC3PARAM, the record that states them (RFC 5155 section 4.1).
+fn chainPolicyOf(allocator: std.mem.Allocator, served: *const zone_index.Zone) Error!ChainPolicy {
+    var has_nsec = false;
+    var has_nsec3 = false;
+    for (served.records.items[0..served.records.len]) |record| {
+        if (record.rrtype.eql(.NSEC)) has_nsec = true;
+        if (record.rrtype.eql(.NSEC3)) has_nsec3 = true;
+    }
+    if (has_nsec3) {
+        const params = (try apexNsec3Param(allocator, served)) orelse return Error.BadChainParameters;
+        return .{ .chain = .nsec3, .iterations = params.iterations, .salt = params.salt };
+    }
+    if (has_nsec) return .{ .chain = .nsec };
+    return Error.BadChainParameters;
 }
 
 /// The chain the zone publishes. Without the operator's choice the zone's own
@@ -756,9 +792,10 @@ const Nsec3Params = struct {
 };
 
 /// The apex NSEC3PARAM of the zone, or null when the zone carries none. Only
-/// SHA-1 (RFC 5155 section 3.1.1) and the Opt-Out flag clear are implemented,
-/// so a record asking for anything else is refused rather than published with
-/// parameters this build cannot honour.
+/// SHA-1 (RFC 5155 section 3.1.1) is implemented, and the only flag a zone
+/// may ask for is the Opt-Out one (RFC 5155 section 3.1.2.1), so a record
+/// asking for anything else is refused rather than published with parameters
+/// this build cannot honour.
 fn apexNsec3Param(allocator: std.mem.Allocator, zone: *const zone_index.Zone) Error!?Nsec3Params {
     var found: ?Nsec3Params = null;
     for (zone.records.items[0..zone.records.len]) |record| {
@@ -770,7 +807,10 @@ fn apexNsec3Param(allocator: std.mem.Allocator, zone: *const zone_index.Zone) Er
             else => return Error.BadZoneRecord,
         };
         if (bytes.len < 5) return Error.BadZoneRecord;
-        if (bytes[0] != 1 or bytes[1] != 0) return Error.BadZoneRecord;
+        if (bytes[0] != 1) return Error.BadZoneRecord;
+        // RFC 5155 section 3.1.2: every flag but the Opt-Out one is reserved
+        // and must be zero.
+        if (bytes[1] & ~dns_validate.nsec3_opt_out != 0) return Error.BadZoneRecord;
         found = .{
             .algorithm = bytes[0],
             .flags = bytes[1],
@@ -904,13 +944,24 @@ fn appendNsec3Chain(
     defer entries.deinit(allocator);
     var codes: std.ArrayList(u16) = .empty;
     defer codes.deinit(allocator);
+    const opt_out = (params.flags & dns_validate.nsec3_opt_out) != 0;
     var group: usize = 0;
     for (owners.items) |owner_wire| {
         while (group < rrsets.items.len and !std.mem.eql(u8, rrsets.items[group].owner_wire, owner_wire)) group += 1;
         const start = group;
         while (group < rrsets.items.len and std.mem.eql(u8, rrsets.items[group].owner_wire, owner_wire)) group += 1;
         codes.clearRetainingCapacity();
-        for (rrsets.items[start..group]) |rrset| try codes.append(allocator, rrset.rrtype);
+        var has_ns = false;
+        var has_ds = false;
+        for (rrsets.items[start..group]) |rrset| {
+            try codes.append(allocator, rrset.rrtype);
+            if (rrset.rrtype == RecordType.NS.code()) has_ns = true;
+            if (rrset.rrtype == RecordType.DS.code()) has_ds = true;
+        }
+        // RFC 5155 section 7.1: an Opt-Out chain leaves the owner name of an
+        // unsigned delegation out, and the record that covers its hash
+        // carries the Opt-Out bit instead.
+        if (opt_out and has_ns and !has_ds) continue;
         // The RRSIG over every RRset at the name is a type present at the name.
         try codes.append(allocator, RecordType.RRSIG.code());
         try entries.append(allocator, .{
@@ -1695,6 +1746,7 @@ const nsec3_www_hash = [_]u8{ 0x31, 0x5f, 0x4a, 0x7c, 0xa2, 0xfc, 0xd7, 0xfe, 0x
 /// One NSEC3 record of a signed zone, as the zone holds it.
 const Nsec3Record = struct {
     owner_text: []const u8,
+    flags: u8,
     next_hash: []const u8,
     bitmap: []const u8,
 };
@@ -1716,6 +1768,7 @@ fn nsec3Records(allocator: std.mem.Allocator, zone: *const zone_index.Zone) ![]N
         const decoded = dns_validate.parseNsec3Rdata(raw) orelse return error.TestUnexpectedResult;
         try out.append(allocator, .{
             .owner_text = record.ownerText(),
+            .flags = decoded.flags,
             .next_hash = decoded.next_hash,
             .bitmap = decoded.bitmap,
         });
@@ -2000,6 +2053,60 @@ test "the operator's NSEC choice drops the zone's own NSEC3PARAM" {
     try std.testing.expect(!hasRecord(&zone, "example.", .NSEC3PARAM));
 }
 
+test "a zone that is signed again keeps the chain the served zone publishes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var key = try parseKey(rfc8080_ed25519_key);
+    defer key.deinit();
+
+    // The served zone publishes the NSEC3 chain, because its own apex
+    // NSEC3PARAM states the parameters of that chain.
+    var served = try loadZone(nsec3_sign_zone);
+    defer served.deinit();
+    try signZone(allocator, &served, &key, rfc8080_window);
+    const served_dnskey = (try findOpaque(&served, "example.", .DNSKEY, null)).?;
+
+    var zone = try loadZone(nsec_sign_zone);
+    defer zone.deinit();
+    try resignZone(allocator, &zone, &key, rfc8080_window, &served);
+
+    // The key is the one the server holds, so the key tag and the DS do not
+    // move with the zone.
+    const dnskey = (try findOpaque(&zone, "example.", .DNSKEY, null)).?;
+    try std.testing.expectEqualSlices(u8, served_dnskey, dnskey);
+    try std.testing.expectEqual(dns_dnssec.keyTag(dnskey), std.mem.readInt(u16, (try findOpaque(&zone, "example.", .DS, null)).?[0..2], .big));
+
+    // The chain is the one the served zone publishes: NSEC3, with the
+    // parameters its NSEC3PARAM states.
+    try std.testing.expect(!hasRecord(&zone, "example.", .NSEC));
+    const records = try nsec3Records(allocator, &zone);
+    try std.testing.expectEqual(@as(usize, 2), records.len);
+    const param = (try findOpaque(&zone, "example.", .NSEC3PARAM, null)).?;
+    try std.testing.expectEqual(@as(u8, 1), param[0]);
+    try std.testing.expectEqual(@as(u8, 0), param[1]);
+    try std.testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, param[2..4], .big));
+    try std.testing.expectEqual(@as(u8, 4), param[4]);
+    try std.testing.expectEqualSlices(u8, "salt", param[5..9]);
+
+    // A served zone that publishes the NSEC chain is signed again with it.
+    var nsec_served = try loadZone(nsec_sign_zone);
+    defer nsec_served.deinit();
+    try signZone(allocator, &nsec_served, &key, rfc8080_window);
+
+    var nsec_zone = try loadZone(nsec3_sign_zone);
+    defer nsec_zone.deinit();
+    try resignZone(allocator, &nsec_zone, &key, rfc8080_window, &nsec_served);
+
+    try std.testing.expect(hasRecord(&nsec_zone, "example.", .NSEC));
+    try std.testing.expect(hasRecord(&nsec_zone, "www.example.", .NSEC));
+    try std.testing.expect(!hasRecord(&nsec_zone, "example.", .NSEC3));
+    // RFC 5155 section 7.3: a zone that publishes the NSEC chain carries no
+    // NSEC3PARAM, so the record the file states is dropped.
+    try std.testing.expect(!hasRecord(&nsec_zone, "example.", .NSEC3PARAM));
+}
+
 test "the operator's NSEC3 choice builds the chain in a zone that states no NSEC3PARAM" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2040,4 +2147,145 @@ test "the operator's NSEC3 choice builds the chain in a zone that states no NSEC
         found = true;
     }
     try std.testing.expect(found);
+}
+
+/// A zone with an unsigned delegation whose apex NSEC3PARAM asks for the
+/// Opt-Out flag (RFC 5155 section 3.1.2.1): the chain leaves the delegation
+/// out and the record that covers it carries the flag.
+const nsec3_optout_sign_zone =
+    \\$ORIGIN example.
+    \\$TTL 3600
+    \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+    \\@ IN NS ns.example.
+    \\@ IN NSEC3PARAM 1 1 2 73616c74
+    \\www IN A 192.0.2.1
+    \\unsigned-sub IN NS ns.unsigned-sub.example.
+    \\
+;
+
+/// The same zone with the flag clear: the delegation keeps its NSEC3, and no
+/// record of the chain covers an unsigned delegation.
+const nsec3_optout_clear_sign_zone =
+    \\$ORIGIN example.
+    \\$TTL 3600
+    \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+    \\@ IN NS ns.example.
+    \\@ IN NSEC3PARAM 1 0 2 73616c74
+    \\www IN A 192.0.2.1
+    \\unsigned-sub IN NS ns.unsigned-sub.example.
+    \\
+;
+
+/// The hash of the unsigned delegation of that zone, as the hashlib oracle
+/// computed it with the salt "salt" and 2 iterations.
+const nsec3_unsigned_sub_hash = [_]u8{ 0x61, 0xb9, 0xf0, 0x9a, 0xcd, 0x45, 0x1c, 0x93, 0x07, 0xf7, 0x77, 0xb1, 0xb8, 0x67, 0x9a, 0xc1, 0x58, 0x83, 0xe0, 0xc4 };
+
+test "a zone with an unsigned delegation and an Opt-Out NSEC3PARAM is signed with an Opt-Out chain (RFC 5155 7.1)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var key = try parseKey(rfc8080_ed25519_key);
+    defer key.deinit();
+
+    var zone = try loadZone(nsec3_optout_sign_zone);
+    defer zone.deinit();
+    try signZone(allocator, &zone, &key, rfc8080_window);
+
+    // RFC 5155 section 7.1: the owner name of an unsigned delegation is left
+    // out of an Opt-Out chain, so the chain holds the apex and "www" only.
+    const records = try nsec3Records(allocator, &zone);
+    try std.testing.expectEqual(@as(usize, 2), records.len);
+
+    var matched = false;
+    var covered = false;
+    for (records) |record| {
+        // RFC 5155 section 7.1: every record of an Opt-Out chain carries the
+        // flag, so the record that covers the delegation does too.
+        try std.testing.expect(record.flags & dns_validate.nsec3_opt_out != 0);
+        const owner = try Name.fromText(record.owner_text);
+        const owner_hash = dns_validate.nsec3OwnerHash(owner) orelse return error.TestUnexpectedResult;
+        if (std.mem.eql(u8, &owner_hash, &nsec3_unsigned_sub_hash)) matched = true;
+        if (record.next_hash.len != 20) return error.TestUnexpectedResult;
+        if (!dns_validate.nsec3Covers(owner_hash, record.next_hash[0..20].*, nsec3_unsigned_sub_hash)) continue;
+        covered = true;
+    }
+    // The chain never claims the delegation itself exists.
+    try std.testing.expect(!matched);
+    // The delegation's next closer name is covered by a record of the chain.
+    try std.testing.expect(covered);
+}
+
+test "the same zone without the Opt-Out flag keeps every record and carries no flag" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var key = try parseKey(rfc8080_ed25519_key);
+    defer key.deinit();
+
+    var zone = try loadZone(nsec3_optout_clear_sign_zone);
+    defer zone.deinit();
+    try signZone(allocator, &zone, &key, rfc8080_window);
+
+    // The chain is the one it always was: every owner name keeps its NSEC3,
+    // the delegation among them.
+    const records = try nsec3Records(allocator, &zone);
+    try std.testing.expectEqual(@as(usize, 3), records.len);
+
+    var matched = false;
+    for (records) |record| {
+        // RFC 5155 section 3.1.2.1: a record that is not Opt-Out covers no
+        // unsigned delegation.
+        try std.testing.expectEqual(@as(u8, 0), record.flags & dns_validate.nsec3_opt_out);
+        const owner = try Name.fromText(record.owner_text);
+        const owner_hash = dns_validate.nsec3OwnerHash(owner) orelse return error.TestUnexpectedResult;
+        if (std.mem.eql(u8, &owner_hash, &nsec3_unsigned_sub_hash)) matched = true;
+    }
+    try std.testing.expect(matched);
+}
+
+test "the referral to an unsigned delegation under an Opt-Out chain is proved (RFC 5155 7.2.7, 8.9)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var key = try parseKey(rfc8080_ed25519_key);
+    defer key.deinit();
+
+    var zone = try loadZone(nsec3_optout_sign_zone);
+    defer zone.deinit();
+    try signZone(allocator, &zone, &key, rfc8080_window);
+
+    // The delegation is unsigned and the chain holds no NSEC3 for it, so the
+    // answer is a referral with the closest provable encloser proof of
+    // section 7.2.7.
+    const request = try denialQuery(allocator, "unsigned-sub.example.", .A);
+    const response = try (@import("../auth/response.zig")).buildResponse(request, &zone);
+    try std.testing.expectEqual(dns_header.Rcode.no_error, response.header.rcode);
+    try std.testing.expect(!response.header.authoritative);
+
+    // The proof carries the NSEC3 that covers the next closer name of the
+    // delegation, and that record carries the Opt-Out flag.
+    var covered = false;
+    for (response.authorities.items) |record| {
+        if (!record.rrtype.eql(.NSEC3)) continue;
+        const raw = switch (record.rdata) {
+            .Unknown => |*unknown| unknown.bytes(),
+            else => continue,
+        };
+        const rdata = dns_validate.parseNsec3Rdata(raw) orelse return error.TestUnexpectedResult;
+        if (rdata.next_hash.len != 20) return error.TestUnexpectedResult;
+        const owner_hash = dns_validate.nsec3OwnerHash(record.owner) orelse return error.TestUnexpectedResult;
+        if (!dns_validate.nsec3Covers(owner_hash, rdata.next_hash[0..20].*, nsec3_unsigned_sub_hash)) continue;
+        covered = true;
+        try std.testing.expect(rdata.flags & dns_validate.nsec3_opt_out != 0);
+    }
+    try std.testing.expect(covered);
+
+    // The project's own validator accepts the answer: the delegation is proved
+    // unsigned (RFC 5155 section 8.9).
+    var anchors = dns_validate.Anchors{};
+    const result = try dns_validate.validate(allocator, &anchors, request, response, &.{}, rfc8080_window.inception + 1);
+    try std.testing.expectEqual(dns_validate.Status.insecure, result.status);
 }

@@ -5,9 +5,11 @@
 /// Errors: Query and response failures are typed; transport I/O is handled by platform listeners.
 const std = @import("std");
 const builtin = @import("builtin");
+const dns_dnssec = @import("../dns/dnssec.zig");
 const dns_message = @import("../dns/message.zig");
 const dns_rdata = @import("../dns/rdata.zig");
 const dns_types = @import("../dns/types.zig");
+const dns_validate = @import("../dns/validate.zig");
 const dns_writer = @import("../dns/writer.zig");
 const response = @import("response.zig");
 const zone_parser = @import("../zone/parser.zig");
@@ -51,8 +53,9 @@ pub const ReloadOutcome = enum {
     wrong_zone,
     /// The new zone's SOA serial is not RFC 1982 newer than the served one.
     serial_not_newer,
-    /// The served zone is signed at startup, and a reload cannot re-sign it.
-    signed_zone,
+    /// The served zone is signed and the new one could not be signed, so the
+    /// served zone stays.
+    sign_failed,
 };
 
 /// What one TSIG key file replacement did. The served keys change only when
@@ -340,9 +343,12 @@ pub const Runtime = struct {
     /// Replaces the zone with apex `origin` by the zone built from `text`.
     /// The new zone is parsed and built completely before the served zone
     /// changes, so a text that does not parse, names another apex, or
-    /// carries no RFC 1982 newer serial leaves the old zone serving. The
-    /// serial transition is recorded, so an IXFR client at the old serial
-    /// gets the incremental answer instead of a full AXFR.
+    /// carries no RFC 1982 newer serial leaves the old zone serving. A zone
+    /// that was signed is signed again with the key the server holds, so the
+    /// served chain covers the new content; a zone that cannot be signed
+    /// leaves the old zone serving too. The serial transition is recorded,
+    /// so an IXFR client at the old serial gets the incremental answer
+    /// instead of a full AXFR.
     pub fn replaceZoneText(self: *Runtime, io: std.Io, origin: []const u8, text: []const u8) ReloadOutcome {
         var zone_file = zone_parser.ZoneFile.parse(text) catch |err| {
             reportReload(io, "error: cannot parse the zone file for {s}: {t}", .{ origin, err });
@@ -370,12 +376,6 @@ pub const Runtime = struct {
             reportReload(io, "error: the server does not serve a zone for {s}", .{origin});
             return .no_zone;
         };
-        // A zone signed at startup carries records the zone file does not
-        // have, so replacing it would drop the signatures.
-        if (self.zones.items[target].generated.len != 0) {
-            reportReload(io, "error: the zone for {s} is signed at startup and cannot be replaced", .{origin});
-            return .signed_zone;
-        }
         const new_serial = zone.soaSerial() orelse {
             reportReload(io, "error: the zone file for {s} has no SOA serial", .{origin});
             return .load_failed;
@@ -398,6 +398,23 @@ pub const Runtime = struct {
                 reportReload(io, "error: the zone file for {s} carries serial {d}, not comparable with the served serial {d}", .{ origin, new_serial, old_serial });
                 return .serial_not_newer;
             },
+        }
+        // A zone that was signed is signed again here, with the key the server
+        // holds, so the served chain covers the new content. A zone that was
+        // not signed is not signed by a reload.
+        if (self.zones.items[target].generated.len != 0) {
+            if (self.dnssec_session) |*session| {
+                zone_signer.resignZone(self.allocator, &zone, &session.key, .{
+                    .inception = session.options.inception,
+                    .expiration = session.options.expiration,
+                }, &self.zones.items[target]) catch |err| {
+                    reportReload(io, "error: cannot sign the reloaded zone for {s}: {t}", .{ origin, err });
+                    return .sign_failed;
+                };
+            } else {
+                reportReload(io, "error: the zone for {s} is signed and the server holds no signing key", .{origin});
+                return .sign_failed;
+            }
         }
         // The delta log is parallel to the zone list, and a runtime built
         // from a zone list starts without one.
@@ -2945,7 +2962,7 @@ test "a zone file for another apex is refused" {
     try expectReloadedAddress(&runtime, arena.allocator(), .{ 192, 0, 2, 1 });
 }
 
-test "a zone signed at startup is not replaced" {
+test "a signed zone the server holds no signing key for is not replaced" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2953,8 +2970,9 @@ test "a zone signed at startup is not replaced" {
     defer runtime.deinit();
 
     // The startup signer installs the records it generates in the zone's
-    // `generated` field. A zone that carries them cannot be replaced by the
-    // zone file, because the file has no signatures to offer.
+    // `generated` field. A zone that carries them is signed again on every
+    // reload, and a server that holds no key cannot sign it, so the served
+    // zone stays.
     var generated = [_]zone_parser.ZoneRecord{.{
         .owner = "example.",
         .ttl = 3600,
@@ -2963,6 +2981,227 @@ test "a zone signed at startup is not replaced" {
     }};
     runtime.zones.items[0].generated = generated[0..];
 
-    try std.testing.expectEqual(ReloadOutcome.signed_zone, runtime.replaceZoneText(io, "example.", reload_zone_next));
+    try std.testing.expectEqual(ReloadOutcome.sign_failed, runtime.replaceZoneText(io, "example.", reload_zone_next));
     try expectReloadedAddress(&runtime, arena.allocator(), .{ 192, 0, 2, 1 });
+}
+
+/// The RFC 8080 section 6.1 Ed25519 key: the key the server signs a zone
+/// with.
+const dnssec_reload_key = "ed25519 DSSF3o0s0f+ElWzj9E/Osxw8hLpk55chkmx0LYN5WiY=\n";
+
+/// The window every signature of these tests carries, so the validator
+/// accepts them at a fixed time.
+const dnssec_reload_window = zone_signer.Options{ .inception = 1_000_000_000, .expiration = 2_000_000_000 };
+
+const dnssec_reload_zone =
+    \\$ORIGIN example.
+    \\$TTL 3600
+    \\@ IN SOA ns.example. hostmaster.example. 10 3600 900 1209600 3600
+    \\@ IN NS ns.example.
+    \\www IN A 192.0.2.1
+    \\
+;
+
+/// The same zone with a newer serial and another owner name, so the denial
+/// records have to name the new content.
+const dnssec_reload_zone_next =
+    \\$ORIGIN example.
+    \\$TTL 3600
+    \\@ IN SOA ns.example. hostmaster.example. 11 3600 900 1209600 3600
+    \\@ IN NS ns.example.
+    \\mail IN A 192.0.2.2
+    \\
+;
+
+/// A zone file that already carries DNSSEC records, which the signer refuses
+/// rather than sign twice.
+const dnssec_reload_zone_signed =
+    \\$ORIGIN example.
+    \\$TTL 3600
+    \\@ IN SOA ns.example. hostmaster.example. 12 3600 900 1209600 3600
+    \\@ IN NS ns.example.
+    \\@ IN DNSKEY 257 3 15 zPnZ/QwEe7S8C5SPz2OfS5RR40ATk2/rYnE9xHIEijs=
+    \\mail IN A 192.0.2.2
+    \\
+;
+
+/// A DO-bit query for the apex SOA of the zone above.
+const dnssec_reload_soa_query = [_]u8{
+    0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+    7,    'e',  'x',  'a',  'm',  'p',  'l',  'e',  0,    0x00, 0x06, 0x00,
+    0x01, 0x00, 0x00, 0x29, 0x04, 0xd0, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00,
+};
+
+/// The RDATA of the first record of `rrtype` at `owner`, copied out of the
+/// zone so it outlives the parsed value.
+fn zoneOpaque(
+    allocator: std.mem.Allocator,
+    zone: *const zone_index.Zone,
+    rrtype: dns_types.RecordType,
+    owner: []const u8,
+) !?[]u8 {
+    for (zone.records.items[0..zone.records.len]) |record| {
+        if (!record.rrtype.eql(rrtype)) continue;
+        if (!std.ascii.eqlIgnoreCase(record.ownerText(), owner)) continue;
+        const rdata = try zone_parser.parseRData(rrtype, record.rdataText());
+        const bytes = switch (rdata) {
+            .Unknown => |*unknown| unknown.bytes(),
+            else => continue,
+        };
+        return try allocator.dupe(u8, bytes);
+    }
+    return null;
+}
+
+/// The RRSIG at `owner` that covers `covered`, copied out of the zone.
+fn zoneRrsig(
+    allocator: std.mem.Allocator,
+    zone: *const zone_index.Zone,
+    owner: []const u8,
+    covered: u16,
+) !?[]u8 {
+    for (zone.records.items[0..zone.records.len]) |record| {
+        if (!record.rrtype.eql(.RRSIG)) continue;
+        if (!std.ascii.eqlIgnoreCase(record.ownerText(), owner)) continue;
+        const rdata = try zone_parser.parseRData(.RRSIG, record.rdataText());
+        const bytes = switch (rdata) {
+            .Unknown => |*unknown| unknown.bytes(),
+            else => continue,
+        };
+        if (bytes.len < 2 or std.mem.readInt(u16, bytes[0..2], .big) != covered) continue;
+        return try allocator.dupe(u8, bytes);
+    }
+    return null;
+}
+
+fn zoneHas(zone: *const zone_index.Zone, rrtype: dns_types.RecordType, owner: []const u8) bool {
+    for (zone.records.items[0..zone.records.len]) |record| {
+        if (!record.rrtype.eql(rrtype)) continue;
+        if (!std.ascii.eqlIgnoreCase(record.ownerText(), owner)) continue;
+        return true;
+    }
+    return false;
+}
+
+test "a signed zone that is reloaded is signed again with the same key" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var runtime = Runtime{ .allocator = std.testing.allocator };
+    defer runtime.deinit();
+    try runtime.appendZoneText(dnssec_reload_zone);
+
+    var key = try zone_signer.parseKey(dnssec_reload_key);
+    defer key.deinit();
+    try zone_signer.signZone(runtime.allocator, &runtime.zones.items[0], &key, dnssec_reload_window);
+    runtime.dnssec_session = zone_signer.Session.start(&key, dnssec_reload_window);
+
+    // The chain the startup signing pass made: the signature over the old
+    // SOA and the DNSKEY that names the key.
+    const old_rrsig = (try zoneRrsig(allocator, &runtime.zones.items[0], "example.", dns_types.RecordType.SOA.code())).?;
+    const old_dnskey = (try zoneOpaque(allocator, &runtime.zones.items[0], .DNSKEY, "example.")).?;
+
+    try std.testing.expectEqual(ReloadOutcome.replaced, runtime.replaceZoneText(io, "example.", dnssec_reload_zone_next));
+
+    // The served zone is the new content.
+    try std.testing.expectEqual(@as(?u32, 11), runtime.zones.items[0].soaSerial());
+
+    // RFC 4034 section 5.3.1: the key tag is the identity of the key, so the
+    // DNSKEY and the DS that states its key tag do not move with the zone.
+    const new_dnskey = (try zoneOpaque(allocator, &runtime.zones.items[0], .DNSKEY, "example.")).?;
+    try std.testing.expectEqualSlices(u8, old_dnskey, new_dnskey);
+    const ds = (try zoneOpaque(allocator, &runtime.zones.items[0], .DS, "example.")).?;
+    try std.testing.expectEqual(dns_dnssec.keyTag(new_dnskey), std.mem.readInt(u16, ds[0..2], .big));
+
+    // The signature over the old SOA is gone: the new one covers the new
+    // content, so it is a different signature.
+    const new_rrsig = (try zoneRrsig(allocator, &runtime.zones.items[0], "example.", dns_types.RecordType.SOA.code())).?;
+    try std.testing.expect(!std.mem.eql(u8, old_rrsig, new_rrsig));
+
+    // The project's own validator accepts the new signature over the new
+    // SOA, with the DNSKEY the zone publishes as the trust anchor.
+    var anchors = dns_validate.Anchors{};
+    anchors.items[0] = .{
+        .owner = (try @import("../dns/name.zig").Name.fromText("example.")),
+        .rrtype = .DNSKEY,
+        .rdata = new_dnskey,
+    };
+    anchors.len = 1;
+    var output: [1024]u8 = undefined;
+    const response_bytes = try runtime.answer(&dnssec_reload_soa_query, &output);
+    const query = try dns_message.Message.parseQuery(allocator, &dnssec_reload_soa_query);
+    const answer = try dns_message.Message.parse(allocator, response_bytes);
+    const result = try dns_validate.validate(allocator, &anchors, query, answer, &.{}, dnssec_reload_window.inception + 1);
+    try std.testing.expectEqual(dns_validate.Status.secure, result.status);
+
+    // The denial records are the new content's: the chain names the new owner
+    // and no longer names the old one.
+    try std.testing.expect(zoneHas(&runtime.zones.items[0], .NSEC, "mail.example."));
+    try std.testing.expect(!zoneHas(&runtime.zones.items[0], .NSEC, "www.example."));
+    const apex_nsec = (try zoneOpaque(allocator, &runtime.zones.items[0], .NSEC, "example.")).?;
+    const next = (try @import("../dns/name.zig").Name.fromText("mail.example.")).asWire();
+    try std.testing.expectEqualSlices(u8, next, apex_nsec[0..next.len]);
+
+    // The denial records of the new content are signed, so the proof the
+    // reloaded zone serves can be authenticated.
+    try std.testing.expect((try zoneRrsig(allocator, &runtime.zones.items[0], "mail.example.", dns_types.RecordType.NSEC.code())) != null);
+}
+
+test "a reload that fails leaves the served signed zone in place" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var runtime = Runtime{ .allocator = std.testing.allocator };
+    defer runtime.deinit();
+    try runtime.appendZoneText(dnssec_reload_zone);
+
+    var key = try zone_signer.parseKey(dnssec_reload_key);
+    defer key.deinit();
+    try zone_signer.signZone(runtime.allocator, &runtime.zones.items[0], &key, dnssec_reload_window);
+    runtime.dnssec_session = zone_signer.Session.start(&key, dnssec_reload_window);
+
+    const old_rrsig = (try zoneRrsig(allocator, &runtime.zones.items[0], "example.", dns_types.RecordType.SOA.code())).?;
+
+    try std.testing.expectEqual(ReloadOutcome.load_failed, runtime.replaceZoneText(io, "example.", "not a zone file\n"));
+
+    // A zone file that already carries DNSSEC records cannot be signed, so
+    // the reload is refused rather than half-signed.
+    try std.testing.expectEqual(ReloadOutcome.sign_failed, runtime.replaceZoneText(io, "example.", dnssec_reload_zone_signed));
+
+    // The served zone keeps the old serial, the old signature, and the old
+    // denial records.
+    try std.testing.expectEqual(@as(?u32, 10), runtime.zones.items[0].soaSerial());
+    const kept_rrsig = (try zoneRrsig(allocator, &runtime.zones.items[0], "example.", dns_types.RecordType.SOA.code())).?;
+    try std.testing.expectEqualSlices(u8, old_rrsig, kept_rrsig);
+    try std.testing.expect(zoneHas(&runtime.zones.items[0], .NSEC, "www.example."));
+    try std.testing.expect(!zoneHas(&runtime.zones.items[0], .NSEC, "mail.example."));
+}
+
+test "a zone that was not signed is not signed by a reload" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = Runtime{ .allocator = std.testing.allocator };
+    defer runtime.deinit();
+    try runtime.appendZoneText(reload_zone);
+
+    var key = try zone_signer.parseKey(dnssec_reload_key);
+    defer key.deinit();
+    runtime.dnssec_session = zone_signer.Session.start(&key, dnssec_reload_window);
+
+    try std.testing.expectEqual(ReloadOutcome.replaced, runtime.replaceZoneText(io, "example.", reload_zone_next));
+
+    // The zone was not signed before the reload, so it is not signed after
+    // it either.
+    const zone = &runtime.zones.items[0];
+    try std.testing.expect(!zoneHas(zone, .DNSKEY, "example."));
+    try std.testing.expect(!zoneHas(zone, .DS, "example."));
+    try std.testing.expect(!zoneHas(zone, .RRSIG, "example."));
+    try std.testing.expect(!zoneHas(zone, .NSEC, "example."));
+    try std.testing.expectEqual(@as(usize, 0), zone.generated.len);
 }

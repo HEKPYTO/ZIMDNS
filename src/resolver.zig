@@ -27,6 +27,11 @@ pub const MAX_FAILURE_CACHE_ENTRIES = 64;
 /// second and never longer than five minutes. The operator sets the time
 /// with `minimum-failure-cache-time`, inside those bounds.
 pub const DEFAULT_FAILURE_CACHE_SECONDS: u32 = 5;
+/// RFC 4035 section 4.7 leaves the threshold to the implementation: a
+/// validation failure is answered from the cache only after the question has
+/// failed to validate more times than this. One is the smallest threshold
+/// that keeps a single transient failure out of the cache.
+pub const VALIDATION_FAILURE_THRESHOLD: u32 = 1;
 pub const STALE_WINDOW_SECONDS: i64 = 24 * 60 * 60;
 pub const STALE_TTL: u32 = 30;
 /// RFC 2308 section 5 and RFC 8198 section 5.4: the effective TTL of a
@@ -499,6 +504,10 @@ const CacheEntry = struct {
 const Failure = struct {
     rcode: dns_header.Rcode = .servfail,
     ede: ?u16 = null,
+    /// RFC 4035 section 4.7: this failure is a DNSSEC validation failure,
+    /// so the cache of it is used only after the question has failed to
+    /// validate more times than the threshold.
+    validation: bool = false,
 };
 
 const FailureEntry = struct {
@@ -508,6 +517,18 @@ const FailureEntry = struct {
     /// RFC 9520 section 3.2: the consecutive failures of this question. The
     /// count drives the backoff and is forgotten when the question resolves.
     streak: u32 = 0,
+    /// RFC 4035 section 4.7: the number of times the responses for this
+    /// question failed to validate. The cache of validation failures is
+    /// used only once this count passes the threshold.
+    validation_failures: u32 = 0,
+
+    /// RFC 4035 section 4.7: a validation failure is answered from the cache
+    /// only after the question failed to validate more times than the
+    /// threshold; every other failure is answered at once.
+    fn servable(self: *const FailureEntry) bool {
+        if (!self.failure.validation) return true;
+        return self.validation_failures > VALIDATION_FAILURE_THRESHOLD;
+    }
 };
 
 /// RFC 9520 section 3.2: the cache of resolution failures. It is a table of
@@ -545,6 +566,7 @@ const FailureCache = struct {
     fn put(self: *FailureCache, key: CacheKey, failure: Failure, now: i64) void {
         var slot: usize = 0;
         var streak: u32 = 1;
+        var validation_failures: u32 = 0;
         var index: usize = 0;
         var empty: ?usize = null;
         while (index < self.len) : (index += 1) {
@@ -555,6 +577,9 @@ const FailureCache = struct {
             if (self.entries[index].key.sameQuestion(&key)) {
                 slot = index;
                 streak = self.entries[index].streak +| 1;
+                // RFC 4035 section 4.7: the count of the validation failures
+                // of the question survives the other failures it had.
+                validation_failures = self.entries[index].validation_failures;
                 break;
             }
         } else {
@@ -568,25 +593,27 @@ const FailureCache = struct {
                 self.replacement = (self.replacement + 1) % MAX_FAILURE_CACHE_ENTRIES;
             }
         }
+        if (failure.validation) validation_failures = validation_failures +| 1;
         self.entries[slot] = .{
             .key = key,
             .expires_at = now + @as(i64, self.ttlFor(streak)),
             .failure = failure,
             .streak = streak,
+            .validation_failures = validation_failures,
         };
     }
 
     /// The failure of this question, or null when it has no live failure.
     /// An expired entry is not served, but its count is kept until the
     /// question resolves, so a failure that keeps repeating is held longer.
-    fn lookup(self: *FailureCache, key: *const CacheKey, now: i64) ?Failure {
+    fn lookup(self: *FailureCache, key: *const CacheKey, now: i64) ?FailureEntry {
         var index: usize = 0;
         while (index < self.len) : (index += 1) {
             const entry = &self.entries[index];
             if (entry.key.name_len == 0) continue;
             if (!entry.key.sameQuestion(key)) continue;
             if (now >= entry.expires_at) return null;
-            return entry.failure;
+            return entry.*;
         }
         return null;
     }
@@ -1090,16 +1117,21 @@ pub const Resolver = struct {
         }
         // RFC 9520 section 3.2: a cached resolution failure answers the next
         // client for the same question, and no outgoing query is sent for it.
-        if (self.cache.failures.lookup(&key, now)) |failure| {
+        if (self.cache.failures.lookup(&key, now)) |entry| {
             // A stale answer is still better than a failure, and it needs no
             // outgoing query either.
             if (try self.cache.lookup(&key, query, now, output, true)) |stale| {
                 if (cookie == .valid) return self.addCachedCookie(output, query, cookie.valid);
                 return stale.bytes;
             }
-            const bytes = try self.failureResponse(query, failure, output);
-            if (cookie == .valid) return self.addCachedCookie(output, query, cookie.valid);
-            return bytes;
+            // RFC 4035 section 4.7: a validation failure is answered from the
+            // cache only after the question failed to validate more times
+            // than the threshold. Before that the client goes upstream again.
+            if (entry.servable()) {
+                const bytes = try self.failureResponse(query, entry.failure, output);
+                if (cookie == .valid) return self.addCachedCookie(output, query, cookie.valid);
+                return bytes;
+            }
         }
         const exchange = self.queryUpstream(query_bytes, query, scope) catch |err| switch (err) {
             Error.UpstreamFailure,
@@ -1176,10 +1208,11 @@ pub const Resolver = struct {
                 // false when CD is set, and that is exactly the case section
                 // 5.5 says must be returned in full instead.
                 // RFC 9520 section 3.4: the validation failure is cached, so
-                // the next client for the same question is answered with the
-                // same SERVFAIL and the same code and no new upstream query.
+                // the question is not asked upstream again once it has failed
+                // to validate more times than the threshold of RFC 4035
+                // section 4.7.
                 .bogus => {
-                    self.cache.failures.put(key, .{ .rcode = .servfail, .ede = result.ede }, now);
+                    self.cache.failures.put(key, .{ .rcode = .servfail, .ede = result.ede, .validation = true }, now);
                     return self.relayBogus(query, cookie, result.ede, output);
                 },
                 .insecure => {
@@ -1205,9 +1238,10 @@ pub const Resolver = struct {
             .synthesized => |answer_scope| upstream_scope = answer_scope,
             .bogus => |ede| {
                 // RFC 9520 section 3.4: the validation failure is cached, so
-                // the next client for the same question is answered with the
-                // same SERVFAIL and the same code.
-                self.cache.failures.put(key, .{ .rcode = .servfail, .ede = ede }, now);
+                // the question is not asked upstream again once it has failed
+                // to validate more times than the threshold of RFC 4035
+                // section 4.7.
+                self.cache.failures.put(key, .{ .rcode = .servfail, .ede = ede, .validation = true }, now);
                 return self.relayBogus(query, cookie, ede, output);
             },
         }
@@ -1286,8 +1320,9 @@ pub const Resolver = struct {
 
     /// SERVFAIL plus the RFC 8914 DNSSEC-bogus INFO-CODE the validator
     /// produced, with the cookie the same answer path would have carried.
-    /// RFC 9520 section 3.4: the failure is in the failure cache, so the next
-    /// client for the same question is answered with the same RCODE and code.
+    /// RFC 9520 section 3.4: the failure is in the failure cache, and RFC
+    /// 4035 section 4.7 keeps it there until the question has failed to
+    /// validate more times than the threshold.
     fn relayBogus(self: *Resolver, query: dns_message.Message, cookie: CookieDecision, ede_code: u16, output: []u8) ![]const u8 {
         _ = self;
         var message = try Resolver.buildDnssecBogusResponse(query, ede_code);
@@ -6425,7 +6460,7 @@ test "RFC 9520 section 3.2: a cached failure is answered as the failure it is" {
     // NXDOMAIN, never a NODATA, and never an authenticated answer.
     for ([_]dns_header.Rcode{ .servfail, .refused, .formerr }) |rcode| {
         cache.failures.put(key, .{ .rcode = rcode, .ede = EDE_NETWORK_ERROR }, 1000);
-        const failure = cache.failures.lookup(&key, 1001).?;
+        const failure = cache.failures.lookup(&key, 1001).?.failure;
         const bytes = try resolver.failureResponse(query, failure, &output);
         const message = try dns_message.Message.parse(arena.allocator(), bytes);
         try std.testing.expectEqual(rcode, message.header.rcode);
@@ -6640,7 +6675,7 @@ const ValidationFixture = struct {
     }
 };
 
-test "RFC 9520 section 3.4: a validation failure is cached and answered without a second upstream query" {
+test "RFC 4035 section 4.7: a validation failure is not answered from the cache before the threshold" {
     const io = std.Io.Threaded.global_single_threaded.io();
     const fixture = try ValidationFixture.create(io);
     defer fixture.destroy();
@@ -6653,14 +6688,77 @@ test "RFC 9520 section 3.4: a validation failure is cached and answered without 
     // The RFC 8914 code the validator produced rides along with it.
     try expectEde(first_message, EDE_RRSIGS_MISSING, "rrsigs missing");
 
-    // The same question again: the validation failure is in the cache, so no
-    // second query goes upstream and the client sees the same failure.
+    // The same question again: the validation failure is in the cache
+    // (RFC 9520 section 3.4), but the count of the failures of the question
+    // has not passed the threshold yet, so the question goes upstream again
+    // and the client sees the same failure.
     const second = try fixture.resolver.answer(fixture.encoded, fixture.query, &client, &output);
     const second_message = try dns_message.Message.parse(fixture.arena.allocator(), second);
     try std.testing.expectEqual(dns_header.Rcode.servfail, second_message.header.rcode);
     try expectEde(second_message, EDE_RRSIGS_MISSING, "rrsigs missing");
 
-    try std.testing.expectEqual(@as(usize, 1), fixture.upstream.requests);
+    // The upstream saw both queries, and the failure is still cached.
+    try std.testing.expectEqual(@as(usize, 2), fixture.upstream.requests);
+    const key = try CacheKey.fromQuestion(fixture.query);
+    try std.testing.expect(fixture.resolver.cache.failures.lookup(&key, fixture.now()) != null);
+}
+
+test "RFC 4035 section 4.7: a validation failure past the threshold is answered from the cache" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const fixture = try ValidationFixture.create(io);
+    defer fixture.destroy();
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42723);
+
+    // Two failures of the question: the count of the validation failures
+    // passes the threshold.
+    _ = try fixture.resolver.answer(fixture.encoded, fixture.query, &client, &output);
+    _ = try fixture.resolver.answer(fixture.encoded, fixture.query, &client, &output);
+
+    // The next client is answered from the cache with the same SERVFAIL and
+    // the same code, and the upstream is not asked again.
+    const cached = try fixture.resolver.answer(fixture.encoded, fixture.query, &client, &output);
+    const message = try dns_message.Message.parse(fixture.arena.allocator(), cached);
+    try std.testing.expectEqual(dns_header.Rcode.servfail, message.header.rcode);
+    try expectEde(message, EDE_RRSIGS_MISSING, "rrsigs missing");
+    try std.testing.expectEqual(@as(usize, 2), fixture.upstream.requests);
+}
+
+test "RFC 4035 section 4.7: a failure that is not a validation failure is answered from the cache at once" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    var upstream = FailingUpstream{ .io = io, .udp = &upstream_socket, .rcode = .servfail };
+    const thread = try std.Thread.spawn(.{}, serveFailingUpstream, .{&upstream});
+
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = upstream_socket.address },
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2933, "fail.example.", true);
+    defer query.deinit();
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42724);
+
+    const first = try resolver.answer(encoded, query, &client, &output);
+    const first_message = try dns_message.Message.parse(arena.allocator(), first);
+    try std.testing.expectEqual(dns_header.Rcode.servfail, first_message.header.rcode);
+
+    // The threshold counts the validation failures of the question, so a
+    // failure that is not one is answered from the cache at once.
+    const second = try resolver.answer(encoded, query, &client, &output);
+    const second_message = try dns_message.Message.parse(arena.allocator(), second);
+    try std.testing.expectEqual(dns_header.Rcode.servfail, second_message.header.rcode);
+    try std.testing.expectEqual(@as(usize, 1), upstream.requests);
+
+    thread.join();
 }
 
 test "RFC 9520 section 3.4: a cached validation failure is answered as the failure it is" {

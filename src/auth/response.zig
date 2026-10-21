@@ -414,10 +414,23 @@ pub fn buildResponseWithPolicy(
                 const any_ttl = if (over_tcp) (policy.minimal_any_ttl_tcp orelse policy.minimal_any_ttl) else policy.minimal_any_ttl;
                 const answer = anyMinimalAnswer(q.name, any_ttl);
                 try response.answers.append(answer);
+                // RFC 8482 section 4.1: the answer may carry a subset of the
+                // owner's RRsets. The RRset that joins the HINFO is the
+                // zone's own and keeps the zone's own TTL.
+                if (anySubsetType(zone, qname_text)) |subset_type| {
+                    var index: usize = 0;
+                    while (index < zone.records.len) : (index += 1) {
+                        const record = zone.records.items[index];
+                        if (!record.rrtype.eql(subset_type)) continue;
+                        if (!std.ascii.eqlIgnoreCase(record.ownerText(), qname_text)) continue;
+                        try response.answers.append(try toResourceRecord(record, null));
+                    }
+                }
                 // RFC 8482 section 4.2: a signed zone must return a valid
                 // RRSIG for the RRsets in the answer when the query sets DO=1.
                 // The HINFO is synthesized, so no signature over it exists in
-                // the zone and one is made here.
+                // the zone and one is made here; the RRset that joined it is
+                // the zone's own, and its RRSIG rides along with the answer.
                 if (dnssec_ok) {
                     if (session) |signing| try appendMinimalAnyRrsig(&response, zone, signing, answer);
                 }
@@ -449,6 +462,8 @@ pub fn buildResponseWithPolicy(
         if (lookup.kind == .nodata or lookup.kind == .nxdomain) {
             const proved = appendDenialProofs(&response, zone, qname_text, q.qtype, lookup.kind) catch false;
             if (!proved) refuseUnprovenDenial(&response);
+        } else if (lookup.kind == .referral) {
+            appendReferralProofs(&response, zone, lookup.authorities.items) catch {};
         }
     } else {
         dns_dnssec.stripProofRecords(&response, q.qtype);
@@ -485,6 +500,55 @@ fn anyMinimalAnswer(owner: dns_name.Name, ttl: u32) dns_record.ResourceRecord {
         .ttl = ttl,
         .rdata = .{ .HINFO = rdata },
     };
+}
+
+/// The RRset that joins the HINFO in a minimal ANY answer, or null when the
+/// owner holds a single RRset and the HINFO answers alone. RFC 8482 section
+/// 4.1 lets the answer carry a subset of the owner's RRsets and leaves the
+/// choice to the responder; section 4.3 names the types an initiator most
+/// often wants (CNAME, MX, A, AAAA), and the order it lists them in is the
+/// project's preference order. Every other type follows, in type-code order.
+fn anySubsetType(zone: *const zone_index.Zone, owner_text: []const u8) ?dns_types.RecordType {
+    var selected: ?dns_types.RecordType = null;
+    var selected_rank: u32 = std.math.maxInt(u32);
+    var selected_records: usize = 0;
+    var total: usize = 0;
+    var index: usize = 0;
+    while (index < zone.records.len) : (index += 1) {
+        const record = zone.records.items[index];
+        if (!std.ascii.eqlIgnoreCase(record.ownerText(), owner_text)) continue;
+        if (!isAnySubsetCandidate(record.rrtype)) continue;
+        total += 1;
+        const rank = anySubsetRank(record.rrtype);
+        if (rank < selected_rank) {
+            selected_rank = rank;
+            selected = record.rrtype;
+            selected_records = 1;
+        } else if (rank == selected_rank) {
+            selected_records += 1;
+        }
+    }
+    // Only the selected type's own records share its rank, so a total above
+    // the selected count means the owner holds more than one RRset.
+    if (total <= selected_records) return null;
+    return selected;
+}
+
+/// The DNSSEC proof records are not data the owner publishes, and the answer
+/// already carries a synthesized HINFO at that owner.
+fn isAnySubsetCandidate(rrtype: dns_types.RecordType) bool {
+    return !rrtype.eql(.RRSIG) and !rrtype.eql(.NSEC) and
+        !rrtype.eql(.NSEC3) and !rrtype.eql(.HINFO);
+}
+
+/// RFC 8482 section 4.3 lists the types it keeps in the order the project
+/// prefers them; every other type follows, in type-code order.
+fn anySubsetRank(rrtype: dns_types.RecordType) u32 {
+    if (rrtype.eql(.CNAME)) return 0;
+    if (rrtype.eql(.MX)) return 1;
+    if (rrtype.eql(.A)) return 2;
+    if (rrtype.eql(.AAAA)) return 3;
+    return 4 + @as(u32, rrtype.code());
 }
 
 /// RFC 8482 section 4.2: the minimal ANY answer is synthesized, so it is not
@@ -857,8 +921,9 @@ fn appendNsec3Proofs(
     // RFC 5155 section 7.2.4: a DS NODATA with no matching NSEC3 is proved
     // by the closest provable encloser proof, and the NSEC3 that covers the
     // next closer name must carry the Opt-Out flag (RFC 5155 section 6).
-    if (qtype.eql(.DS)) {
-        if (nxdomain) return false;
+    // A DS query for a name that does not exist is a name error and carries
+    // the proof of section 7.2.2, not the no-data proof of this section.
+    if (qtype.eql(.DS) and !nxdomain) {
         const encloser = nsec3ClosestEncloser(chain, qname, origin) orelse return false;
         const entries = chain.entries orelse return false;
         if (!entries[encloser.cover].opt_out) return false;
@@ -949,6 +1014,49 @@ fn appendNsec3(
     try response.authorities.append(rr);
     try response.authorities.append(signature);
     return true;
+}
+
+/// RFC 5155 section 7.2.7: a referral to an unsigned subzone carries the
+/// proof that the delegation may be unsigned. Under an Opt-Out chain the
+/// delegation has no NSEC3 of its own, so the proof is the closest provable
+/// encloser proof of the delegation name, whose NSEC3 that covers the next
+/// closer name carries the Opt-Out flag. A chain that cannot prove that
+/// leaves the referral the way it was.
+fn appendReferralProofs(
+    response: *dns_message.Message,
+    zone: *const zone_index.Zone,
+    authorities: []const zone_parser.ZoneRecord,
+) !void {
+    const delegation = delegationOwner(authorities) orelse return;
+    var chain = try nsec3Chain(response.allocator, zone);
+    defer chain.deinit(response.allocator);
+    const entries = chain.entries orelse return;
+    if (!chain.consistent) return;
+    const name = dns_name.Name.fromText(delegation) catch return;
+    const origin = dns_name.Name.fromText(zone.originText()) catch return;
+    const encloser = nsec3ClosestEncloser(&chain, name, origin) orelse return;
+    // RFC 5155 section 7.2.7: the NSEC3 that covers the next closer name
+    // for the delegation must carry the Opt-Out flag.
+    if (!entries[encloser.cover].opt_out) return;
+    const proof = [_]usize{ encloser.match, encloser.cover };
+    const before = response.authorities.len;
+    if (!try appendNsec3Set(response, zone, &chain, proof[0..])) {
+        response.authorities.len = before;
+        return;
+    }
+    // RFC 5155 section 7.3: the apex NSEC3PARAM states the parameters of the
+    // chain, so a validator can check the hash the proof was built with.
+    try appendApexNsec3Param(response, zone);
+}
+
+/// The owner of the NS RRset a referral carries: the delegation the referral
+/// points at (RFC 5155 section 8.9).
+fn delegationOwner(authorities: []const zone_parser.ZoneRecord) ?[]const u8 {
+    for (authorities) |record| {
+        if (!record.rrtype.eql(.NS)) continue;
+        return record.ownerText();
+    }
+    return null;
 }
 
 /// The RRSIG that covers an NSEC3 RRset (RFC 4035 section 5.4).
@@ -2108,6 +2216,100 @@ test "a DS NODATA at a name the chain holds keeps the matching NSEC3 proof (RFC 
 
     // Every proof record rides with the RRSIG that covers it.
     try expectNsec3ProofsSigned(&response);
+}
+
+test "a DS query for a name that does not exist is answered with the name error proof (RFC 5155 7.2.2)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(nsec3_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    // The name does not exist, so the answer is a name error and not a
+    // no-data answer: RFC 5155 section 7.2.2 gives the name error proof.
+    const query = try testDoQuery(arena.allocator(), 0x4483, "nothere.example.", .DS, true);
+    const response = try buildResponse(query, &zone);
+    try std.testing.expectEqual(header.Rcode.nxdomain, response.header.rcode);
+
+    // The closest encloser is the apex, proved by the NSEC3 that matches it.
+    const encloser = servedNsec3Match(&response, nsec3_apex_hash) orelse return error.TestExpectedEqual;
+    try std.testing.expect(encloser.rrtype.eql(.NSEC3));
+    // The NSEC3 that covers the next closer "nothere.example.".
+    try std.testing.expect(servedNsec3Cover(&response, nsec3_missing_hash) != null);
+    // And the NSEC3 that covers the wildcard at the closest encloser.
+    try std.testing.expect(servedNsec3Cover(&response, nsec3_wildcard_hash) != null);
+    // The proof never claims the queried name exists.
+    try std.testing.expect(servedNsec3Match(&response, nsec3_missing_hash) == null);
+
+    // Every proof record rides with the RRSIG that covers it.
+    try expectNsec3ProofsSigned(&response);
+
+    // The project's own validator accepts the answer: it is a name error
+    // proof (RFC 5155 section 8.4), so it validates, and without an anchor
+    // the answer is insecure rather than secure.
+    var anchors = dns_validate.Anchors{};
+    const result = try dns_validate.validate(arena.allocator(), &anchors, query, response, &.{}, 1_500_000_000);
+    try std.testing.expectEqual(dns_validate.Status.insecure, result.status);
+}
+
+test "a referral to an unsigned subzone carries the Opt-Out closest provable encloser proof (RFC 5155 7.2.7)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(nsec3_optout_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    // The delegation is unsigned and the chain holds no NSEC3 for it, so the
+    // referral says the delegation may be unsigned with the closest provable
+    // encloser proof of section 7.2.7.
+    const query = try testDoQuery(arena.allocator(), 0x4484, "unsigned-sub.example.", .A, true);
+    const response = try buildResponse(query, &zone);
+    try std.testing.expectEqual(header.Rcode.no_error, response.header.rcode);
+    try std.testing.expect(!response.header.authoritative);
+
+    // The closest provable encloser is the apex, proved by the NSEC3 that
+    // matches it (RFC 5155 section 7.2.1).
+    const encloser = servedNsec3Match(&response, nsec3_apex_hash) orelse return error.TestExpectedEqual;
+    try std.testing.expect(encloser.rrtype.eql(.NSEC3));
+    // The next closer "unsigned-sub.example." is covered by the NSEC3 whose
+    // Opt-Out flag section 7.2.7 requires.
+    const cover = servedNsec3Cover(&response, nsec3_unsigned_sub_hash) orelse return error.TestExpectedEqual;
+    try std.testing.expect(servedNsec3OptOut(cover));
+    // The chain never claims the delegation itself exists.
+    try std.testing.expect(servedNsec3Match(&response, nsec3_unsigned_sub_hash) == null);
+
+    // Every proof record rides with the RRSIG that covers it.
+    try expectNsec3ProofsSigned(&response);
+
+    // The project's own validator accepts the answer: the referral proves the
+    // delegation unsigned (RFC 5155 section 8.9).
+    var anchors = dns_validate.Anchors{};
+    const result = try dns_validate.validate(arena.allocator(), &anchors, query, response, &.{}, 1_500_000_000);
+    try std.testing.expectEqual(dns_validate.Status.insecure, result.status);
+}
+
+test "a referral under a chain with no Opt-Out flag keeps the answer it had" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(nsec3_optout_clear_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    const query = try testDoQuery(arena.allocator(), 0x4485, "unsigned-sub.example.", .A, true);
+    const response = try buildResponse(query, &zone);
+    try std.testing.expectEqual(header.Rcode.no_error, response.header.rcode);
+    try std.testing.expect(!response.header.authoritative);
+
+    // The chain cannot prove the delegation unsigned: the NSEC3 that covers
+    // the next closer name carries no Opt-Out flag (RFC 5155 section 6), so
+    // the referral is the one the zone always answered, with no proof.
+    try std.testing.expect(servedNsec3Match(&response, nsec3_apex_hash) == null);
+    for (response.authorities.slice()) |record| {
+        try std.testing.expect(!record.rrtype.eql(.NSEC3));
+    }
 }
 
 test "a zone without an NSEC3 chain keeps its NSEC denial proof" {
@@ -3418,7 +3620,6 @@ test "RFC 8482: ANY at an existing owner answers one synthesized HINFO" {
         \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
         \\@ IN NS ns1.home.arpa.
         \\dns IN A 192.168.1.1
-        \\dns IN TXT "hello"
         \\alias IN CNAME dns
         \\deep.branch IN A 192.168.1.7
         \\
@@ -3690,6 +3891,187 @@ test "RFC 8482: an unsigned zone answers the HINFO with no RRSIG" {
     const answer = try buildResponseWithPolicy(query, &zone, .{}, null, false);
     try std.testing.expectEqual(@as(u16, 1), answer.header.answer_count);
     try std.testing.expect(answer.answers.items[0].rrtype.eql(hinfo_type));
+}
+
+test "RFC 8482 section 4.1: an ANY query at an owner with more than one RRset answers a subset" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\multi IN A 192.0.2.1
+        \\multi IN AAAA 2001:db8::1
+        \\multi IN TXT "hello"
+        \\
+    );
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    // Section 4.1: the answer carries a subset of the owner's RRsets, and
+    // section 7 keeps TC clear because the subset is not a truncation.
+    const response = try buildResponse(try testQuery(arena.allocator(), "multi.home.arpa.", .ANY), &zone);
+    try std.testing.expectEqual(header.Rcode.no_error, response.header.rcode);
+    try std.testing.expect(!response.header.truncated);
+    try std.testing.expectEqual(@as(u16, 2), response.header.answer_count);
+    try std.testing.expectEqual(@as(u16, 0), response.header.authority_count);
+
+    // The HINFO is the first RRset of the answer and keeps its own TTL.
+    try std.testing.expect(response.answers.items[0].rrtype.eql(hinfo_type));
+    try std.testing.expectEqual(@as(u32, 86400), response.answers.items[0].ttl);
+    const hinfo = response.answers.items[0].rdata.HINFO;
+    try std.testing.expectEqualStrings("RFC8482", hinfo.cpuText());
+    try std.testing.expectEqualStrings("", hinfo.osText());
+
+    // The second RRset is the one the rule selects: section 4.3's list puts A
+    // ahead of AAAA, and the TXT is not in it. No other RRset comes with it.
+    try std.testing.expect(response.answers.items[1].rrtype.eql(.A));
+    try std.testing.expectEqual(@as(u32, 3600), response.answers.items[1].ttl);
+    try std.testing.expectEqualSlices(u8, &.{ 192, 0, 2, 1 }, &response.answers.items[1].rdata.A);
+}
+
+test "RFC 8482 section 4.1: the RRset that joins the HINFO keeps the zone's own TTL" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\multi 120 IN A 192.0.2.1
+        \\multi 120 IN TXT "hello"
+        \\
+    );
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    // The operator's TTL belongs to the synthesized HINFO alone; the RRset
+    // that joins it is the zone's own and keeps the zone's own TTL.
+    const udp = try buildResponseWithPolicy(try testQuery(arena.allocator(), "multi.home.arpa.", .ANY), &zone, .{ .minimal_any_ttl = 300 }, null, false);
+    try std.testing.expectEqual(@as(u16, 2), udp.header.answer_count);
+    try std.testing.expectEqual(@as(u32, 300), udp.answers.items[0].ttl);
+    try std.testing.expectEqual(@as(u32, 120), udp.answers.items[1].ttl);
+
+    // Section 4.4: the transport moves the HINFO's TTL, not the RRset's.
+    const tcp = try buildResponseWithPolicy(try testQuery(arena.allocator(), "multi.home.arpa.", .ANY), &zone, .{ .minimal_any_ttl = 300, .minimal_any_ttl_tcp = 3600 }, null, true);
+    try std.testing.expectEqual(@as(u16, 2), tcp.header.answer_count);
+    try std.testing.expectEqual(@as(u32, 3600), tcp.answers.items[0].ttl);
+    try std.testing.expectEqual(@as(u32, 120), tcp.answers.items[1].ttl);
+}
+
+test "RFC 8482 section 4.1: a DO=1 ANY query on a signed zone signs every RRset of the subset" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+        \\@ IN NS ns.example.
+        \\ns IN A 192.0.2.1
+        \\www IN A 192.0.2.2
+        \\www IN TXT "hello"
+        \\
+    );
+    defer zone_file.deinit();
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    // The RFC 8080 section 6.1 Ed25519 key, so nothing secret enters the
+    // repository and the DNSKEY it derives is the one the RFC pins.
+    var key = try zone_signer.parseKey("ed25519 DSSF3o0s0f+ElWzj9E/Osxw8hLpk55chkmx0LYN5WiY=\n");
+    defer key.deinit();
+    const dnskey_rdata = try key.dnskeyRdata(arena.allocator());
+    const window = zone_signer.Options{ .inception = 1_000_000_000, .expiration = 2_000_000_000 };
+    try zone_signer.signZone(arena.allocator(), &zone, &key, window);
+    var session = zone_signer.Session.start(&key, window);
+    defer session.deinit();
+
+    const query = try testDoQuery(arena.allocator(), 0x4a05, "www.example.", .ANY, true);
+    const answer = try buildResponseWithPolicy(query, &zone, .{}, &session, false);
+
+    // The HINFO, the RRset that joined it, and an RRSIG over each of them:
+    // section 4.2 asks for a valid RRSIG for the RRsets in the answer.
+    try std.testing.expectEqual(@as(u16, 4), answer.header.answer_count);
+    try std.testing.expect(answer.answers.items[0].rrtype.eql(hinfo_type));
+    try std.testing.expect(answer.answers.items[1].rrtype.eql(.A));
+
+    var hinfo_rrsig: ?[]const u8 = null;
+    var a_rrsig: ?[]const u8 = null;
+    for (answer.answers.items) |record| {
+        if (!record.rrtype.eql(.RRSIG)) continue;
+        const raw = switch (record.rdata) {
+            .Unknown => |*unknown| unknown.bytes(),
+            else => return error.TestUnexpectedResult,
+        };
+        // RFC 4034 section 3.1.1: the type covered is the RRset's own type.
+        const covered = std.mem.readInt(u16, raw[0..2], .big);
+        if (covered == hinfo_type.code()) hinfo_rrsig = raw;
+        if (covered == dns_types.RecordType.A.code()) a_rrsig = raw;
+    }
+    try std.testing.expect(hinfo_rrsig != null);
+    try std.testing.expect(a_rrsig != null);
+
+    // The signatures are checked by the project's own validator, which
+    // rebuilds the canonical RR form from the answer and verifies it against
+    // the zone's own DNSKEY.
+    var anchors = dns_validate.Anchors{};
+    anchors.items[0] = .{ .owner = try dns_name.Name.fromText("example."), .rrtype = .DNSKEY, .rdata = dnskey_rdata };
+    anchors.len = 1;
+    const result = try dns_validate.validate(arena.allocator(), &anchors, query, answer, &.{}, 1_500_000_000);
+    try std.testing.expectEqual(dns_validate.Status.secure, result.status);
+}
+
+test "RFC 8482: the answers the subset does not reach keep their bytes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
+        \\alias IN CNAME dns
+        \\deep.branch IN A 192.168.1.7
+        \\
+    );
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    // An owner with a single RRset answers the HINFO alone, a CNAME owner
+    // answers with the CNAME RRset, an empty non-terminal keeps NODATA, and a
+    // name that does not exist keeps NXDOMAIN. The bytes are the ones the
+    // server sent before the subset existed.
+    try expectAnswerHex(
+        "12348400000100010000000003646e7304686f6d6504617270610000ff0001c00c000d0001000151800009075246433834383200",
+        try buildResponse(try testQuery(arena.allocator(), "dns.home.arpa.", .ANY), &zone),
+    );
+    try expectAnswerHex(
+        "12348400000100010000000005616c69617304686f6d6504617270610000ff0001c00c0005000100000e10000603646e73c012",
+        try buildResponse(try testQuery(arena.allocator(), "alias.home.arpa.", .ANY), &zone),
+    );
+    try expectAnswerHex(
+        "123484000001000000010000066272616e636804686f6d6504617270610000ff0001c0130006000100000e100027036e7331c0130a686f73746d6173746572c0130000000100000e10000003840012750000000e10",
+        try buildResponse(try testQuery(arena.allocator(), "branch.home.arpa.", .ANY), &zone),
+    );
+    try expectAnswerHex(
+        "12348403000100000001000004676f6e6504686f6d6504617270610000ff0001c0110006000100000e100027036e7331c0110a686f73746d6173746572c0110000000100000e10000003840012750000000e10",
+        try buildResponse(try testQuery(arena.allocator(), "gone.home.arpa.", .ANY), &zone),
+    );
+}
+
+/// Asserts the wire bytes of an answer against their hexadecimal form.
+fn expectAnswerHex(expected_hex: []const u8, response: dns_message.Message) !void {
+    var encoded: [512]u8 = undefined;
+    var writer = dns_writer.Writer.init(&encoded);
+    try response.encode(&writer);
+    var expected: [512]u8 = undefined;
+    const decoded = try std.fmt.hexToBytes(&expected, expected_hex);
+    try std.testing.expectEqualSlices(u8, decoded, writer.written());
 }
 
 test "RFC 9471: a referral carries in-domain and sibling-domain glue" {
