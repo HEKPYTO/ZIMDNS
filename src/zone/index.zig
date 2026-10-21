@@ -215,6 +215,16 @@ pub const Zone = struct {
         return isSubdomainOrEqual(qname, self.originText());
     }
 
+    /// Whether the zone publishes RRSIG records: its RRsets are signed, so an
+    /// answer that carries an RRset the server cannot sign is bogus for a
+    /// validating client (RFC 4035 section 5.3).
+    pub fn carriesRrsigs(self: *const Zone) bool {
+        for (self.records.items[0..self.records.len]) |record| {
+            if (record.rrtype.eql(.RRSIG)) return true;
+        }
+        return false;
+    }
+
     fn lookupExact(self: *const Zone, allocator: std.mem.Allocator, qname: []const u8, qtype: RecordType, result: *LookupResult) ?LookupKind {
         var owner_exists = false;
         var saw_cname = false;

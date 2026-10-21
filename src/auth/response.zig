@@ -481,16 +481,29 @@ fn buildMinimalAnyAnswer(
     session: ?*const zone_signer.Session,
     answer_owner: ?[]const u8,
 ) !void {
-    const answer = anyMinimalAnswer(owner, ttl);
-    try response.answers.append(answer);
-    // RFC 8482 section 4.2: a signed zone must return a valid RRSIG for the
-    // RRsets in the answer when the query sets DO=1. The HINFO is
-    // synthesized, so no signature over it exists in the zone and one is
-    // made here.
-    if (dnssec_ok) {
-        if (session) |signing| try appendMinimalAnyRrsig(response, zone, signing, answer);
+    // RFC 8482 section 4.2: the synthesized HINFO is not in the zone file, so
+    // the server can only answer with it when it can sign it. A zone that
+    // publishes RRSIGs and no key to sign with cannot: section 4.1 asks for
+    // the RRsets in the answer to be signed, and an unsigned RRset in a
+    // signed zone is bogus (RFC 4035 section 5.3). The answer is then the
+    // zone's own RRsets, which carry their own signatures.
+    const synthesize = session != null or !zone.carriesRrsigs();
+    if (synthesize) {
+        const answer = anyMinimalAnswer(owner, ttl);
+        try response.answers.append(answer);
+        // RFC 8482 section 4.2: a signed zone must return a valid RRSIG for the
+        // RRsets in the answer when the query sets DO=1. The HINFO is
+        // synthesized, so no signature over it exists in the zone and one is
+        // made here.
+        if (dnssec_ok) {
+            if (session) |signing| try appendMinimalAnyRrsig(response, zone, signing, answer);
+        }
     }
-    const mask = anySubsetMask(zone, owner_text) orelse return;
+    const subset = anySubset(zone, owner_text);
+    // An owner that holds a single RRset has no subset to offer, so the
+    // HINFO answers alone. An answer that carries the zone's own RRsets has
+    // no HINFO to hold them, so every RRset of the subset joins it.
+    const mask = if (synthesize and subset.single) 0 else subset.mask;
     const limit = payloadLimitFor(response.edns);
     for (any_subset_types, 0..) |rrtype, position| {
         if ((mask & (@as(u8, 1) << @intCast(position))) == 0) continue;
@@ -576,10 +589,18 @@ fn anyMinimalAnswer(owner: dns_name.Name, ttl: u32) dns_record.ResourceRecord {
 /// RRset alone (section 4.1).
 const any_subset_types = [_]dns_types.RecordType{ .CNAME, .MX, .A, .AAAA };
 
-/// The types of the RRsets that join the HINFO in a minimal ANY answer: the
-/// RFC 8482 section 4.3 types the owner holds, and no other. An owner that
-/// holds a single RRset has no subset to offer, so the HINFO answers alone.
-fn anySubsetMask(zone: *const zone_index.Zone, owner_text: []const u8) ?u8 {
+/// The RRsets at the owner that RFC 8482 section 4.3 names.
+const AnySubset = struct {
+    /// The types the owner holds, a bit per type of `any_subset_types`.
+    mask: u8,
+    /// The owner holds one RRset and no other, so there is no subset to
+    /// offer and the HINFO answers alone.
+    single: bool,
+};
+
+/// The RRsets at the owner that RFC 8482 section 4.3 names, and whether the
+/// owner holds a single RRset.
+fn anySubset(zone: *const zone_index.Zone, owner_text: []const u8) AnySubset {
     var total: usize = 0;
     var first_type: ?dns_types.RecordType = null;
     var first_type_records: usize = 0;
@@ -602,8 +623,7 @@ fn anySubsetMask(zone: *const zone_index.Zone, owner_text: []const u8) ?u8 {
     }
     // Only the records of the first type share its count, so a total above
     // that count means the owner holds more than one RRset.
-    if (total <= first_type_records) return null;
-    return mask;
+    return .{ .mask = mask, .single = total <= first_type_records };
 }
 
 /// The DNSSEC proof records are not data the owner publishes, and the answer
@@ -4366,6 +4386,240 @@ test "RFC 8482 section 7: the answer carries no TC bit and keeps the RRsets that
     const reply = try truncateClassicUdpResponse(message_writer.written(), &truncated);
     try std.testing.expectEqualSlices(u8, message_writer.written(), reply);
     try std.testing.expect((std.mem.readInt(u16, reply[2..4], .big) & header.Flags.tc) == 0);
+}
+
+/// The zone the signer signed, with the signatures it made written into the
+/// file: a zone that carries its own DNSSEC records, which the server holds
+/// no key to sign with.
+fn zoneFileWithOwnRrsigs(
+    allocator: std.mem.Allocator,
+    zone_text: []const u8,
+    signed: *const zone_index.Zone,
+    owner_text: []const u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try out.writer.writeAll(zone_text);
+    for (signed.records.items) |record| {
+        if (!record.rrtype.eql(.RRSIG)) continue;
+        if (!std.ascii.eqlIgnoreCase(record.ownerText(), owner_text)) continue;
+        try out.writer.print("{s} {d} IN RRSIG {s}\n", .{ record.ownerText(), record.ttl, record.rdataText() });
+    }
+    return out.toOwnedSlice();
+}
+
+/// A zone that carries its own DNSSEC records, and the DNSKEY the validator
+/// trusts for it.
+const OwnRrsigZone = struct {
+    zone: zone_index.Zone,
+    dnskey: []const u8,
+
+    fn deinit(self: *OwnRrsigZone) void {
+        self.zone.deinit();
+    }
+};
+
+/// The zone the signer signed, written back as a zone file that holds the
+/// signatures the signer made. The server holds no key for such a zone.
+fn zoneWithOwnRrsigs(allocator: std.mem.Allocator, zone_text: []const u8, owner_text: []const u8) !OwnRrsigZone {
+    var zone_file = try zone_parser.ZoneFile.parse(zone_text);
+    defer zone_file.deinit();
+    var signed = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer signed.deinit();
+
+    // The RFC 8080 section 6.1 Ed25519 key, so nothing secret enters the
+    // repository and the DNSKEY it derives is the one the RFC pins.
+    var key = try zone_signer.parseKey("ed25519 DSSF3o0s0f+ElWzj9E/Osxw8hLpk55chkmx0LYN5WiY=\n");
+    defer key.deinit();
+    const dnskey = try key.dnskeyRdata(allocator);
+    const window = zone_signer.Options{ .inception = 1_000_000_000, .expiration = 2_000_000_000 };
+    try zone_signer.signZone(allocator, &signed, &key, window);
+
+    const text = try zoneFileWithOwnRrsigs(allocator, zone_text, &signed, owner_text);
+    var own_file = try zone_parser.ZoneFile.parse(text);
+    defer own_file.deinit();
+    const own = try zone_index.Zone.fromZoneFile(&own_file);
+    return .{ .zone = own, .dnskey = dnskey };
+}
+
+const own_rrsig_zone_text =
+    \\$ORIGIN example.
+    \\$TTL 3600
+    \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+    \\@ IN NS ns.example.
+    \\ns IN A 192.0.2.1
+    \\www IN A 192.0.2.2
+    \\www IN AAAA 2001:db8::2
+    \\
+;
+
+test "RFC 8482: a zone that carries its own DNSSEC records answers the ANY query with its own RRsets" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var own = try zoneWithOwnRrsigs(arena.allocator(), own_rrsig_zone_text, "www.example.");
+    defer own.deinit();
+
+    // Section 4.1: the zone is signed, so the RRsets in the answer must be
+    // signed too. The HINFO is not in the zone file and no key can sign it,
+    // so the answer is the zone's own RRsets with their own signatures.
+    const query = try testDoQuery(arena.allocator(), 0x4a10, "www.example.", .ANY, true);
+    const answer = try buildResponseWithPolicy(query, &own.zone, .{}, null, false);
+    try std.testing.expectEqual(@as(u16, 4), answer.header.answer_count);
+    try std.testing.expect(answer.answers.items[0].rrtype.eql(.A));
+    try std.testing.expect(answer.answers.items[1].rrtype.eql(.RRSIG));
+    try std.testing.expect(answer.answers.items[2].rrtype.eql(.AAAA));
+    try std.testing.expect(answer.answers.items[3].rrtype.eql(.RRSIG));
+    // No HINFO rides along: it would be an unsigned RRset in a signed zone.
+    for (answer.answers.slice()) |record| {
+        try std.testing.expect(!record.rrtype.eql(hinfo_type));
+    }
+
+    // The answer is judged by the project's own validator, which rebuilds the
+    // canonical RR form from the answer and verifies it against the zone's
+    // own DNSKEY.
+    var anchors = dns_validate.Anchors{};
+    anchors.items[0] = .{ .owner = try dns_name.Name.fromText("example."), .rrtype = .DNSKEY, .rdata = own.dnskey };
+    anchors.len = 1;
+    const result = try dns_validate.validate(arena.allocator(), &anchors, query, answer, &.{}, 1_500_000_000);
+    try std.testing.expectEqual(dns_validate.Status.secure, result.status);
+}
+
+test "RFC 8482: a zone that carries its own DNSSEC records answers a DO=0 ANY query with its own RRsets" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var own = try zoneWithOwnRrsigs(arena.allocator(), own_rrsig_zone_text, "www.example.");
+    defer own.deinit();
+
+    // The DO bit decides whether the signatures ride along, not whether the
+    // HINFO is synthesized, so the answer is the zone's own RRsets without
+    // them.
+    const query = try testDoQuery(arena.allocator(), 0x4a11, "www.example.", .ANY, false);
+    const answer = try buildResponseWithPolicy(query, &own.zone, .{}, null, false);
+    try std.testing.expectEqual(@as(u16, 2), answer.header.answer_count);
+    try std.testing.expect(answer.answers.items[0].rrtype.eql(.A));
+    try std.testing.expect(answer.answers.items[1].rrtype.eql(.AAAA));
+    for (answer.answers.slice()) |record| {
+        try std.testing.expect(!record.rrtype.eql(hinfo_type));
+        try std.testing.expect(!record.rrtype.eql(.RRSIG));
+    }
+}
+
+test "RFC 8482: a zone with no DNSSEC records answers the ANY query with the synthesized HINFO" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
+        \\
+    );
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    // The bytes the server sent before a zone that carries its own DNSSEC
+    // records was answered with its own RRsets.
+    try expectAnswerHex(
+        "12348400000100010000000003646e7304686f6d6504617270610000ff0001c00c000d0001000151800009075246433834383200",
+        try buildResponse(try testQuery(arena.allocator(), "dns.home.arpa.", .ANY), &zone),
+    );
+
+    // Section 4.2: the HINFO the RFC describes, CPU "RFC8482" and the null
+    // OS string. A zone that is not signed has no signature to carry.
+    const answer = try buildResponseWithPolicy(try testDoQuery(arena.allocator(), 0x4a12, "dns.home.arpa.", .ANY, true), &zone, .{}, null, false);
+    try std.testing.expectEqual(@as(u16, 1), answer.header.answer_count);
+    try std.testing.expect(answer.answers.items[0].rrtype.eql(hinfo_type));
+    const hinfo = answer.answers.items[0].rdata.HINFO;
+    try std.testing.expectEqualStrings("RFC8482", hinfo.cpuText());
+    try std.testing.expectEqualStrings("", hinfo.osText());
+    for (answer.answers.slice()) |record| {
+        try std.testing.expect(!record.rrtype.eql(.RRSIG));
+    }
+}
+
+test "RFC 8482: a zone signed through the key file answers the ANY query with the synthesized HINFO" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+        \\@ IN NS ns.example.
+        \\ns IN A 192.0.2.1
+        \\www IN A 192.0.2.2
+        \\www IN AAAA 2001:db8::2
+        \\
+    );
+    defer zone_file.deinit();
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    // The RFC 8080 section 6.1 Ed25519 key, so nothing secret enters the
+    // repository and the DNSKEY it derives is the one the RFC pins.
+    var key = try zone_signer.parseKey("ed25519 DSSF3o0s0f+ElWzj9E/Osxw8hLpk55chkmx0LYN5WiY=\n");
+    defer key.deinit();
+    const window = zone_signer.Options{ .inception = 1_000_000_000, .expiration = 2_000_000_000 };
+    try zone_signer.signZone(arena.allocator(), &zone, &key, window);
+    var session = zone_signer.Session.start(&key, window);
+    defer session.deinit();
+
+    // The server holds the key, so it signs the HINFO it synthesizes and
+    // answers with the HINFO and the section 4.3 set, each RRset with its
+    // own RRSIG.
+    const query = try testDoQuery(arena.allocator(), 0x4a13, "www.example.", .ANY, true);
+    const answer = try buildResponseWithPolicy(query, &zone, .{}, &session, false);
+    try std.testing.expectEqual(@as(u16, 6), answer.header.answer_count);
+    try std.testing.expect(answer.answers.items[0].rrtype.eql(hinfo_type));
+    try std.testing.expect(answer.answers.items[1].rrtype.eql(.RRSIG));
+    try std.testing.expect(answer.answers.items[2].rrtype.eql(.A));
+    try std.testing.expect(answer.answers.items[3].rrtype.eql(.RRSIG));
+    try std.testing.expect(answer.answers.items[4].rrtype.eql(.AAAA));
+    try std.testing.expect(answer.answers.items[5].rrtype.eql(.RRSIG));
+}
+
+test "RFC 8482 section 7: the answer for a zone that carries its own DNSSEC records fits the payload" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_text: std.Io.Writer.Allocating = .init(arena.allocator());
+    defer zone_text.deinit();
+    const writer = &zone_text.writer;
+    try writer.writeAll(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+        \\@ IN NS ns.example.
+        \\
+    );
+    var index: usize = 0;
+    while (index < 25) : (index += 1) {
+        try writer.print("multi IN A 192.0.2.{d}\n", .{index + 1});
+    }
+    try writer.writeAll("multi IN AAAA 2001:db8::1\n");
+
+    var own = try zoneWithOwnRrsigs(arena.allocator(), zone_text.written(), "multi.example.");
+    defer own.deinit();
+
+    // The client advertises the classic payload, and the A RRset with the
+    // signature that rides along with it does not fit, so the RRset goes and
+    // the AAAA that fits stays: section 7 says the answer carries no TC bit.
+    var query = try testDoQuery(arena.allocator(), 0x4a14, "multi.example.", .ANY, true);
+    query.edns.?.udp_payload_size = CLASSIC_UDP_MESSAGE_SIZE;
+    const answer = try buildResponseWithPolicy(query, &own.zone, .{}, null, false);
+    try std.testing.expect(!answer.header.truncated);
+    try std.testing.expectEqual(@as(u16, 2), answer.header.answer_count);
+    try std.testing.expect(answer.answers.items[0].rrtype.eql(.AAAA));
+    try std.testing.expect(answer.answers.items[1].rrtype.eql(.RRSIG));
+
+    var encoded: [2048]u8 = undefined;
+    var message_writer = dns_writer.Writer.init(&encoded);
+    try answer.encode(&message_writer);
+    try std.testing.expect(message_writer.len() <= CLASSIC_UDP_MESSAGE_SIZE);
 }
 
 test "RFC 9471: a referral carries in-domain and sibling-domain glue" {
