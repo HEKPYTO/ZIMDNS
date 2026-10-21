@@ -416,6 +416,24 @@ pub const ProvenDenial = struct {
     proof: ?Proof = null,
 };
 
+/// The answer a cached wildcard proof gives (RFC 8198 section 5.3). The
+/// records are the wildcard's own records; the owner name they are sent
+/// under is the queried name, not the wildcard's (RFC 4035 section 5.3.2).
+pub const WildcardAnswer = struct {
+    /// The wildcard the records come from, e.g. "*.example.".
+    wildcard: Name,
+    /// The wildcard's records, of the queried type.
+    records: [4]record_mod.ResourceRecord = undefined,
+    len: u8 = 0,
+    /// The zone SOA that arrived with the proof (RFC 2308 section 3).
+    soa: ?record_mod.ResourceRecord,
+    /// The proof the answer rests on (RFC 8020 section 2).
+    proof: ?Proof = null,
+    /// The TTL the answer carries: the TTL of the wildcard's records, held
+    /// down to the life of the proof (RFC 8198 section 4).
+    ttl: u32,
+};
+
 /// Keep a proof record as the upstream answer published it, when it can be
 /// carried in another message unchanged. Every name in its RDATA must be
 /// written out in full: a compression pointer names a place in the message
@@ -459,6 +477,19 @@ fn proofNamesUncompressed(rrtype: RecordType, rdata: []const u8) bool {
     return false;
 }
 
+/// True when a proof record is malformed because a name in its RDATA was
+/// compressed. RFC 4034 section 4.1.1 says a sender MUST NOT compress the
+/// NSEC next domain name, and RFC 3597 section 4 forbids compression in the
+/// RDATA of a type that is not well known, so such a record cannot be used
+/// as a proof.
+pub fn proofMalformed(record: record_mod.ResourceRecord) bool {
+    const rdata = switch (record.rdata) {
+        .Unknown => |*unknown| unknown.bytes(),
+        else => return false,
+    };
+    return !proofNamesUncompressed(record.rrtype, rdata);
+}
+
 /// Parent name with the leftmost label stripped; null for the root and for
 /// malformed wire input. Used to walk the ancestor chain toward the closest
 /// encloser on the RFC 8198 section 5 path.
@@ -472,6 +503,50 @@ fn parentName(name: Name) ?Name {
     var out = Name{};
     @memcpy(out.wire[0..rest.len], rest);
     out.wire_len = @intCast(rest.len);
+    return out;
+}
+
+/// The Labels field of an RRSIG RDATA (RFC 4034 section 3.2.5): the label
+/// count of the original owner name, the wildcard label not counted.
+pub fn rrsigLabels(rrsig_rdata: []const u8) ?u8 {
+    if (rrsig_rdata.len < 4) return null;
+    return rrsig_rdata[3];
+}
+
+/// The label count of a name, the root label not counted.
+pub fn labelCount(name: Name) u8 {
+    const wire = name.asWire();
+    var count: u8 = 0;
+    var index: usize = 0;
+    while (index < wire.len and wire[index] != 0) : (count += 1) {
+        if (wire[index] > 63) break;
+        index += 1 + wire[index];
+    }
+    return count;
+}
+
+/// The wildcard owner name an RRSIG's Labels field names: "*." followed by
+/// the rightmost labels of the queried name (RFC 4035 section 5.3.2). Null
+/// when the name would exceed the 255-octet wire limit.
+pub fn wildcardFromLabels(qname: Name, labels: u8) ?Name {
+    const wire = qname.asWire();
+    var offsets: [128]usize = undefined;
+    var count: usize = 0;
+    var index: usize = 0;
+    while (index < wire.len and wire[index] != 0) {
+        if (wire[index] > 63 or count >= offsets.len) return null;
+        offsets[count] = index;
+        count += 1;
+        index += 1 + wire[index];
+    }
+    if (labels == 0 or labels > count) return null;
+    const tail = wire[offsets[count - labels]..];
+    if (tail.len + 2 > 255) return null;
+    var out = Name{};
+    out.wire[0] = 1;
+    out.wire[1] = '*';
+    @memcpy(out.wire[2..][0..tail.len], tail);
+    out.wire_len = @intCast(tail.len + 2);
     return out;
 }
 
@@ -552,8 +627,25 @@ pub const AggressiveCache = struct {
         expires_at: i64 = 0,
     };
 
+    /// A wildcard RRset the cache holds (RFC 8198 section 5.3). The records
+    /// are the wildcard's own, and the answer sends them under the queried
+    /// name (RFC 4035 section 5.3.2).
+    const WildcardEntry = struct {
+        valid: bool = false,
+        name: Name = Name.root(),
+        records: [4]record_mod.ResourceRecord = undefined,
+        len: u8 = 0,
+        expires_at: i64 = 0,
+    };
+
     entries: [capacity]Entry = @splat(Entry{}),
     next_slot: usize = 0,
+
+    /// The wildcard RRsets the cache holds. RFC 8198 section 5.3 lets a
+    /// resolver answer from the wildcard it has, and requires it to fall
+    /// back to the authoritative servers when the wildcard is not there.
+    wildcards: [4]WildcardEntry = @splat(WildcardEntry{}),
+    next_wildcard: usize = 0,
 
     /// Cache a proving NSEC RRset. The proof records the upstream answer
     /// published are kept with it, so a cut answer can return them
@@ -619,6 +711,103 @@ pub const AggressiveCache = struct {
         for (&self.entries) |*entry| {
             if (entry.valid and now >= entry.expires_at) entry.valid = false;
         }
+        for (&self.wildcards) |*entry| {
+            if (entry.valid and now >= entry.expires_at) entry.valid = false;
+        }
+    }
+
+    /// RFC 8198 section 5.3: cache the wildcard RRset an upstream answer
+    /// carried, so a later query the wildcard covers is answered from it.
+    /// The records are the wildcard's own, and the answer sends them under
+    /// the queried name (RFC 4035 section 5.3.2).
+    pub fn insertWildcard(self: *AggressiveCache, name: Name, records: []const record_mod.ResourceRecord, now: i64, ttl: u32) void {
+        if (records.len == 0) return;
+        const slot = &self.wildcards[self.next_wildcard];
+        self.next_wildcard = (self.next_wildcard + 1) % self.wildcards.len;
+        slot.valid = true;
+        slot.name = name;
+        const len = @min(records.len, slot.records.len);
+        for (records[0..len], 0..) |record, index| {
+            // A record whose RDATA borrows the message it came from cannot
+            // outlive that message in the cache.
+            switch (record.rdata) {
+                .Unknown => return,
+                else => {},
+            }
+            var copy = record;
+            copy.owner = name;
+            slot.records[index] = copy;
+        }
+        slot.len = @intCast(len);
+        slot.expires_at = now +| @min(@as(i64, ttl), max_entry_ttl_seconds);
+    }
+
+    /// The proof a wildcard answer rests on: an NSEC that covers the
+    /// queried name (RFC 4035 section 5.4), or an NSEC3 that covers the
+    /// hash of the name (RFC 5155 section 8.8).
+    const WildcardProof = struct {
+        records: ?Proof = null,
+        soa: ?record_mod.ResourceRecord = null,
+        expires_at: i64 = 0,
+    };
+
+    fn wildcardProof(self: *const AggressiveCache, qname: Name) ?WildcardProof {
+        if (self.findCovering(qname)) |entry| {
+            return .{ .records = self.proofOf(entry), .soa = entry.soa, .expires_at = entry.expires_at };
+        }
+        var index: usize = 0;
+        while (index < self.entries.len) : (index += 1) {
+            const head = &self.entries[index];
+            if (!head.valid or !head.is_nsec3) continue;
+            // One chain at a time: a record of another chain cannot prove
+            // this one (RFC 5155 section 8.2).
+            if (self.chainSeen(head, index)) continue;
+            const chain = head.nsec3_chain;
+            if (!isWithin(qname, chain.zone)) continue;
+            const cover = self.findNsec3Cover(&chain, nsec3HashIn(chain, qname)) orelse continue;
+            // RFC 8198 section 5.2: a covering NSEC3 with the Opt-Out flag
+            // set does not prove the non-existence of the name.
+            if (cover.nsec3_opt_out) continue;
+            return .{ .records = self.proofOf(cover), .soa = cover.soa, .expires_at = cover.expires_at };
+        }
+        return null;
+    }
+
+    /// RFC 8198 section 5.3: the answer a cached wildcard proof gives, or
+    /// null when the cache holds no wildcard the queried name falls under
+    /// or no proof that the name does not exist.
+    ///
+    /// The wildcard covers a name one label below its own parent, so the
+    /// queried name is the next closer name of the closest encloser and
+    /// the proof that the name does not exist is the one that covers it
+    /// (RFC 4035 section 5.4, RFC 5155 section 8.8).
+    pub fn wildcardAnswer(self: *AggressiveCache, qname: Name, qtype: RecordType, now: i64) ?WildcardAnswer {
+        self.evictExpired(now);
+        const encloser = parentName(qname) orelse return null;
+        for (&self.wildcards) |*entry| {
+            if (!entry.valid) continue;
+            const wildcard_parent = parentName(entry.name) orelse continue;
+            if (!wildcard_parent.eql(&encloser)) continue;
+            var found = false;
+            for (entry.records[0..entry.len]) |record| {
+                if (record.rrtype.eql(qtype)) found = true;
+            }
+            if (!found) continue;
+            const proof = self.wildcardProof(qname) orelse continue;
+            const remaining = @min(entry.expires_at, proof.expires_at) - now;
+            if (remaining <= 0) continue;
+            var answer = WildcardAnswer{
+                .wildcard = entry.name,
+                .records = undefined,
+                .soa = proof.soa,
+                .proof = proof.records,
+                .ttl = @min(@as(u32, @intCast(remaining)), entry.records[0].ttl),
+            };
+            @memcpy(answer.records[0..entry.len], entry.records[0..entry.len]);
+            answer.len = entry.len;
+            return answer;
+        }
+        return null;
     }
 
     fn findNsecOwner(self: *const AggressiveCache, owner: Name) ?*const Entry {
@@ -1028,6 +1217,67 @@ test "aggressive NXDOMAIN needs closest-encloser and wildcard proofs (RFC 8198 5
     wild.insertNsec(try Name.fromText("mail.example."), try Name.fromText("www.example."), &bitmap, now, 3600, null, .{});
     wild.insertNsec(try Name.fromText("*.example."), try Name.fromText("mail.example."), &bitmap, now, 3600, null, .{});
     try std.testing.expect((try wild.deny(qnx, .A, now)) == null);
+}
+
+test "aggressive cache answers the name a cached wildcard proof covers (RFC 8198 5.3)" {
+    const now: i64 = 1_000_000;
+    const bitmap = [_]u8{ 0x00, 0x06, 0x40, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    var cache = AggressiveCache{};
+    // The (mail.example., www.example.) span covers nx.example.
+    cache.insertNsec(try Name.fromText("mail.example."), try Name.fromText("www.example."), &bitmap, now, 3600, null, .{});
+    const wildcard = try Name.fromText("*.example.");
+    cache.insertWildcard(wildcard, &.{.{
+        .owner = wildcard,
+        .rrtype = .A,
+        .class = .IN,
+        .ttl = 300,
+        .rdata = .{ .A = .{ 192, 0, 2, 1 } },
+    }}, now, 300);
+
+    const answer = cache.wildcardAnswer(try Name.fromText("nx.example."), .A, now).?;
+    try std.testing.expectEqual(@as(u8, 1), answer.len);
+    try std.testing.expectEqual(@as(u32, 300), answer.ttl);
+    try std.testing.expect(answer.wildcard.eql(&wildcard));
+    try std.testing.expectEqual(@as(u8, 192), answer.records[0].rdata.A[0]);
+
+    // A name the wildcard does not cover is not answered from the cache.
+    try std.testing.expect(cache.wildcardAnswer(try Name.fromText("deep.nx.example."), .A, now) == null);
+    // A name with no proof that it does not exist is not answered either.
+    try std.testing.expect(cache.wildcardAnswer(try Name.fromText("zzz.example."), .A, now) == null);
+    // A type the wildcard does not hold is not answered from the cache.
+    try std.testing.expect(cache.wildcardAnswer(try Name.fromText("nx.example."), .AAAA, now) == null);
+}
+
+test "aggressive cache answers a wildcard an NSEC3 proof covers (RFC 8198 5.3)" {
+    const now: i64 = 1_000_000;
+    const zone = try Name.fromText("example.");
+    const qname = try Name.fromText("nx.example.");
+    const wildcard = try Name.fromText("*.example.");
+    const bitmap = [_]u8{ 0x00, 0x07, 0x40, 0x00, 0x00, 0x00, 0x02, 0xa0, 0x00 };
+    const qname_hash = testChainHash(qname);
+    const wildcard_record = record_mod.ResourceRecord{
+        .owner = wildcard,
+        .rrtype = .A,
+        .class = .IN,
+        .ttl = 300,
+        .rdata = .{ .A = .{ 192, 0, 2, 1 } },
+    };
+    var cache = AggressiveCache{};
+    // The NSEC3 that covers the hash of the queried name (RFC 5155 section 8.8).
+    cache.insertNsec3(try testChainOwner(2, zone), testHashNeighbour(qname_hash, false), testHashNeighbour(qname_hash, true), false, test_chain_iterations, &test_chain_salt, &bitmap, now, 3600, null, .{});
+    cache.insertWildcard(wildcard, &.{wildcard_record}, now, 300);
+
+    const answer = cache.wildcardAnswer(qname, .A, now).?;
+    try std.testing.expectEqual(@as(u8, 1), answer.len);
+    try std.testing.expectEqual(@as(u32, 300), answer.ttl);
+    try std.testing.expectEqual(@as(u8, 192), answer.records[0].rdata.A[0]);
+
+    // A covering NSEC3 with the Opt-Out flag set proves no non-existence
+    // (RFC 8198 section 5.2), so the wildcard answers nothing.
+    var opt_out = AggressiveCache{};
+    opt_out.insertNsec3(try testChainOwner(2, zone), testHashNeighbour(qname_hash, false), testHashNeighbour(qname_hash, true), true, test_chain_iterations, &test_chain_salt, &bitmap, now, 3600, null, .{});
+    opt_out.insertWildcard(wildcard, &.{wildcard_record}, now, 300);
+    try std.testing.expect(opt_out.wildcardAnswer(qname, .A, now) == null);
 }
 
 test "exact deny requires the NSEC bit and a well-formed bitmap" {

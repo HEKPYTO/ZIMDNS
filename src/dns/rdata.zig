@@ -36,6 +36,16 @@ pub const max_unknown_len = 2048;
 /// record whose RDATA is longer than the inline buffer borrows those bytes
 /// from the message it was parsed from.
 pub const max_opaque_rdata_len: usize = 65535;
+
+/// RFC 1035 section 4.2.2: a DNS message is prefixed with a two-octet length
+/// field, so a message is at most 65535 octets. The answer that carries a
+/// record also carries the 12-octet header, the echoed question (a 255-octet
+/// name, QTYPE, and QCLASS), the record's own fields (a 255-octet owner
+/// name, TYPE, CLASS, TTL, and the two-octet RDLENGTH), and the 11-octet
+/// EDNS OPT record, so this is the longest RDATA one message can carry. A
+/// zone that holds more holds a record no message can carry.
+pub const max_message_rdata_len: usize = 65535 - 12 - (255 + 2 + 2) - (255 + 2 + 2 + 4 + 2) - 11;
+
 const max_opt_data_len = 512;
 const max_caa_payload_len = max_unknown_len - 2;
 const max_sshfp_fingerprint_len = 32;

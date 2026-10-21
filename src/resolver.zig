@@ -1113,6 +1113,13 @@ pub const Resolver = struct {
                     if (cookie == .valid) return self.addCachedCookie(output, query, cookie.valid);
                     return bytes;
                 }
+                // RFC 8198 section 5.3: the wildcard the cache holds answers
+                // the name it covers, without an upstream query.
+                if (self.dnssec_aggressive.wildcardAnswer(question.name, question.qtype, now)) |wildcard| {
+                    const bytes = try self.wildcardAnswer(query, wildcard, key, now, output);
+                    if (cookie == .valid) return self.addCachedCookie(output, query, cookie.valid);
+                    return bytes;
+                }
             }
         }
         // RFC 9520 section 3.2: a cached resolution failure answers the next
@@ -1361,37 +1368,17 @@ pub const Resolver = struct {
         if (!response.header.authenticated_data) return;
         harvestSectionNsec(&self.dnssec_aggressive, response.answers.slice(), now);
         harvestSectionNsec(&self.dnssec_aggressive, response.authorities.slice(), now);
+        harvestWildcard(&self.dnssec_aggressive, response, now);
     }
 
     /// RFC 8198 section 5: the denial this server synthesizes from a cached
     /// NSEC proof. It is kept in the negative cache, so the next client for
     /// a name the denial covers is answered without an upstream query.
     fn aggressiveAnswer(self: *Resolver, query: dns_message.Message, proof: dnssec.ProvenDenial, key: CacheKey, now: i64, output: []u8) ![]const u8 {
-        const q = query.question orelse return Error.BadUpstreamResponse;
-        var message = dns_message.Message{
-            .allocator = query.allocator,
-            .header = .{
-                .id = query.header.id,
-                .qr = true,
-                .recursion_desired = query.header.recursion_desired,
-                .recursion_available = true,
-                .rcode = switch (proof.denial) {
-                    .nxdomain => .nxdomain,
-                    .nodata => .no_error,
-                },
-                .question_count = 1,
-            },
-            .question = q,
-            .answers = try dns_message.RecordSection.init(query.allocator, 0),
-            .authorities = try dns_message.RecordSection.init(query.allocator, 0),
-            .additionals = try dns_message.RecordSection.init(query.allocator, 0),
-            .edns = if (query.edns) |edns| .{
-                .udp_payload_size = @max(dns_message.CLASSIC_UDP_PAYLOAD_SIZE, @min(edns.udp_payload_size, dns_message.DEFAULT_EDNS_UDP_PAYLOAD_SIZE)),
-                .extended_rcode = 0,
-                .version = dns_message.EDNS_VERSION,
-                .dnssec_ok = edns.dnssec_ok,
-            } else null,
-        };
+        var message = try aggressiveMessage(query, switch (proof.denial) {
+            .nxdomain => .nxdomain,
+            .nodata => .no_error,
+        });
         errdefer message.deinit();
         // RFC 2308 section 3: a negative answer carries the zone SOA, so the
         // client can cache the denial itself. A denial with no SOA stays
@@ -1431,6 +1418,49 @@ pub const Resolver = struct {
             plain_key.dnssec_ok = false;
             self.cache.putDenial(plain_key, &message, ttl, now) catch {};
         }
+        return writer.written();
+    }
+
+    /// RFC 8198 section 5.3: the answer a cached wildcard proof gives. It
+    /// has the shape the denial path builds: the records in the answer
+    /// section, the zone SOA and the proof in the authority section.
+    fn wildcardAnswer(self: *Resolver, query: dns_message.Message, wildcard: dnssec.WildcardAnswer, key: CacheKey, now: i64, output: []u8) ![]const u8 {
+        const q = query.question orelse return Error.BadUpstreamResponse;
+        var message = try aggressiveMessage(query, .no_error);
+        errdefer message.deinit();
+        // RFC 4035 section 5.3.2: the answer carries the wildcard's records
+        // under the queried name, and RFC 2181 section 8 keeps the TTL of
+        // the source RRset.
+        for (wildcard.records[0..wildcard.len]) |record| {
+            var copy = record;
+            copy.owner = q.name;
+            copy.ttl = wildcard.ttl;
+            try message.answers.append(copy);
+            message.header.answer_count += 1;
+        }
+        // RFC 2308 section 3: the zone SOA rides with the proof, the way it
+        // rides with a denial.
+        if (wildcard.soa) |soa| {
+            var soa_record = soa;
+            soa_record.ttl = self.denialTtl(now, soa);
+            try message.authorities.append(soa_record);
+            message.header.authority_count = 1;
+        }
+        // RFC 8020 section 2: the cut answer carries the proof that
+        // justifies it, and only for a client that asked for it.
+        if (wildcard.proof) |records| {
+            if (wantsDnssecProofs(query)) {
+                for (records.records[0..records.len]) |record| {
+                    const parsed = dns_record.ResourceRecord.parse(record.bytes(), 0) catch continue;
+                    try message.authorities.append(parsed.record);
+                    message.header.authority_count += 1;
+                }
+            }
+        }
+        if (query.edns) |edns| try appendOpt(&message, edns);
+        try appendEcsScope(&message, key.ecs, 0);
+        var writer = dns_writer.Writer.init(output);
+        message.encode(&writer) catch return Error.ResponseTooLarge;
         return writer.written();
     }
 
@@ -2316,6 +2346,66 @@ fn wantsDnssecProofs(query: dns_message.Message) bool {
     return edns.dnssec_ok;
 }
 
+/// The message the aggressive paths answer with: the query echoed, the
+/// sections empty, and the EDNS policy of the query.
+fn aggressiveMessage(query: dns_message.Message, rcode: dns_header.Rcode) !dns_message.Message {
+    const q = query.question orelse return Error.BadUpstreamResponse;
+    return dns_message.Message{
+        .allocator = query.allocator,
+        .header = .{
+            .id = query.header.id,
+            .qr = true,
+            .recursion_desired = query.header.recursion_desired,
+            .recursion_available = true,
+            .rcode = rcode,
+            .question_count = 1,
+        },
+        .question = q,
+        .answers = try dns_message.RecordSection.init(query.allocator, 0),
+        .authorities = try dns_message.RecordSection.init(query.allocator, 0),
+        .additionals = try dns_message.RecordSection.init(query.allocator, 0),
+        .edns = if (query.edns) |edns| .{
+            .udp_payload_size = @max(dns_message.CLASSIC_UDP_PAYLOAD_SIZE, @min(edns.udp_payload_size, dns_message.DEFAULT_EDNS_UDP_PAYLOAD_SIZE)),
+            .extended_rcode = 0,
+            .version = dns_message.EDNS_VERSION,
+            .dnssec_ok = edns.dnssec_ok,
+        } else null,
+    };
+}
+
+/// RFC 8198 section 5.3: the wildcard RRset an upstream answer carried. A
+/// response whose RRSIG Labels field is below the label count of the
+/// queried name is a wildcard expansion (RFC 4035 section 5.3.4), and the
+/// wildcard it came from is the one the RRSIG names (RFC 4035 section 5.3.2).
+fn harvestWildcard(cache: *dnssec.AggressiveCache, response: dns_message.Message, now: i64) void {
+    const question = response.question orelse return;
+    const answers = response.answers.slice();
+    for (answers) |*record| {
+        if (!record.rrtype.eql(.RRSIG)) continue;
+        if (!record.owner.eql(&question.name)) continue;
+        const raw = switch (record.rdata) {
+            .Unknown => |*unknown| unknown.bytes(),
+            else => continue,
+        };
+        const labels = dnssec.rrsigLabels(raw) orelse continue;
+        if (labels >= dnssec.labelCount(question.name)) continue;
+        const wildcard = dnssec.wildcardFromLabels(question.name, labels) orelse continue;
+        const covered = dns_types.RecordType.fromCode(dnssec.rrsigCovers(raw) catch continue);
+        var records: [4]dns_record.ResourceRecord = undefined;
+        var count: usize = 0;
+        var ttl: u32 = 0;
+        for (answers) |candidate| {
+            if (!candidate.rrtype.eql(covered)) continue;
+            if (count >= records.len) break;
+            records[count] = candidate;
+            count += 1;
+            ttl = candidate.ttl;
+        }
+        if (count == 0) continue;
+        cache.insertWildcard(wildcard, records[0..count], now, ttl);
+    }
+}
+
 fn harvestSectionNsec(cache: *dnssec.AggressiveCache, records: []const dns_record.ResourceRecord, now: i64) void {
     // RFC 2308 section 3: the SOA of the zone rides with the proof that
     // arrived with it, so a denial the proof gives can carry it.
@@ -2326,6 +2416,13 @@ fn harvestSectionNsec(cache: *dnssec.AggressiveCache, records: []const dns_recor
                 .Unknown => |*unknown| unknown.bytes(),
                 else => continue,
             };
+            // RFC 4034 section 4.1.1: a sender MUST NOT compress the next
+            // domain name, and RFC 3597 section 4 forbids compression in the
+            // RDATA of a type that is not well known. A proof that kept a
+            // pointer is malformed and is refused: a pointer names a place
+            // in the message it came from, so the name it points at is not
+            // the name of this record.
+            if (dnssec.proofMalformed(record.*)) continue;
             const next = dns_name.Name.parse(raw, 0) catch continue;
             cache.insertNsec(record.owner, next.name, raw[next.next_offset..], now, record.ttl, soa, .{
                 .record = record.*,
@@ -3783,6 +3880,140 @@ test "aggressive NSEC answers denials without upstream and honors CD" {
     cd_query.header.checking_disabled = true;
     cd_query.edns.?.dnssec_ok = true;
     try std.testing.expect(!wantsDnssecProofs(cd_query));
+}
+
+/// The RRSIG of a wildcard-expanded answer: the type it covers, and the
+/// Labels field of the wildcard it came from (RFC 4034 section 3.2.5).
+fn makeTestWildcardRrsig(covered: dns_types.RecordType, labels: u8) !dns_rdata.Unknown {
+    var rdata = dns_rdata.Unknown{};
+    std.mem.writeInt(u16, rdata.data[0..2], covered.code(), .big);
+    rdata.data[2] = 8; // algorithm
+    rdata.data[3] = labels;
+    const signer = (try dns_name.Name.fromText("example.")).asWire();
+    @memcpy(rdata.data[18..][0..signer.len], signer);
+    rdata.len = @intCast(18 + signer.len);
+    return rdata;
+}
+
+/// The upstream answer that expanded a wildcard, with the proof that the
+/// queried name does not exist (RFC 4035 section 5.4) and the zone SOA.
+fn makeTestWildcardResponse(allocator: std.mem.Allocator, name_text: []const u8) !dns_message.Message {
+    var response = try makePositiveResponseFor(allocator, name_text, 300);
+    errdefer response.deinit();
+    response.header.authenticated_data = true;
+    try response.answers.append(.{
+        .owner = try dns_name.Name.fromText(name_text),
+        .rrtype = .RRSIG,
+        .class = .IN,
+        .ttl = 300,
+        .rdata = .{ .Unknown = try makeTestWildcardRrsig(.A, 2) },
+    });
+    response.header.answer_count = 2;
+    // The (mail.example., www.example.) span covers nx.example.
+    const bitmap = [_]u8{ 0x00, 0x06, 0x40, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    try response.authorities.append(try makeTestNsecRecord("mail.example.com.", "www.example.com.", &bitmap, 3600));
+    try response.authorities.append(try makeTestSoa(3600, 3600));
+    response.header.authority_count = 2;
+    return response;
+}
+
+test "a cached wildcard proof answers the client without an upstream query" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = try std.Io.net.IpAddress.parse("127.0.0.1", 9) },
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const now: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+
+    // The upstream answer expanded the wildcard "*.example." for the name
+    // "nx.example." (RFC 4035 section 5.3.2).
+    var response = try makeTestWildcardResponse(arena.allocator(), "nx.example.com.");
+    defer response.deinit();
+    resolver.harvestNsecProofs(response, now);
+
+    var query = try makeTestQuery(arena.allocator(), 0x2707, "nx.example.com.", true);
+    defer query.deinit();
+    query.edns.?.dnssec_ok = true;
+    query.additionals.items[0].ttl |= 0x8000;
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42604);
+    // The forwarder points at a closed port: the answer comes from the
+    // cached wildcard, not from an upstream query.
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    const parsed = try dns_message.Message.parse(arena.allocator(), bytes);
+    try std.testing.expectEqual(dns_header.Rcode.no_error, parsed.header.rcode);
+    try std.testing.expectEqual(@as(usize, 1), parsed.answers.len);
+    // The answer carries the wildcard's records under the queried name.
+    try std.testing.expect((parsed.answers.items[0].owner).eql(&try dns_name.Name.fromText("nx.example.com.")));
+    try std.testing.expectEqual(dns_types.RecordType.A, parsed.answers.items[0].rrtype);
+    try std.testing.expectEqual(@as(u8, 192), parsed.answers.items[0].rdata.A[0]);
+    // The zone SOA rides in the authority section, the way a denial's does.
+    try std.testing.expectEqual(@as(usize, 1), parsed.authorities.len);
+    try std.testing.expectEqual(dns_types.RecordType.SOA, parsed.authorities.items[0].rrtype);
+}
+
+test "a name the cached wildcard proof does not cover goes upstream" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = try std.Io.net.IpAddress.parse("127.0.0.1", 9) },
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const now: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+
+    var response = try makeTestWildcardResponse(arena.allocator(), "nx.example.com.");
+    defer response.deinit();
+    resolver.harvestNsecProofs(response, now);
+
+    // "deep.nx.example.com." is below the wildcard, so the proof does not
+    // cover it and the question goes to the authoritative servers.
+    var query = try makeTestQuery(arena.allocator(), 0x2708, "deep.nx.example.com.", true);
+    defer query.deinit();
+    query.edns.?.dnssec_ok = true;
+    query.additionals.items[0].ttl |= 0x8000;
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42605);
+    try std.testing.expectError(Error.UpstreamFailure, resolver.answer(encoded, query, &client, &output));
+}
+test "a proof whose RDATA kept a compression pointer is refused as malformed" {
+    const now: i64 = 1_000_000;
+    var cache = dnssec.AggressiveCache{};
+    // The next domain name of an NSEC must not be compressed (RFC 4034
+    // section 4.1.1, RFC 3597 section 4): a pointer names a place in the
+    // message it came from, so the name it points at is not this record's.
+    var rdata = dns_rdata.Unknown{};
+    rdata.data[0] = 0xc0;
+    rdata.data[1] = 0x04;
+    rdata.data[2] = 0x00;
+    rdata.data[3] = 0x06;
+    rdata.data[4] = 0x00;
+    rdata.data[5] = 0x00;
+    rdata.data[6] = 0x00;
+    rdata.data[7] = 0x00;
+    rdata.data[8] = 0x01;
+    rdata.len = 9;
+    const record = dns_record.ResourceRecord{
+        .owner = try dns_name.Name.fromText("www.example."),
+        .rrtype = .NSEC,
+        .class = .IN,
+        .ttl = 3600,
+        .rdata = .{ .Unknown = rdata },
+    };
+    try std.testing.expect(dnssec.proofMalformed(record));
+    harvestSectionNsec(&cache, &.{record}, now);
+    // The malformed proof is refused: it is not cached, so it denies
+    // nothing and it is not carried in a cut answer.
+    try std.testing.expect((try cache.deny(try dns_name.Name.fromText("www.example."), .A, now)) == null);
+    try std.testing.expect(!cache.entries[0].valid);
 }
 
 /// The hash a name has in an NSEC3 chain (RFC 5155 section 5).

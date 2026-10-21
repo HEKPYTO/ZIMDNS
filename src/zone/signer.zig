@@ -300,6 +300,18 @@ pub const Options = struct {
     /// zone's own apex NSEC3PARAM in charge, which is what the server did
     /// before the operator could choose.
     chain: ?ChainPolicy = null,
+
+    /// The same window counted from `now`: the validity period the server
+    /// was configured with, starting at the moment of the signing
+    /// (RFC 4034 section 3.1.5). The expiration saturates, because the field
+    /// cannot state a date past the range of its 32 bits.
+    pub fn fromNow(self: Options, now: u32) Options {
+        return .{
+            .inception = now,
+            .expiration = now +| (self.expiration -| self.inception),
+            .chain = self.chain,
+        };
+    }
 };
 
 /// The chain a signed zone publishes: the RFC 4034 section 6.1 NSEC chain or
@@ -428,8 +440,8 @@ pub fn signZone(
 
 /// Signs `zone` again with the chain `served` publishes, so a zone that is
 /// reloaded keeps the chain the validators have already seen. The key is the
-/// one the server holds, so the key tag (RFC 4034 section 5.3.1) and the DS
-/// that states it do not move.
+/// one the server holds, so the key tag (RFC 4034 section 3.1.6) and the DS
+/// that states it (section 5.1.1) do not move.
 pub fn resignZone(
     allocator: std.mem.Allocator,
     zone: *zone_index.Zone,
@@ -1710,6 +1722,16 @@ test "the signing session wipes the private key when it is deinitialized" {
     for (std.mem.asBytes(material)) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
 }
 
+test "a window counted from now keeps the validity period it was given" {
+    const window = Options{ .inception = 1_000_000_000, .expiration = 1_000_000_000 + 30 * 24 * 60 * 60 };
+    const refreshed = window.fromNow(2_000_000_000);
+    try std.testing.expectEqual(@as(u32, 2_000_000_000), refreshed.inception);
+    try std.testing.expectEqual(
+        window.expiration - window.inception,
+        refreshed.expiration - refreshed.inception,
+    );
+}
+
 test "the key file accepts only one known algorithm and a correctly sized secret" {
     try std.testing.expectError(Error.BadKeyFile, parseKey("rsa-sha256 AAAA\n"));
     try std.testing.expectError(Error.BadKeyFile, parseKey("ed448 AAAA\n"));
@@ -1809,8 +1831,8 @@ fn dnskeyAnchor(allocator: std.mem.Allocator, key: *const Key) ![]const u8 {
     return std.fmt.allocPrint(allocator, "example. DNSKEY 257 3 15 {s}\n", .{encoded});
 }
 
-/// A DO-bit query for a name the zone does not have, so the answer is a denial.
-fn denialQuery(allocator: std.mem.Allocator, name_text: []const u8, qtype: dns_types.RecordType) !dns_message.Message {
+/// A DO-bit query, so the answer carries the RRSIGs that cover it.
+fn doBitQuery(allocator: std.mem.Allocator, name_text: []const u8, qtype: dns_types.RecordType) !dns_message.Message {
     var message = dns_message.Message{
         .allocator = allocator,
         .header = .{ .id = 0x4406 },
@@ -1961,7 +1983,7 @@ test "the NSEC3 chain is signed, and the project's own validator accepts it" {
     }
 
     // The served denial is proved by the generated chain.
-    const request = try denialQuery(allocator, "missing.example.", .A);
+    const request = try doBitQuery(allocator, "missing.example.", .A);
     const response = try (@import("../auth/response.zig")).buildResponse(request, &zone);
     // The closest encloser proof (RFC 5155 section 7.2.2) and the apex
     // NSEC3PARAM ride along, and no NSEC proof does.
@@ -2018,7 +2040,7 @@ test "the project's own validator accepts the signatures over the NSEC3 chain" {
     // no DNSKEY of its own to verify.
     var anchors = try dns_validate.Anchors.parse(allocator, try dnskeyAnchor(allocator, &key));
     defer anchors.deinit(allocator);
-    const request = try denialQuery(allocator, "missing.example.", .A);
+    const request = try doBitQuery(allocator, "missing.example.", .A);
     const result = try dns_validate.validate(allocator, &anchors, request, response, &.{}, rfc8080_window.inception + 1);
     try std.testing.expectEqual(dns_validate.Status.secure, result.status);
 }
@@ -2316,7 +2338,7 @@ test "the referral to an unsigned delegation under an Opt-Out chain is proved (R
     // The delegation is unsigned and the chain holds no NSEC3 for it, so the
     // answer is a referral with the closest provable encloser proof of
     // section 7.2.7.
-    const request = try denialQuery(allocator, "unsigned-sub.example.", .A);
+    const request = try doBitQuery(allocator, "unsigned-sub.example.", .A);
     const response = try (@import("../auth/response.zig")).buildResponse(request, &zone);
     try std.testing.expectEqual(dns_header.Rcode.no_error, response.header.rcode);
     try std.testing.expect(!response.header.authoritative);
@@ -2344,4 +2366,80 @@ test "the referral to an unsigned delegation under an Opt-Out chain is proved (R
     var anchors = dns_validate.Anchors{};
     const result = try dns_validate.validate(allocator, &anchors, request, response, &.{}, rfc8080_window.inception + 1);
     try std.testing.expectEqual(dns_validate.Status.insecure, result.status);
+}
+
+/// A zone whose owner names and whose RDATA names are written in upper case.
+const mixed_case_sign_zone =
+    \\$ORIGIN example.
+    \\$TTL 3600
+    \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 3600
+    \\@ IN NS ns.example.
+    \\WWW IN CNAME Target.Example.
+    \\Target IN A 192.0.2.1
+    \\
+;
+
+/// The same zone written in lower case: the twin the canonical form of the
+/// zone above must match.
+const lower_case_sign_zone =
+    \\$ORIGIN example.
+    \\$TTL 3600
+    \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 3600
+    \\@ IN NS ns.example.
+    \\www IN CNAME target.example.
+    \\target IN A 192.0.2.1
+    \\
+;
+
+test "RFC 4034 6.2: the signature is over the canonical form and the served name is not" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var key = try parseKey(rfc8080_ed25519_key);
+    defer key.deinit();
+
+    var zone = try loadZone(mixed_case_sign_zone);
+    defer zone.deinit();
+    try signZone(allocator, &zone, &key, rfc8080_window);
+
+    // The answer the server serves carries the case the zone wrote: the
+    // owner of the CNAME and the name inside its RDATA.
+    const request = try doBitQuery(allocator, "www.example.", .A);
+    const response = try (@import("../auth/response.zig")).buildResponse(request, &zone);
+    try std.testing.expectEqual(@as(usize, 4), response.answers.len);
+    var text: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("WWW.example.", try response.answers.items[0].owner.toText(&text));
+    try std.testing.expectEqualStrings("Target.Example.", try response.answers.items[0].rdata.CNAME.toText(&text));
+
+    // The validator reads the answer off the wire, where the case is the one
+    // the zone wrote, and rebuilds the canonical form from it (RFC 4034
+    // section 6.2), so the signature the signer made still verifies.
+    var encoded: [2048]u8 = undefined;
+    var writer = dns_writer.Writer.init(&encoded);
+    try response.encode(&writer);
+    const wire = try dns_message.Message.parse(allocator, writer.written());
+    var anchors = try dns_validate.Anchors.parse(allocator, try dnskeyAnchor(allocator, &key));
+    defer anchors.deinit(allocator);
+    const result = try dns_validate.validate(allocator, &anchors, request, wire, &.{}, rfc8080_window.inception + 1);
+    try std.testing.expectEqual(dns_validate.Status.secure, result.status);
+}
+
+test "RFC 8976: the ZONEMD digest of a mixed-case zone is the digest of its lower-case twin" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var mixed = try loadZone(mixed_case_sign_zone);
+    defer mixed.deinit();
+    var lower = try loadZone(lower_case_sign_zone);
+    defer lower.deinit();
+
+    // RFC 4034 section 6.2: the digest covers the canonical form, in which
+    // every name is lowercase, so the two zones digest the same.
+    var mixed_digest: [dns_rdata.max_zonemd_digest_len]u8 = undefined;
+    var lower_digest: [dns_rdata.max_zonemd_digest_len]u8 = undefined;
+    try zonemd.computeDigest(&mixed, .sha384, allocator, &mixed_digest);
+    try zonemd.computeDigest(&lower, .sha384, allocator, &lower_digest);
+    try std.testing.expectEqualSlices(u8, lower_digest[0..48], mixed_digest[0..48]);
 }

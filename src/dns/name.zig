@@ -34,7 +34,20 @@ pub const Name = struct {
         return name;
     }
 
+    /// Parses presentation text into the canonical lowercase form every
+    /// comparison and every signature uses.
     pub fn fromText(text: []const u8) Error!Name {
+        return fromTextWithCase(text, true);
+    }
+
+    /// Parses presentation text and keeps every label byte as it was written.
+    /// RFC 4343 section 4.1 does no case conversion on output, so a name the
+    /// zone stored is served with the case the zone wrote.
+    pub fn fromTextPreservingCase(text: []const u8) Error!Name {
+        return fromTextWithCase(text, false);
+    }
+
+    fn fromTextWithCase(text: []const u8, fold_case: bool) Error!Name {
         if (std.mem.eql(u8, text, ".")) return Name.root();
         var name = Name{ .wire_len = 0 };
         var start: usize = 0;
@@ -50,7 +63,7 @@ pub const Name = struct {
             }
             if (label.len > max_label_len) return Error.LabelTooLong;
             try name.pushByte(@intCast(label.len));
-            for (label) |byte| try name.pushByte(std.ascii.toLower(byte));
+            for (label) |byte| try name.pushByte(if (fold_case) std.ascii.toLower(byte) else byte);
             start = dot_index + 1;
             if (start == text.len) {
                 try name.pushByte(0);

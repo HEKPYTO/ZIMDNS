@@ -269,7 +269,9 @@ pub const Zone = struct {
                     result.soa = null;
                     return .yxdomain;
                 };
-                const synthesized_target = dns_name.Name.fromText(target_name_text) catch {
+                // The synthesized target carries the case the DNAME's own
+                // target was written in (RFC 4343 section 4.1).
+                const synthesized_target = dns_name.Name.fromTextPreservingCase(target_name_text) catch {
                     result.soa = null;
                     return .yxdomain;
                 };
@@ -432,14 +434,15 @@ pub fn registerZoneSize(zone: *const Zone) void {
     journal_mod.registerZoneSize(zone.originText(), fullTransferBytes(zone));
 }
 
-/// Turns one zone record into the DNS record the transfer answers carry.
+/// Turns one zone record into the DNS record the zone holds, with the names
+/// in the case the zone wrote them in (RFC 4343 section 4.1).
 fn toResourceRecord(record: parser.ZoneRecord) ?dns_record.ResourceRecord {
     return .{
-        .owner = dns_name.Name.fromText(record.ownerText()) catch return null,
+        .owner = dns_name.Name.fromTextPreservingCase(record.ownerText()) catch return null,
         .rrtype = record.rrtype,
         .class = dns_types.Class.IN,
         .ttl = record.ttl,
-        .rdata = parser.parseRData(record.rrtype, record.rdataText()) catch return null,
+        .rdata = parser.parseRDataPreservingCase(record.rrtype, record.rdataText()) catch return null,
     };
 }
 

@@ -1361,8 +1361,16 @@ pub fn zoneRecordToResourceRecord(record: zone_parser.ZoneRecord, owner_override
 }
 
 fn toResourceRecord(record: zone_parser.ZoneRecord, owner_override: ?[]const u8) !dns_record.ResourceRecord {
+    // RFC 4343 section 4.1: the output does no case conversion, so the owner
+    // the zone stored is served with the case the zone wrote. A wildcard
+    // answer's owner is the name the client asked for and not a name the
+    // zone stored, so it keeps the folded form the answer always had.
+    const owner = if (owner_override) |text|
+        dns_name.Name.fromText(text) catch return Error.BadZoneRecord
+    else
+        dns_name.Name.fromTextPreservingCase(record.ownerText()) catch return Error.BadZoneRecord;
     return .{
-        .owner = dns_name.Name.fromText(owner_override orelse record.ownerText()) catch return Error.BadZoneRecord,
+        .owner = owner,
         .rrtype = record.rrtype,
         .class = dns_types.Class.IN,
         .ttl = record.ttl,
@@ -1376,8 +1384,11 @@ fn toNegativeSoa(record: zone_parser.ZoneRecord) !dns_record.ResourceRecord {
     return rr;
 }
 
+/// The RDATA of a served record, with the names inside it in the case the
+/// zone wrote them. The signature over the RRset is made over the canonical
+/// form instead (RFC 4034 section 6.2), so the two never have to agree.
 fn parseZoneRData(record: zone_parser.ZoneRecord) !dns_rdata.RData {
-    return zone_parser.parseRData(record.rrtype, record.rdataText()) catch Error.BadZoneRecord;
+    return zone_parser.parseRDataPreservingCase(record.rrtype, record.rdataText()) catch Error.BadZoneRecord;
 }
 
 test "authoritative response builder answers exact A query" {
@@ -1415,6 +1426,57 @@ test "authoritative response builder answers exact A query" {
     try std.testing.expectEqual(@as(u16, 0x1234), round_trip.header.id);
     try std.testing.expectEqual(@as(u16, 1), round_trip.header.answer_count);
     try std.testing.expectEqualSlices(u8, &.{ 192, 168, 1, 1 }, &round_trip.answers.items[0].rdata.A);
+}
+
+test "RFC 4343 4.1: the zone's own stored case reaches the wire" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(
+        \\$ORIGIN Example.
+        \\$TTL 3600
+        \\@ IN SOA ns.Example. hostmaster.Example. 1 3600 900 1209600 3600
+        \\@ IN NS ns.Example.
+        \\WWW IN CNAME Target.Example.
+        \\Target IN A 192.0.2.1
+        \\
+    );
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    // The question names the same name in another case: RFC 1035 section
+    // 2.3.3 compares without regard to case, so the zone answers it.
+    const request = dns_message.Message{
+        .allocator = arena.allocator(),
+        .header = .{ .id = 0x1234 },
+        .question = .{
+            .name = try dns_name.Name.fromTextPreservingCase("Www.Example."),
+            .qtype = .A,
+            .qclass = dns_types.Class.IN,
+        },
+    };
+    const response = try buildResponse(request, &zone);
+    try std.testing.expectEqual(@as(usize, 2), response.answers.len);
+
+    var text: [256]u8 = undefined;
+    const cname = response.answers.items[0];
+    try std.testing.expect(cname.rrtype.eql(.CNAME));
+    // The owner and the name inside the RDATA keep the case the zone wrote.
+    try std.testing.expectEqualStrings("WWW.Example.", try cname.owner.toText(&text));
+    try std.testing.expectEqualStrings("Target.Example.", try cname.rdata.CNAME.toText(&text));
+
+    // On the wire the same two names carry that case: the owner is the
+    // zone's own spelling and the RDATA holds the target as it was written.
+    var encoded: [512]u8 = undefined;
+    var writer = @import("../dns/writer.zig").Writer.init(&encoded);
+    try cname.encode(&writer);
+    const wire = writer.written();
+    const owner_wire = [_]u8{ 3, 'W', 'W', 'W', 7, 'E', 'x', 'a', 'm', 'p', 'l', 'e', 0 };
+    try std.testing.expectEqualSlices(u8, &owner_wire, wire[0..owner_wire.len]);
+    // The RDATA follows the owner and the ten-octet record header.
+    const rdata_wire = [_]u8{ 6, 'T', 'a', 'r', 'g', 'e', 't', 7, 'E', 'x', 'a', 'm', 'p', 'l', 'e', 0 };
+    const rdata_start = owner_wire.len + 10;
+    try std.testing.expectEqualSlices(u8, &rdata_wire, wire[rdata_start .. rdata_start + rdata_wire.len]);
 }
 
 test "authoritative response builder returns CNAME and SOA-backed negatives" {

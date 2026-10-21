@@ -207,6 +207,10 @@ fn canonicalEntries(zone: *const zone_index.Zone, allocator: std.mem.Allocator) 
     const scratch = arena.allocator();
 
     var entries: std.ArrayList(Entry) = .empty;
+    // The canonical RDATA of the biggest record the zone may carry does not
+    // fit in the 2048-octet buffer the typed RDATA uses, so the buffer here
+    // is the zone's own bound.
+    const rdata_buffer = try scratch.alloc(u8, dns_rdata.max_message_rdata_len);
     // The records this server generated when it signed the zone at startup are
     // not part of the zone the publisher digested: their signatures depend on
     // the run, so no publisher can have covered them.
@@ -222,8 +226,7 @@ fn canonicalEntries(zone: *const zone_index.Zone, allocator: std.mem.Allocator) 
 
         // RDATA in canonical form: every domain name fully expanded and
         // lowercased, and no compression (RFC 4034 section 6.2).
-        var rdata_buffer: [2048]u8 = undefined;
-        var rdata_writer = dns_writer.Writer.init(&rdata_buffer);
+        var rdata_writer = dns_writer.Writer.init(rdata_buffer);
         rdata.encode(&rdata_writer) catch return Error.BadZoneRecord;
         try entries.append(scratch, .{
             .owner_wire = try scratch.dupe(u8, owner.asWire()),
@@ -841,4 +844,40 @@ test "a zone with no apex ZONEMD record verifies without hashing" {
     var report: [report_max_len]u8 = undefined;
     const message = try verify(&zone, std.testing.allocator, &report);
     try std.testing.expectEqualStrings("zone example.: no apex ZONEMD record, digest not verified", message);
+}
+
+test "a zone with a record at the message bound computes its digest" {
+    // The digest path encodes a record's RDATA, and the biggest record a zone
+    // may carry does not fit in the 2048-octet buffer the typed RDATA uses, so
+    // the digest of such a zone is still computed.
+    const bound = dns_rdata.max_message_rdata_len;
+    var text: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer text.deinit();
+    try text.writer.writeAll(
+        "$ORIGIN example.\n" ++
+            "$TTL 86400\n" ++
+            "@ IN SOA ns1 admin 1 1800 900 604800 86400\n" ++
+            "@ IN NS ns1\n" ++
+            "@ IN ZONEMD 1 1 2 ",
+    );
+    // A SHA512 digest, so the apex record is a well-formed ZONEMD.
+    var index: usize = 0;
+    while (index < 64) : (index += 1) {
+        try text.writer.print("{x:0>2}", .{@as(u8, @truncate(index))});
+    }
+    try text.writer.writeAll("\nbig IN TYPE65280 \\# ");
+    try text.writer.print("{d} ", .{bound});
+    index = 0;
+    while (index < bound) : (index += 1) {
+        try text.writer.print("{x:0>2}", .{@as(u8, @truncate(index))});
+    }
+    try text.writer.writeAll("\n");
+
+    var zone_file = try zone_parser.ZoneFile.parse(text.written());
+    defer zone_file.deinit();
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    var digest: [dns_rdata.max_zonemd_digest_len]u8 = undefined;
+    try computeDigest(&zone, .sha512, std.testing.allocator, &digest);
 }

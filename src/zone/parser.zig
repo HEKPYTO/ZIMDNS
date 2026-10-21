@@ -8,6 +8,9 @@ const dns_rdata = @import("../dns/rdata.zig");
 const dns_record = @import("../dns/record.zig");
 const Class = @import("../dns/types.zig").Class;
 const dns_writer = @import("../dns/writer.zig");
+const dns_message = @import("../dns/message.zig");
+const zone_index = @import("index.zig");
+const auth_response = @import("../auth/response.zig");
 
 /// Maximum temporary parser-owned backing used while loading one zone.
 pub const max_zone_allocation_bytes: usize = 16 * 1024 * 1024;
@@ -398,33 +401,50 @@ fn validateName(text: []const u8) Error!void {
     if (name.hasHyphenEdgeLabel()) return Error.BadName;
 }
 
-/// Parses one supported zone-text RDATA value. Zone loading calls this before
-/// retaining a record; responses reuse it as a defensive conversion step. A
-/// type this server does not implement carries its RDATA whole, so the bytes
-/// given are the RDATA itself.
+/// Parses one supported zone-text RDATA value in the canonical form, with
+/// every name inside it folded to lowercase. Zone loading calls this before
+/// retaining a record, and the signer and the digest use it, because RFC 4034
+/// section 6.2 signs that form. A type this server does not implement carries
+/// its RDATA whole, so the bytes given are the RDATA itself.
 pub fn parseRData(rrtype: RecordType, text: []const u8) Error!dns_rdata.RData {
+    return parseRDataWithCase(rrtype, text, true);
+}
+
+/// The same parse with the case of the names inside the RDATA kept as the
+/// zone wrote them. RFC 4343 section 4.1 does no case conversion on output,
+/// so this is the form a served record carries. The canonical parse above is
+/// the one the signer and the digest use (RFC 4034 section 6.2).
+pub fn parseRDataPreservingCase(rrtype: RecordType, text: []const u8) Error!dns_rdata.RData {
+    return parseRDataWithCase(rrtype, text, false);
+}
+
+fn parseRDataWithCase(rrtype: RecordType, text: []const u8, fold_case: bool) Error!dns_rdata.RData {
     if (rrtype.eql(.A)) return .{ .A = try parseIpv4(text) };
     if (rrtype.eql(.AAAA)) return .{ .AAAA = try parseIpv6(text) };
-    if (rrtype.eql(.NS)) return .{ .NS = try parseRdataName(text) };
-    if (rrtype.eql(.CNAME)) return .{ .CNAME = try parseRdataName(text) };
-    if (rrtype.eql(.DNAME)) return .{ .DNAME = try parseRdataName(text) };
-    if (rrtype.eql(.PTR)) return .{ .PTR = try parseRdataName(text) };
-    if (rrtype.eql(.SOA)) return .{ .SOA = try parseSoa(text) };
-    if (rrtype.eql(.MX)) return .{ .MX = try parseMx(text) };
-    if (rrtype.eql(.RT)) return .{ .RT = try parseMx(text) };
-    if (rrtype.eql(.RP)) return .{ .RP = try parseRp(text) };
-    if (rrtype.eql(.AFSDB)) return .{ .AFSDB = try parseAfsdb(text) };
+    if (rrtype.eql(.NS)) return .{ .NS = try parseRdataName(text, fold_case) };
+    if (rrtype.eql(.CNAME)) return .{ .CNAME = try parseRdataName(text, fold_case) };
+    if (rrtype.eql(.DNAME)) return .{ .DNAME = try parseRdataName(text, fold_case) };
+    if (rrtype.eql(.PTR)) return .{ .PTR = try parseRdataName(text, fold_case) };
+    if (rrtype.eql(.SOA)) return .{ .SOA = try parseSoa(text, fold_case) };
+    if (rrtype.eql(.MX)) return .{ .MX = try parseMx(text, fold_case) };
+    if (rrtype.eql(.RT)) return .{ .RT = try parseMx(text, fold_case) };
+    if (rrtype.eql(.RP)) return .{ .RP = try parseRp(text, fold_case) };
+    if (rrtype.eql(.AFSDB)) return .{ .AFSDB = try parseAfsdb(text, fold_case) };
     if (rrtype.eql(.X25)) return .{ .X25 = try parseX25(text) };
     if (rrtype.eql(.ISDN)) return .{ .ISDN = try parseIsdn(text) };
     if (rrtype.eql(.HINFO)) return .{ .HINFO = try parseHinfo(text) };
     if (rrtype.eql(.TXT)) return .{ .TXT = try parseTxt(text) };
-    if (rrtype.eql(.SRV)) return .{ .SRV = try parseSrv(text) };
-    if (rrtype.eql(.NAPTR)) return .{ .NAPTR = try parseNaptr(text) };
+    if (rrtype.eql(.SRV)) return .{ .SRV = try parseSrv(text, fold_case) };
+    if (rrtype.eql(.NAPTR)) return .{ .NAPTR = try parseNaptr(text, fold_case) };
     if (rrtype.eql(.CAA)) return .{ .CAA = try parseCaa(text) };
     if (rrtype.eql(.SSHFP)) return .{ .SSHFP = try parseSshfp(text) };
     if (rrtype.eql(.TLSA)) return .{ .TLSA = try parseTlsa(text) };
     if (rrtype.eql(.URI)) return .{ .URI = try parseUri(text) };
     if (rrtype.eql(.APL)) return .{ .APL = try parseApl(text) };
+    // RFC 4034 section 6.2 folds the names inside the RDATA of the types it
+    // lists, and SVCB and HTTPS are not among them, so their target name
+    // stays folded: the served form and the signed form must be the same
+    // bytes for a type whose canonical form keeps the case.
     if (rrtype.eql(.SVCB)) return .{ .SVCB = try parseSvcb(text) };
     if (rrtype.eql(.HTTPS)) return .{ .HTTPS = try parseSvcb(text) };
     if (rrtype.eql(.DNSKEY)) return .{ .Unknown = try parseDnskey(text) };
@@ -457,8 +477,9 @@ fn isOpaqueType(rrtype: RecordType) bool {
 
 /// RFC 3597 section 5: the RDATA of a record whose type this server does not
 /// implement is written in the generic form `\# <length> <hex>`, where the
-/// length is the RDLENGTH in octets. RFC 1035 section 3.2.1 makes RDLENGTH a
-/// 16-bit field, so the octets stop at the same 65535 the wire path accepts.
+/// length is the RDLENGTH in octets. RFC 1035 section 4.2.2 caps a DNS
+/// message at 65535 octets, so a zone holds no record longer than the longest
+/// RDATA one message can carry.
 /// The octets are copied into the caller's storage, which is the zone's own,
 /// so they stay valid for as long as the zone lives.
 fn decodeGenericRdata(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
@@ -468,7 +489,7 @@ fn decodeGenericRdata(allocator: std.mem.Allocator, text: []const u8) ![]const u
     const body = input[2..];
     var tokens = std.mem.tokenizeAny(u8, body, separators);
     const length = std.fmt.parseInt(usize, tokens.next() orelse return Error.BadRecord, 10) catch return Error.BadRecord;
-    if (length > dns_rdata.max_opaque_rdata_len) return Error.BadRecord;
+    if (length > dns_rdata.max_message_rdata_len) return Error.BadRecord;
 
     var digits: usize = 0;
     while (tokens.next()) |word| {
@@ -901,40 +922,41 @@ fn maskAplAddress(address: []u8, prefix: u8) void {
     if (first_zero < address.len) @memset(address[first_zero..], 0);
 }
 
-fn parseRdataName(text: []const u8) Error!dns_name.Name {
-    return dns_name.Name.fromText(text) catch Error.BadRecord;
+fn parseRdataName(text: []const u8, fold_case: bool) Error!dns_name.Name {
+    if (fold_case) return dns_name.Name.fromText(text) catch Error.BadRecord;
+    return dns_name.Name.fromTextPreservingCase(text) catch Error.BadRecord;
 }
 
-fn parseMx(text: []const u8) Error!dns_rdata.Mx {
+fn parseMx(text: []const u8, fold_case: bool) Error!dns_rdata.Mx {
     var tokens = std.mem.tokenizeAny(u8, text, " \t\r\n");
     const preference = parseStrictDecimal(u16, tokens.next() orelse return Error.BadRecord) orelse return Error.BadRecord;
     const exchange = tokens.next() orelse return Error.BadRecord;
     if (tokens.next() != null) return Error.BadRecord;
     return .{
         .preference = preference,
-        .exchange = try parseRdataName(exchange),
+        .exchange = try parseRdataName(exchange, fold_case),
     };
 }
 
-fn parseAfsdb(text: []const u8) Error!dns_rdata.Mx {
+fn parseAfsdb(text: []const u8, fold_case: bool) Error!dns_rdata.Mx {
     var tokens = std.mem.tokenizeAny(u8, text, " \t\r\n");
     const subtype = parseStrictDecimal(u16, tokens.next() orelse return Error.BadRecord) orelse return Error.BadRecord;
     const hostname = tokens.next() orelse return Error.BadRecord;
     if (tokens.next() != null) return Error.BadRecord;
     return .{
         .preference = subtype,
-        .exchange = try parseRdataName(hostname),
+        .exchange = try parseRdataName(hostname, fold_case),
     };
 }
 
-fn parseRp(text: []const u8) Error!dns_rdata.Rp {
+fn parseRp(text: []const u8, fold_case: bool) Error!dns_rdata.Rp {
     var tokens = std.mem.tokenizeAny(u8, text, " \t\r\n");
     const mbox = tokens.next() orelse return Error.BadRecord;
     const txt = tokens.next() orelse return Error.BadRecord;
     if (tokens.next() != null) return Error.BadRecord;
     return .{
-        .mbox = try parseRdataName(mbox),
-        .txt = try parseRdataName(txt),
+        .mbox = try parseRdataName(mbox, fold_case),
+        .txt = try parseRdataName(txt, fold_case),
     };
 }
 
@@ -1046,7 +1068,7 @@ fn parseHinfo(text: []const u8) Error!dns_rdata.Hinfo {
     return dns_rdata.Hinfo.init(cpu_buffer[0..cpu_len], os_buffer[0..os_len]) catch Error.BadRecord;
 }
 
-fn parseSrv(text: []const u8) Error!dns_rdata.Srv {
+fn parseSrv(text: []const u8, fold_case: bool) Error!dns_rdata.Srv {
     var tokens = std.mem.tokenizeAny(u8, text, " \t\r\n");
     const priority = parseStrictDecimal(u16, tokens.next() orelse return Error.BadRecord) orelse return Error.BadRecord;
     const weight = parseStrictDecimal(u16, tokens.next() orelse return Error.BadRecord) orelse return Error.BadRecord;
@@ -1057,7 +1079,7 @@ fn parseSrv(text: []const u8) Error!dns_rdata.Srv {
         .priority = priority,
         .weight = weight,
         .port = port,
-        .target = try parseRdataName(target),
+        .target = try parseRdataName(target, fold_case),
     };
 }
 
@@ -1282,7 +1304,7 @@ fn parseUri(text: []const u8) Error!dns_rdata.Uri {
 fn parseSvcb(text: []const u8) Error!dns_rdata.Svcb {
     var tokens = std.mem.tokenizeAny(u8, text, " \t\r\n");
     const priority = parseStrictDecimal(u16, tokens.next() orelse return Error.BadRecord) orelse return Error.BadRecord;
-    const target = try parseRdataName(tokens.next() orelse return Error.BadRecord);
+    const target = try parseRdataName(tokens.next() orelse return Error.BadRecord, true);
 
     var params: [dns_rdata.max_svcb_params_len]u8 = undefined;
     var params_len: usize = 0;
@@ -1487,7 +1509,7 @@ fn stripSvcbQuotes(text: []const u8) ?[]const u8 {
     return text;
 }
 
-fn parseNaptr(text: []const u8) Error!dns_rdata.Naptr {
+fn parseNaptr(text: []const u8, fold_case: bool) Error!dns_rdata.Naptr {
     const input = std.mem.trim(u8, text, " \t\r\n");
     var index: usize = 0;
     const order = try parseNaptrDecimal(input, &index);
@@ -1512,7 +1534,7 @@ fn parseNaptr(text: []const u8) Error!dns_rdata.Naptr {
     const replacement_text = input[replacement_start..index];
     if (!std.mem.endsWith(u8, replacement_text, ".")) return Error.BadRecord;
     if (std.mem.indexOfScalar(u8, replacement_text, '"') != null) return Error.BadRecord;
-    naptr.replacement = dns_name.Name.fromText(replacement_text) catch return Error.BadRecord;
+    naptr.replacement = try parseRdataName(replacement_text, fold_case);
     while (index < input.len and std.ascii.isWhitespace(input[index])) index += 1;
     if (index != input.len) return Error.BadRecord;
 
@@ -1578,7 +1600,7 @@ fn parseNaptrQuoted(text: []const u8, index: *usize, output: []u8) Error!usize {
     return length;
 }
 
-fn parseSoa(text: []const u8) Error!dns_rdata.Soa {
+fn parseSoa(text: []const u8, fold_case: bool) Error!dns_rdata.Soa {
     var tokens = std.mem.tokenizeAny(u8, text, " \t\r\n");
     const mname = tokens.next() orelse return Error.BadRecord;
     const rname = tokens.next() orelse return Error.BadRecord;
@@ -1590,8 +1612,8 @@ fn parseSoa(text: []const u8) Error!dns_rdata.Soa {
     if (minimum > max_ttl) return Error.BadTtl;
     if (tokens.next() != null) return Error.BadRecord;
     return .{
-        .mname = try parseRdataName(mname),
-        .rname = try parseRdataName(rname),
+        .mname = try parseRdataName(mname, fold_case),
+        .rname = try parseRdataName(rname, fold_case),
         .serial = serial,
         .refresh = refresh,
         .retry = retry,
@@ -1910,10 +1932,10 @@ test "zone parser keeps a generic record whole" {
     try std.testing.expectEqualSlices(u8, rdata.Unknown.bytes(), wire[wire.len - length ..]);
 }
 
-test "zone parser accepts a generic record at the opaque bound and refuses one past it" {
-    // RFC 1035 section 3.2.1: RDLENGTH is a 16-bit field, so the RDATA is at
-    // most 65535 octets, the same bound the wire path accepts.
-    const bound = dns_rdata.max_opaque_rdata_len;
+test "zone parser accepts a generic record at the message bound and refuses one past it" {
+    // RFC 1035 section 4.2.2: a DNS message is at most 65535 octets, so the
+    // RDATA a zone may carry is what one message has left over.
+    const bound = dns_rdata.max_message_rdata_len;
     var at_bound = try zoneWithGenericRecord(bound);
     defer at_bound.deinit();
 
@@ -1925,6 +1947,39 @@ test "zone parser accepts a generic record at the opaque bound and refuses one p
     var past_bound = try zoneWithGenericRecord(bound + 1);
     defer past_bound.deinit();
     try std.testing.expectError(Error.BadRecord, ZoneFile.parse(past_bound.written()));
+}
+
+test "zone parser serves a record at the message bound" {
+    // The bound is the longest RDATA one DNS message can carry, so the
+    // authoritative answer path encodes the record into a message that fits.
+    const bound = dns_rdata.max_message_rdata_len;
+    var text = try zoneWithGenericRecord(bound);
+    defer text.deinit();
+
+    var zone_file = try ZoneFile.parse(text.written());
+    defer zone_file.deinit();
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const request = try dns_message.Message.parseQuery(arena.allocator(), &.{
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        3,    'b',  'i',  'g',  7,    'e',  'x',  'a',  'm',  'p',  'l',  'e',
+        0,    0xff, 0x00, 0x00, 0x01,
+    });
+    var response = try auth_response.buildResponse(request, &zone);
+    defer response.deinit();
+
+    var buffer: [65535]u8 = undefined;
+    var writer = dns_writer.Writer.init(&buffer);
+    try response.encode(&writer);
+    const wire = writer.written();
+
+    // The record's octets reach the wire unchanged.
+    const rdata = zone.records.items[2].rdataText();
+    try std.testing.expectEqual(@as(usize, bound), rdata.len);
+    try std.testing.expectEqualSlices(u8, rdata, wire[wire.len - bound ..]);
 }
 
 test "zone parser refuses an unknown type that is not in the generic form" {

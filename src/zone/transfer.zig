@@ -206,7 +206,9 @@ pub fn orderedAxfrRecords(
 
 fn toResourceRecord(record: zone_parser.ZoneRecord) Error!dns_record.ResourceRecord {
     return .{
-        .owner = dns_name.Name.fromText(record.ownerText()) catch return Error.BadZoneRecord,
+        // RFC 4343 section 4.1: the output does no case conversion, so the
+        // transfer carries the owner name the zone file spelled.
+        .owner = dns_name.Name.fromTextPreservingCase(record.ownerText()) catch return Error.BadZoneRecord,
         .rrtype = record.rrtype,
         .class = dns_types.Class.IN,
         .ttl = record.ttl,
@@ -1315,4 +1317,39 @@ test "transfer chains one TSIG per message through the chainedMac primitive" {
 
     const last = encoded[index - 1][0..lens[index - 1]];
     try std.testing.expectError(error.BadMac, dns_tsig.verifyChained(&.{last}, secret, request_mac[0..], 32));
+}
+
+test "an AXFR answer carries the owner name the zone file spelled" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    // RFC 4343 section 4.1: the output does no case conversion, so the
+    // transfer carries the zone's own spelling of the owner name.
+    var zone_file = try zone_parser.ZoneFile.parse(
+        \\$ORIGIN Example.
+        \\$TTL 3600
+        \\@ IN SOA ns.Example. hostmaster.Example. 10 3600 900 1209600 3600
+        \\@ IN NS ns.Example.
+        \\WWW IN A 192.0.2.1
+        \\
+    );
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+    const request = try dns_message.Message.parseQuery(arena.allocator(), &axfr_query_bytes);
+    const messages = try buildAxfrMessages(arena.allocator(), &request, &zone, 8);
+    defer {
+        for (messages) |*message| message.deinit();
+        arena.allocator().free(messages);
+    }
+
+    var buffer: [256]u8 = undefined;
+    var saw_owner = false;
+    for (messages) |message| {
+        for (message.answers.items[0..message.answers.len]) |record| {
+            if (!record.rrtype.eql(.A)) continue;
+            saw_owner = true;
+            try std.testing.expectEqualStrings("WWW.Example.", try record.owner.toText(&buffer));
+        }
+    }
+    try std.testing.expect(saw_owner);
 }

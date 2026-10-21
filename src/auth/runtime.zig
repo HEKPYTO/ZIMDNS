@@ -404,13 +404,23 @@ pub const Runtime = struct {
         // not signed is not signed by a reload.
         if (self.zones.items[target].generated.len != 0) {
             if (self.dnssec_session) |*session| {
-                zone_signer.resignZone(self.allocator, &zone, &session.key, .{
-                    .inception = session.options.inception,
-                    .expiration = session.options.expiration,
-                }, &self.zones.items[target]) catch |err| {
+                // A reload signs the zone with a window that starts now, so a
+                // zone that has been running for weeks is signed with the
+                // validity period it has left (RFC 4034 section 3.1.5). The
+                // key does not move, so a validator that holds the old DS
+                // still validates the reloaded zone.
+                const now_seconds: u32 = @intCast(@divTrunc(
+                    std.Io.Clock.real.now(io).nanoseconds,
+                    std.time.ns_per_s,
+                ));
+                const window = session.options.fromNow(now_seconds);
+                zone_signer.resignZone(self.allocator, &zone, &session.key, window, &self.zones.items[target]) catch |err| {
                     reportReload(io, "error: cannot sign the reloaded zone for {s}: {t}", .{ origin, err });
                     return .sign_failed;
                 };
+                // The session signs the RFC 8482 minimal answer too, so its
+                // window moves with the zone's.
+                session.options = window;
             } else {
                 reportReload(io, "error: the zone for {s} is signed and the server holds no signing key", .{origin});
                 return .sign_failed;
@@ -3445,6 +3455,26 @@ const dnssec_reload_zone_next =
     \\
 ;
 
+/// A second zone, so a reload of one zone leaves the other one alone.
+const dnssec_reload_zone_other =
+    \\$ORIGIN other.
+    \\$TTL 3600
+    \\@ IN SOA ns.other. hostmaster.other. 10 3600 900 1209600 3600
+    \\@ IN NS ns.other.
+    \\www IN A 192.0.2.3
+    \\
+;
+
+/// The same second zone with a newer serial.
+const dnssec_reload_zone_other_next =
+    \\$ORIGIN other.
+    \\$TTL 3600
+    \\@ IN SOA ns.other. hostmaster.other. 11 3600 900 1209600 3600
+    \\@ IN NS ns.other.
+    \\mail IN A 192.0.2.4
+    \\
+;
+
 /// A zone file that already carries DNSSEC records, which the signer refuses
 /// rather than sign twice.
 const dnssec_reload_zone_signed =
@@ -3506,6 +3536,27 @@ fn zoneRrsig(
     return null;
 }
 
+/// The validity period an RRSIG carries: the inception and the expiration,
+/// in seconds since the epoch (RFC 4034 section 3.1.5).
+const SignatureWindow = struct {
+    inception: u32,
+    expiration: u32,
+};
+
+fn rrsigWindow(rrsig: []const u8) SignatureWindow {
+    std.debug.assert(rrsig.len >= 16);
+    return .{
+        .inception = std.mem.readInt(u32, rrsig[12..16], .big),
+        .expiration = std.mem.readInt(u32, rrsig[8..12], .big),
+    };
+}
+
+/// The wall clock in seconds since the epoch, the unit a signature window is
+/// counted in.
+fn nowSeconds(io: std.Io) u32 {
+    return @intCast(@divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+}
+
 fn zoneHas(zone: *const zone_index.Zone, rrtype: dns_types.RecordType, owner: []const u8) bool {
     for (zone.records.items[0..zone.records.len]) |record| {
         if (!record.rrtype.eql(rrtype)) continue;
@@ -3534,17 +3585,19 @@ test "a signed zone that is reloaded is signed again with the same key" {
     // SOA and the DNSKEY that names the key.
     const old_rrsig = (try zoneRrsig(allocator, &runtime.zones.items[0], "example.", dns_types.RecordType.SOA.code())).?;
     const old_dnskey = (try zoneOpaque(allocator, &runtime.zones.items[0], .DNSKEY, "example.")).?;
+    const old_ds = (try zoneOpaque(allocator, &runtime.zones.items[0], .DS, "example.")).?;
 
     try std.testing.expectEqual(ReloadOutcome.replaced, runtime.replaceZoneText(io, "example.", dnssec_reload_zone_next));
 
     // The served zone is the new content.
     try std.testing.expectEqual(@as(?u32, 11), runtime.zones.items[0].soaSerial());
 
-    // RFC 4034 section 5.3.1: the key tag is the identity of the key, so the
-    // DNSKEY and the DS that states its key tag do not move with the zone.
+    // RFC 4034 section 5.1.4: the DS holds a digest of the DNSKEY it names,
+    // so the DNSKEY, its key tag, and the DS do not move with the zone.
     const new_dnskey = (try zoneOpaque(allocator, &runtime.zones.items[0], .DNSKEY, "example.")).?;
     try std.testing.expectEqualSlices(u8, old_dnskey, new_dnskey);
     const ds = (try zoneOpaque(allocator, &runtime.zones.items[0], .DS, "example.")).?;
+    try std.testing.expectEqualSlices(u8, old_ds, ds);
     try std.testing.expectEqual(dns_dnssec.keyTag(new_dnskey), std.mem.readInt(u16, ds[0..2], .big));
 
     // The signature over the old SOA is gone: the new one covers the new
@@ -3553,7 +3606,9 @@ test "a signed zone that is reloaded is signed again with the same key" {
     try std.testing.expect(!std.mem.eql(u8, old_rrsig, new_rrsig));
 
     // The project's own validator accepts the new signature over the new
-    // SOA, with the DNSKEY the zone publishes as the trust anchor.
+    // SOA, with the DNSKEY the zone publishes as the trust anchor. The
+    // signature carries the window the reload started, so the validator is
+    // given a time inside that window.
     var anchors = dns_validate.Anchors{};
     anchors.items[0] = .{
         .owner = (try @import("../dns/name.zig").Name.fromText("example.")),
@@ -3565,7 +3620,7 @@ test "a signed zone that is reloaded is signed again with the same key" {
     const response_bytes = try runtime.answer(&dnssec_reload_soa_query, &output);
     const query = try dns_message.Message.parseQuery(allocator, &dnssec_reload_soa_query);
     const answer = try dns_message.Message.parse(allocator, response_bytes);
-    const result = try dns_validate.validate(allocator, &anchors, query, answer, &.{}, dnssec_reload_window.inception + 1);
+    const result = try dns_validate.validate(allocator, &anchors, query, answer, &.{}, rrsigWindow(new_rrsig).inception + 1);
     try std.testing.expectEqual(dns_validate.Status.secure, result.status);
 
     // The denial records are the new content's: the chain names the new owner
@@ -3579,6 +3634,76 @@ test "a signed zone that is reloaded is signed again with the same key" {
     // The denial records of the new content are signed, so the proof the
     // reloaded zone serves can be authenticated.
     try std.testing.expect((try zoneRrsig(allocator, &runtime.zones.items[0], "mail.example.", dns_types.RecordType.NSEC.code())) != null);
+}
+
+test "a reload signs the zone with a window that starts now" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var runtime = Runtime{ .allocator = std.testing.allocator };
+    defer runtime.deinit();
+    try runtime.appendZoneText(dnssec_reload_zone);
+
+    var key = try zone_signer.parseKey(dnssec_reload_key);
+    defer key.deinit();
+    try zone_signer.signZone(runtime.allocator, &runtime.zones.items[0], &key, dnssec_reload_window);
+    runtime.dnssec_session = zone_signer.Session.start(&key, dnssec_reload_window);
+
+    const old_rrsig = (try zoneRrsig(allocator, &runtime.zones.items[0], "example.", dns_types.RecordType.SOA.code())).?;
+    const old_window = rrsigWindow(old_rrsig);
+
+    const before = nowSeconds(io);
+    try std.testing.expectEqual(ReloadOutcome.replaced, runtime.replaceZoneText(io, "example.", dnssec_reload_zone_next));
+    const after = nowSeconds(io);
+
+    const new_rrsig = (try zoneRrsig(allocator, &runtime.zones.items[0], "example.", dns_types.RecordType.SOA.code())).?;
+    const new_window = rrsigWindow(new_rrsig);
+
+    // The reloaded zone is signed with a window that starts at the reload, so
+    // a zone that has been running for weeks is signed with the validity
+    // period it has left (RFC 4034 section 3.1.5).
+    try std.testing.expect(new_window.inception >= before);
+    try std.testing.expect(new_window.inception <= after);
+    try std.testing.expect(new_window.inception != old_window.inception);
+
+    // The window is the one the server was configured with, counted from the
+    // reload and not from the start of the server.
+    try std.testing.expectEqual(
+        old_window.expiration - old_window.inception,
+        new_window.expiration - new_window.inception,
+    );
+}
+
+test "a zone that is not reloaded keeps the window it was signed with" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var runtime = Runtime{ .allocator = std.testing.allocator };
+    defer runtime.deinit();
+    try runtime.appendZoneText(dnssec_reload_zone);
+    try runtime.appendZoneText(dnssec_reload_zone_other);
+
+    var key = try zone_signer.parseKey(dnssec_reload_key);
+    defer key.deinit();
+    try zone_signer.signZone(runtime.allocator, &runtime.zones.items[0], &key, dnssec_reload_window);
+    runtime.dnssec_session = zone_signer.Session.start(&key, dnssec_reload_window);
+
+    const old_rrsig = (try zoneRrsig(allocator, &runtime.zones.items[0], "example.", dns_types.RecordType.SOA.code())).?;
+    const old_window = rrsigWindow(old_rrsig);
+
+    // Another zone is reloaded; the signed one is not.
+    try std.testing.expectEqual(ReloadOutcome.replaced, runtime.replaceZoneText(io, "other.", dnssec_reload_zone_other_next));
+
+    // The signed zone keeps the signatures it was signed with: only a reload
+    // of that zone refreshes its window.
+    const kept_rrsig = (try zoneRrsig(allocator, &runtime.zones.items[0], "example.", dns_types.RecordType.SOA.code())).?;
+    try std.testing.expectEqualSlices(u8, old_rrsig, kept_rrsig);
+    try std.testing.expectEqual(old_window.inception, rrsigWindow(kept_rrsig).inception);
+    try std.testing.expectEqual(old_window.expiration, rrsigWindow(kept_rrsig).expiration);
 }
 
 test "a reload that fails leaves the served signed zone in place" {
