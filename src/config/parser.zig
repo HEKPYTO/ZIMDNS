@@ -13,6 +13,7 @@ pub const Error = error{
     BadAddress,
     BadCidr,
     BadNat64Prefix,
+    BadExcludedRange,
     TextTooLong,
     TooManyItems,
 };
@@ -88,6 +89,16 @@ pub const Cidr = struct {
             .ip6 => |ip6| if (!self.v6) false else maskedEqual(&self.bytes, &ip6.bytes, self.prefix),
         };
     }
+
+    pub fn containsIpv4(self: *const Cidr, address: [4]u8) bool {
+        if (self.v6) return false;
+        return maskedEqual(self.bytes[0..4], &address, self.prefix);
+    }
+
+    pub fn containsIpv6(self: *const Cidr, address: [16]u8) bool {
+        if (!self.v6) return false;
+        return maskedEqual(&self.bytes, &address, self.prefix);
+    }
 };
 
 fn maskedEqual(left: []const u8, right: []const u8, prefix: u8) bool {
@@ -106,6 +117,9 @@ fn maskedEqual(left: []const u8, right: []const u8, prefix: u8) bool {
 pub const Nat64Prefix = struct {
     bytes: [16]u8 = @splat(0),
     length: u8 = 96,
+    /// RFC 6147 section 5.1.7: the IPv4 address range the prefix serves. The
+    /// default range 0.0.0.0/0 serves every IPv4 address.
+    range: Cidr = .{},
 
     pub fn parse(value: []const u8) Error!Nat64Prefix {
         const slash = std.mem.lastIndexOfScalar(u8, value, '/') orelse return Error.BadNat64Prefix;
@@ -133,6 +147,30 @@ pub const Forwarder = struct {
 
     pub fn addressText(self: *const Forwarder) []const u8 {
         return self.address.text();
+    }
+};
+
+/// RFC 5452 section 9.2: a source port the forwarder must not use. The
+/// range covers one port when its ends are the same, and a value of
+/// `first-last` covers every port between them.
+pub const PortRange = struct {
+    first: u16 = 0,
+    last: u16 = 0,
+
+    pub fn parse(value: []const u8) Error!PortRange {
+        if (std.mem.indexOfScalar(u8, value, '-')) |split| {
+            const first = std.fmt.parseInt(u16, value[0..split], 10) catch return Error.BadPort;
+            const last = std.fmt.parseInt(u16, value[split + 1 ..], 10) catch return Error.BadPort;
+            if (first == 0 or last == 0 or first > last) return Error.BadPort;
+            return .{ .first = first, .last = last };
+        }
+        const port = std.fmt.parseInt(u16, value, 10) catch return Error.BadPort;
+        if (port == 0) return Error.BadPort;
+        return .{ .first = port, .last = port };
+    }
+
+    pub fn contains(self: PortRange, port: u16) bool {
+        return port >= self.first and port <= self.last;
     }
 };
 
@@ -238,15 +276,32 @@ pub const Config = struct {
     /// (see AnswerPolicy.minimal_any_ttl); set via `minimal-any-ttl <seconds>`.
     minimal_any_ttl: ?u32 = null,
 
-    /// RFC 6147 DNS64 synthesis prefix, in the RFC 6052 section 2.2 format.
-    /// Null means the forwarder never synthesizes an AAAA, which is the
-    /// default; set via `nat64-prefix <prefix>`.
-    nat64_prefix: ?Nat64Prefix = null,
+    /// RFC 6147 DNS64 synthesis prefixes, in the RFC 6052 section 2.2 format,
+    /// each with the IPv4 address range it serves. No prefix means the
+    /// forwarder never synthesizes an AAAA, which is the default; set via
+    /// `nat64-prefix <prefix> [<ipv4-range>]`.
+    nat64_prefixes: List(Nat64Prefix) = .{},
+
+    /// RFC 6147 section 5.1.4: the IPv6 prefix ranges whose AAAA records are
+    /// treated as an empty answer, on top of the default set. Repeatable via
+    /// `dns64-exclude <ipv6-prefix>`.
+    dns64_excluded: List(Cidr) = .{},
 
     /// RFC 9520 section 3.2: the time a resolution failure stays cached, in
     /// seconds. Null means the resolver's own default; set via
     /// `minimum-failure-cache-time <seconds>`.
     minimum_failure_cache_time: ?u32 = null,
+
+    /// RFC 5452 section 9.2: the source ports the forwarder must not use.
+    /// Empty means every ephemeral port is allowed, which is what the
+    /// forwarder does without the directive; set via
+    /// `forwarder-deny-port <port>`.
+    deny_ports: List(PortRange) = .{},
+
+    /// RFC 7871 section 7.1.1: the maximum cacheable prefix length of the
+    /// client subnet option. Null means the client's own prefix length is
+    /// forwarded unchanged; set via `client-subnet-max-prefix <length>`.
+    max_cacheable_prefix: ?u8 = null,
 
     pub fn tlsCertFileText(self: *const Config) ?[]const u8 {
         if (!self.has_tls_cert_file) return null;
@@ -316,7 +371,10 @@ pub const Config = struct {
         if (std.mem.eql(u8, first, "zoneversion")) return self.parseZoneversion(&tokens);
         if (std.mem.eql(u8, first, "minimal-any-ttl")) return self.parseMinimalAnyTtl(&tokens);
         if (std.mem.eql(u8, first, "nat64-prefix")) return self.parseNat64Prefix(&tokens);
+        if (std.mem.eql(u8, first, "dns64-exclude")) return self.parseDns64Exclude(&tokens);
         if (std.mem.eql(u8, first, "minimum-failure-cache-time")) return self.parseMinimumFailureCacheTime(&tokens);
+        if (std.mem.eql(u8, first, "forwarder-deny-port")) return self.parseForwarderDenyPort(&tokens);
+        if (std.mem.eql(u8, first, "client-subnet-max-prefix")) return self.parseClientSubnetMaxPrefix(&tokens);
         return Error.UnknownDirective;
     }
 
@@ -513,10 +571,42 @@ pub const Config = struct {
     }
 
     fn parseNat64Prefix(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
-        if (self.nat64_prefix != null) return Error.BadDirective;
+        const value = tokens.next() orelse return Error.BadDirective;
+        var prefix = try Nat64Prefix.parse(value);
+        // RFC 6147 section 5.1.7: the prefix may be bound to the IPv4 address
+        // range it serves; without a range it serves every IPv4 address.
+        if (tokens.next()) |range_text| {
+            const range = try Cidr.parse(range_text);
+            if (range.v6) return Error.BadCidr;
+            prefix.range = range;
+        }
+        try requireNoTrailingTokens(tokens);
+        try self.nat64_prefixes.append(prefix);
+    }
+
+    fn parseDns64Exclude(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
         const value = tokens.next() orelse return Error.BadDirective;
         try requireNoTrailingTokens(tokens);
-        self.nat64_prefix = try Nat64Prefix.parse(value);
+        const range = Cidr.parse(value) catch return Error.BadExcludedRange;
+        if (!range.v6) return Error.BadExcludedRange;
+        try self.dns64_excluded.append(range);
+    }
+
+    fn parseForwarderDenyPort(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        const value = tokens.next() orelse return Error.BadDirective;
+        try requireNoTrailingTokens(tokens);
+        try self.deny_ports.append(try PortRange.parse(value));
+    }
+
+    fn parseClientSubnetMaxPrefix(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        if (self.max_cacheable_prefix != null) return Error.BadDirective;
+        const value = tokens.next() orelse return Error.BadDirective;
+        try requireNoTrailingTokens(tokens);
+        const parsed = std.fmt.parseInt(u8, value, 10) catch return Error.BadDirective;
+        // RFC 7871 section 7.1.1: a prefix length is a number of address
+        // bits, and no address family has more than 128 of them.
+        if (parsed > 128) return Error.BadDirective;
+        self.max_cacheable_prefix = parsed;
     }
 
     fn parseMinimumFailureCacheTime(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
@@ -846,20 +936,29 @@ test "config parser takes one RFC 9520 failure cache time and rejects every othe
     try std.testing.expectError(error.UnknownDirective, Config.parse("failure-cache-time 30\n"));
 }
 
-test "config parser takes one RFC 6052 NAT64 prefix and rejects every other shape" {
+test "config parser takes RFC 6052 NAT64 prefixes with their IPv4 ranges" {
     // No prefix means no synthesis, which is the default.
-    try std.testing.expect((try Config.parse("zone one.example primary one.zone\n")).nat64_prefix == null);
+    try std.testing.expect((try Config.parse("zone one.example primary one.zone\n")).nat64_prefixes.len == 0);
 
     // RFC 6052 section 2.2: the well-known prefix and a network-specific
     // prefix are both valid, and the reserved u octet is zero in each.
     const well_known = try Config.parse("nat64-prefix 64:ff9b::/96\n");
-    try std.testing.expectEqual(@as(u8, 96), well_known.nat64_prefix.?.length);
-    try std.testing.expectEqual(@as(u8, 0), well_known.nat64_prefix.?.bytes[8]);
-    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x64, 0xff, 0x9b }, well_known.nat64_prefix.?.bytes[0..4]);
+    try std.testing.expectEqual(@as(usize, 1), well_known.nat64_prefixes.len);
+    try std.testing.expectEqual(@as(u8, 96), well_known.nat64_prefixes.items[0].length);
+    try std.testing.expectEqual(@as(u8, 0), well_known.nat64_prefixes.items[0].bytes[8]);
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x64, 0xff, 0x9b }, well_known.nat64_prefixes.items[0].bytes[0..4]);
 
     const specific = try Config.parse("nat64-prefix 2001:db8::/32\n");
-    try std.testing.expectEqual(@as(u8, 32), specific.nat64_prefix.?.length);
-    try std.testing.expectEqualSlices(u8, &.{ 0x20, 0x01, 0x0d, 0xb8 }, specific.nat64_prefix.?.bytes[0..4]);
+    try std.testing.expectEqual(@as(u8, 32), specific.nat64_prefixes.items[0].length);
+    try std.testing.expectEqualSlices(u8, &.{ 0x20, 0x01, 0x0d, 0xb8 }, specific.nat64_prefixes.items[0].bytes[0..4]);
+
+    // RFC 6147 section 5.1.7: a prefix may name the IPv4 range it serves.
+    const bound = try Config.parse("nat64-prefix 2001:db8:100::/96 192.0.2.0/24\n");
+    try std.testing.expectEqual(@as(u8, 24), bound.nat64_prefixes.items[0].range.prefix);
+    try std.testing.expectEqualSlices(u8, &.{ 192, 0, 2, 0 }, bound.nat64_prefixes.items[0].range.bytes[0..4]);
+    try std.testing.expect(!bound.nat64_prefixes.items[0].range.v6);
+    // Without a range the prefix serves every IPv4 address.
+    try std.testing.expectEqual(@as(u8, 0), well_known.nat64_prefixes.items[0].range.prefix);
 
     // RFC 6052 section 2.2 allows only these prefix lengths, and the u
     // octet (bits 64 to 71) must be zero.
@@ -877,8 +976,85 @@ test "config parser takes one RFC 6052 NAT64 prefix and rejects every other shap
     try std.testing.expectError(error.BadAddress, Config.parse("nat64-prefix 192.0.2.0/96\n"));
     try std.testing.expectError(error.BadAddress, Config.parse("nat64-prefix not-an-address/96\n"));
     try std.testing.expectError(error.BadDirective, Config.parse("nat64-prefix\n"));
-    try std.testing.expectError(error.BadDirective, Config.parse("nat64-prefix 64:ff9b::/96 extra\n"));
+    try std.testing.expectError(error.BadCidr, Config.parse("nat64-prefix 64:ff9b::/96 extra\n"));
+    // The range holds IPv4 addresses, so an IPv6 range is refused.
+    try std.testing.expectError(error.BadCidr, Config.parse("nat64-prefix 64:ff9b::/96 2001:db8::/32\n"));
+    try std.testing.expectError(error.BadCidr, Config.parse("nat64-prefix 64:ff9b::/96 192.0.2.0\n"));
+    try std.testing.expectError(error.BadCidr, Config.parse("nat64-prefix 64:ff9b::/96 192.0.2.0/33\n"));
+}
+
+test "config parser takes the DNS64 excluded ranges and refuses malformed ones" {
+    // RFC 6147 section 5.1.4: without a directive the default set applies.
+    try std.testing.expect((try Config.parse("zone one.example primary one.zone\n")).dns64_excluded.len == 0);
+
+    const one = try Config.parse("dns64-exclude 2001:db8:1::/48\n");
+    try std.testing.expectEqual(@as(usize, 1), one.dns64_excluded.len);
+    try std.testing.expectEqual(@as(u8, 48), one.dns64_excluded.items[0].prefix);
+    try std.testing.expect(one.dns64_excluded.items[0].v6);
+    try std.testing.expectEqualSlices(u8, &.{ 0x20, 0x01, 0x0d, 0xb8 }, one.dns64_excluded.items[0].bytes[0..4]);
+
+    const two = try Config.parse("dns64-exclude 2001:db8:1::/48\ndns64-exclude 2001:db8:2::/48\n");
+    try std.testing.expectEqual(@as(usize, 2), two.dns64_excluded.len);
+    try std.testing.expectEqual(@as(u8, 48), two.dns64_excluded.items[1].prefix);
+
+    for ([_][]const u8{
+        "dns64-exclude 2001:db8:1::\n",
+        "dns64-exclude 2001:db8:1::/48/48\n",
+        "dns64-exclude 192.0.2.0/24\n",
+        "dns64-exclude not-an-address/48\n",
+        "dns64-exclude 2001:db8:1::/129\n",
+    }) |text| {
+        try std.testing.expectError(error.BadExcludedRange, Config.parse(text));
+    }
+    try std.testing.expectError(error.BadDirective, Config.parse("dns64-exclude\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("dns64-exclude 2001:db8:1::/48 extra\n"));
+}
+
+test "config parser takes the denied source ports and refuses malformed ones" {
+    // RFC 5452 section 9.2: without a directive every source port is allowed.
+    try std.testing.expect((try Config.parse("zone one.example primary one.zone\n")).deny_ports.len == 0);
+
+    const config = try Config.parse("forwarder-deny-port 53\nforwarder-deny-port 40000-40100\n");
+    try std.testing.expectEqual(@as(usize, 2), config.deny_ports.len);
+    try std.testing.expectEqual(@as(u16, 53), config.deny_ports.items[0].first);
+    try std.testing.expectEqual(@as(u16, 53), config.deny_ports.items[0].last);
+    try std.testing.expectEqual(@as(u16, 40000), config.deny_ports.items[1].first);
+    try std.testing.expectEqual(@as(u16, 40100), config.deny_ports.items[1].last);
+
+    try std.testing.expectError(error.BadDirective, Config.parse("forwarder-deny-port\n"));
+    for ([_][]const u8{
+        "forwarder-deny-port 0\n",
+        "forwarder-deny-port not-a-port\n",
+        "forwarder-deny-port 65536\n",
+        "forwarder-deny-port 40100-40000\n",
+        "forwarder-deny-port 53-\n",
+        "forwarder-deny-port -53\n",
+    }) |text| {
+        try std.testing.expectError(error.BadPort, Config.parse(text));
+    }
+    try std.testing.expectError(error.BadDirective, Config.parse("forwarder-deny-port 53 extra\n"));
+}
+
+test "config parser takes one maximum cacheable prefix length and refuses malformed ones" {
+    // RFC 7871 section 7.1.1: without a directive the client's own prefix
+    // length is forwarded unchanged.
+    try std.testing.expect((try Config.parse("zone one.example primary one.zone\n")).max_cacheable_prefix == null);
+
+    const config = try Config.parse("client-subnet-max-prefix 24\n");
+    try std.testing.expectEqual(@as(u8, 24), config.max_cacheable_prefix.?);
+    try std.testing.expectEqual(@as(u8, 0), (try Config.parse("client-subnet-max-prefix 0\n")).max_cacheable_prefix.?);
+    try std.testing.expectEqual(@as(u8, 128), (try Config.parse("client-subnet-max-prefix 128\n")).max_cacheable_prefix.?);
+
+    for ([_][]const u8{
+        "client-subnet-max-prefix\n",
+        "client-subnet-max-prefix 129\n",
+        "client-subnet-max-prefix -1\n",
+        "client-subnet-max-prefix 24.5\n",
+    }) |text| {
+        try std.testing.expectError(error.BadDirective, Config.parse(text));
+    }
+    try std.testing.expectError(error.BadDirective, Config.parse("client-subnet-max-prefix 24 extra\n"));
     try std.testing.expectError(error.BadDirective, Config.parse(
-        "nat64-prefix 64:ff9b::/96\nnat64-prefix 2001:db8::/32\n",
+        "client-subnet-max-prefix 24\nclient-subnet-max-prefix 16\n",
     ));
 }

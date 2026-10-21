@@ -5,6 +5,7 @@ const std = @import("std");
 const RecordType = @import("../dns/types.zig").RecordType;
 const dns_name = @import("../dns/name.zig");
 const parser = @import("parser.zig");
+const journal_mod = @import("journal.zig");
 
 pub const LookupKind = enum {
     answer,
@@ -196,6 +197,15 @@ pub const Zone = struct {
         const rdata = parser.parseRData(.SOA, record.rdataText()) catch return null;
         if (rdata != .SOA) return null;
         return rdata.SOA.serial;
+    }
+
+    /// Reports whether the zone holds a record equal to `record`: the same
+    /// owner, TTL, type, and rdata.
+    pub fn hasRecord(self: *const Zone, record: parser.ZoneRecord) bool {
+        for (self.records.items[0..self.records.len]) |*candidate| {
+            if (sameRecord(candidate, &record)) return true;
+        }
+        return false;
     }
 
     pub fn contains(self: *const Zone, qname: []const u8) bool {
@@ -395,6 +405,51 @@ pub const Zone = struct {
 fn failResult(result: *LookupResult, allocator: std.mem.Allocator) LookupResult {
     result.deinit(allocator);
     return .{ .kind = .servfail };
+}
+
+/// The difference between two zone snapshots, in the journal's encoding: the
+/// records the old zone held and the new one does not, then the records the
+/// new zone holds and the old one did not. RFC 1995 section 4 wants the
+/// older SOA to open the deleted records and the newer SOA to open the
+/// added ones. The caller owns the returned text.
+pub fn difference(allocator: std.mem.Allocator, old_zone: *const Zone, new_zone: *const Zone) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    if (old_zone.soa) |*soa| try appendDifferenceRecord(&out, allocator, true, soa);
+    for (old_zone.records.items[0..old_zone.records.len]) |*record| {
+        if (record.rrtype.eql(.SOA)) continue;
+        if (new_zone.hasRecord(record.*)) continue;
+        try appendDifferenceRecord(&out, allocator, true, record);
+    }
+    if (new_zone.soa) |*soa| try appendDifferenceRecord(&out, allocator, false, soa);
+    for (new_zone.records.items[0..new_zone.records.len]) |*record| {
+        if (record.rrtype.eql(.SOA)) continue;
+        if (old_zone.hasRecord(record.*)) continue;
+        try appendDifferenceRecord(&out, allocator, false, record);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// Reports whether two records are the same record: the same owner, TTL,
+/// type, and rdata.
+fn sameRecord(left: *const parser.ZoneRecord, right: *const parser.ZoneRecord) bool {
+    if (left.ttl != right.ttl) return false;
+    if (!left.rrtype.eql(right.rrtype)) return false;
+    if (!std.ascii.eqlIgnoreCase(left.ownerText(), right.ownerText())) return false;
+    return std.mem.eql(u8, left.rdataText(), right.rdataText());
+}
+
+fn appendDifferenceRecord(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    deleted: bool,
+    record: *const parser.ZoneRecord,
+) !void {
+    // A record whose rdata carries a line break cannot be carried in the
+    // journal's line-based encoding, so the difference is left out and the
+    // client at the old serial gets the full transfer.
+    if (std.mem.indexOfAny(u8, record.rdataText(), "\n\r") != null) return error.Unrepresentable;
+    try journal_mod.encodeRecord(out, allocator, deleted, record.ownerText(), record.ttl, record.rrtype.code(), record.rdataText());
 }
 
 fn isStrictSubdomain(name: []const u8, parent: []const u8) bool {

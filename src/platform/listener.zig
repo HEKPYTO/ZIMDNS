@@ -568,6 +568,54 @@ test "TCP handler serves FIFO length-prefixed DNS queries on one stream" {
     server_stream_closed = true;
 }
 
+test "RFC 7828: a TCP client is answered with the keepalive option" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+
+    var listen_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try std.Io.net.IpAddress.listen(&listen_addr, io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    var client_stream = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer client_stream.close(io);
+
+    var client_write_buffer: [512]u8 = undefined;
+    var client_writer = client_stream.writer(io, &client_write_buffer);
+    var prefix: [2]u8 = undefined;
+    std.mem.writeInt(u16, &prefix, @intCast(keepalive_query.len), .big);
+    try client_writer.interface.writeAll(&prefix);
+    try client_writer.interface.writeAll(keepalive_query);
+    try client_writer.interface.flush();
+    try client_stream.shutdown(io, .send);
+
+    var server_stream = try server.accept(io);
+    defer server_stream.close(io);
+
+    try serveTcpStreamOnce(server_stream, io, &runtime);
+
+    var client_read_buffer: [512]u8 = undefined;
+    var client_reader = client_stream.reader(io, &client_read_buffer);
+    const response_len_bytes = try client_reader.interface.takeArray(2);
+    const response_len = std.mem.readInt(u16, response_len_bytes, .big);
+    const response_bytes = try client_reader.interface.take(response_len);
+    const response = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+    // RFC 7828 section 3.3.2: the answer carries the idle timeout the server
+    // applies to the session, counted in units of 100 milliseconds.
+    var keepalive: ?[]const u8 = null;
+    for (response.additionals.items[0..response.additionals.len]) |*record| {
+        if (!record.rrtype.eql(.OPT)) continue;
+        keepalive = dns_rdata.findOption(record.rdata.OPT.bytes(), dns_rdata.EDNS_TCP_KEEPALIVE_OPTION_CODE);
+        break;
+    }
+    try std.testing.expect(keepalive != null);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 50 }, keepalive.?);
+}
+
 test "TCP loop rejects truncated frames before serving the next connection" {
     var io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{
         .concurrent_limit = .limited(TCP_MAX_CONNECTION_WORKERS),
@@ -1312,11 +1360,11 @@ const unix_tcp_deadlines = if (TCP_DEADLINES_SUPPORTED) struct {
             // RFC 9210 section 3: a query that arrived over TCP is answered
             // the way the same query over UDP is answered, forwarding
             // included, and the peer address is the client the policy sees.
+            // RFC 7828 section 3.3.2: only a TCP session is answered with
+            // the edns-tcp-keepalive option, so the transport names the
+            // entry point.
             const client = &stream.socket.address;
-            const response_bytes = if (counters) |value|
-                try runtime.answerFromWithMetrics(request, &response_buffer, client, value)
-            else
-                try runtime.answerFrom(request, &response_buffer, client);
+            const response_bytes = try runtime.answerFromTcp(request, &response_buffer, client, counters);
             if (response_bytes.len > TCP_MAX_FRAME_SIZE) return Error.ResponseTooLarge;
 
             var prefix: [2]u8 = undefined;
@@ -1377,4 +1425,13 @@ const large_a_query = &[_]u8{
     0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     4,    'm',  'a',  'n',  'y',  4,    'h',  'o',  'm',  'e',  4,    'a',
     'r',  'p',  'a',  0,    0x00, 0x01, 0x00, 0x01,
+};
+
+/// A query whose OPT record carries the empty edns-tcp-keepalive option of
+/// RFC 7828 section 3.2.1.
+const keepalive_query = &[_]u8{
+    0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+    3,    'd',  'n',  's',  4,    'h',  'o',  'm',  'e',  4,    'a',  'r',
+    'p',  'a',  0,    0x00, 0x01, 0x00, 0x01, 0,    0x00, 0x29, 0x04, 0xd0,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x0b, 0x00, 0x00,
 };

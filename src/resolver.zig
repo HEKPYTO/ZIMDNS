@@ -33,6 +33,9 @@ pub const STALE_TTL: u32 = 30;
 /// negative answer is capped at three hours.
 pub const MAX_NEGATIVE_TTL: u32 = 3 * 60 * 60;
 pub const UDP_ATTEMPTS = 2;
+/// RFC 5452 section 9.2: a source port the operator denied is never used,
+/// so the socket is bound again until an allowed port is found.
+pub const SOURCE_PORT_ATTEMPTS = 8;
 pub const UDP_TIMEOUT: std.Io.Timeout = .{ .duration = .{
     .raw = .fromMilliseconds(1000),
     .clock = .awake,
@@ -97,19 +100,50 @@ pub const Endpoint = struct {
     address: std.Io.net.IpAddress,
 };
 
+/// The DNS64 prefixes and excluded ranges a policy holds: the fixed array
+/// and the number of slots in use.
+pub fn Dns64List(comptime T: type) type {
+    return struct {
+        items: [32]T = undefined,
+        len: usize = 0,
+
+        pub fn init(values: []const T) @This() {
+            var list = @This(){ .len = values.len };
+            @memcpy(list.items[0..values.len], values);
+            return list;
+        }
+    };
+}
+
 pub const Policy = struct {
     recursion_allow: [32]config.Cidr = undefined,
     recursion_allow_len: usize = 0,
     forwarder: ?Endpoint = null,
     cookies: CookiePolicy = .{},
-    /// RFC 6147 DNS64 synthesis prefix, in the RFC 6052 section 2.2 format.
-    /// Null means the forwarder never synthesizes an AAAA, which is what an
-    /// operator gets without a `nat64-prefix` directive.
-    nat64_prefix: ?config.Nat64Prefix = null,
+    /// RFC 6147 section 5.1.7: the NAT64 prefixes the synthesis may use, each
+    /// with the IPv4 address range it serves. Empty means the forwarder never
+    /// synthesizes an AAAA, which is what an operator gets without a
+    /// `nat64-prefix` directive.
+    nat64_prefixes: Dns64List(config.Nat64Prefix) = .{},
+
+    /// RFC 6147 section 5.1.4: the IPv6 prefix ranges whose AAAA records are
+    /// treated as an empty answer, on top of the default set.
+    dns64_excluded: Dns64List(config.Cidr) = .{},
 
     /// RFC 9520 section 3.2: the time a resolution failure stays cached, in
     /// seconds. The operator sets it with `minimum-failure-cache-time`.
     failure_cache_seconds: u32 = DEFAULT_FAILURE_CACHE_SECONDS,
+
+    /// RFC 5452 section 9.2: the source ports the forwarder must not use.
+    /// Empty means every ephemeral port is allowed, which is what the
+    /// forwarder does without a `forwarder-deny-port` directive.
+    deny_ports: [32]config.PortRange = undefined,
+    deny_ports_len: usize = 0,
+
+    /// RFC 7871 section 7.1.1: the maximum cacheable prefix length of the
+    /// client subnet option. Null means the client's own prefix length is
+    /// forwarded unchanged.
+    max_cacheable_prefix: ?u8 = null,
 
     /// RFC 4035 section 5.2 trust anchors. Empty unless `trust-anchor-file`
     /// named one, so a forwarder with no configured anchor validates nothing
@@ -133,8 +167,26 @@ pub const Policy = struct {
         if (value.cookies.enabled) {
             policy.cookies = CookiePolicy.init(value.cookies.currentText(), value.cookies.previousText());
         }
-        policy.nat64_prefix = value.nat64_prefix;
+        if (value.nat64_prefixes.len > policy.nat64_prefixes.items.len) return error.TooManyItems;
+        index = 0;
+        while (index < value.nat64_prefixes.len) : (index += 1) {
+            policy.nat64_prefixes.items[index] = value.nat64_prefixes.items[index];
+        }
+        policy.nat64_prefixes.len = value.nat64_prefixes.len;
+        if (value.dns64_excluded.len > policy.dns64_excluded.items.len) return error.TooManyItems;
+        index = 0;
+        while (index < value.dns64_excluded.len) : (index += 1) {
+            policy.dns64_excluded.items[index] = value.dns64_excluded.items[index];
+        }
+        policy.dns64_excluded.len = value.dns64_excluded.len;
         if (value.minimum_failure_cache_time) |seconds| policy.failure_cache_seconds = seconds;
+        if (value.deny_ports.len > policy.deny_ports.len) return error.TooManyItems;
+        index = 0;
+        while (index < value.deny_ports.len) : (index += 1) {
+            policy.deny_ports[index] = value.deny_ports.items[index];
+        }
+        policy.deny_ports_len = value.deny_ports.len;
+        if (value.max_cacheable_prefix) |prefix| policy.max_cacheable_prefix = prefix;
         return policy;
     }
 
@@ -384,17 +436,36 @@ fn ecsScopePrefix(message: dns_message.Message) u8 {
     return payload[3];
 }
 
+/// RFC 7871 section 7.1.1: the outgoing SOURCE PREFIX-LENGTH is the
+/// shorter of the client's and the server's maximum cacheable prefix
+/// length, and the address is truncated to that many bits.
+fn trimmedScope(scope: EcsScope, max_prefix: ?u8) EcsScope {
+    const max = max_prefix orelse return scope;
+    if (scope.prefix <= max) return scope;
+    var trimmed = scope;
+    trimmed.prefix = max;
+    const whole = @as(usize, max) / 8;
+    const remainder = max % 8;
+    if (remainder == 0) {
+        @memset(trimmed.address[whole..], 0);
+    } else {
+        trimmed.address[whole] &= @as(u8, 0xff) << @intCast(8 - remainder);
+        @memset(trimmed.address[whole + 1 ..], 0);
+    }
+    return trimmed;
+}
+
 /// RFC 7871 section 6 and 7.3: the scope of an upstream answer is the scope
 /// the upstream reported, and an answer with no Client Subnet option has
 /// the scope of 0. A scope the resolver cannot use, one wider than the
 /// prefix the query asked for, is reported as 0: a client is never told the
 /// answer covers a scope the resolver did not learn from the upstream.
-fn upstreamEcsScope(response: dns_message.Message, query: dns_message.Message) u8 {
-    const scope = ecsScopePrefix(response);
-    if (scope == 0) return 0;
-    const asked = ecsScope(query) orelse return 0;
-    if (scope > asked.prefix) return 0;
-    return scope;
+fn upstreamEcsScope(response: dns_message.Message, scope: EcsScope) u8 {
+    const reported = ecsScopePrefix(response);
+    if (reported == 0) return 0;
+    if (scope.family == 0) return 0;
+    if (reported > scope.prefix) return 0;
+    return reported;
 }
 
 /// RFC 7871 section 7.2.2: a client that sent the option gets one in the
@@ -402,9 +473,9 @@ fn upstreamEcsScope(response: dns_message.Message, query: dns_message.Message) u
 /// the scope the upstream answered with, and the address is the one the
 /// resolver sent upstream, so no address bit the client did not send is
 /// disclosed.
-fn appendEcsScope(message: *dns_message.Message, query: dns_message.Message, scope_prefix: u8) !void {
+fn appendEcsScope(message: *dns_message.Message, scope: EcsScope, scope_prefix: u8) !void {
     if (message.edns == null) return;
-    const scope = ecsScope(query) orelse return;
+    if (scope.family == 0) return;
     var buffer: [4 + 16]u8 = undefined;
     try appendOption(message, dns_rdata.EDNS_ECS_OPTION_CODE, ecsPayload(scope, scope_prefix, &buffer));
 }
@@ -615,7 +686,7 @@ const Cache = struct {
             message.question = query.question;
             stripProofsForClient(&message, query);
             if (query.edns != null) try appendOpt(&message, query.edns.?);
-            try appendEcsScope(&message, query, entry.ecs_scope);
+            try appendEcsScope(&message, key.ecs, entry.ecs_scope);
             if (!fresh) try appendEde(&message, if (entry.nxdomain) EDE_STALE_NXDOMAIN else EDE_STALE_ANSWER);
             var writer = dns_writer.Writer.init(output);
             message.encode(&writer) catch return Error.ResponseTooLarge;
@@ -665,7 +736,7 @@ const Cache = struct {
         applyNegativeTtl(&message, remainingTtl(entry, elapsed));
         stripProofsForClient(&message, query);
         if (query.edns != null) try appendOpt(&message, query.edns.?);
-        try appendEcsScope(&message, query, entry.ecs_scope);
+        try appendEcsScope(&message, key.ecs, entry.ecs_scope);
         var writer = dns_writer.Writer.init(output);
         message.encode(&writer) catch return Error.ResponseTooLarge;
         return .{ .stale = false, .bytes = writer.written() };
@@ -889,7 +960,14 @@ pub const Resolver = struct {
         if (query.header.opcode != .query) return Error.UnsupportedOpcode;
         const cookie = self.clientCookie(query, client);
         if (cookie == .invalid) return self.cookieFailure(query, client, output);
-        const key = try CacheKey.fromQuestion(query);
+        var key = try CacheKey.fromQuestion(query);
+        // RFC 7871 section 7.1.1: the query goes upstream with the shorter
+        // of the client's prefix length and the server's maximum cacheable
+        // prefix length, and the key follows the scope the query was sent
+        // with, so an answer fetched for one scope is never served to a
+        // client that asked for another.
+        const scope = self.upstreamScope(query);
+        if (scope) |value| key.ecs = value;
         const now: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(self.io).nanoseconds, std.time.ns_per_s));
         if (try self.cache.lookup(&key, query, now, output, false)) |hit| {
             if (cookie == .valid) return self.addCachedCookie(output, query, cookie.valid);
@@ -935,7 +1013,7 @@ pub const Resolver = struct {
             if (cookie == .valid) return self.addCachedCookie(output, query, cookie.valid);
             return bytes;
         }
-        var response = self.queryUdp(query_bytes, query) catch |err| switch (err) {
+        var response = self.queryUdp(query_bytes, query, scope) catch |err| switch (err) {
             Error.UpstreamFailure,
             Error.BadUpstreamResponse,
             => {
@@ -966,7 +1044,7 @@ pub const Resolver = struct {
         response.question = query.question;
         // RFC 7871 section 6: the scope of the answer is the scope the
         // upstream reported, so it is read before the options are stripped.
-        const upstream_scope = upstreamEcsScope(response, query);
+        const upstream_scope = upstreamEcsScope(response, key.ecs);
         stripOptions(&response);
         // RFC 5452 section 6: only data in the domain of the query may be
         // accepted, so the additional section keeps the records whose owner
@@ -1045,7 +1123,7 @@ pub const Resolver = struct {
         // happens on the way out only.
         stripProofsForClient(&response, query);
         if (query.edns) |edns| try appendOpt(&response, edns);
-        try appendEcsScope(&response, query, upstream_scope);
+        try appendEcsScope(&response, key.ecs, upstream_scope);
         // DNSSEC presence signals (RFC 8914 6-10) ride along as informational
         // EDE on a relayed response this server did NOT validate. Once the
         // validator has spoken above, its verdict is the answer: emitting a
@@ -1060,6 +1138,14 @@ pub const Resolver = struct {
         var writer = dns_writer.Writer.init(output);
         response.encode(&writer) catch return Error.ResponseTooLarge;
         return writer.written();
+    }
+
+    /// RFC 7871 section 7.1.1: the scope the query is sent upstream with,
+    /// the client's scope trimmed to the server's maximum cacheable prefix
+    /// length. Null when the client sent no option.
+    fn upstreamScope(self: *const Resolver, query: dns_message.Message) ?EcsScope {
+        const scope = ecsScope(query) orelse return null;
+        return trimmedScope(scope, self.policy.max_cacheable_prefix);
     }
 
     /// True when this response is one this server validates itself: a
@@ -1178,7 +1264,7 @@ pub const Resolver = struct {
             }
         }
         if (query.edns) |edns| try appendOpt(&message, edns);
-        try appendEcsScope(&message, query, 0);
+        try appendEcsScope(&message, key.ecs, 0);
         var writer = dns_writer.Writer.init(output);
         message.encode(&writer) catch return Error.ResponseTooLarge;
         // The denial and its proof are kept for the clients that asked for
@@ -1251,7 +1337,7 @@ pub const Resolver = struct {
         return writer.written();
     }
 
-    fn queryUdp(self: *Resolver, query_bytes: []const u8, query: dns_message.Message) !dns_message.Message {
+    fn queryUdp(self: *Resolver, query_bytes: []const u8, query: dns_message.Message, scope: ?EcsScope) !dns_message.Message {
         const upstream = self.upstream orelse return Error.NoForwarder;
         var query_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
         if (query_bytes.len < 2 or query_bytes.len > query_buffer.len) return Error.UpstreamFailure;
@@ -1261,15 +1347,11 @@ pub const Resolver = struct {
         var response_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
         var attempt: usize = 0;
         while (attempt < UDP_ATTEMPTS) : (attempt += 1) {
-            var local = switch (upstream) {
-                .ip4 => std.Io.net.IpAddress{ .ip4 = .unspecified(0) },
-                .ip6 => std.Io.net.IpAddress{ .ip6 = .unspecified(0) },
-            };
-            var socket = std.Io.net.IpAddress.bind(&local, self.io, .{ .mode = .dgram, .protocol = .udp }) catch return Error.UpstreamFailure;
+            var socket = try self.bindSourceSocket(upstream);
             defer socket.close(self.io);
             var randomized_id: [2]u8 = undefined;
             self.io.randomSecure(&randomized_id) catch return Error.UpstreamFailure;
-            const upstream_query = try buildUpstreamQuery(query_bytes, query, &query_buffer, &self.policy.anchors);
+            const upstream_query = try buildUpstreamQuery(query_bytes, query, &query_buffer, &self.policy.anchors, scope);
             @memcpy(query_buffer[0..2], &randomized_id);
             const expected_id = std.mem.readInt(u16, &randomized_id, .big);
 
@@ -1277,9 +1359,9 @@ pub const Resolver = struct {
             while (true) {
                 const incoming = socket.receiveTimeout(self.io, &response_buffer, UDP_TIMEOUT) catch break;
                 if (!incoming.from.eql(&upstream)) continue;
-                switch (classifyUpstreamPacket(self.allocator, query, expected_id, incoming.data)) {
+                switch (classifyUpstreamPacket(self.allocator, query, expected_id, incoming.data, scope)) {
                     .ignore => continue,
-                    .truncated => return self.queryTcpAfterTruncation(query_buffer[0..upstream_query.len], query, expected_id, UPSTREAM_TCP_DEADLINES_SUPPORTED),
+                    .truncated => return self.queryTcpAfterTruncation(query_buffer[0..upstream_query.len], query, expected_id, UPSTREAM_TCP_DEADLINES_SUPPORTED, scope),
                     .ready => |message| return message,
                 }
             }
@@ -1287,19 +1369,37 @@ pub const Resolver = struct {
         return Error.UpstreamFailure;
     }
 
-    fn queryTcpAfterTruncation(self: *Resolver, query_bytes: []const u8, query: dns_message.Message, expected_id: u16, comptime deadline_support: bool) !dns_message.Message {
+    /// RFC 5452 section 9.2: the source port of an outgoing query is an
+    /// unpredictable ephemeral port, and a port the operator denied is
+    /// never used: the socket is closed and another one is bound until a
+    /// port outside the denylist is found, and the query fails when there
+    /// is none.
+    fn bindSourceSocket(self: *Resolver, upstream: std.Io.net.IpAddress) !std.Io.net.Socket {
+        var attempt: usize = 0;
+        while (attempt < SOURCE_PORT_ATTEMPTS) : (attempt += 1) {
+            var local = switch (upstream) {
+                .ip4 => std.Io.net.IpAddress{ .ip4 = .unspecified(0) },
+                .ip6 => std.Io.net.IpAddress{ .ip6 = .unspecified(0) },
+            };
+            const socket = std.Io.net.IpAddress.bind(&local, self.io, .{ .mode = .dgram, .protocol = .udp }) catch return Error.UpstreamFailure;
+            if (!portDenied(self.policy.deny_ports[0..self.policy.deny_ports_len], localPort(socket))) return socket;
+            socket.close(self.io);
+        }
+        return Error.UpstreamFailure;
+    }
+    fn queryTcpAfterTruncation(self: *Resolver, query_bytes: []const u8, query: dns_message.Message, expected_id: u16, comptime deadline_support: bool, scope: ?EcsScope) !dns_message.Message {
         if (comptime !deadline_support) return Error.UpstreamFailure;
-        return self.queryTcp(query_bytes, query, expected_id);
+        return self.queryTcp(query_bytes, query, expected_id, scope);
     }
 
-    fn queryTcp(self: *Resolver, query_bytes: []const u8, query: dns_message.Message, expected_id: u16) !dns_message.Message {
+    fn queryTcp(self: *Resolver, query_bytes: []const u8, query: dns_message.Message, expected_id: u16, scope: ?EcsScope) !dns_message.Message {
         const upstream = self.upstream orelse return Error.NoForwarder;
         var stream = if (comptime UPSTREAM_TCP_DEADLINES_SUPPORTED)
-            connectTcpWithTimeout(self.io, &upstream, .{
+            connectTcpWithTimeoutAvoiding(self.io, &upstream, .{
                 .mode = .stream,
                 .protocol = .tcp,
                 .timeout = TCP_TIMEOUT,
-            }) catch return Error.UpstreamFailure
+            }, self.policy.deny_ports[0..self.policy.deny_ports_len]) catch return Error.UpstreamFailure
         else
             std.Io.net.IpAddress.connect(&upstream, self.io, .{
                 .mode = .stream,
@@ -1307,6 +1407,11 @@ pub const Resolver = struct {
                 .timeout = TCP_TIMEOUT,
             }) catch return Error.UpstreamFailure;
         defer stream.close(self.io);
+        if (comptime !UPSTREAM_TCP_DEADLINES_SUPPORTED) {
+            // The plain connector binds its own source port, so a denied
+            // port is refused here instead of carrying a query.
+            if (portDenied(self.policy.deny_ports[0..self.policy.deny_ports_len], localPort(stream.socket))) return Error.UpstreamFailure;
+        }
         const frame_deadline = tcp_deadline.deadlineFromTimeout(self.io, TCP_TIMEOUT) orelse return Error.UpstreamFailure;
         setTcpIoTimeout(stream);
 
@@ -1325,7 +1430,7 @@ pub const Resolver = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const response = dns_message.Message.parse(arena.allocator(), response_bytes[0..response_len]) catch return Error.BadUpstreamResponse;
-        if (!validUpstreamResponse(response, query, expected_id)) return Error.BadUpstreamResponse;
+        if (!validUpstreamResponse(response, query, expected_id, scope)) return Error.BadUpstreamResponse;
         return cloneMessage(self.allocator, response);
     }
 };
@@ -1349,12 +1454,12 @@ const Dns64Outcome = union(enum) {
 /// too. Returns `.none` when nothing is synthesized, which leaves the answer
 /// as the upstream sent it.
 fn synthesizeDns64Answer(self: *Resolver, query: dns_message.Message, response: *dns_message.Message, now: i64) !Dns64Outcome {
-    const prefix = self.policy.nat64_prefix orelse return .none;
+    if (self.policy.nat64_prefixes.len == 0) return .none;
     if (!dns64Applies(query, response.*)) return .none;
     // RFC 6147 section 5.1.4: an AAAA record inside the excluded ranges is
     // not real AAAA data. The offending records are dropped, and an answer
     // that held only such records is then empty, so the synthesis proceeds.
-    dropExcludedAaaa(response, prefix);
+    dropExcludedAaaa(response, &self.policy);
     // RFC 6147 section 5.1.1: a name with a real AAAA is never synthesized
     // over. Section 5.1.2: any other RCODE "is treated as though the RCODE
     // were 0 and the answer section were empty".
@@ -1378,7 +1483,7 @@ fn synthesizeDns64Answer(self: *Resolver, query: dns_message.Message, response: 
         var a_query_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
         var a_writer = dns_writer.Writer.init(&a_query_buffer);
         a_query.encode(&a_writer) catch return .none;
-        var a_response = self.queryUdp(a_writer.written(), a_query) catch return .none;
+        var a_response = self.queryUdp(a_writer.written(), a_query, null) catch return .none;
         defer a_response.deinit();
         if (validating) {
             // RFC 6147 section 5.5: "If the data does not validate, the
@@ -1388,7 +1493,7 @@ fn synthesizeDns64Answer(self: *Resolver, query: dns_message.Message, response: 
         }
         // The A answer may carry a further chain, which is followed too.
         const owner = followAliasChain(a_response, target, zone_name, &chain) orelse return .none;
-        if (try synthesizeDns64(prefix, owner, response, a_response, &chain)) return .synthesized;
+        if (try synthesizeDns64(&self.policy, owner, response, a_response, &chain)) return .synthesized;
         // No A records at the owner: the chain goes on, if it goes on at all.
         if (owner.eql(&target) or hops >= zone.MaxAliasHops) return .none;
         target = owner;
@@ -1554,13 +1659,20 @@ const dns64_excluded_ranges = [_]struct { bytes: [16]u8, octets: usize }{
 };
 
 /// RFC 6147 section 5.1.4: the address is inside the exclusion set, so the
-/// AAAA record that holds it is not real AAAA data.
-fn dns64Excluded(address: [16]u8, prefix: config.Nat64Prefix) bool {
+/// AAAA record that holds it is not real AAAA data. The set is the default
+/// ranges, the site's own prefixes, and the ranges the operator named.
+fn dns64Excluded(address: [16]u8, policy: *const Policy) bool {
     for (dns64_excluded_ranges) |range| {
         if (addressInRange(address, range.bytes, range.octets)) return true;
     }
-    // The site's own Pref64::/n, the prefix this server synthesizes into.
-    return addressInRange(address, prefix.bytes, @as(usize, prefix.length) / 8);
+    // The site's own Pref64::/n, the prefixes this server synthesizes into.
+    for (policy.nat64_prefixes.items[0..policy.nat64_prefixes.len]) |prefix| {
+        if (addressInRange(address, prefix.bytes, @as(usize, prefix.length) / 8)) return true;
+    }
+    for (policy.dns64_excluded.items[0..policy.dns64_excluded.len]) |range| {
+        if (range.containsIpv6(address)) return true;
+    }
+    return false;
 }
 
 /// The leading octets of the address are the ones the range covers. Every
@@ -1572,16 +1684,39 @@ fn addressInRange(address: [16]u8, network: [16]u8, octets: usize) bool {
 
 /// RFC 6147 section 5.1.4: the offending AAAA records "MUST NOT" be returned
 /// as part of a response, so they are taken out of the answer section.
-fn dropExcludedAaaa(response: *dns_message.Message, prefix: config.Nat64Prefix) void {
+fn dropExcludedAaaa(response: *dns_message.Message, policy: *const Policy) void {
     var kept: usize = 0;
     for (response.answers.slice()) |record| {
-        if (record.rdata == .AAAA and dns64Excluded(record.rdata.AAAA, prefix)) continue;
+        if (record.rdata == .AAAA and dns64Excluded(record.rdata.AAAA, policy)) continue;
         response.answers.items[kept] = record;
         kept += 1;
     }
     if (kept == response.answers.len) return;
     response.answers.len = kept;
     response.header.answer_count = @intCast(kept);
+}
+
+/// RFC 6147 section 5.1.7: "The DNS64 MUST check each A RR against
+/// configured IPv4 address ranges and select the corresponding IPv6 prefix to
+/// use in synthesizing the AAAA RR". The most specific range wins, and a
+/// prefix configured without a range serves every IPv4 address.
+fn selectPrefix(policy: *const Policy, address: [4]u8) ?config.Nat64Prefix {
+    var chosen: ?config.Nat64Prefix = null;
+    var chosen_len: u8 = 0;
+    for (policy.nat64_prefixes.items[0..policy.nat64_prefixes.len]) |candidate| {
+        if (!candidate.range.containsIpv4(address)) continue;
+        if (chosen == null or candidate.range.prefix > chosen_len) {
+            chosen = candidate;
+            chosen_len = candidate.range.prefix;
+        }
+    }
+    return chosen;
+}
+
+/// RFC 6147 section 5.1.7: the prefix that builds the synthetic AAAA of an A
+/// record, or null when no configured prefix serves the address.
+fn prefixForRecord(policy: *const Policy, record: dns_record.ResourceRecord) ?config.Nat64Prefix {
+    return selectPrefix(policy, record.rdata.A);
 }
 
 /// RFC 6147 section 5.1.6: the A query for the owner that holds the A
@@ -1614,7 +1749,7 @@ fn buildAQuery(self: *Resolver, query: dns_message.Message, name: dns_name.Name)
 /// SOA with the TTL RFC 2308 section 5 gives a negative answer, so the client
 /// can cache the missing AAAA. The answer claims neither authority nor
 /// DNSSEC security: the record comes from no zone.
-fn synthesizeDns64(prefix: config.Nat64Prefix, owner: dns_name.Name, response: *dns_message.Message, a_response: dns_message.Message, chain: *const AliasChain) !bool {
+fn synthesizeDns64(policy: *const Policy, owner: dns_name.Name, response: *dns_message.Message, a_response: dns_message.Message, chain: *const AliasChain) !bool {
     var soa: ?dns_record.ResourceRecord = null;
     for (response.authorities.slice()) |record| {
         if (record.rrtype.eql(.SOA)) {
@@ -1624,7 +1759,9 @@ fn synthesizeDns64(prefix: config.Nat64Prefix, owner: dns_name.Name, response: *
     }
     var usable: usize = 0;
     for (a_response.answers.slice()) |record| {
-        if (record.rrtype.eql(.A) and record.owner.eql(&owner)) usable += 1;
+        if (!record.rrtype.eql(.A) or !record.owner.eql(&owner)) continue;
+        if (prefixForRecord(policy, record) == null) continue;
+        usable += 1;
     }
     if (usable == 0) return false;
 
@@ -1640,6 +1777,7 @@ fn synthesizeDns64(prefix: config.Nat64Prefix, owner: dns_name.Name, response: *
     }
     for (a_response.answers.slice()) |record| {
         if (!record.rrtype.eql(.A) or !record.owner.eql(&owner)) continue;
+        const prefix = prefixForRecord(policy, record) orelse continue;
         try response.answers.append(.{
             .owner = record.owner,
             .rrtype = .AAAA,
@@ -1693,11 +1831,11 @@ const UpstreamPacket = union(enum) {
 
 /// Parses and validates one UDP datagram with a scratch arena owned by this
 /// call, so the receive loop holds no deferred cleanups across iterations.
-fn classifyUpstreamPacket(allocator: std.mem.Allocator, query: dns_message.Message, expected_id: u16, data: []const u8) UpstreamPacket {
+fn classifyUpstreamPacket(allocator: std.mem.Allocator, query: dns_message.Message, expected_id: u16, data: []const u8, scope: ?EcsScope) UpstreamPacket {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const response = dns_message.Message.parse(arena.allocator(), data) catch return .ignore;
-    if (!validUpstreamResponse(response, query, expected_id)) return .ignore;
+    if (!validUpstreamResponse(response, query, expected_id, scope)) return .ignore;
     if (response.header.truncated) return .truncated;
     return .{ .ready = cloneMessage(allocator, response) catch return .ignore };
 }
@@ -1719,6 +1857,7 @@ fn buildUpstreamQuery(
     query: dns_message.Message,
     output: []u8,
     anchors: *const validate.Anchors,
+    scope: ?EcsScope,
 ) ![]const u8 {
     if (query.edns == null) {
         // RFC 3225 section 3: a recursive DNSSEC-aware server MUST set the DO
@@ -1763,11 +1902,12 @@ fn buildUpstreamQuery(
     upstream_edns.dnssec_ok = true;
     try appendOpt(&sanitized, upstream_edns);
     // RFC 7871 section 7.1.1: the SOURCE PREFIX-LENGTH of the client's own
-    // option caps what this server may ask upstream, so the option travels
-    // with the prefix the client asked for and a scope of 0.
-    if (ecsScope(query)) |scope| {
+    // option caps what this server may ask upstream, and the server's
+    // maximum cacheable prefix length caps it further, so the option
+    // travels with the prefix the query was sent with and a scope of 0.
+    if (scope) |value| {
         var ecs_buffer: [4 + 16]u8 = undefined;
-        try appendOption(&sanitized, dns_rdata.EDNS_ECS_OPTION_CODE, ecsPayload(scope, 0, &ecs_buffer));
+        try appendOption(&sanitized, dns_rdata.EDNS_ECS_OPTION_CODE, ecsPayload(value, 0, &ecs_buffer));
     }
     appendKeyTags(&sanitized, query, anchors);
     var writer = dns_writer.Writer.init(output);
@@ -1793,6 +1933,33 @@ fn appendKeyTags(message: *dns_message.Message, query: dns_message.Message, anch
 /// Keep the same `ConnectOptions.timeout` contract while enforcing it with a
 /// nonblocking connect and poll before handing the socket back to `std.Io`.
 pub fn connectTcpWithTimeout(
+    io: std.Io,
+    address: *const std.Io.net.IpAddress,
+    options: std.Io.net.IpAddress.ConnectOptions,
+) std.Io.net.IpAddress.ConnectError!std.Io.net.Stream {
+    return connectTcpWithTimeoutAvoiding(io, address, options, &.{});
+}
+
+/// RFC 5452 section 9.2: the source port of the TCP retry is an
+/// ephemeral port too, and a port the operator denied is never used: the
+/// socket is closed and another one is bound until a port outside the
+/// denylist is found.
+fn connectTcpWithTimeoutAvoiding(
+    io: std.Io,
+    address: *const std.Io.net.IpAddress,
+    options: std.Io.net.IpAddress.ConnectOptions,
+    deny_ports: []const config.PortRange,
+) std.Io.net.IpAddress.ConnectError!std.Io.net.Stream {
+    var attempt: usize = 0;
+    while (attempt < SOURCE_PORT_ATTEMPTS) : (attempt += 1) {
+        const stream = try connectTcpOnce(io, address, options);
+        if (!portDenied(deny_ports, localPort(stream.socket))) return stream;
+        stream.close(io);
+    }
+    return error.Unexpected;
+}
+
+fn connectTcpOnce(
     io: std.Io,
     address: *const std.Io.net.IpAddress,
     options: std.Io.net.IpAddress.ConnectOptions,
@@ -1849,6 +2016,23 @@ pub fn connectTcpWithTimeout(
     return .{ .socket = socket };
 }
 
+/// RFC 5452 section 9.2: a source port the operator denied is never used.
+fn portDenied(ports: []const config.PortRange, port: u16) bool {
+    for (ports) |range| {
+        if (range.contains(port)) return true;
+    }
+    return false;
+}
+
+/// The port a bound socket sends from, which is the source port of the
+/// query it carries.
+fn localPort(socket: std.Io.net.Socket) u16 {
+    return switch (socket.address) {
+        .ip4 => |ip4| ip4.port,
+        .ip6 => |ip6| ip6.port,
+    };
+}
+
 fn fdFlags(fd: std.posix.fd_t) !usize {
     const result = std.posix.system.fcntl(fd, std.posix.F.GETFL, @as(usize, 0));
     if (std.posix.errno(result) != .SUCCESS) return error.Unexpected;
@@ -1878,21 +2062,21 @@ fn cloneMessage(allocator: std.mem.Allocator, source: dns_message.Message) !dns_
     return dns_message.Message.parse(allocator, writer.written());
 }
 
-fn validUpstreamResponse(response: dns_message.Message, query: dns_message.Message, expected_id: u16) bool {
+fn validUpstreamResponse(response: dns_message.Message, query: dns_message.Message, expected_id: u16, scope: ?EcsScope) bool {
     if (!response.header.qr or response.header.id != expected_id or response.header.opcode != query.header.opcode or response.header.question_count != 1) return false;
     const expected = query.question orelse return false;
     const actual = response.question orelse return false;
     if (!actual.name.eql(&expected.name) or !actual.qtype.eql(expected.qtype) or !actual.qclass.eql(expected.qclass)) return false;
-    return validEcsResponse(response, query);
+    return validEcsResponse(response, scope);
 }
 
 /// RFC 7871 section 7.3: an answer that carries a Client Subnet option must
 /// match the family, the prefix, and the address bits the query asked for,
 /// and an answer that carries one for a query that asked for none is
 /// unsolicited and is dropped.
-fn validEcsResponse(response: dns_message.Message, query: dns_message.Message) bool {
+fn validEcsResponse(response: dns_message.Message, scope: ?EcsScope) bool {
     if (findOption(response, dns_rdata.EDNS_ECS_OPTION_CODE) == null) return true;
-    const asked = ecsScope(query) orelse return false;
+    const asked = scope orelse return false;
     const answered = ecsScope(response) orelse return false;
     if (answered.family != asked.family) return false;
     // A query that named no address leaves the address to the responder.
@@ -2076,7 +2260,7 @@ fn errorResponse(request: dns_message.Message, rcode: dns_header.Rcode, ede_code
     errdefer message.deinit();
     if (with_opt) {
         try appendOpt(&message, edns);
-        try appendEcsScope(&message, request, 0);
+        try appendEcsScope(&message, ecsScope(request) orelse .{}, 0);
         if (rcode == .badcookie) {
             message.edns.?.extended_rcode = 1;
             message.additionals.items[message.additionals.len - 1].ttl |= @as(u32, 1) << 24;
@@ -2547,7 +2731,7 @@ test "TC fallback is fail closed without deadline support" {
     defer resolver.deinit();
     var query = try makeTestQuery(std.testing.allocator, 0x2580, "example.com.", false);
     defer query.deinit();
-    try std.testing.expectError(Error.UpstreamFailure, resolver.queryTcpAfterTruncation(&.{}, query, 0, false));
+    try std.testing.expectError(Error.UpstreamFailure, resolver.queryTcpAfterTruncation(&.{}, query, 0, false, null));
 }
 
 test "resolver rejects non-query opcodes before cache or upstream" {
@@ -2576,7 +2760,7 @@ test "resolver forwards the client subnet option upstream" {
     try appendOption(&query, dns_rdata.EDNS_ECS_OPTION_CODE, &ecs);
 
     var output: [512]u8 = undefined;
-    const encoded = try buildUpstreamQuery(&.{ 0xde, 0xad }, query, &output, &.{});
+    const encoded = try buildUpstreamQuery(&.{ 0xde, 0xad }, query, &output, &.{}, ecsScope(query));
 
     var parsed_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer parsed_arena.deinit();
@@ -2597,7 +2781,7 @@ test "resolver forwards the client subnet option upstream" {
     response.question = query.question;
     try appendOpt(&response, query.edns.?);
     try appendOption(&response, dns_rdata.EDNS_ECS_OPTION_CODE, &ecs);
-    try std.testing.expect(validUpstreamResponse(response, query, query.header.id));
+    try std.testing.expect(validUpstreamResponse(response, query, query.header.id, ecsScope(query)));
 
     var other = try makePositiveResponse(arena.allocator(), 60);
     defer other.deinit();
@@ -2605,7 +2789,7 @@ test "resolver forwards the client subnet option upstream" {
     other.question = query.question;
     try appendOpt(&other, query.edns.?);
     try appendOption(&other, dns_rdata.EDNS_ECS_OPTION_CODE, &.{ 0, 1, 24, 0, 198, 51, 100 });
-    try std.testing.expect(!validUpstreamResponse(other, query, query.header.id));
+    try std.testing.expect(!validUpstreamResponse(other, query, query.header.id, ecsScope(query)));
 }
 
 /// The fake upstream the client subnet tests forward to. It records the
@@ -2855,7 +3039,7 @@ test "a client without the client subnet option keeps today's behavior" {
     defer plain.deinit();
 
     var output: [512]u8 = undefined;
-    const encoded = try buildUpstreamQuery(&.{ 0xde, 0xad }, plain, &output, &.{});
+    const encoded = try buildUpstreamQuery(&.{ 0xde, 0xad }, plain, &output, &.{}, null);
     var parsed_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer parsed_arena.deinit();
     const upstream = try dns_message.Message.parse(parsed_arena.allocator(), encoded);
@@ -2901,7 +3085,7 @@ test "resolver rejects ECS-bearing upstream responses before cache" {
     try appendOpt(&response, query.edns.?);
     const ecs = [_]u8{ 0, 1, 24, 0, 192, 0, 2 };
     try appendOption(&response, dns_rdata.EDNS_ECS_OPTION_CODE, &ecs);
-    try std.testing.expect(!validUpstreamResponse(response, query, query.header.id));
+    try std.testing.expect(!validUpstreamResponse(response, query, query.header.id, null));
 }
 
 test "buildUpstreamQuery strips the other client EDNS options but preserves payload size and DO" {
@@ -2924,7 +3108,7 @@ test "buildUpstreamQuery strips the other client EDNS options but preserves payl
     try appendOption(&query, dns_rdata.EDNS_EXPIRE_OPTION_CODE, &.{});
 
     var output: [512]u8 = undefined;
-    const encoded = try buildUpstreamQuery(&.{ 0xde, 0xad }, query, &output, &.{});
+    const encoded = try buildUpstreamQuery(&.{ 0xde, 0xad }, query, &output, &.{}, ecsScope(query));
 
     var parsed_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer parsed_arena.deinit();
@@ -2955,7 +3139,7 @@ test "RFC 3225: buildUpstreamQuery sets DO=1 when the client cleared DO" {
     query.additionals.items[0].ttl = 0;
 
     var output: [512]u8 = undefined;
-    const encoded = try buildUpstreamQuery(&.{ 0xde, 0xad }, query, &output, &.{});
+    const encoded = try buildUpstreamQuery(&.{ 0xde, 0xad }, query, &output, &.{}, null);
 
     var parsed_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer parsed_arena.deinit();
@@ -2975,7 +3159,7 @@ test "RFC 4343 4.1: the upstream query keeps the case the client sent" {
     )).name;
 
     var output: [512]u8 = undefined;
-    const encoded = try buildUpstreamQuery(&.{ 0xde, 0xad }, query, &output, &.{});
+    const encoded = try buildUpstreamQuery(&.{ 0xde, 0xad }, query, &output, &.{}, null);
 
     var parsed_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer parsed_arena.deinit();
@@ -2996,7 +3180,7 @@ test "RFC 4035 section 4.6: buildUpstreamQuery clears the client's AD bit" {
     const original = try encodeTestMessage(plain, &original_bytes);
 
     var output: [512]u8 = undefined;
-    const composed = try buildUpstreamQuery(original, plain, &output, &.{});
+    const composed = try buildUpstreamQuery(original, plain, &output, &.{}, null);
 
     // The client's own octets head the upstream query with the AD bit
     // cleared, and one OPT record with DO=1 follows them (RFC 3225 section 3):
@@ -3024,7 +3208,7 @@ test "RFC 4035 section 4.6: buildUpstreamQuery clears the client's AD bit" {
     dnssec_query.additionals.items[0].ttl = 0x8000;
 
     var edns_output: [512]u8 = undefined;
-    const composed_edns = try buildUpstreamQuery(&.{ 0xde, 0xad }, dnssec_query, &edns_output, &.{});
+    const composed_edns = try buildUpstreamQuery(&.{ 0xde, 0xad }, dnssec_query, &edns_output, &.{}, null);
     var parsed_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer parsed_arena.deinit();
     const upstream = try dns_message.Message.parse(parsed_arena.allocator(), composed_edns);
@@ -3044,7 +3228,7 @@ test "RFC 3225 section 3: a client query without EDNS still asks the upstream wi
     const original = try encodeTestMessage(plain, &original_bytes);
 
     var output: [512]u8 = undefined;
-    const composed = try buildUpstreamQuery(original, plain, &output, &.{});
+    const composed = try buildUpstreamQuery(original, plain, &output, &.{}, null);
 
     // The question the client sent is the question that goes upstream: only
     // the header's ARCOUNT grows, to carry the record appended to it.
@@ -3128,7 +3312,7 @@ test "RFC 8145: an upstream DNSKEY query carries the anchors' key tags and nothi
     dnskey_query.question.?.qtype = .DNSKEY;
     const dnskey_upstream = try dns_message.Message.parse(
         parsed_arena.allocator(),
-        try buildUpstreamQuery(&.{ 0xde, 0xad }, dnskey_query, &output, &anchors),
+        try buildUpstreamQuery(&.{ 0xde, 0xad }, dnskey_query, &output, &anchors, null),
     );
     // 34959 is the RFC 4034 Appendix B checksum of the DNSKEY RDATA
     // 01 01 03 08 41 42 43 44 that `257 3 8 QUJDRA==` encodes.
@@ -3142,7 +3326,7 @@ test "RFC 8145: an upstream DNSKEY query carries the anchors' key tags and nothi
     ds_query.question.?.qtype = .DNSKEY;
     const ds_upstream = try dns_message.Message.parse(
         parsed_arena.allocator(),
-        try buildUpstreamQuery(&.{ 0xbe, 0xef }, ds_query, &output, &anchors),
+        try buildUpstreamQuery(&.{ 0xbe, 0xef }, ds_query, &output, &anchors, null),
     );
     try std.testing.expectEqualSlices(u8, &.{ 0xec, 0x45 }, findOption(ds_upstream, dns_rdata.EDNS_KEY_TAG_OPTION_CODE).?);
 
@@ -3152,7 +3336,7 @@ test "RFC 8145: an upstream DNSKEY query carries the anchors' key tags and nothi
     defer a_query.deinit();
     const a_upstream = try dns_message.Message.parse(
         parsed_arena.allocator(),
-        try buildUpstreamQuery(&.{ 0xbe, 0xef }, a_query, &output, &anchors),
+        try buildUpstreamQuery(&.{ 0xbe, 0xef }, a_query, &output, &anchors, null),
     );
     try std.testing.expect(findOption(a_upstream, dns_rdata.EDNS_KEY_TAG_OPTION_CODE) == null);
     try std.testing.expectEqual(@as(usize, 0), a_upstream.additionals.items[0].rdata.OPT.bytes().len);
@@ -3164,7 +3348,7 @@ test "RFC 8145: an upstream DNSKEY query carries the anchors' key tags and nothi
     unanchored.question.?.qtype = .DNSKEY;
     const plain_upstream = try dns_message.Message.parse(
         parsed_arena.allocator(),
-        try buildUpstreamQuery(&.{ 0xbe, 0xef }, unanchored, &output, &.{}),
+        try buildUpstreamQuery(&.{ 0xbe, 0xef }, unanchored, &output, &.{}, null),
     );
     try std.testing.expect(findOption(plain_upstream, dns_rdata.EDNS_KEY_TAG_OPTION_CODE) == null);
 }
@@ -4113,7 +4297,7 @@ test "upstream packet classification isolates validation and truncation" {
     var query = try makeTestQuery(arena.allocator(), 0x2606, "example.com.", false);
     defer query.deinit();
 
-    try std.testing.expect(classifyUpstreamPacket(arena.allocator(), query, 0x2606, &.{ 1, 2, 3 }) == .ignore);
+    try std.testing.expect(classifyUpstreamPacket(arena.allocator(), query, 0x2606, &.{ 1, 2, 3 }, null) == .ignore);
 
     var truncated = try makePositiveResponse(arena.allocator(), 60);
     defer truncated.deinit();
@@ -4121,14 +4305,14 @@ test "upstream packet classification isolates validation and truncation" {
     truncated.header.truncated = true;
     var wire: [2048]u8 = undefined;
     const truncated_bytes = try encodeTestMessage(truncated, &wire);
-    try std.testing.expect(classifyUpstreamPacket(arena.allocator(), query, 0x9999, truncated_bytes) == .ignore);
-    try std.testing.expect(classifyUpstreamPacket(arena.allocator(), query, query.header.id, truncated_bytes) == .truncated);
+    try std.testing.expect(classifyUpstreamPacket(arena.allocator(), query, 0x9999, truncated_bytes, null) == .ignore);
+    try std.testing.expect(classifyUpstreamPacket(arena.allocator(), query, query.header.id, truncated_bytes, null) == .truncated);
 
     var good = try makePositiveResponse(arena.allocator(), 60);
     defer good.deinit();
     good.header.id = query.header.id;
     const good_bytes = try encodeTestMessage(good, &wire);
-    var ready = classifyUpstreamPacket(std.testing.allocator, query, query.header.id, good_bytes);
+    var ready = classifyUpstreamPacket(std.testing.allocator, query, query.header.id, good_bytes, null);
     switch (ready) {
         .ready => |*message| {
             defer message.deinit();
@@ -4219,7 +4403,7 @@ test "RFC 6147: an empty AAAA answer is answered with an AAAA synthesized from t
 
     var resolver = try Resolver.init(std.testing.allocator, io, .{
         .forwarder = .{ .address = upstream_socket.address },
-        .nat64_prefix = try config.Nat64Prefix.parse("64:ff9b::/96"),
+        .nat64_prefixes = .init(&.{try config.Nat64Prefix.parse("64:ff9b::/96")}),
     });
     defer resolver.deinit();
 
@@ -4279,7 +4463,7 @@ test "RFC 6147 section 5.1.5: an answer without an SOA is chased under the hop l
 
     var resolver = try Resolver.init(std.testing.allocator, io, .{
         .forwarder = .{ .address = upstream_socket.address },
-        .nat64_prefix = try config.Nat64Prefix.parse("64:ff9b::/96"),
+        .nat64_prefixes = .init(&.{try config.Nat64Prefix.parse("64:ff9b::/96")}),
     });
     defer resolver.deinit();
 
@@ -4326,7 +4510,7 @@ test "RFC 6147 section 5.1.1: a name with a real AAAA is never synthesized over"
 
     var resolver = try Resolver.init(std.testing.allocator, io, .{
         .forwarder = .{ .address = upstream_socket.address },
-        .nat64_prefix = try config.Nat64Prefix.parse("64:ff9b::/96"),
+        .nat64_prefixes = .init(&.{try config.Nat64Prefix.parse("64:ff9b::/96")}),
     });
     defer resolver.deinit();
 
@@ -4379,7 +4563,7 @@ test "RFC 6147 section 5.1.4: an AAAA in an excluded range is not a real AAAA an
 
     var resolver = try Resolver.init(std.testing.allocator, io, .{
         .forwarder = .{ .address = upstream_socket.address },
-        .nat64_prefix = try config.Nat64Prefix.parse("64:ff9b::/96"),
+        .nat64_prefixes = .init(&.{try config.Nat64Prefix.parse("64:ff9b::/96")}),
     });
     defer resolver.deinit();
 
@@ -4441,7 +4625,7 @@ test "RFC 6147 section 5.1.4: the site's own prefix and the well-known prefix ar
 
     var resolver = try Resolver.init(std.testing.allocator, io, .{
         .forwarder = .{ .address = upstream_socket.address },
-        .nat64_prefix = try config.Nat64Prefix.parse("2001:db8:64::/96"),
+        .nat64_prefixes = .init(&.{try config.Nat64Prefix.parse("2001:db8:64::/96")}),
     });
     defer resolver.deinit();
 
@@ -4496,7 +4680,7 @@ test "RFC 6147 section 5.1.4: a real AAAA beside an excluded one is the answer a
 
     var resolver = try Resolver.init(std.testing.allocator, io, .{
         .forwarder = .{ .address = upstream_socket.address },
-        .nat64_prefix = try config.Nat64Prefix.parse("64:ff9b::/96"),
+        .nat64_prefixes = .init(&.{try config.Nat64Prefix.parse("64:ff9b::/96")}),
     });
     defer resolver.deinit();
 
@@ -4564,6 +4748,156 @@ test "a forwarder without a NAT64 prefix never synthesizes and asks the upstream
     try std.testing.expectEqual(@as(usize, 1), upstream.requests);
 }
 
+test "RFC 6147 section 5.1.4: an AAAA in a range the operator excluded is not a real AAAA" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    // The range the operator excluded, 2001:db8:1::/48.
+    const aaaa_records = [_]dns_record.ResourceRecord{dns64TestAaaaRecord("excluded.example.", .{
+        0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+    })};
+    const a_records = [_]dns_record.ResourceRecord{dns64TestARecord("excluded.example.")};
+    const soa_records = [_]dns_record.ResourceRecord{dns64TestSoaRecord("example.")};
+    var upstream = Dns64Upstream{
+        .io = io,
+        .udp = &upstream_socket,
+        .aaaa = &aaaa_records,
+        .a = &a_records,
+        .soa = &soa_records,
+    };
+    const thread = try std.Thread.spawn(.{}, serveDns64Upstream, .{&upstream});
+
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = upstream_socket.address },
+        .nat64_prefixes = .init(&.{try config.Nat64Prefix.parse("64:ff9b::/96")}),
+        .dns64_excluded = .init(&.{try config.Cidr.parse("2001:db8:1::/48")}),
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2909, "excluded.example.", false);
+    defer query.deinit();
+    query.question.?.qtype = .AAAA;
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42709);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    thread.join();
+
+    // RFC 6147 section 5.1.4: an answer that holds only an excluded AAAA
+    // counts as an empty answer, so the synthesis answers the client.
+    const response = try dns_message.Message.parse(arena.allocator(), bytes);
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+    try std.testing.expect(response.answers.items[0].rrtype.eql(.AAAA));
+    try std.testing.expectEqualSlices(u8, &.{
+        0x00, 0x64, 0xff, 0x9b, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x02, 0x21,
+    }, &response.answers.items[0].rdata.AAAA);
+    try std.testing.expectEqual(@as(usize, 2), upstream.requests);
+}
+
+test "RFC 6147 section 5.1.4: an AAAA outside every excluded range is still a real AAAA" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    const aaaa_records = [_]dns_record.ResourceRecord{dns64TestAaaaRecord("real.example.", .{
+        0x20, 0x01, 0x0d, 0xb8, 0x00, 0x02, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x20, 0x01, 0x0d, 0xb8,
+    })};
+    const a_records = [_]dns_record.ResourceRecord{dns64TestARecord("real.example.")};
+    const soa_records = [_]dns_record.ResourceRecord{dns64TestSoaRecord("example.")};
+    var upstream = Dns64Upstream{
+        .io = io,
+        .udp = &upstream_socket,
+        .aaaa = &aaaa_records,
+        .a = &a_records,
+        .soa = &soa_records,
+    };
+    const thread = try std.Thread.spawn(.{}, serveDns64Upstream, .{&upstream});
+
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = upstream_socket.address },
+        .nat64_prefixes = .init(&.{try config.Nat64Prefix.parse("64:ff9b::/96")}),
+        .dns64_excluded = .init(&.{try config.Cidr.parse("2001:db8:1::/48")}),
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x290a, "real.example.", false);
+    defer query.deinit();
+    query.question.?.qtype = .AAAA;
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42710);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    thread.join();
+
+    // The real AAAA is the answer, and no A query followed it.
+    const response = try dns_message.Message.parse(arena.allocator(), bytes);
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+    try std.testing.expectEqualSlices(u8, &.{
+        0x20, 0x01, 0x0d, 0xb8, 0x00, 0x02, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x20, 0x01, 0x0d, 0xb8,
+    }, &response.answers.items[0].rdata.AAAA);
+    try std.testing.expectEqual(@as(usize, 1), upstream.requests);
+}
+
+test "RFC 6147 section 5.1.7: the prefix that serves the IPv4 address builds the AAAA" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    const a_records = [_]dns_record.ResourceRecord{dns64TestARecord("v4only.example.")};
+    const soa_records = [_]dns_record.ResourceRecord{dns64TestSoaRecord("example.")};
+    var upstream = Dns64Upstream{
+        .io = io,
+        .udp = &upstream_socket,
+        .a = &a_records,
+        .soa = &soa_records,
+    };
+    const thread = try std.Thread.spawn(.{}, serveDns64Upstream, .{&upstream});
+
+    // The well-known prefix serves every IPv4 address, the other prefix
+    // serves the range 192.0.2.0/24, which holds the A record's address.
+    var bound = try config.Nat64Prefix.parse("2001:db8:100::/96");
+    bound.range = try config.Cidr.parse("192.0.2.0/24");
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = upstream_socket.address },
+        .nat64_prefixes = .init(&.{ try config.Nat64Prefix.parse("64:ff9b::/96"), bound }),
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x290b, "v4only.example.", false);
+    defer query.deinit();
+    query.question.?.qtype = .AAAA;
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42711);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    thread.join();
+
+    // The more specific range wins, so the address carries 2001:db8:100::.
+    const response = try dns_message.Message.parse(arena.allocator(), bytes);
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+    try std.testing.expectEqualSlices(u8, &.{
+        0x20, 0x01, 0x0d, 0xb8, 0x01, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x02, 0x21,
+    }, &response.answers.items[0].rdata.AAAA);
+}
+
 test "RFC 6147 section 5.1.2: an error RCODE counts as an empty answer and the synthesis answers the client" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
@@ -4583,7 +4917,7 @@ test "RFC 6147 section 5.1.2: an error RCODE counts as an empty answer and the s
 
     var resolver = try Resolver.init(std.testing.allocator, io, .{
         .forwarder = .{ .address = upstream_socket.address },
-        .nat64_prefix = try config.Nat64Prefix.parse("64:ff9b::/96"),
+        .nat64_prefixes = .init(&.{try config.Nat64Prefix.parse("64:ff9b::/96")}),
     });
     defer resolver.deinit();
 
@@ -4631,7 +4965,7 @@ test "RFC 6147 section 5.1.2: an NXDOMAIN is relayed as the error it is" {
 
     var resolver = try Resolver.init(std.testing.allocator, io, .{
         .forwarder = .{ .address = upstream_socket.address },
-        .nat64_prefix = try config.Nat64Prefix.parse("64:ff9b::/96"),
+        .nat64_prefixes = .init(&.{try config.Nat64Prefix.parse("64:ff9b::/96")}),
     });
     defer resolver.deinit();
 
@@ -4677,7 +5011,7 @@ test "RFC 6147 section 5.1.5: the synthesis follows a CNAME to the owner that ho
 
     var resolver = try Resolver.init(std.testing.allocator, io, .{
         .forwarder = .{ .address = upstream_socket.address },
-        .nat64_prefix = try config.Nat64Prefix.parse("64:ff9b::/96"),
+        .nat64_prefixes = .init(&.{try config.Nat64Prefix.parse("64:ff9b::/96")}),
     });
     defer resolver.deinit();
 
@@ -4739,7 +5073,7 @@ test "RFC 6147 section 5.1.5: the synthesis follows a DNAME to the substituted o
 
     var resolver = try Resolver.init(std.testing.allocator, io, .{
         .forwarder = .{ .address = upstream_socket.address },
-        .nat64_prefix = try config.Nat64Prefix.parse("64:ff9b::/96"),
+        .nat64_prefixes = .init(&.{try config.Nat64Prefix.parse("64:ff9b::/96")}),
     });
     defer resolver.deinit();
 
@@ -4798,7 +5132,7 @@ test "RFC 6147 section 5.1.5: a CNAME loop stops the synthesis and asks the upst
 
     var resolver = try Resolver.init(std.testing.allocator, io, .{
         .forwarder = .{ .address = upstream_socket.address },
-        .nat64_prefix = try config.Nat64Prefix.parse("64:ff9b::/96"),
+        .nat64_prefixes = .init(&.{try config.Nat64Prefix.parse("64:ff9b::/96")}),
     });
     defer resolver.deinit();
 
@@ -4849,7 +5183,7 @@ test "RFC 6147 section 5.5: a bogus A answer is never synthesized from" {
     );
     var resolver = try Resolver.init(std.testing.allocator, io, .{
         .forwarder = .{ .address = upstream_socket.address },
-        .nat64_prefix = try config.Nat64Prefix.parse("64:ff9b::/96"),
+        .nat64_prefixes = .init(&.{try config.Nat64Prefix.parse("64:ff9b::/96")}),
         .anchors = anchors,
     });
     defer resolver.deinit();
@@ -4903,7 +5237,7 @@ test "RFC 6147 section 5.5: a validating resolver synthesizes from an answer tha
     );
     var resolver = try Resolver.init(std.testing.allocator, io, .{
         .forwarder = .{ .address = upstream_socket.address },
-        .nat64_prefix = try config.Nat64Prefix.parse("64:ff9b::/96"),
+        .nat64_prefixes = .init(&.{try config.Nat64Prefix.parse("64:ff9b::/96")}),
         .anchors = anchors,
     });
     defer resolver.deinit();
@@ -4953,7 +5287,7 @@ test "RFC 6147 section 5.5: a resolver with no trust anchor synthesizes without 
     // on the answer the upstream sent.
     var resolver = try Resolver.init(std.testing.allocator, io, .{
         .forwarder = .{ .address = upstream_socket.address },
-        .nat64_prefix = try config.Nat64Prefix.parse("64:ff9b::/96"),
+        .nat64_prefixes = .init(&.{try config.Nat64Prefix.parse("64:ff9b::/96")}),
     });
     defer resolver.deinit();
 
@@ -5001,7 +5335,7 @@ test "RFC 6147 section 5.5: a bogus negative AAAA answer is not synthesized over
     );
     var resolver = try Resolver.init(std.testing.allocator, io, .{
         .forwarder = .{ .address = upstream_socket.address },
-        .nat64_prefix = try config.Nat64Prefix.parse("64:ff9b::/96"),
+        .nat64_prefixes = .init(&.{try config.Nat64Prefix.parse("64:ff9b::/96")}),
         .anchors = anchors,
     });
     defer resolver.deinit();
@@ -5603,7 +5937,7 @@ test "RFC 1035 section 4.1.1: the upstream query never carries the reserved Z bi
     try std.testing.expectEqual(@as(u8, 0x40), raw[3] & 0x40);
 
     var output: [512]u8 = undefined;
-    const composed = try buildUpstreamQuery(raw[0..original.len], query, &output, &.{});
+    const composed = try buildUpstreamQuery(raw[0..original.len], query, &output, &.{}, null);
     // RFC 1035 section 4.1.1: the Z bit must be zero in all queries.
     try std.testing.expectEqual(@as(u8, 0), composed[3] & 0x40);
 }
@@ -6064,4 +6398,143 @@ fn makeTestSoa(ttl: u32, minimum: u32) !dns_record.ResourceRecord {
             .minimum = minimum,
         } },
     };
+}
+
+test "RFC 5452 section 9.2: the upstream socket never binds a denied source port" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    // Every port the operating system can assign is denied, so the forwarder
+    // has no source port left and sends nothing at all.
+    var upstream = EcsUpstream{ .io = io, .udp = &upstream_socket };
+    const thread = try std.Thread.spawn(.{}, serveEcsUpstream, .{&upstream});
+    var policy = Policy{ .forwarder = .{ .address = upstream_socket.address } };
+    policy.deny_ports[0] = .{ .first = 1024, .last = 65535 };
+    policy.deny_ports_len = 1;
+    var resolver = try Resolver.init(std.testing.allocator, io, policy);
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2611, "example.com.", true);
+    defer query.deinit();
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42640);
+    try std.testing.expectError(Error.UpstreamFailure, resolver.answer(encoded, query, &client, &output));
+    thread.join();
+    try std.testing.expectEqual(@as(usize, 0), upstream.requests);
+}
+
+test "RFC 5452 section 9.2: a denied port the forwarder would not use anyway changes nothing" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    var upstream = EcsUpstream{ .io = io, .udp = &upstream_socket };
+    const thread = try std.Thread.spawn(.{}, serveEcsUpstream, .{&upstream});
+    var policy = Policy{ .forwarder = .{ .address = upstream_socket.address } };
+    // Port 53 is the resolver port, not a source port of a forwarder that
+    // is not the local resolver, so denying it leaves the query untouched.
+    policy.deny_ports[0] = .{ .first = 53, .last = 53 };
+    policy.deny_ports_len = 1;
+    var resolver = try Resolver.init(std.testing.allocator, io, policy);
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2612, "example.com.", true);
+    defer query.deinit();
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42641);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    thread.join();
+    try std.testing.expectEqual(@as(usize, 1), upstream.requests);
+    const response = try dns_message.Message.parse(arena.allocator(), bytes);
+    try std.testing.expectEqual(dns_header.Rcode.no_error, response.header.rcode);
+}
+
+test "RFC 7871 section 7.1.1: the client subnet prefix is trimmed to the maximum cacheable prefix length" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    var upstream = EcsUpstream{ .io = io, .udp = &upstream_socket, .max_requests = 2, .answer_scope = 16 };
+    const thread = try std.Thread.spawn(.{}, serveEcsUpstream, .{&upstream});
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = upstream_socket.address },
+        .max_cacheable_prefix = 16,
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2613, "example.com.", true);
+    defer query.deinit();
+    try appendOption(&query, dns_rdata.EDNS_ECS_OPTION_CODE, &.{ 0, 1, 24, 0, 192, 0, 2 });
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42642);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    thread.join();
+
+    // The upstream saw the trimmed prefix and the trimmed address.
+    try std.testing.expectEqual(@as(usize, 6), upstream.seen_len);
+    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, upstream.seen[0..2], .big));
+    try std.testing.expectEqual(@as(u8, 16), upstream.seen[2]);
+    try std.testing.expectEqual(@as(u8, 0), upstream.seen[3]);
+    try std.testing.expectEqualSlices(u8, &.{ 192, 0 }, upstream.seen[4..6]);
+
+    // The client learns the scope the query was actually sent with.
+    const response = try dns_message.Message.parse(arena.allocator(), bytes);
+    const ecs = findOption(response, dns_rdata.EDNS_ECS_OPTION_CODE).?;
+    try std.testing.expectEqual(@as(usize, 6), ecs.len);
+    try std.testing.expectEqual(@as(u8, 16), ecs[2]);
+    try std.testing.expectEqual(@as(u8, 16), ecs[3]);
+    try std.testing.expectEqualSlices(u8, &.{ 192, 0 }, ecs[4..]);
+}
+
+test "RFC 7871 section 7.3.1: a trimmed scope keys the cache, so another scope is not served from it" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    var upstream = EcsUpstream{ .io = io, .udp = &upstream_socket, .max_requests = 2, .answer_scope = 16 };
+    const thread = try std.Thread.spawn(.{}, serveEcsUpstream, .{&upstream});
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = upstream_socket.address },
+        .max_cacheable_prefix = 16,
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2614, "example.com.", true);
+    defer query.deinit();
+    try appendOption(&query, dns_rdata.EDNS_ECS_OPTION_CODE, &.{ 0, 1, 24, 0, 192, 0, 2 });
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42643);
+    _ = try resolver.answer(encoded, query, &client, &output);
+
+    // A client in another network asks for a prefix of its own; the answer
+    // cached for the first scope does not answer it.
+    var other = try makeTestQuery(arena.allocator(), 0x2615, "example.com.", true);
+    defer other.deinit();
+    try appendOption(&other, dns_rdata.EDNS_ECS_OPTION_CODE, &.{ 0, 1, 24, 0, 198, 51, 100 });
+    var other_bytes: [1024]u8 = undefined;
+    const other_encoded = try encodeTestMessage(other, &other_bytes);
+    _ = try resolver.answer(other_encoded, other, &client, &output);
+    thread.join();
+    try std.testing.expectEqual(@as(usize, 2), upstream.requests);
 }

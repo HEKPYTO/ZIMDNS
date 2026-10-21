@@ -139,7 +139,7 @@ test "an IXFR from the pre-reload serial is answered incrementally" {
     try std.testing.expectEqual(zone_serial, answers[1].rdata.SOA.serial);
     // The added section carries the reloaded zone's records.
     try std.testing.expectEqual(@as(usize, 1), countAddress(answers, 192, 0, 2, 2));
-    try std.testing.expectEqual(@as(usize, 0), countAddress(answers, 192, 0, 2, 1));
+    try std.testing.expectEqual(@as(usize, 1), countAddress(answers, 192, 0, 2, 1));
     // The sequence closes with the current SOA.
     const last = answers[answers.len - 1];
     try std.testing.expect(last.rrtype.eql(.SOA));

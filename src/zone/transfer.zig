@@ -332,11 +332,12 @@ pub fn buildIxfrUpToDateMessage(
     return message;
 }
 
-/// Builds a coarse-grained RFC 1995 incremental sequence for a client at
-/// `client_serial`: current SOA, the superseded SOA marking the start of the
-/// deleted section, every current non-SOA record as the added section, then
-/// the current SOA closing the sequence. Position conveys delete versus add
-/// per RFC 1995 section 3; per-record deltas are not tracked by this profile.
+/// Builds the RFC 1995 section 4 incremental answer for a client at
+/// `client_serial`: the current SOA, then the difference sequence of every
+/// recorded transition on the way to the current serial, then the current
+/// SOA again. A difference sequence is the deleted records with the older SOA
+/// first and the added records with the newer SOA first, so a client that
+/// applies the sequences reaches the current zone.
 pub fn buildIxfrIncrementalMessages(
     allocator: std.mem.Allocator,
     request: *const dns_message.Message,
@@ -344,29 +345,40 @@ pub fn buildIxfrIncrementalMessages(
     client_serial: u32,
 ) Error!dns_message.Message {
     const apex_soa = zone.soa orelse return Error.MissingSoa;
+    const current_serial = zone.soaSerial() orelse return Error.MissingSoa;
     var message = try baseTransferMessage(allocator, request);
     errdefer message.deinit();
-    const current_soa = toResourceRecord(apex_soa) catch return Error.BadTransferQuery;
+    const current_soa = toResourceRecord(apex_soa) catch return Error.BadZoneRecord;
     message.answers.append(current_soa) catch return Error.BadTransferQuery;
-    const current_rdata = zone_parser.parseRData(.SOA, apex_soa.rdataText()) catch return Error.BadZoneRecord;
-    var old_soa_value = current_rdata.SOA;
-    old_soa_value.serial = client_serial;
-    message.answers.append(.{
-        .owner = dns_name.Name.fromText(apex_soa.ownerText()) catch return Error.BadZoneRecord,
-        .rrtype = .SOA,
-        .class = dns_types.Class.IN,
-        .ttl = apex_soa.ttl,
-        .rdata = .{ .SOA = old_soa_value },
-    }) catch return Error.BadTransferQuery;
-    for (zone.records.items[0..zone.records.len]) |record| {
-        if (record.rrtype.eql(dns_types.RecordType.SOA)) continue;
-        const converted = toResourceRecord(record) catch return Error.BadTransferQuery;
-        message.answers.append(converted) catch return Error.BadTransferQuery;
+    var next = client_serial;
+    var hops: usize = 0;
+    while (next != current_serial) : (hops += 1) {
+        if (hops > journal_mod.max_stored_deltas) return Error.BadTransferQuery;
+        const delta = journal_mod.nextDelta(zone.originText(), next) orelse return Error.BadTransferQuery;
+        const records = journal_mod.decodeRecords(allocator, delta.text) catch return Error.BadTransferQuery;
+        defer allocator.free(records);
+        for (records) |record| {
+            const converted = toDeltaResourceRecord(record) catch return Error.BadZoneRecord;
+            message.answers.append(converted) catch return Error.BadTransferQuery;
+        }
+        next = delta.to_serial;
     }
-    const closing_soa = toResourceRecord(apex_soa) catch return Error.BadTransferQuery;
+    const closing_soa = toResourceRecord(apex_soa) catch return Error.BadZoneRecord;
     message.answers.append(closing_soa) catch return Error.BadTransferQuery;
     try setHeaderCounts(&message);
     return message;
+}
+
+/// Builds one record of a difference sequence into the answer.
+fn toDeltaResourceRecord(record: journal_mod.DeltaRecord) Error!dns_record.ResourceRecord {
+    const rrtype = dns_types.RecordType.fromCode(record.rrtype_code);
+    return .{
+        .owner = dns_name.Name.fromText(record.owner) catch return Error.BadZoneRecord,
+        .rrtype = rrtype,
+        .class = dns_types.Class.IN,
+        .ttl = record.ttl,
+        .rdata = zone_parser.parseRData(rrtype, record.rdata) catch return Error.BadZoneRecord,
+    };
 }
 
 /// Extracts the sender's serial from a NOTIFY request: the SOA the master
@@ -533,10 +545,38 @@ const transfer_test_zone =
     \\
 ;
 
+/// The same zone before the change: the address of www and the mail record
+/// are the ones the change replaces.
+const transfer_test_zone_old =
+    \\$ORIGIN example.
+    \\$TTL 3600
+    \\@ IN SOA ns.example. hostmaster.example. 9 3600 900 1209600 3600
+    \\@ IN NS ns.example.
+    \\www IN A 192.0.2.9
+    \\mail IN MX 5 old.example.
+    \\
+;
+
 fn loadTransferTestZone() !zone_index.Zone {
     var zone_file = try zone_parser.ZoneFile.parse(transfer_test_zone);
     return zone_index.Zone.fromZoneFile(&zone_file);
 }
+
+fn loadTransferTestOldZone() !zone_index.Zone {
+    var zone_file = try zone_parser.ZoneFile.parse(transfer_test_zone_old);
+    return zone_index.Zone.fromZoneFile(&zone_file);
+}
+
+/// The difference the change from the old zone to the new one makes, in the
+/// journal's encoding: the older SOA and the records it removed, then the
+/// newer SOA and the records it added.
+const transfer_test_difference =
+    "D example. 3600 6 ns.example. hostmaster.example. 9 3600 900 1209600 3600\n" ++
+    "D www.example. 3600 1 192.0.2.9\n" ++
+    "D mail.example. 3600 15 5 old.example.\n" ++
+    "A example. 3600 6 ns.example. hostmaster.example. 10 3600 900 1209600 3600\n" ++
+    "A www.example. 3600 1 192.0.2.1\n" ++
+    "A mail.example. 3600 15 10 mail.example.\n";
 
 const axfr_query_bytes = [_]u8{
     0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -568,7 +608,8 @@ test "transfer peek dispatches raw AXFR and IXFR queries without allocation" {
 
 test "transfer decides IXFR shapes from serial order and delta history" {
     var log = journal_mod.DeltaLog{};
-    try log.record(9, 10);
+    log.setOrigin("decision.example.");
+    try log.record(9, 10, transfer_test_difference);
     try std.testing.expectEqual(IxfrDecision.up_to_date, decideIxfr(10, 10, &log));
     try std.testing.expectEqual(IxfrDecision.incremental, decideIxfr(10, 9, &log));
     try std.testing.expectEqual(IxfrDecision.fallback_axfr, decideIxfr(10, 8, &log));
@@ -729,7 +770,8 @@ test "transfer answers IXFR from the authority SOA serial" {
     try std.testing.expectEqual(@as(?u32, 9), clientSerialFromMessage(&parsed));
 
     var log = journal_mod.DeltaLog{};
-    try log.record(9, 10);
+    log.setOrigin("example.");
+    try log.record(9, 10, transfer_test_difference);
     try std.testing.expectEqual(IxfrDecision.incremental, decideIxfr(10, clientSerialFromMessage(&parsed), &log));
 
     var up_to_date = try buildIxfrUpToDateMessage(arena.allocator(), &parsed, &zone);
@@ -743,6 +785,169 @@ test "transfer answers IXFR from the authority SOA serial" {
     try std.testing.expectEqual(@as(u32, 10), incremental.answers.items[0].rdata.SOA.serial);
     try std.testing.expectEqual(@as(u32, 9), incremental.answers.items[1].rdata.SOA.serial);
     try std.testing.expectEqual(@as(u32, 10), incremental.answers.items[incremental.answers.len - 1].rdata.SOA.serial);
+}
+
+/// An IXFR request for `origin` from `serial`: the question plus the
+/// client's SOA in the authority section.
+fn ixfrRequest(allocator: std.mem.Allocator, origin: []const u8, serial: u32) !dns_message.Message {
+    const owner = try dns_name.Name.fromText(origin);
+    var request = dns_message.Message{
+        .allocator = allocator,
+        .header = .{ .id = 0x3333, .question_count = 1, .authority_count = 1 },
+        .question = .{ .name = owner, .qtype = .IXFR, .qclass = .IN },
+        .answers = try dns_message.RecordSection.init(allocator, 0),
+        .authorities = try dns_message.RecordSection.init(allocator, 0),
+        .additionals = try dns_message.RecordSection.init(allocator, 0),
+    };
+    try request.authorities.append(.{
+        .owner = owner,
+        .rrtype = .SOA,
+        .class = .IN,
+        .ttl = 3600,
+        .rdata = .{ .SOA = .{
+            .mname = try dns_name.Name.fromText("ns.example."),
+            .rname = try dns_name.Name.fromText("hostmaster.example."),
+            .serial = serial,
+            .refresh = 3600,
+            .retry = 900,
+            .expire = 1209600,
+            .minimum = 3600,
+        } },
+    });
+    return request;
+}
+
+test "an IXFR for the old serial carries the difference sequence" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var old_zone = try loadTransferTestOldZone();
+    defer old_zone.deinit();
+    var new_zone = try loadTransferTestZone();
+    defer new_zone.deinit();
+
+    // The difference the reload computes: the two zones side by side.
+    const difference = try zone_index.difference(allocator, &old_zone, &new_zone);
+    defer allocator.free(difference);
+
+    var log = journal_mod.DeltaLog{};
+    log.setOrigin("example.");
+    try log.record(9, 10, difference);
+    try std.testing.expectEqual(IxfrDecision.incremental, decideIxfr(10, 9, &log));
+
+    const request = try ixfrRequest(arena.allocator(), "example.", 9);
+    var message = try buildIxfrIncrementalMessages(arena.allocator(), &request, &new_zone, 9);
+    defer message.deinit();
+
+    // RFC 1995 section 4: the current SOA, the deleted records with the
+    // older SOA first, the added records with the newer SOA first, and the
+    // current SOA again.
+    try std.testing.expectEqual(@as(usize, 8), message.answers.len);
+    try std.testing.expectEqual(@as(u32, 10), message.answers.items[0].rdata.SOA.serial);
+    try std.testing.expectEqual(@as(u32, 9), message.answers.items[1].rdata.SOA.serial);
+    try std.testing.expectEqual(@as(u32, 10), message.answers.items[4].rdata.SOA.serial);
+    try std.testing.expectEqual(@as(u32, 10), message.answers.items[7].rdata.SOA.serial);
+    // The deleted record is the address www had before the change, and the
+    // added record is the address it has now.
+    try std.testing.expectEqual([4]u8{ 192, 0, 2, 9 }, message.answers.items[2].rdata.A);
+    try std.testing.expectEqual([4]u8{ 192, 0, 2, 1 }, message.answers.items[5].rdata.A);
+}
+
+/// Reports whether two zone records are the same record.
+fn sameZoneText(left: zone_parser.ZoneRecord, right: zone_parser.ZoneRecord) bool {
+    if (left.ttl != right.ttl) return false;
+    if (!left.rrtype.eql(right.rrtype)) return false;
+    if (!std.ascii.eqlIgnoreCase(left.ownerText(), right.ownerText())) return false;
+    return std.mem.eql(u8, left.rdataText(), right.rdataText());
+}
+
+/// Reports whether a zone record is the same record as a record of a
+/// difference.
+fn sameZoneRecord(record: zone_parser.ZoneRecord, delta: journal_mod.DeltaRecord) bool {
+    if (record.ttl != delta.ttl) return false;
+    if (record.rrtype.code() != delta.rrtype_code) return false;
+    if (!std.ascii.eqlIgnoreCase(record.ownerText(), delta.owner)) return false;
+    return std.mem.eql(u8, record.rdataText(), delta.rdata);
+}
+
+test "applying the difference to the old zone yields the new zone's records" {
+    const allocator = std.testing.allocator;
+    var old_zone = try loadTransferTestOldZone();
+    defer old_zone.deinit();
+    var new_zone = try loadTransferTestZone();
+    defer new_zone.deinit();
+
+    const difference = try zone_index.difference(allocator, &old_zone, &new_zone);
+    defer allocator.free(difference);
+    const records = try journal_mod.decodeRecords(allocator, difference);
+    defer allocator.free(records);
+
+    // The old zone's records, with the deleted ones gone and the added ones
+    // in their place.
+    var applied: std.ArrayList(zone_parser.ZoneRecord) = .empty;
+    defer applied.deinit(allocator);
+    for (old_zone.records.items[0..old_zone.records.len]) |record| {
+        if (record.rrtype.eql(.SOA)) continue;
+        var deleted = false;
+        for (records) |delta| {
+            if (!delta.deleted) continue;
+            if (!sameZoneRecord(record, delta)) continue;
+            deleted = true;
+            break;
+        }
+        if (deleted) continue;
+        try applied.append(allocator, record);
+    }
+    for (records) |delta| {
+        if (delta.deleted) continue;
+        if (dns_types.RecordType.fromCode(delta.rrtype_code).eql(.SOA)) continue;
+        try applied.append(allocator, .{
+            .owner = delta.owner,
+            .ttl = delta.ttl,
+            .rrtype = dns_types.RecordType.fromCode(delta.rrtype_code),
+            .rdata = delta.rdata,
+        });
+    }
+
+    // The applied zone holds the records of the new zone.
+    var expected: usize = 0;
+    for (new_zone.records.items[0..new_zone.records.len]) |record| {
+        if (record.rrtype.eql(.SOA)) continue;
+        expected += 1;
+        var found = false;
+        for (applied.items) |candidate| {
+            if (!sameZoneText(candidate, record)) continue;
+            found = true;
+            break;
+        }
+        try std.testing.expect(found);
+    }
+    try std.testing.expectEqual(expected, applied.items.len);
+}
+
+test "an IXFR for an unknown serial gets the full transfer" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var new_zone = try loadTransferTestZone();
+    defer new_zone.deinit();
+
+    var log = journal_mod.DeltaLog{};
+    log.setOrigin("example.");
+    try log.record(9, 10, transfer_test_difference);
+
+    // A client at a serial the log does not know gets the whole zone.
+    try std.testing.expectEqual(IxfrDecision.fallback_axfr, decideIxfr(10, 8, &log));
+    const request = try dns_message.Message.parseQuery(arena.allocator(), &axfr_query_bytes);
+    const messages = try buildAxfrMessages(arena.allocator(), &request, &new_zone, 64);
+    defer {
+        for (messages) |*message| message.deinit();
+        arena.allocator().free(messages);
+    }
+    try std.testing.expectEqual(@as(usize, 1), messages.len);
+    try std.testing.expectEqual(new_zone.records.len + 1, messages[0].answers.len);
+    try std.testing.expect(messages[0].answers.items[0].rrtype.eql(.SOA));
+    try std.testing.expect(messages[0].answers.items[messages[0].answers.len - 1].rrtype.eql(.SOA));
 }
 
 /// A NOTIFY request for example. whose answer section hints at an SOA with

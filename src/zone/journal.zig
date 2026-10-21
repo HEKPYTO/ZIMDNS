@@ -53,10 +53,22 @@ pub const max_path_len = 256;
 /// size: a bigger file is not read, and the file cannot grow without bound.
 pub const max_journal_bytes = 1024 * 1024;
 
+/// The largest difference one transition carries, in bytes of encoded text.
+/// A change bigger than this is not recorded as a difference, so the client
+/// at the old serial gets the full transfer instead of a wrong difference.
+pub const max_delta_bytes = 1024;
+
+/// The differences the running server keeps. The delta log holds eight
+/// transitions, so the store holds more than a log can reach.
+pub const max_stored_deltas = 32;
+
 pub const DeltaError = error{
     SerialEqual,
     SerialOlder,
     SerialUndefined,
+    /// The transition carries no difference, so the client at its serial is
+    /// answered with the full transfer.
+    NoDifference,
 };
 
 /// One transition read from the journal file.
@@ -71,11 +83,173 @@ pub const Transition = struct {
     }
 };
 
+/// One stored difference: the records one transition removed and added.
+const StoredDelta = struct {
+    origin: [max_origin_len]u8 = undefined,
+    origin_len: usize = 0,
+    from_serial: u32 = 0,
+    to_serial: u32 = 0,
+    text: [max_delta_bytes]u8 = undefined,
+    text_len: usize = 0,
+};
+
+/// The differences the running server keeps. The store is bounded: the
+/// oldest difference goes when a new one arrives, and the transition it
+/// belonged to falls back to the full transfer.
+var stored: [max_stored_deltas]StoredDelta = undefined;
+var stored_len: usize = 0;
+
+/// One difference on the way from a client's serial to the current one.
+pub const Delta = struct {
+    from_serial: u32,
+    to_serial: u32,
+    /// The records the transition removed and added, in the journal's
+    /// encoding.
+    text: []const u8,
+};
+
+/// Keeps the difference of one transition. A difference that does not fit the
+/// bound, or a transition that is not RFC 1982 newer, is not kept: the
+/// client at its serial then gets the full transfer.
+fn storeDelta(origin: []const u8, from_serial: u32, to_serial: u32, text: []const u8) void {
+    if (origin.len == 0 or origin.len > max_origin_len) return;
+    if (text.len == 0 or text.len > max_delta_bytes) return;
+    if (compareSerial(to_serial, from_serial) != .newer) return;
+    // A transition the store already holds keeps its place: the difference
+    // that comes later is the one the answer is built from.
+    for (stored[0..stored_len]) |*entry| {
+        if (entry.from_serial != from_serial or entry.to_serial != to_serial) continue;
+        if (!std.ascii.eqlIgnoreCase(entry.origin[0..entry.origin_len], origin)) continue;
+        @memcpy(entry.text[0..text.len], text);
+        entry.text_len = text.len;
+        return;
+    }
+    if (stored_len == max_stored_deltas) {
+        std.mem.copyForwards(StoredDelta, stored[0 .. max_stored_deltas - 1], stored[1..]);
+        stored_len = max_stored_deltas - 1;
+    }
+    const entry = &stored[stored_len];
+    @memcpy(entry.origin[0..origin.len], origin);
+    entry.origin_len = origin.len;
+    entry.from_serial = from_serial;
+    entry.to_serial = to_serial;
+    @memcpy(entry.text[0..text.len], text);
+    entry.text_len = text.len;
+    stored_len += 1;
+}
+
+/// The difference one transition carries, or null when the store does not
+/// hold it.
+pub fn differenceFor(origin: []const u8, from_serial: u32, to_serial: u32) ?[]const u8 {
+    for (stored[0..stored_len]) |*entry| {
+        if (entry.from_serial != from_serial or entry.to_serial != to_serial) continue;
+        if (!std.ascii.eqlIgnoreCase(entry.origin[0..entry.origin_len], origin)) continue;
+        return entry.text[0..entry.text_len];
+    }
+    return null;
+}
+
+/// The next difference on the way out of `from_serial`, or null when the
+/// store does not hold one.
+pub fn nextDelta(origin: []const u8, from_serial: u32) ?Delta {
+    for (stored[0..stored_len]) |*entry| {
+        if (entry.from_serial != from_serial) continue;
+        if (!std.ascii.eqlIgnoreCase(entry.origin[0..entry.origin_len], origin)) continue;
+        return .{
+            .from_serial = entry.from_serial,
+            .to_serial = entry.to_serial,
+            .text = entry.text[0..entry.text_len],
+        };
+    }
+    return null;
+}
+
+/// Reports whether the store holds every difference on the way from
+/// `client_serial` to `current_serial`.
+pub fn differenceChainHolds(origin: []const u8, client_serial: u32, current_serial: u32) bool {
+    var next = client_serial;
+    var hops: usize = 0;
+    while (next != current_serial) : (hops += 1) {
+        if (hops > max_stored_deltas) return false;
+        const delta = nextDelta(origin, next) orelse return false;
+        next = delta.to_serial;
+    }
+    return true;
+}
+
+/// One record of a difference, as the journal's encoding carries it.
+pub const DeltaRecord = struct {
+    /// True for a record the transition removed, false for one it added.
+    deleted: bool,
+    owner: []const u8,
+    ttl: u32,
+    rrtype_code: u16,
+    rdata: []const u8,
+};
+
+/// Appends one record to a difference, in the journal's encoding: the flag
+/// ('D' for a deleted record, 'A' for an added one), the owner, the TTL, the
+/// type code, and the rdata, which is the rest of the line.
+pub fn encodeRecord(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    deleted: bool,
+    owner: []const u8,
+    ttl: u32,
+    rrtype_code: u16,
+    rdata: []const u8,
+) !void {
+    var head: [max_origin_len + 64]u8 = undefined;
+    const text = std.fmt.bufPrint(
+        &head,
+        "{c} {s} {d} {d} ",
+        .{ @as(u8, if (deleted) 'D' else 'A'), owner, ttl, rrtype_code },
+    ) catch return error.OutOfMemory;
+    try out.appendSlice(allocator, text);
+    try out.appendSlice(allocator, rdata);
+    try out.append(allocator, '\n');
+}
+
+/// The records a difference carries, in the order the difference lists them:
+/// the deleted records first, then the added ones. The slices point into
+/// `text`, which the caller owns.
+pub fn decodeRecords(allocator: std.mem.Allocator, text: []const u8) ![]DeltaRecord {
+    var records: std.ArrayList(DeltaRecord) = .empty;
+    errdefer records.deinit(allocator);
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const record = parseDeltaRecord(line) orelse continue;
+        try records.append(allocator, record);
+    }
+    return records.toOwnedSlice(allocator);
+}
+
+fn parseDeltaRecord(line: []const u8) ?DeltaRecord {
+    if (line.len < 2) return null;
+    const flag = line[0];
+    if (flag != 'D' and flag != 'A') return null;
+    var tokens = std.mem.tokenizeAny(u8, line[1..], " ");
+    const owner = tokens.next() orelse return null;
+    const ttl_text = tokens.next() orelse return null;
+    const type_text = tokens.next() orelse return null;
+    const ttl = std.fmt.parseInt(u32, ttl_text, 10) catch return null;
+    const rrtype_code = std.fmt.parseInt(u16, type_text, 10) catch return null;
+    return .{
+        .deleted = flag == 'D',
+        .owner = owner,
+        .ttl = ttl,
+        .rrtype_code = rrtype_code,
+        .rdata = tokens.rest(),
+    };
+}
+
 /// The durable RFC 1995 delta journal: the file that keeps a zone's serial
 /// transitions across a restart, so an IXFR client at an old serial is still
 /// answered incrementally after the server comes back. One transition per
-/// line, holding the zone apex and the two serials. Nothing else is written
-/// to the file: no zone data and no key material.
+/// line, holding the zone apex, the two serials, and the difference the
+/// transition carries. Nothing else is written to the file: no zone data and
+/// no key material.
 pub const Journal = struct {
     io: std.Io,
     file: ?std.Io.File = null,
@@ -107,16 +281,33 @@ pub const Journal = struct {
         }
     }
 
-    /// Appends one transition. The record is one line written at the end of
-    /// the file, so a write that is cut short leaves a truncated tail the
-    /// reader skips. A failed write leaves the journal as it was. A file at
-    /// its bound takes no more transitions: the transition is dropped and
-    /// counted, and the server keeps working without it.
-    pub fn append(self: *Journal, origin: []const u8, from_serial: u32, to_serial: u32) void {
+    /// Appends one transition and the difference it carries. The record is
+    /// one line written at the end of the file, so a write that is cut short
+    /// leaves a truncated tail the reader skips. A failed write leaves the
+    /// journal as it was. A file at its bound takes no more transitions: the
+    /// transition is dropped and counted, and the server keeps working
+    /// without it. A difference too big for the bound is left out of the
+    /// line: the transition keeps its serials, and the client at the old
+    /// serial gets the full transfer.
+    pub fn append(self: *Journal, origin: []const u8, from_serial: u32, to_serial: u32, difference: []const u8) void {
         const file = self.file orelse return;
         if (origin.len == 0 or origin.len > max_origin_len) return;
-        var line: [max_origin_len + 32]u8 = undefined;
-        const text = std.fmt.bufPrint(&line, "{s} {d} {d}\n", .{ origin, from_serial, to_serial }) catch return;
+        const payload = if (difference.len <= max_delta_bytes) difference else "";
+        var line: [max_origin_len + 64 + 2 * max_delta_bytes]u8 = undefined;
+        const head = std.fmt.bufPrint(&line, "{s} {d} {d}", .{ origin, from_serial, to_serial }) catch return;
+        var length = head.len;
+        if (payload.len != 0) {
+            line[length] = ' ';
+            length += 1;
+            for (payload) |byte| {
+                line[length] = hexDigits[byte >> 4];
+                line[length + 1] = hexDigits[byte & 0x0f];
+                length += 2;
+            }
+        }
+        line[length] = '\n';
+        length += 1;
+        const text = line[0..length];
         // The file stops growing at its bound, so a long-lived server cannot
         // fill the disk. The transition is lost, and the zone falls back to
         // the full transfer once the in-memory log no longer holds it.
@@ -160,10 +351,20 @@ pub const Journal = struct {
         }
         var transitions: std.ArrayList(Transition) = .empty;
         errdefer transitions.deinit(allocator);
+        var payload_buffer: [max_delta_bytes]u8 = undefined;
         var lines = std.mem.splitScalar(u8, text, '\n');
         while (lines.next()) |line| {
-            const transition = parseTransition(line) orelse continue;
-            try transitions.append(allocator, transition);
+            const parsed = parseLine(line, &payload_buffer) orelse continue;
+            // The difference the line carries goes to the store, so a
+            // transition restored from the file can be answered
+            // incrementally.
+            storeDelta(
+                parsed.transition.originText(),
+                parsed.transition.from_serial,
+                parsed.transition.to_serial,
+                parsed.difference,
+            );
+            try transitions.append(allocator, parsed.transition);
         }
         return transitions.toOwnedSlice(allocator);
     }
@@ -188,13 +389,24 @@ fn reportDropped(io: std.Io, origin: []const u8, from_serial: u32, to_serial: u3
     stderr_writer.interface.flush() catch {};
 }
 
-/// Parses one journal line: the zone apex and the two serials of the
-/// transition. A line that does not parse is not a transition.
-fn parseTransition(line: []const u8) ?Transition {
+/// One journal line: the transition it holds and the difference it carries.
+const ParsedLine = struct {
+    transition: Transition,
+    /// The difference, decoded into the caller's buffer. Empty when the line
+    /// carries none, as a line written before the journal carried
+    /// differences does.
+    difference: []const u8,
+};
+
+/// Parses one journal line: the zone apex, the two serials of the
+/// transition, and the difference it carries. A line that does not parse is
+/// not a transition.
+fn parseLine(line: []const u8, buffer: []u8) ?ParsedLine {
     var tokens = std.mem.tokenizeAny(u8, line, " \t");
     const origin = tokens.next() orelse return null;
     const from_text = tokens.next() orelse return null;
     const to_text = tokens.next() orelse return null;
+    const payload = tokens.next();
     if (tokens.next() != null) return null;
     if (origin.len == 0 or origin.len > max_origin_len) return null;
     const from_serial = std.fmt.parseInt(u32, from_text, 10) catch return null;
@@ -202,7 +414,36 @@ fn parseTransition(line: []const u8) ?Transition {
     var transition = Transition{ .from_serial = from_serial, .to_serial = to_serial };
     @memcpy(transition.origin[0..origin.len], origin);
     transition.origin_len = origin.len;
-    return transition;
+    var difference: []const u8 = &.{};
+    if (payload) |hex| {
+        difference = decodeHex(hex, buffer) orelse return null;
+    }
+    return .{ .transition = transition, .difference = difference };
+}
+
+const hexDigits = "0123456789abcdef";
+
+fn hexValue(digit: u8) ?u8 {
+    return switch (digit) {
+        '0'...'9' => digit - '0',
+        'a'...'f' => digit - 'a' + 10,
+        'A'...'F' => digit - 'A' + 10,
+        else => null,
+    };
+}
+
+/// Decodes the hex payload of a journal line into `buffer`. Null when the
+/// payload is not hex or does not fit.
+fn decodeHex(hex: []const u8, buffer: []u8) ?[]const u8 {
+    if (hex.len % 2 != 0) return null;
+    if (hex.len / 2 > buffer.len) return null;
+    var index: usize = 0;
+    while (index < hex.len) : (index += 2) {
+        const high = hexValue(hex[index]) orelse return null;
+        const low = hexValue(hex[index + 1]) orelse return null;
+        buffer[index / 2] = (high << 4) | low;
+    }
+    return buffer[0 .. hex.len / 2];
 }
 
 /// The journal the running server appends to. One process serves one
@@ -243,22 +484,27 @@ pub const DeltaLog = struct {
         return self.origin[0..self.origin_len];
     }
 
-    /// Records that the zone moved from `from_serial` to `to_serial`.
-    /// Only RFC 1982 newer transitions are accepted. The transition is
-    /// appended to the journal when one is active, so the log survives a
-    /// restart; a journal that cannot be written does not fail the record,
-    /// because the in-memory log still carries the transition. A journal at
-    /// its bound drops the transition: the server keeps running, the drop is
-    /// reported, and the transition is gone after a restart, so the zone
-    /// falls back to the full transfer.
-    pub fn record(self: *DeltaLog, from_serial: u32, to_serial: u32) DeltaError!void {
+    /// Records that the zone moved from `from_serial` to `to_serial`, with
+    /// the difference the two zones make. Only RFC 1982 newer transitions
+    /// are accepted. The transition is appended to the journal when one is
+    /// active, so the log survives a restart; a journal that cannot be
+    /// written does not fail the record, because the in-memory log still
+    /// carries the transition. A journal at its bound drops the
+    /// transition: the server keeps running, the drop is reported, and the
+    /// transition is gone after a restart, so the zone falls back to the
+    /// full transfer.
+    pub fn record(self: *DeltaLog, from_serial: u32, to_serial: u32, difference: []const u8) DeltaError!void {
         try self.push(from_serial, to_serial);
-        if (active) |journal| journal.append(self.originText(), from_serial, to_serial);
+        storeDelta(self.originText(), from_serial, to_serial, difference);
+        if (active) |journal| journal.append(self.originText(), from_serial, to_serial, difference);
     }
 
     /// Puts a transition read from the journal file into the log without
     /// writing it back: the file is the record, and the log is its replay.
+    /// A transition the file holds no difference for is not restored: the
+    /// client at its serial gets the full transfer.
     pub fn restore(self: *DeltaLog, from_serial: u32, to_serial: u32) DeltaError!void {
+        if (differenceFor(self.originText(), from_serial, to_serial) == null) return DeltaError.NoDifference;
         try self.push(from_serial, to_serial);
     }
 
@@ -289,10 +535,21 @@ pub const DeltaLog = struct {
     }
 
     /// Reports whether the log connects `client_serial` to `current_serial`
-    /// through recorded transitions. A missing link means the delta is no
-    /// longer known and the server must answer the IXFR with a full AXFR.
+    /// through recorded transitions, and whether every transition on the way
+    /// carries the difference the incremental answer needs. A missing link
+    /// means the delta is no longer known and the server must answer the
+    /// IXFR with a full AXFR.
     pub fn canServeIncremental(self: *const DeltaLog, client_serial: u32, current_serial: u32) bool {
         if (client_serial == current_serial) return true;
+        if (!self.chainConnects(client_serial, current_serial)) return false;
+        // Every transition on the way carries the difference the incremental
+        // answer is built from.
+        return differenceChainHolds(self.originText(), client_serial, current_serial);
+    }
+
+    /// Reports whether the recorded transitions connect `client_serial` to
+    /// `current_serial`.
+    fn chainConnects(self: *const DeltaLog, client_serial: u32, current_serial: u32) bool {
         var next = client_serial;
         var hops: usize = 0;
         while (hops <= self.len) : (hops += 1) {
@@ -310,10 +567,15 @@ pub const DeltaLog = struct {
     }
 };
 
+/// A difference one transition carries: the journal only keeps the text, the
+/// transfer reads it.
+const test_difference = "D a.chain.example. 3600 1 192.0.2.1\nA a.chain.example. 3600 1 192.0.2.2\n";
+
 test "delta log serves incremental answers only across recorded transitions" {
     var log = DeltaLog{};
-    try log.record(10, 11);
-    try log.record(11, 12);
+    log.setOrigin("chain.example.");
+    try log.record(10, 11, test_difference);
+    try log.record(11, 12, test_difference);
     try std.testing.expect(log.hasSerial(10));
     try std.testing.expect(log.hasSerial(12));
     try std.testing.expect(!log.hasSerial(9));
@@ -326,17 +588,18 @@ test "delta log serves incremental answers only across recorded transitions" {
 
 test "delta log rejects transitions that are not RFC 1982 newer" {
     var log = DeltaLog{};
-    try std.testing.expectError(DeltaError.SerialEqual, log.record(10, 10));
-    try std.testing.expectError(DeltaError.SerialOlder, log.record(11, 10));
-    try std.testing.expectError(DeltaError.SerialUndefined, log.record(0, 0x8000_0000));
+    try std.testing.expectError(DeltaError.SerialEqual, log.record(10, 10, test_difference));
+    try std.testing.expectError(DeltaError.SerialOlder, log.record(11, 10, test_difference));
+    try std.testing.expectError(DeltaError.SerialUndefined, log.record(0, 0x8000_0000, test_difference));
     try std.testing.expectEqual(@as(usize, 0), log.len);
 }
 
 test "delta log evicts the oldest transition once bounded" {
     var log = DeltaLog{};
+    log.setOrigin("bounded.example.");
     var serial: u32 = 1;
     while (serial <= max_deltas + 1) : (serial += 1) {
-        try log.record(serial, serial + 1);
+        try log.record(serial, serial + 1, test_difference);
     }
     try std.testing.expectEqual(max_deltas, log.len);
     try std.testing.expect(!log.hasSerial(1));
@@ -356,7 +619,7 @@ test "the journal file carries a transition across a restart" {
 
     var log = DeltaLog{};
     log.setOrigin("one.example.");
-    try log.record(10, 11);
+    try log.record(10, 11, test_difference);
     journal.close();
 
     // A server that comes back reads the file and finds the transition.
@@ -370,9 +633,46 @@ test "the journal file carries a transition across a restart" {
     try std.testing.expectEqual(@as(u32, 11), transitions[0].to_serial);
 
     var restored = DeltaLog{};
+    restored.setOrigin("one.example.");
     try restored.restore(transitions[0].from_serial, transitions[0].to_serial);
     try std.testing.expect(restored.canServeIncremental(10, 11));
     try std.testing.expect(!restored.canServeIncremental(9, 11));
+    // The difference the file carried is what the answer is built from.
+    try std.testing.expect(differenceFor("one.example.", 10, 11) != null);
+    // The client at the old serial is answered incrementally again.
+    const transfer = @import("transfer.zig");
+    try std.testing.expectEqual(transfer.IxfrDecision.incremental, transfer.decideIxfr(11, 10, &restored));
+}
+
+test "a journal file in the old format falls back to the full transfer" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A file written before the journal carried differences: the serials of
+    // the transition are there, the difference is not.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "journal.log",
+        .data = "old.example. 10 11\n",
+    });
+
+    var journal = try Journal.open(io, tmp.dir, "journal.log");
+    defer journal.close();
+    const transitions = try journal.read(std.testing.allocator);
+    defer std.testing.allocator.free(transitions);
+
+    // The file is read, so the server starts.
+    try std.testing.expectEqual(@as(usize, 1), transitions.len);
+    try std.testing.expectEqual(@as(u32, 10), transitions[0].from_serial);
+    try std.testing.expectEqual(@as(u32, 11), transitions[0].to_serial);
+
+    // The transition cannot be turned into a difference, so it is not
+    // restored and the client at its serial gets the full transfer.
+    var restored = DeltaLog{};
+    restored.setOrigin("old.example.");
+    try std.testing.expectError(DeltaError.NoDifference, restored.restore(transitions[0].from_serial, transitions[0].to_serial));
+    const transfer = @import("transfer.zig");
+    try std.testing.expectEqual(transfer.IxfrDecision.fallback_axfr, transfer.decideIxfr(11, 10, &restored));
 }
 
 test "the journal skips a corrupt or truncated record" {
@@ -406,7 +706,7 @@ test "the journal skips a torn record that has no closing newline" {
     // newline, and it reads as a complete transition.
     try tmp.dir.writeFile(io, .{
         .sub_path = "journal.log",
-        .data = "one.example. 10 11\ntwo.example. 20 21",
+        .data = "torn.example. 10 11\ntwo.example. 20 21",
     });
 
     var journal = try Journal.open(io, tmp.dir, "journal.log");
@@ -416,14 +716,16 @@ test "the journal skips a torn record that has no closing newline" {
 
     // The whole record is kept, the torn one is not.
     try std.testing.expectEqual(@as(usize, 1), transitions.len);
-    try std.testing.expectEqualStrings("one.example.", transitions[0].originText());
+    try std.testing.expectEqualStrings("torn.example.", transitions[0].originText());
     try std.testing.expectEqual(@as(u32, 10), transitions[0].from_serial);
     try std.testing.expectEqual(@as(u32, 11), transitions[0].to_serial);
 
-    // The torn transition is not known, so a client at its serial is not
-    // answered incrementally.
+    // The record carries no difference, so it cannot be turned into one:
+    // the transition is not restored, and a client at its serial is answered
+    // with the full transfer.
     var restored = DeltaLog{};
-    try restored.restore(transitions[0].from_serial, transitions[0].to_serial);
+    restored.setOrigin("torn.example.");
+    try std.testing.expectError(DeltaError.NoDifference, restored.restore(transitions[0].from_serial, transitions[0].to_serial));
     try std.testing.expect(!restored.canServeIncremental(20, 21));
 }
 
@@ -443,7 +745,7 @@ test "the journal stops growing at its bound and drops the transitions past it" 
     var serial: u32 = 1;
     var dropped: u32 = 0;
     while (journal.dropped == 0 and serial < 100_000) : (serial += 1) {
-        journal.append(origin, serial, serial + 1);
+        journal.append(origin, serial, serial + 1, test_difference);
         if (journal.dropped > 0) dropped = serial;
     }
 
@@ -472,7 +774,7 @@ test "a journal at its bound leaves the dropped transition to the full transfer 
     var serial: u32 = 1;
     var dropped: u32 = 0;
     while (journal.dropped == 0 and serial < 100_000) : (serial += 1) {
-        journal.append(origin, serial, serial + 1);
+        journal.append(origin, serial, serial + 1, test_difference);
         if (journal.dropped > 0) dropped = serial;
     }
     journal.close();

@@ -955,6 +955,8 @@ test "server context carries the NAT64 prefix into the forwarding policy" {
         \\zone one.example primary one.zone
         \\forwarder 127.0.0.1:5353
         \\nat64-prefix 64:ff9b::/96
+        \\nat64-prefix 2001:db8:100::/96 192.0.2.0/24
+        \\dns64-exclude 2001:db8:1::/48
         \\
     });
 
@@ -963,10 +965,17 @@ test "server context carries the NAT64 prefix into the forwarding policy" {
     var runtime = try context.takeRuntime(io);
     defer runtime.deinit();
 
-    // The prefix reaches the resolver that answers the forwarding path.
-    const prefix = runtime.resolver.?.policy.nat64_prefix.?;
-    try std.testing.expectEqual(@as(u8, 96), prefix.length);
-    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x64, 0xff, 0x9b }, prefix.bytes[0..4]);
+    // The prefixes reach the resolver that answers the forwarding path.
+    const policy = &runtime.resolver.?.policy;
+    try std.testing.expectEqual(@as(usize, 2), policy.nat64_prefixes.len);
+    try std.testing.expectEqual(@as(u8, 96), policy.nat64_prefixes.items[0].length);
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x64, 0xff, 0x9b }, policy.nat64_prefixes.items[0].bytes[0..4]);
+    try std.testing.expectEqual(@as(u8, 24), policy.nat64_prefixes.items[1].range.prefix);
+    try std.testing.expectEqualSlices(u8, &.{ 192, 0, 2, 0 }, policy.nat64_prefixes.items[1].range.bytes[0..4]);
+    // The excluded ranges reach the resolver too.
+    try std.testing.expectEqual(@as(usize, 1), policy.dns64_excluded.len);
+    try std.testing.expectEqual(@as(u8, 48), policy.dns64_excluded.items[0].prefix);
+    try std.testing.expectEqualSlices(u8, &.{ 0x20, 0x01, 0x0d, 0xb8 }, policy.dns64_excluded.items[0].bytes[0..4]);
 }
 
 test "server context carries the RFC 9520 failure cache time into the forwarding policy" {
@@ -989,6 +998,35 @@ test "server context carries the RFC 9520 failure cache time into the forwarding
 
     // The cache time reaches the resolver that holds the failure cache.
     try std.testing.expectEqual(@as(u32, 42), runtime.resolver.?.policy.failure_cache_seconds);
+}
+
+test "server context carries the denied source ports and the cacheable prefix into the forwarding policy" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{ .sub_path = "one.zone", .data = "$ORIGIN one.example.\n$TTL 3600\n@ IN SOA ns.one.example. hostmaster.one.example. 1 3600 900 1209600 3600\n@ IN NS ns.one.example.\n" });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data =
+        \\zone one.example primary one.zone
+        \\forwarder 127.0.0.1:5353
+        \\forwarder-deny-port 53
+        \\forwarder-deny-port 40000-40100
+        \\client-subnet-max-prefix 24
+        \\
+    });
+
+    var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+    defer context.deinit();
+    var runtime = try context.takeRuntime(io);
+    defer runtime.deinit();
+
+    // The denied ports and the maximum cacheable prefix reach the resolver
+    // that answers the forwarding path.
+    const policy = &runtime.resolver.?.policy;
+    try std.testing.expectEqual(@as(usize, 2), policy.deny_ports_len);
+    try std.testing.expectEqual(@as(u16, 53), policy.deny_ports[0].first);
+    try std.testing.expectEqual(@as(u16, 40100), policy.deny_ports[1].last);
+    try std.testing.expectEqual(@as(u8, 24), policy.max_cacheable_prefix.?);
 }
 
 /// The zone the IXFR journal tests serve, at the serial the client asks
@@ -1083,7 +1121,21 @@ test "the IXFR journal keeps a zone change across a restart" {
     // The journal holds the transition, and nothing but the transition.
     const journal_text = try dir.dir.readFileAlloc(io, "journal.log", std.testing.allocator, .limited(4096));
     defer std.testing.allocator.free(journal_text);
-    try std.testing.expectEqualStrings("one.example. 10 11\n", journal_text);
+    // The journal line carries the difference as well as the serials: the
+    // records the old zone held and the new one does not, then the records
+    // the new zone holds and the old one did not.
+    const difference =
+        "D one.example. 3600 6 ns.one.example. hostmaster.one.example. 10 3600 900 1209600 3600\n" ++
+        "D www.one.example. 3600 1 192.0.2.1\n" ++
+        "A one.example. 3600 6 ns.one.example. hostmaster.one.example. 11 3600 900 1209600 3600\n" ++
+        "A www.one.example. 3600 1 192.0.2.2\n";
+    var hex: [2 * difference.len]u8 = undefined;
+    const digits = "0123456789abcdef";
+    for (difference, 0..) |byte, index| {
+        hex[2 * index] = digits[byte >> 4];
+        hex[2 * index + 1] = digits[byte & 0x0f];
+    }
+    try std.testing.expectEqualStrings("one.example. 10 11 " ++ hex[0..] ++ "\n", journal_text);
 
     // The operator's replacement zone file is what the restarted server
     // serves.
@@ -1098,7 +1150,7 @@ test "the IXFR journal keeps a zone change across a restart" {
 
     const frames = try ixfrFrames(arena.allocator(), &runtime, &ixfr_query_bytes);
     try std.testing.expectEqual(@as(usize, 1), countSoaSerial(frames, 10));
-    try std.testing.expectEqual(@as(usize, 2), countSoaSerial(frames, 11));
+    try std.testing.expectEqual(@as(usize, 3), countSoaSerial(frames, 11));
 }
 
 test "a corrupt IXFR journal is skipped and the zone falls back to a full transfer" {

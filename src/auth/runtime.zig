@@ -407,7 +407,16 @@ pub const Runtime = struct {
                 return .load_failed;
             };
         }
-        self.transfer_delta_logs.items[target].record(old_serial, new_serial) catch |err| {
+        // The difference between the two zones is computed here, where both
+        // snapshots exist, so the incremental answer carries the records
+        // that changed.
+        const difference = zone_index.difference(self.allocator, &self.zones.items[target], &zone) catch |err| {
+            reportReload(io, "error: cannot compute the difference of the zone for {s}: {t}", .{ origin, err });
+            return .load_failed;
+        };
+        defer self.allocator.free(difference);
+        self.transfer_delta_logs.items[target].setOrigin(zone.originText());
+        self.transfer_delta_logs.items[target].record(old_serial, new_serial, difference) catch |err| {
             reportReload(io, "error: cannot record the serial transition for {s}: {t}", .{ origin, err });
             return .serial_not_newer;
         };
@@ -737,6 +746,29 @@ pub const Runtime = struct {
         return output[0..writer.len()];
     }
 
+    /// Answers one request and counts it, so every transport that reports
+    /// metrics counts the same way.
+    fn answerCounted(
+        self: *Runtime,
+        allocator: std.mem.Allocator,
+        query_bytes: []const u8,
+        output: []u8,
+        client: ?*const std.Io.net.IpAddress,
+        counters: ?*metrics.Counters,
+        over_tcp: bool,
+    ) ![]const u8 {
+        if (counters) |value| value.queries_total += 1;
+        const result = self.answerIncoming(allocator, query_bytes, output, client, counters, over_tcp) catch |err| {
+            if (counters) |value| {
+                if (err == Error.BadQuery) value.bad_queries_total += 1;
+                if (err == Error.EncodeFailed) value.encode_failures_total += 1;
+            }
+            return err;
+        };
+        if (counters) |value| value.responses_total += 1;
+        return result;
+    }
+
     fn answerIncoming(
         self: *Runtime,
         allocator: std.mem.Allocator,
@@ -783,7 +815,7 @@ pub const Runtime = struct {
         defer arena.deinit();
         self.lock();
         defer self.unlock();
-        return self.answerIncoming(arena.allocator(), query_bytes, output, client, null, false);
+        return self.answerCounted(arena.allocator(), query_bytes, output, client, null, false);
     }
 
     /// Answers a request that arrived on a TCP session. RFC 7828 section 3.3.2
@@ -800,7 +832,7 @@ pub const Runtime = struct {
         defer arena.deinit();
         self.lock();
         defer self.unlock();
-        return self.answerIncoming(arena.allocator(), query_bytes, output, client, counters, true);
+        return self.answerCounted(arena.allocator(), query_bytes, output, client, counters, true);
     }
 
     pub fn truncateUdpResponse(self: *Runtime, query_bytes: []const u8, response_bytes: []const u8, output: []u8) ![]const u8 {
@@ -1085,18 +1117,11 @@ pub const Runtime = struct {
     }
 
     pub fn answerFromWithMetrics(self: *Runtime, query_bytes: []const u8, output: []u8, client: *const std.Io.net.IpAddress, counters: *metrics.Counters) ![]const u8 {
-        counters.queries_total += 1;
         self.lock();
         defer self.unlock();
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
-        const result = self.answerIncoming(arena.allocator(), query_bytes, output, client, counters, false) catch |err| {
-            if (err == Error.BadQuery) counters.bad_queries_total += 1;
-            if (err == Error.EncodeFailed) counters.encode_failures_total += 1;
-            return err;
-        };
-        counters.responses_total += 1;
-        return result;
+        return self.answerCounted(arena.allocator(), query_bytes, output, client, counters, false);
     }
 
     pub fn answerWithMetrics(self: *const Runtime, query_bytes: []const u8, output: []u8, counters: *metrics.Counters) ![]const u8 {
