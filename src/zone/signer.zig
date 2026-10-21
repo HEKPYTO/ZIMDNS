@@ -448,12 +448,15 @@ fn alreadySigned(zone: *const zone_index.Zone) bool {
 }
 
 fn collectEntries(allocator: std.mem.Allocator, zone: *const zone_index.Zone, entries: *std.ArrayList(Entry)) Error!void {
+    // A record of a type this server does not implement carries its RDATA
+    // whole, so the buffer holds the opaque bound, not the signer's own.
+    const buffer = allocator.alloc(u8, dns_rdata.max_opaque_rdata_len) catch return Error.OutOfMemory;
+    defer allocator.free(buffer);
     for (zone.records.items[0..zone.records.len]) |record| {
         if (!zone.contains(record.ownerText())) continue;
         const owner = Name.fromText(record.ownerText()) catch return Error.BadZoneRecord;
         const rdata = zone_parser.parseRData(record.rrtype, record.rdataText()) catch return Error.BadZoneRecord;
-        var buffer: [max_rdata_len]u8 = undefined;
-        var writer = dns_writer.Writer.init(&buffer);
+        var writer = dns_writer.Writer.init(buffer);
         rdata.encode(&writer) catch return Error.BadZoneRecord;
         try entries.append(allocator, .{
             .owner_wire = try allocator.dupe(u8, owner.asWire()),

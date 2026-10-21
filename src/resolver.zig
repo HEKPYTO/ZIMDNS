@@ -364,15 +364,29 @@ fn ecsScope(message: dns_message.Message) ?EcsScope {
     return scope;
 }
 
-/// The option payload of a scope. RFC 7871 section 6 gives the layout, and
-/// section 7.1.1 keeps the scope of a query at 0.
-fn ecsPayload(scope: EcsScope, buffer: *[4 + 16]u8) []const u8 {
+/// The option payload of a scope. RFC 7871 section 6 gives the layout:
+/// FAMILY, SOURCE PREFIX-LENGTH, SCOPE PREFIX-LENGTH, and the address
+/// truncated to the source prefix. Section 7.1.1 keeps the scope of a query
+/// at 0; an answer carries the scope the answer was fetched for.
+fn ecsPayload(scope: EcsScope, scope_prefix: u8, buffer: *[4 + 16]u8) []const u8 {
     std.mem.writeInt(u16, buffer[0..2], scope.family, .big);
     buffer[2] = scope.prefix;
-    buffer[3] = 0;
+    buffer[3] = scope_prefix;
     const address_len = (@as(usize, scope.prefix) + 7) / 8;
     @memcpy(buffer[4..][0..address_len], scope.address[0..address_len]);
     return buffer[0 .. 4 + address_len];
+}
+
+/// RFC 7871 section 7.2.2: a client that sent the option gets one in the
+/// answer and a client that sent none never sees one. The scope reported is
+/// the scope the answer was fetched for, the one the cache key holds, and
+/// the address is the one the resolver sent upstream, so no address bit the
+/// client did not send is disclosed.
+fn appendEcsScope(message: *dns_message.Message, query: dns_message.Message) !void {
+    if (message.edns == null) return;
+    const scope = ecsScope(query) orelse return;
+    var buffer: [4 + 16]u8 = undefined;
+    try appendOption(message, dns_rdata.EDNS_ECS_OPTION_CODE, ecsPayload(scope, scope.prefix, &buffer));
 }
 
 const CacheEntry = struct {
@@ -575,6 +589,7 @@ const Cache = struct {
             message.question = query.question;
             stripProofsForClient(&message, query);
             if (query.edns != null) try appendOpt(&message, query.edns.?);
+            try appendEcsScope(&message, query);
             if (!fresh) try appendEde(&message, if (entry.nxdomain) EDE_STALE_NXDOMAIN else EDE_STALE_ANSWER);
             var writer = dns_writer.Writer.init(output);
             message.encode(&writer) catch return Error.ResponseTooLarge;
@@ -624,6 +639,7 @@ const Cache = struct {
         applyNegativeTtl(&message, remainingTtl(entry, elapsed));
         stripProofsForClient(&message, query);
         if (query.edns != null) try appendOpt(&message, query.edns.?);
+        try appendEcsScope(&message, query);
         var writer = dns_writer.Writer.init(output);
         message.encode(&writer) catch return Error.ResponseTooLarge;
         return .{ .stale = false, .bytes = writer.written() };
@@ -953,6 +969,7 @@ pub const Resolver = struct {
         // happens on the way out only.
         stripProofsForClient(&response, query);
         if (query.edns) |edns| try appendOpt(&response, edns);
+        try appendEcsScope(&response, query);
         // DNSSEC presence signals (RFC 8914 6-10) ride along as informational
         // EDE on a relayed response this server did NOT validate. Once the
         // validator has spoken above, its verdict is the answer: emitting a
@@ -1071,14 +1088,32 @@ pub const Resolver = struct {
             try message.authorities.append(soa_record);
             message.header.authority_count = 1;
         }
+        // RFC 8020 section 2: the cut answer carries the proof that
+        // justifies it. The proof rides only for a client that asked for
+        // it (RFC 3225 section 3), and the denial without a proof is served
+        // all the same.
+        if (proof.proof) |records| {
+            if (wantsDnssecProofs(query)) {
+                for (records.records[0..records.len]) |record| {
+                    const parsed = dns_record.ResourceRecord.parse(record.bytes(), 0) catch continue;
+                    try message.authorities.append(parsed.record);
+                    message.header.authority_count += 1;
+                }
+            }
+        }
         if (query.edns) |edns| try appendOpt(&message, edns);
+        try appendEcsScope(&message, query);
         var writer = dns_writer.Writer.init(output);
         message.encode(&writer) catch return Error.ResponseTooLarge;
-        // The denial carries no DNSSEC record, so it is kept as the variant
-        // for the clients that did not ask for the proofs.
-        var denial_key = key;
-        denial_key.dnssec_ok = false;
-        if (ttl != 0) self.cache.putDenial(denial_key, &message, ttl, now) catch {};
+        // The denial and its proof are kept for the clients that asked for
+        // the proofs and for the clients that did not, so the next client in
+        // the scope is answered from the cache either way.
+        if (ttl != 0) {
+            self.cache.putDenial(key, &message, ttl, now) catch {};
+            var plain_key = key;
+            plain_key.dnssec_ok = false;
+            self.cache.putDenial(plain_key, &message, ttl, now) catch {};
+        }
         return writer.written();
     }
 
@@ -1635,7 +1670,7 @@ fn buildUpstreamQuery(
     // with the prefix the client asked for and a scope of 0.
     if (ecsScope(query)) |scope| {
         var ecs_buffer: [4 + 16]u8 = undefined;
-        try appendOption(&sanitized, dns_rdata.EDNS_ECS_OPTION_CODE, ecsPayload(scope, &ecs_buffer));
+        try appendOption(&sanitized, dns_rdata.EDNS_ECS_OPTION_CODE, ecsPayload(scope, 0, &ecs_buffer));
     }
     appendKeyTags(&sanitized, query, anchors);
     var writer = dns_writer.Writer.init(output);
@@ -1813,8 +1848,29 @@ fn harvestSectionNsec(cache: *dnssec.AggressiveCache, records: []const dns_recor
             else => continue,
         };
         const next = dns_name.Name.parse(raw, 0) catch continue;
-        cache.insertNsec(record.owner, next.name, raw[next.next_offset..], now, record.ttl, soa);
+        cache.insertNsec(record.owner, next.name, raw[next.next_offset..], now, record.ttl, soa, .{
+            .nsec = record.*,
+            .rrsig = coveringRrsig(records, record.owner),
+        });
     }
+}
+
+/// The RRSIG that covers the NSEC at `owner` in the same section. RFC 4035
+/// section 3.1.3 wants the proof returned with the signature that covers
+/// it, and RFC 8020 section 2 returns that signature with a cut answer.
+fn coveringRrsig(records: []const dns_record.ResourceRecord, owner: dns_name.Name) ?dns_record.ResourceRecord {
+    for (records) |*record| {
+        if (!record.rrtype.eql(.RRSIG)) continue;
+        if (!record.owner.eql(&owner)) continue;
+        const raw = switch (record.rdata) {
+            .Unknown => |*unknown| unknown.bytes(),
+            else => continue,
+        };
+        const covered = dnssec.rrsigCovers(raw) catch continue;
+        if (covered != dns_types.RecordType.NSEC.code()) continue;
+        return record.*;
+    }
+    return null;
 }
 
 /// The zone SOA of a section, which a negative answer carries (RFC 2308
@@ -1923,6 +1979,7 @@ fn errorResponse(request: dns_message.Message, rcode: dns_header.Rcode, ede_code
     errdefer message.deinit();
     if (with_opt) {
         try appendOpt(&message, edns);
+        try appendEcsScope(&message, request);
         if (rcode == .badcookie) {
             message.edns.?.extended_rcode = 1;
             message.additionals.items[message.additionals.len - 1].ttl |= @as(u32, 1) << 24;
@@ -2454,6 +2511,165 @@ test "resolver forwards the client subnet option upstream" {
     try std.testing.expect(!validUpstreamResponse(other, query, query.header.id));
 }
 
+/// The fake upstream the client subnet tests forward to. It records the
+/// client subnet option of the query it received and answers the question.
+const EcsUpstream = struct {
+    io: std.Io,
+    udp: *const std.Io.net.Socket,
+    /// The number of queries the fake answers before it stops.
+    max_requests: usize = 1,
+    /// The client subnet option the upstream saw, if any.
+    seen: [4 + 16]u8 = @splat(0),
+    seen_len: usize = 0,
+    requests: usize = 0,
+};
+
+fn serveEcsUpstream(args: *EcsUpstream) void {
+    const timeout: std.Io.Timeout = .{ .duration = .{
+        .raw = .fromSeconds(2),
+        .clock = .awake,
+    } };
+    var request_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
+    while (args.requests < args.max_requests) {
+        const incoming = args.udp.receiveTimeout(args.io, &request_buffer, timeout) catch return;
+        args.requests += 1;
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const query = dns_message.Message.parseQuery(arena.allocator(), incoming.data) catch return;
+        if (findOption(query, dns_rdata.EDNS_ECS_OPTION_CODE)) |option| {
+            args.seen_len = @min(option.len, args.seen.len);
+            @memcpy(args.seen[0..args.seen_len], option[0..args.seen_len]);
+        }
+        const question = query.question orelse return;
+        var answer_slot: [1]dns_record.ResourceRecord = undefined;
+        answer_slot[0] = .{
+            .owner = question.name,
+            .rrtype = .A,
+            .class = .IN,
+            .ttl = 60,
+            .rdata = .{ .A = .{ 192, 0, 2, 1 } },
+        };
+        var response_buffer: [2048]u8 = undefined;
+        const bytes = buildDns64UpstreamAnswer(&response_buffer, query, &answer_slot, &.{}, .no_error) catch return;
+        args.udp.send(args.io, &incoming.from, bytes) catch return;
+    }
+}
+
+test "RFC 7871 section 7.2.2: the answer reports the client subnet scope the resolver used" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    var upstream = EcsUpstream{ .io = io, .udp = &upstream_socket };
+    const thread = try std.Thread.spawn(.{}, serveEcsUpstream, .{&upstream});
+
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = upstream_socket.address },
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2607, "example.com.", true);
+    defer query.deinit();
+    try appendOption(&query, dns_rdata.EDNS_ECS_OPTION_CODE, &.{ 0, 1, 24, 0, 192, 0, 2 });
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42630);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    thread.join();
+
+    const response = try dns_message.Message.parse(arena.allocator(), bytes);
+    try std.testing.expectEqual(dns_header.Rcode.no_error, response.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+    // RFC 7871 section 7.2.2: the client that sent the option gets one back.
+    const ecs = findOption(response, dns_rdata.EDNS_ECS_OPTION_CODE).?;
+    try std.testing.expectEqual(@as(usize, 7), ecs.len);
+    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, ecs[0..2], .big));
+    // The source prefix mirrors the query and the scope is the one the
+    // resolver used, so the client learns the scope of the answer.
+    try std.testing.expectEqual(@as(u8, 24), ecs[2]);
+    try std.testing.expectEqual(@as(u8, 24), ecs[3]);
+    try std.testing.expectEqualSlices(u8, &.{ 192, 0, 2 }, ecs[4..]);
+    // The upstream saw the scope the answer reports.
+    try std.testing.expectEqual(@as(usize, 7), upstream.seen_len);
+    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, upstream.seen[0..2], .big));
+    try std.testing.expectEqual(@as(u8, 24), upstream.seen[2]);
+    try std.testing.expectEqual(@as(u8, 0), upstream.seen[3]);
+}
+
+test "RFC 7871 section 7.2.2: a client that sent no client subnet option gets none in the answer" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    var upstream = EcsUpstream{ .io = io, .udp = &upstream_socket, .max_requests = 2 };
+    const thread = try std.Thread.spawn(.{}, serveEcsUpstream, .{&upstream});
+
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = upstream_socket.address },
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var client = try std.Io.net.IpAddress.parse("127.0.0.1", 42631);
+    var output: [2048]u8 = undefined;
+
+    // A query with EDNS but no client subnet option is answered with the
+    // OPT record of the query and with no option in it.
+    var edns_query = try makeTestQuery(arena.allocator(), 0x2608, "example.com.", true);
+    defer edns_query.deinit();
+    var edns_bytes: [1024]u8 = undefined;
+    const encoded_edns = try encodeTestMessage(edns_query, &edns_bytes);
+    const edns_answer = try resolver.answer(encoded_edns, edns_query, &client, &output);
+    const edns_response = try dns_message.Message.parse(arena.allocator(), edns_answer);
+    try std.testing.expect(edns_response.edns != null);
+    try std.testing.expect(findOption(edns_response, dns_rdata.EDNS_ECS_OPTION_CODE) == null);
+    try std.testing.expectEqual(@as(usize, 0), upstream.seen_len);
+
+    // A query without EDNS is answered without an OPT record, so it cannot
+    // carry the option either.
+    var plain_query = try makeTestQuery(arena.allocator(), 0x2609, "other.example.", false);
+    defer plain_query.deinit();
+    var plain_bytes: [1024]u8 = undefined;
+    const encoded_plain = try encodeTestMessage(plain_query, &plain_bytes);
+    const plain_answer = try resolver.answer(encoded_plain, plain_query, &client, &output);
+    thread.join();
+    const plain_response = try dns_message.Message.parse(arena.allocator(), plain_answer);
+    try std.testing.expect(plain_response.edns == null);
+    try std.testing.expect(findOption(plain_response, dns_rdata.EDNS_ECS_OPTION_CODE) == null);
+}
+
+test "a cached answer reports the client subnet scope the cache key holds" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var scoped = try makeTestQuery(arena.allocator(), 0x260a, "example.com.", true);
+    defer scoped.deinit();
+    try appendOption(&scoped, dns_rdata.EDNS_ECS_OPTION_CODE, &.{ 0, 1, 24, 0, 192, 0, 2 });
+
+    var response = try makePositiveResponse(arena.allocator(), 60);
+    defer response.deinit();
+    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    defer cache.deinit();
+    try cache.put(try CacheKey.fromQuestion(scoped), &response, 4000);
+
+    var output: [2048]u8 = undefined;
+    const key = try CacheKey.fromQuestion(scoped);
+    const hit = (try cache.lookup(&key, scoped, 4001, &output, false)).?;
+    const answer = try dns_message.Message.parse(arena.allocator(), hit.bytes);
+    // RFC 7871 section 7.2.2: the cached answer reports the scope it was
+    // fetched for, so the client learns the scope of the answer it got.
+    const ecs = findOption(answer, dns_rdata.EDNS_ECS_OPTION_CODE).?;
+    try std.testing.expectEqual(@as(usize, 7), ecs.len);
+    try std.testing.expectEqual(@as(u8, 24), ecs[2]);
+    try std.testing.expectEqual(@as(u8, 24), ecs[3]);
+    try std.testing.expectEqualSlices(u8, &.{ 192, 0, 2 }, ecs[4..]);
+}
+
 test "the answer cache keeps the client subnet scopes apart" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2963,6 +3179,7 @@ test "aggressive NSEC answers denials without upstream and honors CD" {
         now,
         3600,
         try makeTestSoa(3600, 3600),
+        .{},
     );
     resolver.dnssec_aggressive.insertNsec(
         try dns_name.Name.fromText("mail.example."),
@@ -2971,6 +3188,7 @@ test "aggressive NSEC answers denials without upstream and honors CD" {
         now,
         3600,
         try makeTestSoa(3600, 3600),
+        .{},
     );
 
     var query = try makeTestQuery(arena.allocator(), 0x2704, "nx.example.", true);
@@ -3018,6 +3236,7 @@ test "RFC 8198 section 4: a synthesized denial is reused from the negative cache
         now,
         3600,
         try makeTestSoa(3600, 3600),
+        .{},
     );
     resolver.dnssec_aggressive.insertNsec(
         try dns_name.Name.fromText("mail.example."),
@@ -3026,6 +3245,7 @@ test "RFC 8198 section 4: a synthesized denial is reused from the negative cache
         now,
         3600,
         try makeTestSoa(3600, 3600),
+        .{},
     );
 
     var client = try std.Io.net.IpAddress.parse("127.0.0.1", 42620);
@@ -3066,6 +3286,220 @@ test "RFC 8198 section 4: a synthesized denial is reused from the negative cache
     try std.testing.expectError(Error.UpstreamFailure, resolver.answer(encoded_outside, outside, &client, &output));
 }
 
+/// The NSEC record an upstream answer carries: the next owner name and the
+/// type bitmap in the RDATA (RFC 4034 section 4.1.2).
+fn makeTestNsecRecord(owner_text: []const u8, next_text: []const u8, bitmap: []const u8, ttl: u32) !dns_record.ResourceRecord {
+    var rdata = dns_rdata.Unknown{};
+    const wire = (try dns_name.Name.fromText(next_text)).asWire();
+    @memcpy(rdata.data[0..wire.len], wire);
+    @memcpy(rdata.data[wire.len..][0..bitmap.len], bitmap);
+    rdata.len = @intCast(wire.len + bitmap.len);
+    return .{
+        .owner = try dns_name.Name.fromText(owner_text),
+        .rrtype = .NSEC,
+        .class = .IN,
+        .ttl = ttl,
+        .rdata = .{ .Unknown = rdata },
+    };
+}
+
+/// The RRSIG that covers an NSEC RRset (RFC 4034 section 3.2): the
+/// 18-octet header, the signer's name, and the signature.
+fn makeTestRrsigRecord(owner_text: []const u8, signer_text: []const u8, ttl: u32) !dns_record.ResourceRecord {
+    var rdata = dns_rdata.Unknown{};
+    const wire = (try dns_name.Name.fromText(signer_text)).asWire();
+    std.mem.writeInt(u16, rdata.data[0..2], dns_types.RecordType.NSEC.code(), .big);
+    rdata.data[2] = 8; // algorithm
+    rdata.data[3] = 2; // labels
+    std.mem.writeInt(u32, rdata.data[4..8], ttl, .big);
+    std.mem.writeInt(u32, rdata.data[8..12], 0xffff_ffff, .big); // expiration
+    std.mem.writeInt(u32, rdata.data[12..16], 0, .big); // inception
+    std.mem.writeInt(u16, rdata.data[16..18], 1234, .big); // key tag
+    @memcpy(rdata.data[18..][0..wire.len], wire);
+    @memset(rdata.data[18 + wire.len ..][0..8], 0x5a); // the signature
+    rdata.len = @intCast(18 + wire.len + 8);
+    return .{
+        .owner = try dns_name.Name.fromText(owner_text),
+        .rrtype = .RRSIG,
+        .class = .IN,
+        .ttl = ttl,
+        .rdata = .{ .Unknown = rdata },
+    };
+}
+
+/// The proofs an upstream answer carried for the closest encloser
+/// "example." and the name below it, with the RRSIG that covers each one
+/// when the answer carried it.
+fn harvestTestProofs(cache: *dnssec.AggressiveCache, now: i64, with_rrsig: bool) !void {
+    const bitmap = [_]u8{ 0x00, 0x06, 0x40, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    const records = [_]dns_record.ResourceRecord{
+        try makeTestSoa(3600, 3600),
+        try makeTestNsecRecord("example.", "mail.example.", &bitmap, 3600),
+        try makeTestNsecRecord("mail.example.", "www.example.", &bitmap, 3600),
+        try makeTestRrsigRecord("example.", "example.", 3600),
+        try makeTestRrsigRecord("mail.example.", "example.", 3600),
+    };
+    harvestSectionNsec(cache, if (with_rrsig) &records else records[0..3], now);
+}
+
+test "RFC 8020 section 2: a cut answer carries the NSEC proof and its RRSIG" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = try std.Io.net.IpAddress.parse("127.0.0.1", 9) },
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const now: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+    try harvestTestProofs(&resolver.dnssec_aggressive, now, true);
+
+    var client = try std.Io.net.IpAddress.parse("127.0.0.1", 42630);
+    var output: [4096]u8 = undefined;
+    var query = try makeTestQuery(arena.allocator(), 0x2900, "nx.example.", true);
+    defer query.deinit();
+    query.edns.?.dnssec_ok = true;
+    query.additionals.items[0].ttl |= 0x8000;
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    const answer = try dns_message.Message.parse(arena.allocator(), bytes);
+    try std.testing.expectEqual(dns_header.Rcode.nxdomain, answer.header.rcode);
+    // The proof rides in the authority section: the SOA, the two NSEC
+    // records the denial rests on, and the RRSIG that covers each.
+    var soa_count: usize = 0;
+    var nsec_count: usize = 0;
+    var rrsig_count: usize = 0;
+    for (answer.authorities.slice()) |record| {
+        if (record.rrtype.eql(.SOA)) soa_count += 1;
+        if (record.rrtype.eql(.NSEC)) nsec_count += 1;
+        if (record.rrtype.eql(.RRSIG)) rrsig_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), soa_count);
+    try std.testing.expectEqual(@as(usize, 2), nsec_count);
+    try std.testing.expectEqual(@as(usize, 2), rrsig_count);
+}
+
+test "RFC 8020 section 2: a cut answer for a client without DO carries no proof" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = try std.Io.net.IpAddress.parse("127.0.0.1", 9) },
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const now: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+    try harvestTestProofs(&resolver.dnssec_aggressive, now, true);
+
+    var client = try std.Io.net.IpAddress.parse("127.0.0.1", 42631);
+    var output: [4096]u8 = undefined;
+    // The first client asked for the proofs, so the denial is cached with
+    // them.
+    var first = try makeTestQuery(arena.allocator(), 0x2901, "nx.example.", true);
+    defer first.deinit();
+    first.edns.?.dnssec_ok = true;
+    first.additionals.items[0].ttl |= 0x8000;
+    var first_bytes: [1024]u8 = undefined;
+    const encoded_first = try encodeTestMessage(first, &first_bytes);
+    _ = try resolver.answer(encoded_first, first, &client, &output);
+
+    // The second client did not ask for the proofs: the cached denial is
+    // answered with the SOA and without the proof records.
+    var second = try makeTestQuery(arena.allocator(), 0x2902, "nx.example.", true);
+    defer second.deinit();
+    var second_bytes: [1024]u8 = undefined;
+    const encoded_second = try encodeTestMessage(second, &second_bytes);
+    const bytes = try resolver.answer(encoded_second, second, &client, &output);
+    const answer = try dns_message.Message.parse(arena.allocator(), bytes);
+    try std.testing.expectEqual(dns_header.Rcode.nxdomain, answer.header.rcode);
+    var soa_count: usize = 0;
+    for (answer.authorities.slice()) |record| {
+        try std.testing.expect(!record.rrtype.eql(.NSEC));
+        try std.testing.expect(!record.rrtype.eql(.RRSIG));
+        if (record.rrtype.eql(.SOA)) soa_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), soa_count);
+}
+
+test "RFC 8020 section 2: the cut answer for a name below the denial carries the cached proof" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = try std.Io.net.IpAddress.parse("127.0.0.1", 9) },
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const now: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+    try harvestTestProofs(&resolver.dnssec_aggressive, now, true);
+
+    var client = try std.Io.net.IpAddress.parse("127.0.0.1", 42632);
+    var output: [4096]u8 = undefined;
+    var first = try makeTestQuery(arena.allocator(), 0x2903, "nx.example.", true);
+    defer first.deinit();
+    first.edns.?.dnssec_ok = true;
+    first.additionals.items[0].ttl |= 0x8000;
+    var first_bytes: [1024]u8 = undefined;
+    const encoded_first = try encodeTestMessage(first, &first_bytes);
+    _ = try resolver.answer(encoded_first, first, &client, &output);
+
+    // The second client asks for a name below the denial: the answer comes
+    // from the cache with the proof, and the forwarder points at a closed
+    // port, so an upstream attempt would fail instead of answering.
+    var second = try makeTestQuery(arena.allocator(), 0x2904, "deep.nx.example.", true);
+    defer second.deinit();
+    second.edns.?.dnssec_ok = true;
+    second.additionals.items[0].ttl |= 0x8000;
+    var second_bytes: [1024]u8 = undefined;
+    const encoded_second = try encodeTestMessage(second, &second_bytes);
+    const bytes = try resolver.answer(encoded_second, second, &client, &output);
+    const answer = try dns_message.Message.parse(arena.allocator(), bytes);
+    try std.testing.expectEqual(dns_header.Rcode.nxdomain, answer.header.rcode);
+    var nsec_count: usize = 0;
+    var rrsig_count: usize = 0;
+    for (answer.authorities.slice()) |record| {
+        if (record.rrtype.eql(.NSEC)) nsec_count += 1;
+        if (record.rrtype.eql(.RRSIG)) rrsig_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), nsec_count);
+    try std.testing.expectEqual(@as(usize, 2), rrsig_count);
+}
+
+test "RFC 8020 section 2: a cut answer with no proof is served all the same" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = try std.Io.net.IpAddress.parse("127.0.0.1", 9) },
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const now: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+    // The upstream answer carried the NSEC without the RRSIG that covers
+    // it, so there is no proof to return.
+    try harvestTestProofs(&resolver.dnssec_aggressive, now, false);
+
+    var client = try std.Io.net.IpAddress.parse("127.0.0.1", 42633);
+    var output: [4096]u8 = undefined;
+    var query = try makeTestQuery(arena.allocator(), 0x2905, "nx.example.", true);
+    defer query.deinit();
+    query.edns.?.dnssec_ok = true;
+    query.additionals.items[0].ttl |= 0x8000;
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    const answer = try dns_message.Message.parse(arena.allocator(), bytes);
+    try std.testing.expectEqual(dns_header.Rcode.nxdomain, answer.header.rcode);
+    var soa_count: usize = 0;
+    for (answer.authorities.slice()) |record| {
+        try std.testing.expect(!record.rrtype.eql(.NSEC));
+        try std.testing.expect(!record.rrtype.eql(.RRSIG));
+        if (record.rrtype.eql(.SOA)) soa_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), soa_count);
+}
+
 test "RFC 8198 section 5.4: a synthesized denial lives as long as its proof" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3085,6 +3519,7 @@ test "RFC 8198 section 5.4: a synthesized denial lives as long as its proof" {
         now,
         3600,
         try makeTestSoa(3600, 3600),
+        .{},
     );
     resolver.dnssec_aggressive.insertNsec(
         try dns_name.Name.fromText("mail.example."),
@@ -3093,6 +3528,7 @@ test "RFC 8198 section 5.4: a synthesized denial lives as long as its proof" {
         now,
         3600,
         try makeTestSoa(3600, 3600),
+        .{},
     );
     var query = try makeTestQuery(arena.allocator(), 0x2864, "nx.example.", true);
     defer query.deinit();
@@ -3118,6 +3554,7 @@ test "RFC 8198 section 5.4: a synthesized denial lives as long as its proof" {
         now,
         200000,
         try makeTestSoa(200000, 200000),
+        .{},
     );
     capped.dnssec_aggressive.insertNsec(
         try dns_name.Name.fromText("mail.example."),
@@ -3126,6 +3563,7 @@ test "RFC 8198 section 5.4: a synthesized denial lives as long as its proof" {
         now,
         200000,
         try makeTestSoa(200000, 200000),
+        .{},
     );
     var capped_query = try makeTestQuery(arena.allocator(), 0x2865, "nx.example.", true);
     defer capped_query.deinit();
@@ -3157,6 +3595,7 @@ test "RFC 2308 section 5: a synthesized NODATA covers its own name only" {
         now,
         3600,
         try makeTestSoa(3600, 3600),
+        .{},
     );
 
     var client = try std.Io.net.IpAddress.parse("127.0.0.1", 42622);
@@ -3214,6 +3653,7 @@ test "RFC 2308 section 6: a cached denial carries the zone SOA" {
         now,
         3600,
         soa,
+        .{},
     );
     resolver.dnssec_aggressive.insertNsec(
         try dns_name.Name.fromText("mail.example."),
@@ -3222,6 +3662,7 @@ test "RFC 2308 section 6: a cached denial carries the zone SOA" {
         now,
         3600,
         soa,
+        .{},
     );
 
     var client = try std.Io.net.IpAddress.parse("127.0.0.1", 42623);
@@ -3281,6 +3722,7 @@ test "RFC 2308 section 5: the negative TTL of a synthesized denial is the SOA's"
         now,
         3600,
         soa,
+        .{},
     );
     resolver.dnssec_aggressive.insertNsec(
         try dns_name.Name.fromText("mail.example."),
@@ -3289,6 +3731,7 @@ test "RFC 2308 section 5: the negative TTL of a synthesized denial is the SOA's"
         now,
         3600,
         soa,
+        .{},
     );
 
     var client = try std.Io.net.IpAddress.parse("127.0.0.1", 42624);
@@ -3335,6 +3778,7 @@ test "RFC 2308 section 5: a denial without an SOA is not cached" {
         now,
         3600,
         null,
+        .{},
     );
     resolver.dnssec_aggressive.insertNsec(
         try dns_name.Name.fromText("mail.example."),
@@ -3343,6 +3787,7 @@ test "RFC 2308 section 5: a denial without an SOA is not cached" {
         now,
         3600,
         null,
+        .{},
     );
 
     var client = try std.Io.net.IpAddress.parse("127.0.0.1", 42625);
@@ -3392,6 +3837,7 @@ test "aggressive NSEC answers SERVFAIL with bogus EDE on malformed bitmap" {
         now,
         3600,
         null,
+        .{},
     );
     try std.testing.expectError(
         dnssec.Error.MalformedNsec,

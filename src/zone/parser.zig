@@ -5,6 +5,9 @@ const std = @import("std");
 const RecordType = @import("../dns/types.zig").RecordType;
 const dns_name = @import("../dns/name.zig");
 const dns_rdata = @import("../dns/rdata.zig");
+const dns_record = @import("../dns/record.zig");
+const Class = @import("../dns/types.zig").Class;
+const dns_writer = @import("../dns/writer.zig");
 
 /// Maximum temporary parser-owned backing used while loading one zone.
 pub const max_zone_allocation_bytes: usize = 16 * 1024 * 1024;
@@ -32,6 +35,9 @@ pub const ZoneRecord = struct {
     owner: []const u8 = &.{},
     ttl: u32,
     rrtype: RecordType,
+    /// The zone text of the record, or the RDATA octets of a record whose
+    /// type this server does not implement: that record is written in the
+    /// RFC 3597 generic form, and the zone keeps its octets whole.
     rdata: []const u8 = &.{},
 
     pub fn ownerText(self: *const ZoneRecord) []const u8 {
@@ -206,7 +212,15 @@ pub const ZoneFile = struct {
         };
         try self.expandOwner(allocator, owner_token, &record);
         errdefer allocator.free(record.owner);
-        record.rdata = try normalizeRData(allocator, record.rrtype, self.originText(), tokens.rest());
+        const rdata_text = tokens.rest();
+        // A type this server does not implement has no presentation form: its
+        // RDATA is written in the RFC 3597 generic form, and the zone keeps
+        // those octets whole.
+        if (isOpaqueType(record.rrtype)) {
+            record.rdata = try decodeGenericRdata(allocator, rdata_text);
+        } else {
+            record.rdata = try normalizeRData(allocator, record.rrtype, self.originText(), rdata_text);
+        }
         errdefer allocator.free(record.rdata);
         _ = try parseRData(record.rrtype, record.rdataText());
 
@@ -388,7 +402,9 @@ fn validateName(text: []const u8) Error!void {
 }
 
 /// Parses one supported zone-text RDATA value. Zone loading calls this before
-/// retaining a record; responses reuse it as a defensive conversion step.
+/// retaining a record; responses reuse it as a defensive conversion step. A
+/// type this server does not implement carries its RDATA whole, so the bytes
+/// given are the RDATA itself.
 pub fn parseRData(rrtype: RecordType, text: []const u8) Error!dns_rdata.RData {
     if (rrtype.eql(.A)) return .{ .A = try parseIpv4(text) };
     if (rrtype.eql(.AAAA)) return .{ .AAAA = try parseIpv6(text) };
@@ -421,7 +437,67 @@ pub fn parseRData(rrtype: RecordType, text: []const u8) Error!dns_rdata.RData {
     if (rrtype.eql(.NSEC3)) return .{ .Unknown = try parseNsec3(text) };
     if (rrtype.eql(.NSEC3PARAM)) return .{ .Unknown = try parseNsec3Param(text) };
     if (rrtype.eql(.ZONEMD)) return .{ .ZONEMD = try parseZonemd(text) };
-    return Error.BadRecord;
+    // RFC 3597 section 3: the RDATA of a type this server does not implement
+    // is unstructured binary data, stored and transmitted without change. The
+    // zone parser decodes the RFC 3597 generic form before it gets here, so
+    // the bytes given are the RDATA itself, borrowed from the caller's
+    // storage.
+    if (text.len > dns_rdata.max_opaque_rdata_len) return Error.BadRecord;
+    return .{ .Unknown = .{ .len = @intCast(text.len), .borrowed = text } };
+}
+
+/// True when the type has no presentation form, so a record of it is written
+/// in the RFC 3597 generic form and the zone keeps its RDATA whole.
+/// parseRData returns the text it is given, borrowed, for such a type, and
+/// parses or refuses the text for every other type.
+fn isOpaqueType(rrtype: RecordType) bool {
+    const parsed = parseRData(rrtype, "") catch return false;
+    return switch (parsed) {
+        .Unknown => |unknown| unknown.borrowed != null,
+        else => false,
+    };
+}
+
+/// RFC 3597 section 5: the RDATA of a record whose type this server does not
+/// implement is written in the generic form `\# <length> <hex>`, where the
+/// length is the RDLENGTH in octets. RFC 1035 section 3.2.1 makes RDLENGTH a
+/// 16-bit field, so the octets stop at the same 65535 the wire path accepts.
+/// The octets are copied into the caller's storage, which is the zone's own,
+/// so they stay valid for as long as the zone lives.
+fn decodeGenericRdata(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
+    const input = std.mem.trim(u8, text, " \t\r\n");
+    if (input.len < 2 or input[0] != '\\' or input[1] != '#') return Error.BadRecord;
+    const separators = " \t\r\n()";
+    const body = input[2..];
+    var tokens = std.mem.tokenizeAny(u8, body, separators);
+    const length = std.fmt.parseInt(usize, tokens.next() orelse return Error.BadRecord, 10) catch return Error.BadRecord;
+    if (length > dns_rdata.max_opaque_rdata_len) return Error.BadRecord;
+
+    var digits: usize = 0;
+    while (tokens.next()) |word| {
+        if (word.len % 2 != 0) return Error.BadRecord;
+        for (word) |byte| {
+            if (parseHexDigit(byte) == null) return Error.BadRecord;
+        }
+        digits += word.len;
+    }
+    if (digits / 2 != length) return Error.BadRecord;
+
+    const out = try allocator.alloc(u8, length);
+    errdefer allocator.free(out);
+    tokens = std.mem.tokenizeAny(u8, body, separators);
+    _ = tokens.next();
+    var index: usize = 0;
+    while (tokens.next()) |word| {
+        var offset: usize = 0;
+        while (offset < word.len) : (offset += 2) {
+            const high = parseHexDigit(word[offset]).?;
+            const low = parseHexDigit(word[offset + 1]).?;
+            out[index] = (high << 4) | low;
+            index += 1;
+        }
+    }
+    return out;
 }
 
 /// DNSSEC zone RDATA is served opaque (RFC 4034/5155 wire bytes in an Unknown
@@ -1654,6 +1730,116 @@ test "zone parser loads opaque DNSSEC records in presentation and generic form" 
     try std.testing.expectError(Error.BadRecord, parseRData(.DNSKEY, "257 3"));
     try std.testing.expectError(Error.BadRecord, parseRData(.NSEC, "next.example."));
     try std.testing.expectError(Error.BadRecord, parseRData(.DS, "1 2 3 ODD"));
+}
+
+/// The RFC 3597 section 5 generic form of an opaque record whose octets count
+/// up from zero, so the served bytes can be checked one for one.
+fn writeGenericRecordText(writer: *std.Io.Writer, length: usize) !void {
+    try writer.print("\\# {} ", .{length});
+    var index: usize = 0;
+    while (index < length) : (index += 1) {
+        try writer.print("{x:0>2}", .{@as(u8, @truncate(index))});
+    }
+}
+
+/// A zone file with one opaque record of the given length, as the RFC 3597
+/// generic form of a type this server does not implement.
+fn zoneWithGenericRecord(length: usize) !std.Io.Writer.Allocating {
+    var text: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    errdefer text.deinit();
+    try text.writer.writeAll(
+        "$ORIGIN example.\n" ++
+            "$TTL 3600\n" ++
+            "@ IN SOA ns hostmaster 1 3600 900 1209600 3600\n" ++
+            "@ IN NS ns\n" ++
+            "big IN TYPE65280 ",
+    );
+    try writeGenericRecordText(&text.writer, length);
+    try text.writer.writeAll("\n");
+    return text;
+}
+
+test "zone parser keeps a generic record whole" {
+    // RFC 3597 section 3: the RDATA of a type this server does not implement
+    // is unstructured binary data, stored and transmitted without change, so
+    // a record longer than the inline opaque buffer is kept whole.
+    const length = 4096;
+    var text = try zoneWithGenericRecord(length);
+    defer text.deinit();
+
+    var zone = try ZoneFile.parse(text.written());
+    defer zone.deinit();
+    try std.testing.expectEqual(@as(usize, 3), zone.records.len);
+
+    const record = zone.records.items[2];
+    try std.testing.expectEqualStrings("big.example.", record.ownerText());
+    try std.testing.expectEqual(@as(usize, length), record.rdataText().len);
+
+    // The octets live in the zone's own storage, so they stay valid as long
+    // as the zone does.
+    const start = @intFromPtr(zone.backing.ptr);
+    const octets_start = @intFromPtr(record.rdataText().ptr);
+    try std.testing.expect(octets_start >= start);
+    try std.testing.expect(octets_start + length <= start + zone.backing.len);
+
+    const rdata = try parseRData(record.rrtype, record.rdataText());
+    try std.testing.expectEqual(@as(usize, length), rdata.Unknown.bytes().len);
+    for (rdata.Unknown.bytes(), 0..) |byte, index| {
+        try std.testing.expectEqual(@as(u8, @truncate(index)), byte);
+    }
+
+    // The record the response path builds carries those octets on the wire
+    // unchanged.
+    var buffer: [length + 512]u8 = undefined;
+    var writer = dns_writer.Writer.init(&buffer);
+    const resource = dns_record.ResourceRecord{
+        .owner = try dns_name.Name.fromText(record.ownerText()),
+        .rrtype = record.rrtype,
+        .class = Class.IN,
+        .ttl = record.ttl,
+        .rdata = rdata,
+    };
+    try resource.encode(&writer);
+    const wire = writer.written();
+    try std.testing.expectEqualSlices(u8, rdata.Unknown.bytes(), wire[wire.len - length ..]);
+}
+
+test "zone parser accepts a generic record at the opaque bound and refuses one past it" {
+    // RFC 1035 section 3.2.1: RDLENGTH is a 16-bit field, so the RDATA is at
+    // most 65535 octets, the same bound the wire path accepts.
+    const bound = dns_rdata.max_opaque_rdata_len;
+    var at_bound = try zoneWithGenericRecord(bound);
+    defer at_bound.deinit();
+
+    var zone = try ZoneFile.parse(at_bound.written());
+    defer zone.deinit();
+    try std.testing.expectEqual(@as(usize, 3), zone.records.len);
+    try std.testing.expectEqual(@as(usize, bound), zone.records.items[2].rdataText().len);
+
+    var past_bound = try zoneWithGenericRecord(bound + 1);
+    defer past_bound.deinit();
+    try std.testing.expectError(Error.BadRecord, ZoneFile.parse(past_bound.written()));
+}
+
+test "zone parser refuses an unknown type that is not in the generic form" {
+    // RFC 3597 section 5: the RDATA of an unknown type is written in the
+    // generic form, so any other text is a malformed record.
+    try std.testing.expectError(Error.BadRecord, ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns hostmaster 1 3600 900 1209600 3600
+        \\@ IN NS ns
+        \\big IN TYPE65280 hello
+        \\
+    ));
+    try std.testing.expectError(Error.BadRecord, ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns hostmaster 1 3600 900 1209600 3600
+        \\@ IN NS ns
+        \\big IN TYPE65280 \# 4 0A0000
+        \\
+    ));
 }
 
 test "zone parser loads origin ttl and basic records" {

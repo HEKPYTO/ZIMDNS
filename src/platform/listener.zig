@@ -1,5 +1,5 @@
-/// Contract: Serves bounded DNS UDP/TCP request streams through Runtime; UDP may use
-/// its explicit forwarding policy after authoritative selection, while TCP stays authoritative-only.
+/// Contract: Serves bounded DNS UDP/TCP request streams through Runtime; both transports
+/// use the same dispatch, so a forwarding query is answered over either one.
 /// Ownership: Runtime is borrowed; socket streams are consumed/closed by the listener; wire buffers are local.
 /// Errors: DNS failures are typed; socket read/write and bind failures propagate as I/O errors.
 const std = @import("std");
@@ -7,6 +7,9 @@ const builtin = @import("builtin");
 const Runtime = @import("../auth/runtime.zig").Runtime;
 const metrics = @import("../metrics.zig");
 const response_mod = @import("../auth/response.zig");
+const config = @import("../config/parser.zig");
+const resolver_mod = @import("../resolver.zig");
+const dns_message = @import("../dns/message.zig");
 const dns_tsig = @import("../dns/tsig.zig");
 const dns_rdata = @import("../dns/rdata.zig");
 const dns_record = @import("../dns/record.zig");
@@ -898,6 +901,313 @@ test "TCP loop ignores malformed and idle connections before a valid query" {
     try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
 }
 
+test "a forwarding query over the inbound TCP path is answered with the upstream's answer" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+    var upstream = ForwardingUpstream{ .io = io, .udp = &upstream_socket };
+    const upstream_thread = try std.Thread.spawn(.{}, serveForwardingUpstream, .{&upstream});
+
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+    runtime.resolver = try resolver_mod.Resolver.init(std.testing.allocator, io, try forwarding_policy(upstream_socket.address, "127.0.0.0/8"));
+
+    var listen_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try std.Io.net.IpAddress.listen(&listen_addr, io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    var client_stream = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer client_stream.close(io);
+
+    var query_buffer: [512]u8 = undefined;
+    const query = try @import("../cli/query.zig").buildQueryPacket(&query_buffer, 0x7101, "example.com.", .A, false);
+    try @import("../cli/query.zig").sendTcpQuery(client_stream, io, query);
+    try client_stream.shutdown(io, .send);
+
+    const server_stream = try server.accept(io);
+    defer server_stream.close(io);
+    // The accepted socket carries the peer's address, so the policy sees the
+    // client and not the listener.
+    try std.testing.expect(server_stream.socket.address.getPort() != server.socket.address.getPort());
+    try serveTcpStreamOnce(server_stream, io, &runtime);
+    upstream_thread.join();
+
+    var response_buffer: [512]u8 = undefined;
+    const response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query);
+    try std.testing.expectEqual(@as(u16, 0x7101), response.header.id);
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+    try std.testing.expectEqualSlices(u8, &.{ 192, 0, 2, 1 }, &response.answers.items[0].rdata.A);
+    try std.testing.expectEqual(@as(usize, 1), upstream.requests);
+}
+
+test "the same forwarding query over UDP is answered the same way" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+    var upstream = ForwardingUpstream{ .io = io, .udp = &upstream_socket };
+    const upstream_thread = try std.Thread.spawn(.{}, serveForwardingUpstream, .{&upstream});
+
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+    runtime.resolver = try resolver_mod.Resolver.init(std.testing.allocator, io, try forwarding_policy(upstream_socket.address, "127.0.0.0/8"));
+
+    var server_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server_socket = try std.Io.net.IpAddress.bind(&server_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer server_socket.close(io);
+    var client_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var client_socket = try std.Io.net.IpAddress.bind(&client_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer client_socket.close(io);
+
+    var query_buffer: [512]u8 = undefined;
+    const query = try @import("../cli/query.zig").buildQueryPacket(&query_buffer, 0x7102, "example.com.", .A, false);
+    try client_socket.send(io, &server_socket.address, query);
+    try serveUdpOnce(&server_socket, io, &runtime);
+    upstream_thread.join();
+
+    var response_buffer: [512]u8 = undefined;
+    const response = try @import("../cli/query.zig").receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    try std.testing.expectEqual(@as(u16, 0x7102), response.header.id);
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+    try std.testing.expectEqualSlices(u8, &.{ 192, 0, 2, 1 }, &response.answers.items[0].rdata.A);
+}
+
+test "an authoritative query over the inbound TCP path is unchanged" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // A forwarder is configured but must never see the zone's own name.
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+    runtime.resolver = try resolver_mod.Resolver.init(std.testing.allocator, io, try forwarding_policy(upstream_socket.address, "127.0.0.0/8"));
+
+    var listen_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try std.Io.net.IpAddress.listen(&listen_addr, io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    var client_stream = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer client_stream.close(io);
+
+    var query_buffer: [512]u8 = undefined;
+    const query = try @import("../cli/query.zig").buildQueryPacket(&query_buffer, 0x7103, "dns.home.arpa.", .A, false);
+    try @import("../cli/query.zig").sendTcpQuery(client_stream, io, query);
+    try client_stream.shutdown(io, .send);
+
+    const server_stream = try server.accept(io);
+    defer server_stream.close(io);
+    try serveTcpStreamOnce(server_stream, io, &runtime);
+
+    var response_buffer: [512]u8 = undefined;
+    const response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query);
+    try std.testing.expectEqual(@as(u16, 0x7103), response.header.id);
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+    try std.testing.expectEqualSlices(u8, &.{ 192, 168, 1, 1 }, &response.answers.items[0].rdata.A);
+    try std.testing.expect(response.header.authoritative);
+}
+
+test "the recursion ACL refuses a TCP client the UDP path refuses" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+    runtime.resolver = try resolver_mod.Resolver.init(std.testing.allocator, io, try forwarding_policy(upstream_socket.address, "192.0.2.0/24"));
+
+    var listen_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try std.Io.net.IpAddress.listen(&listen_addr, io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    var client_stream = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer client_stream.close(io);
+
+    var query_buffer: [512]u8 = undefined;
+    const query = try @import("../cli/query.zig").buildQueryPacket(&query_buffer, 0x7104, "example.com.", .A, false);
+    try @import("../cli/query.zig").sendTcpQuery(client_stream, io, query);
+    try client_stream.shutdown(io, .send);
+
+    const server_stream = try server.accept(io);
+    defer server_stream.close(io);
+    try serveTcpStreamOnce(server_stream, io, &runtime);
+
+    var response_buffer: [512]u8 = undefined;
+    const response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query);
+    try std.testing.expectEqual(@as(@TypeOf(response.header.rcode), .refused), response.header.rcode);
+    try std.testing.expectEqual(@as(u16, 0), response.header.answer_count);
+}
+
+test "a TCP query whose upstream truncates is retried over TCP upstream" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+    // The upstream answers the retry over TCP on the port the UDP answer
+    // came from.
+    var upstream_tcp_addr = upstream_socket.address;
+    var upstream_tcp = try std.Io.net.IpAddress.listen(&upstream_tcp_addr, io, .{ .reuse_address = true });
+    defer upstream_tcp.deinit(io);
+    var upstream = TruncatingUpstream{ .io = io, .udp = &upstream_socket, .tcp = &upstream_tcp };
+    const upstream_thread = try std.Thread.spawn(.{}, serveTruncatingUpstream, .{&upstream});
+
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+    runtime.resolver = try resolver_mod.Resolver.init(std.testing.allocator, io, try forwarding_policy(upstream_socket.address, "127.0.0.0/8"));
+
+    var listen_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try std.Io.net.IpAddress.listen(&listen_addr, io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    var client_stream = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer client_stream.close(io);
+
+    var query_buffer: [512]u8 = undefined;
+    const query = try @import("../cli/query.zig").buildQueryPacket(&query_buffer, 0x7105, "example.com.", .A, false);
+    try @import("../cli/query.zig").sendTcpQuery(client_stream, io, query);
+    try client_stream.shutdown(io, .send);
+
+    const server_stream = try server.accept(io);
+    defer server_stream.close(io);
+    try serveTcpStreamOnce(server_stream, io, &runtime);
+    upstream_thread.join();
+
+    var response_buffer: [512]u8 = undefined;
+    const response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query);
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+    try std.testing.expectEqualSlices(u8, &.{ 192, 0, 2, 1 }, &response.answers.items[0].rdata.A);
+    try std.testing.expect(!response.header.truncated);
+    try std.testing.expectEqual(@as(usize, 1), upstream.tcp_requests);
+}
+
+/// A forwarding policy that points at the fake upstream and allows the
+/// clients of the CIDR the test names.
+fn forwarding_policy(upstream: std.Io.net.IpAddress, allowed: []const u8) !resolver_mod.Policy {
+    var policy = resolver_mod.Policy{ .forwarder = .{ .address = upstream } };
+    policy.recursion_allow[0] = try config.Cidr.parse(allowed);
+    policy.recursion_allow_len = 1;
+    return policy;
+}
+
+/// The fake upstream a forwarding test forwards to. It answers the question
+/// it is asked with one A record.
+const ForwardingUpstream = struct {
+    io: std.Io,
+    udp: *const std.Io.net.Socket,
+    requests: usize = 0,
+};
+
+const upstream_timeout: std.Io.Timeout = .{ .duration = .{
+    .raw = .fromSeconds(2),
+    .clock = .awake,
+} };
+
+fn serveForwardingUpstream(args: *ForwardingUpstream) void {
+    var request_buffer: [512]u8 = undefined;
+    const incoming = args.udp.receiveTimeout(args.io, &request_buffer, upstream_timeout) catch return;
+    args.requests += 1;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const query = dns_message.Message.parseQuery(arena.allocator(), incoming.data) catch return;
+    var response_buffer: [512]u8 = undefined;
+    const bytes = buildForwardingAnswer(&response_buffer, query, false) catch return;
+    args.udp.send(args.io, &incoming.from, bytes) catch return;
+}
+
+/// The fake upstream that truncates its UDP answer and answers the retry
+/// over TCP.
+const TruncatingUpstream = struct {
+    io: std.Io,
+    udp: *const std.Io.net.Socket,
+    tcp: *std.Io.net.Server,
+    tcp_requests: usize = 0,
+};
+
+fn serveTruncatingUpstream(args: *TruncatingUpstream) void {
+    var request_buffer: [512]u8 = undefined;
+    const incoming = args.udp.receiveTimeout(args.io, &request_buffer, upstream_timeout) catch return;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const query = dns_message.Message.parseQuery(arena.allocator(), incoming.data) catch return;
+    var response_buffer: [512]u8 = undefined;
+    const truncated = buildForwardingAnswer(&response_buffer, query, true) catch return;
+    args.udp.send(args.io, &incoming.from, truncated) catch return;
+
+    const stream = args.tcp.accept(args.io) catch return;
+    defer stream.close(args.io);
+    args.tcp_requests += 1;
+    var read_buffer: [1024]u8 = undefined;
+    var reader = stream.reader(args.io, &read_buffer);
+    const length_bytes = reader.interface.takeArray(2) catch return;
+    const length = std.mem.readInt(u16, length_bytes, .big);
+    if (length == 0 or length > 512) return;
+    var tcp_query: [512]u8 = undefined;
+    reader.interface.readSliceAll(tcp_query[0..length]) catch return;
+    var tcp_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer tcp_arena.deinit();
+    const tcp_message = dns_message.Message.parseQuery(tcp_arena.allocator(), tcp_query[0..length]) catch return;
+    var tcp_response_buffer: [512]u8 = undefined;
+    const bytes = buildForwardingAnswer(&tcp_response_buffer, tcp_message, false) catch return;
+    var write_buffer: [1024]u8 = undefined;
+    var writer = stream.writer(args.io, &write_buffer);
+    var response_length: [2]u8 = undefined;
+    std.mem.writeInt(u16, &response_length, @intCast(bytes.len), .big);
+    writer.interface.writeAll(&response_length) catch return;
+    writer.interface.writeAll(bytes) catch return;
+    writer.interface.flush() catch return;
+}
+
+/// The answer the fake upstream sends for the question it was asked. A
+/// truncated answer carries the TC bit, so the resolver retries over TCP.
+fn buildForwardingAnswer(buffer: []u8, query: dns_message.Message, truncated: bool) ![]const u8 {
+    const question = query.question orelse return error.NoQuestion;
+    var message = dns_message.Message{
+        .allocator = query.allocator,
+        .header = .{
+            .id = query.header.id,
+            .qr = true,
+            .truncated = truncated,
+            .recursion_desired = true,
+            .recursion_available = true,
+            .rcode = .no_error,
+            .question_count = 1,
+        },
+        .question = question,
+    };
+    defer message.deinit();
+    message.answers = try dns_message.RecordSection.init(query.allocator, 0);
+    message.authorities = try dns_message.RecordSection.init(query.allocator, 0);
+    message.additionals = try dns_message.RecordSection.init(query.allocator, 0);
+    try message.answers.append(.{
+        .owner = question.name,
+        .rrtype = .A,
+        .class = .IN,
+        .ttl = 300,
+        .rdata = .{ .A = .{ 192, 0, 2, 1 } },
+    });
+    message.header.answer_count = 1;
+    var writer = dns_writer.Writer.init(buffer);
+    try message.encode(&writer);
+    return writer.written();
+}
+
 const test_zone =
     \\$ORIGIN home.arpa.
     \\$TTL 3600
@@ -999,10 +1309,14 @@ const unix_tcp_deadlines = if (TCP_DEADLINES_SUPPORTED) struct {
                 try serveTransfer(request, stream, io, runtime, timeout, counters);
                 continue;
             }
+            // RFC 9210 section 3: a query that arrived over TCP is answered
+            // the way the same query over UDP is answered, forwarding
+            // included, and the peer address is the client the policy sees.
+            const client = &stream.socket.address;
             const response_bytes = if (counters) |value|
-                try runtime.answerWithMetrics(request, &response_buffer, value)
+                try runtime.answerFromWithMetrics(request, &response_buffer, client, value)
             else
-                try runtime.answer(request, &response_buffer);
+                try runtime.answerFrom(request, &response_buffer, client);
             if (response_bytes.len > TCP_MAX_FRAME_SIZE) return Error.ResponseTooLarge;
 
             var prefix: [2]u8 = undefined;

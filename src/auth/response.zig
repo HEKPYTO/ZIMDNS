@@ -898,25 +898,32 @@ pub fn buildRefusedResponse(request: dns_message.Message) !dns_message.Message {
 pub const EDE_BLOCKED: u16 = 15;
 /// RFC 8914 section 2: the EDE EDNS0 option code is 15.
 const ede_option_code: u16 = 15;
+/// RFC 8914 section 3: the EXTRA-TEXT says why the answer is what it is.
+/// It names the operator's policy and nothing else, so it tells the client
+/// no more than the INFO-CODE already does.
+const ede_blocked_text: []const u8 = "blocked by policy";
 
 /// A refusal that says why: the operator's blocklist refused the name, which
 /// is a policy decision and not a broken server.
 pub fn buildBlockedResponse(request: dns_message.Message) !dns_message.Message {
     var response = try buildRefusedResponse(request);
     errdefer response.deinit();
-    appendEde(&response, EDE_BLOCKED);
+    appendEde(&response, EDE_BLOCKED, ede_blocked_text);
     return response;
 }
 
 /// RFC 8914 section 2: the EDE option rides in the OPT record, and the RFC
 /// allows it "in any response ... to a query that includes an OPT pseudo-RR",
-/// so a query that carried no OPT gets no EDE option. The EXTRA-TEXT is
-/// empty: the INFO-CODE alone names the reason.
-fn appendEde(message: *dns_message.Message, code: u16) void {
+/// so a query that carried no OPT gets no EDE option. The OPTION-DATA is the
+/// 16-bit INFO-CODE followed by the EXTRA-TEXT, so the OPTION-LENGTH is two
+/// plus the text's length.
+fn appendEde(message: *dns_message.Message, code: u16, text: []const u8) void {
     if (message.edns == null) return;
-    var data: [2]u8 = undefined;
-    std.mem.writeInt(u16, &data, code, .big);
-    _ = optOf(message).appendOption(ede_option_code, &data);
+    var data: [2 + 32]u8 = undefined;
+    std.debug.assert(text.len <= 32);
+    std.mem.writeInt(u16, data[0..2], code, .big);
+    @memcpy(data[2..][0..text.len], text);
+    _ = optOf(message).appendOption(ede_option_code, data[0 .. 2 + text.len]);
 }
 
 pub fn buildFormerrResponse(request: dns_message.Message) !dns_message.Message {
@@ -3375,12 +3382,59 @@ test "RFC 8914: a blocked refusal differs from a plain refusal only by the EDE o
     try blocked.encode(&blocked_writer);
 
     // The OPT record ends the answer, so its RDLENGTH is the last two octets:
-    // the blocked answer is the plain one with the six octets of the EDE
-    // option and the RDLENGTH that counts them.
+    // the blocked answer is the plain one with the twenty-three octets of the
+    // EDE option and the RDLENGTH that counts them.
     const plain_wire = plain_writer.written();
     const blocked_wire = blocked_writer.written();
-    try std.testing.expectEqual(plain_wire.len + 6, blocked_wire.len);
+    try std.testing.expectEqual(plain_wire.len + 23, blocked_wire.len);
     try std.testing.expectEqualSlices(u8, plain_wire[0 .. plain_wire.len - 2], blocked_wire[0 .. plain_wire.len - 2]);
-    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x06 }, blocked_wire[plain_wire.len - 2 ..][0..2]);
-    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x0f, 0x00, 0x02, 0x00, 0x0f }, blocked_wire[plain_wire.len..]);
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x17 }, blocked_wire[plain_wire.len - 2 ..][0..2]);
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x0f, 0x00, 0x13, 0x00, 0x0f }, blocked_wire[plain_wire.len..][0..6]);
+    try std.testing.expectEqualStrings("blocked by policy", blocked_wire[plain_wire.len + 6 ..]);
+}
+
+test "RFC 8914: the blocked refusal's EDE option carries its Extra Text" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var request = try testQuery(arena.allocator(), "ads.home.arpa.", .A);
+    request.edns = .{ .udp_payload_size = 1232, .extended_rcode = 0, .version = 0, .dnssec_ok = false };
+    try request.additionals.append(.{
+        .owner = dns_name.Name.root(),
+        .rrtype = .OPT,
+        .class = dns_types.Class.fromCode(1232),
+        .ttl = 0,
+        .rdata = .{ .OPT = .{} },
+    });
+
+    const blocked = try buildBlockedResponse(request);
+    const options = ednsOptions(&blocked).?;
+    // RFC 8914 section 2: the OPTION-CODE is 15 and the OPTION-LENGTH is two
+    // plus the length of the EXTRA-TEXT.
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x0f }, options[0..2]);
+    try std.testing.expectEqual(@as(usize, 2 + "blocked by policy".len), std.mem.readInt(u16, options[2..4], .big));
+    // The INFO-CODE is the 16-bit Blocked code in network byte order, and the
+    // EXTRA-TEXT says why the name was refused.
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x0f }, options[4..6]);
+    try std.testing.expectEqualStrings("blocked by policy", options[6..]);
+}
+
+test "RFC 8914: a plain refusal carries no EDE option" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var request = try testQuery(arena.allocator(), "ads.home.arpa.", .A);
+    request.edns = .{ .udp_payload_size = 1232, .extended_rcode = 0, .version = 0, .dnssec_ok = false };
+    try request.additionals.append(.{
+        .owner = dns_name.Name.root(),
+        .rrtype = .OPT,
+        .class = dns_types.Class.fromCode(1232),
+        .ttl = 0,
+        .rdata = .{ .OPT = .{} },
+    });
+
+    const refused = try buildRefusedResponse(request);
+    const options = ednsOptions(&refused).?;
+    try std.testing.expectEqualSlices(u8, &.{}, options);
+    try std.testing.expect(dns_rdata.findOption(options, ede_option_code) == null);
 }

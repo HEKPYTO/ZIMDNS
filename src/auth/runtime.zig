@@ -1,4 +1,6 @@
-/// Contract: Answers authoritative zones first and optionally forwards authorized UDP queries.
+/// Contract: Answers authoritative zones first and optionally forwards authorized queries.
+/// The forwarding dispatch takes the client address, so one query is answered the same
+/// way over UDP and over TCP.
 /// Ownership: Runtime owns its Zone and inline Blocklist; call Runtime.deinit; query and output buffers are borrowed.
 /// Errors: Query and response failures are typed; transport I/O is handled by platform listeners.
 const std = @import("std");
@@ -50,6 +52,18 @@ pub const ReloadOutcome = enum {
     serial_not_newer,
     /// The served zone is signed at startup, and a reload cannot re-sign it.
     signed_zone,
+};
+
+/// What one TSIG key file replacement did. The served keys change only when
+/// the outcome is `replaced`; every other outcome keeps the keys the server
+/// already has.
+pub const KeyReloadOutcome = enum {
+    /// The keyring was replaced by the one the key file provides.
+    replaced,
+    /// No key file is configured, so there is nothing to reload.
+    no_source,
+    /// The key file could not be read or the key text could not be parsed.
+    load_failed,
 };
 
 const TsigAuth = struct {
@@ -265,11 +279,45 @@ pub const Runtime = struct {
         self.reload_requested.store(true, .release);
     }
 
-    /// Replaces the configured zone when a reload was requested. Returns the
-    /// outcome, or null when no reload was pending.
+    /// Replaces the configured zone and the TSIG keys when a reload was
+    /// requested. Returns the zone outcome, or null when no reload was
+    /// pending.
     pub fn reloadZoneIfRequested(self: *Runtime, io: std.Io) ?ReloadOutcome {
         if (!self.reload_requested.swap(false, .acq_rel)) return null;
+        // A key file that cannot be read leaves the served keys in place,
+        // so the zone is still replaced.
+        _ = self.reloadKeyring(io);
         return self.reloadZone(io);
+    }
+
+    /// Re-reads the TSIG key file and replaces the keyring it provides.
+    /// The file is read and parsed completely before the served keyring
+    /// changes, so a missing, unreadable, or malformed file leaves the keys
+    /// the server already has in place.
+    pub fn reloadKeyring(self: *Runtime, io: std.Io) KeyReloadOutcome {
+        const source = self.keyring.source orelse return .no_source;
+        const text = source.dir.readFileAlloc(io, source.path(), self.allocator, .limited(1024 * 1024)) catch |err| {
+            reportReload(io, "error: cannot read the TSIG key file {s}: {t}", .{ source.path(), err });
+            return .load_failed;
+        };
+        defer {
+            // The key text holds the secrets in their file form.
+            std.crypto.secureZero(u8, text);
+            self.allocator.free(text);
+        }
+        var ring = keyring_mod.Keyring.parse(text) catch |err| {
+            reportReload(io, "error: cannot parse the TSIG key file {s}: {t}", .{ source.path(), err });
+            return .load_failed;
+        };
+        self.lock();
+        defer self.unlock();
+        // The swap happens under the lock, so a request is verified against
+        // the old keyring or the new one, never a half-built one.
+        self.keyring.replace(&ring);
+        // The runtime holds the only remaining copy of the new secrets.
+        ring.deinit();
+        reportReload(io, "reloaded the TSIG key file {s}: {d} key(s)", .{ source.path(), self.keyring.len });
+        return .replaced;
     }
 
     /// Re-reads the configured zone file and replaces the zone it provides.
@@ -1304,6 +1352,161 @@ test "runtime refuses a request whose algorithm no key of the name carries" {
     try std.testing.expectEqual(@as(usize, 0), parsed.additionals.items[0].rdata.TSIG.macBytes().len);
 }
 
+const reload_zone_text =
+    \\$ORIGIN home.arpa.
+    \\$TTL 3600
+    \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+    \\@ IN NS ns1.home.arpa.
+    \\dns IN A 192.168.1.1
+    \\
+;
+
+test "a reload adds the TSIG key the new key file names" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const now = 1_700_000_000;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{
+        .sub_path = "tsig.keys",
+        .data = "key \"new.\" { algorithm hmac-sha256; secret \"YWFhYWJiYmJjY2NjZGRkZGVlZWVmZmZmZ2dnZ2hoaGg=\"; };\n",
+    });
+
+    var keyring = try keyring_mod.Keyring.parse(
+        "key \"key.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };",
+    );
+    try keyring.setSource(dir.dir, "tsig.keys");
+    var runtime = try Runtime.fromZoneTextWithKeyring(reload_zone_text, &keyring);
+    defer runtime.deinit();
+    runtime.setTsigNow(now);
+
+    const added = TestKey{ .algorithm = "hmac-sha256.", .secret = "aaaabbbbccccddddeeeeffffgggghhhh", .name = "new." };
+    const query = try makeSignedQueryWithKey(now, 32, added);
+    var output: [1024]u8 = undefined;
+
+    // The key file is not read yet, so the key is unknown.
+    var response_bytes = try runtime.answer(query.packet[0..query.len], &output);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@as(@TypeOf(parsed.header.rcode), .notauth), parsed.header.rcode);
+    try std.testing.expectEqual(@as(u16, 17), parsed.additionals.items[0].rdata.TSIG.error_code);
+
+    // A SIGHUP re-reads the key file as well as the zone. No zone file is
+    // configured here, so the zone reload has nothing to do; the key file
+    // is read all the same.
+    runtime.requestZoneReload();
+    try std.testing.expectEqual(ReloadOutcome.no_source, runtime.reloadZoneIfRequested(io).?);
+
+    response_bytes = try runtime.answer(query.packet[0..query.len], &output);
+    parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@as(@TypeOf(parsed.header.rcode), .no_error), parsed.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.answer_count);
+    const request_final = (try tsig.parseFinalAdditional(query.packet[0..query.len])).?;
+    const response_final = (try tsig.parseFinalAdditional(response_bytes)).?;
+    try std.testing.expectEqual(@as(u16, 0), response_final.tsig.error_code);
+    _ = try tsig.verify(response_bytes, added.secret, request_final.tsig.macBytes(), 32);
+}
+
+test "a reload drops the TSIG key the new key file no longer names" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const now = 1_700_000_000;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{
+        .sub_path = "tsig.keys",
+        .data = "key \"other.\" { algorithm hmac-sha256; secret \"YWFhYWJiYmJjY2NjZGRkZGVlZWVmZmZmZ2dnZ2hoaGg=\"; };\n",
+    });
+
+    var keyring = try keyring_mod.Keyring.parse(
+        "key \"key.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };",
+    );
+    try keyring.setSource(dir.dir, "tsig.keys");
+    var runtime = try Runtime.fromZoneTextWithKeyring(reload_zone_text, &keyring);
+    defer runtime.deinit();
+    runtime.setTsigNow(now);
+
+    const query = try makeSignedQuery(now, 32);
+    var output: [1024]u8 = undefined;
+    var response_bytes = try runtime.answer(query.packet[0..query.len], &output);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@as(@TypeOf(parsed.header.rcode), .no_error), parsed.header.rcode);
+
+    try std.testing.expectEqual(KeyReloadOutcome.replaced, runtime.reloadKeyring(io));
+
+    response_bytes = try runtime.answer(query.packet[0..query.len], &output);
+    parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@as(@TypeOf(parsed.header.rcode), .notauth), parsed.header.rcode);
+    try std.testing.expectEqual(@as(u16, 17), parsed.additionals.items[0].rdata.TSIG.error_code);
+    try std.testing.expectEqual(@as(usize, 0), parsed.additionals.items[0].rdata.TSIG.macBytes().len);
+}
+
+test "a reload with a malformed key file keeps the served keys" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const now = 1_700_000_000;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{ .sub_path = "tsig.keys", .data = "this is not a key file\n" });
+
+    var keyring = try keyring_mod.Keyring.parse(
+        "key \"key.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };",
+    );
+    try keyring.setSource(dir.dir, "tsig.keys");
+    var runtime = try Runtime.fromZoneTextWithKeyring(reload_zone_text, &keyring);
+    defer runtime.deinit();
+    runtime.setTsigNow(now);
+
+    try std.testing.expectEqual(KeyReloadOutcome.load_failed, runtime.reloadKeyring(io));
+
+    // The server keeps answering with the keys it already has.
+    const query = try makeSignedQuery(now, 32);
+    var output: [1024]u8 = undefined;
+    var response_bytes = try runtime.answer(query.packet[0..query.len], &output);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@as(@TypeOf(parsed.header.rcode), .no_error), parsed.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.answer_count);
+
+    // A key file that is gone is the same failure, and the same answer.
+    try dir.dir.deleteFile(io, "tsig.keys");
+    try std.testing.expectEqual(KeyReloadOutcome.load_failed, runtime.reloadKeyring(io));
+    response_bytes = try runtime.answer(query.packet[0..query.len], &output);
+    parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@as(@TypeOf(parsed.header.rcode), .no_error), parsed.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.answer_count);
+}
+
+test "a reload wipes the secrets of the keyring it replaces" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{
+        .sub_path = "tsig.keys",
+        .data = "key \"other.\" { algorithm hmac-sha256; secret \"YWFhYWJiYmJjY2NjZGRkZGVlZWVmZmZmZ2dnZ2hoaGg=\"; };\n",
+    });
+
+    var keyring = try keyring_mod.Keyring.parse(
+        "key \"key.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };" ++
+            "key \"second.\" { algorithm hmac-sha256; secret \"MTExMTIyMjIzMzMzNDQ0NDU1NTU2NjY2Nzc3Nzg4ODg=\"; };",
+    );
+    try keyring.setSource(dir.dir, "tsig.keys");
+    var runtime = try Runtime.fromZoneTextWithKeyring(reload_zone_text, &keyring);
+    defer runtime.deinit();
+
+    try std.testing.expectEqual(KeyReloadOutcome.replaced, runtime.reloadKeyring(io));
+
+    // The slot the replaced keyring used holds no secret any more.
+    try std.testing.expectEqual(@as(usize, 1), runtime.keyring.len);
+    for (runtime.keyring.keys[1].secret) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+    try std.testing.expectEqual(@as(u8, 0), runtime.keyring.keys[1].secret_len);
+}
+
 test "runtime accepts a signed query whose Original ID differs from the packet ID" {
     const now = 1_700_000_000;
     var keyring = try keyring_mod.Keyring.parse("key \"key.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };");
@@ -1570,6 +1773,8 @@ const SignedQuery = struct {
 const TestKey = struct {
     algorithm: []const u8,
     secret: []const u8,
+    /// The TSIG key name the request names.
+    name: []const u8 = "key.",
 };
 
 const sha256_test_key = TestKey{ .algorithm = "hmac-sha256.", .secret = "01234567890123456789012345678901" };
@@ -1608,7 +1813,7 @@ fn makeSignedQueryWithQuestions(
     key: TestKey,
 ) !SignedQuery {
     const algorithm = try @import("../dns/name.zig").Name.fromText(key.algorithm);
-    const owner = try @import("../dns/name.zig").Name.fromText("key.");
+    const owner = try @import("../dns/name.zig").Name.fromText(key.name);
     const root = @import("../dns/name.zig").Name.root();
     var packet: [512]u8 = undefined;
     var writer = dns_writer.Writer.init(&packet);
@@ -1987,10 +2192,11 @@ test "a blocklisted name is answered REFUSED with the RFC 8914 Blocked EDE code"
     const opt = parsed.additionals.items[0];
     try std.testing.expect(opt.rrtype.eql(.OPT));
     // RFC 8914 section 4.16: INFO-CODE 15 is "Blocked", and the EXTRA-TEXT
-    // is empty, so the option carries the two octets of the code alone.
+    // says why: the operator's policy refused the name.
     const ede = @import("../dns/rdata.zig").findOption(opt.rdata.OPT.bytes(), 15);
     try std.testing.expect(ede != null);
-    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x0f }, ede.?);
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x0f }, ede.?[0..2]);
+    try std.testing.expectEqualStrings("blocked by policy", ede.?[2..]);
 }
 
 test "a blocklisted name without EDNS is refused without an EDE option" {

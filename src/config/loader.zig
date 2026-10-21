@@ -85,6 +85,9 @@ pub const ServerContext = struct {
             const key_text = try readReferencedFile(dir, io, key_path, allocator);
             defer allocator.free(key_text);
             context.keyring = parseKeyTextAndClear(key_text) catch |err| return err;
+            // The reload re-reads this file, so the keyring remembers the
+            // file it was parsed from.
+            context.keyring.setSource(dir, key_path) catch |err| return err;
         }
 
         // The key is read before any zone is loaded, so a bad key file fails

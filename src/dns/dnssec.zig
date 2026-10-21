@@ -16,6 +16,7 @@ const std = @import("std");
 const RecordType = @import("types.zig").RecordType;
 const Name = @import("name.zig").Name;
 const dns_message = @import("message.zig");
+const dns_writer = @import("writer.zig");
 const record_mod = @import("record.zig");
 
 pub const EDE_DNSSEC_BOGUS: u16 = 6;
@@ -316,13 +317,100 @@ pub const Denial = enum {
     nodata,
 };
 
+/// The bound on the RDATA of a proof record a cut answer carries. It holds
+/// an RRSIG with an RSA-2048 signature and a full-length signer name.
+pub const max_proof_rdata_len: usize = 640;
+/// The wire form of a proof record: the owner name, the type, the class,
+/// the TTL, and the RDATA.
+pub const max_proof_wire_len: usize = 255 + 10 + max_proof_rdata_len;
+
+/// A proof record on the wire, so a cut answer carries the bytes the
+/// upstream answer published and not a rebuilt copy.
+pub const ProofRecord = struct {
+    wire: [max_proof_wire_len]u8 = @as([max_proof_wire_len]u8, @splat(@as(u8, 0))),
+    len: u16 = 0,
+
+    pub fn bytes(self: *const ProofRecord) []const u8 {
+        return self.wire[0..self.len];
+    }
+};
+
+/// The proof a cut answer carries (RFC 8020 section 2): the NSEC records the
+/// denial rests on, each with the RRSIG that covers it.
+pub const Proof = struct {
+    records: [6]ProofRecord = @splat(ProofRecord{}),
+    len: u8 = 0,
+
+    /// Add a proof record, skipping an empty one and a record that is
+    /// already there: RFC 4035 section 3.1.3.2 wants a record that proves
+    /// two points included once.
+    fn add(self: *Proof, record: ProofRecord) void {
+        if (record.len == 0) return;
+        for (self.records[0..self.len]) |existing| {
+            if (std.mem.eql(u8, existing.bytes(), record.bytes())) return;
+        }
+        if (self.len >= self.records.len) return;
+        self.records[self.len] = record;
+        self.len += 1;
+    }
+};
+
+/// The proof records an upstream answer carried with a proving NSEC: the
+/// NSEC itself and the RRSIG that covers it (RFC 4035 section 3.1.3).
+pub const NsecProof = struct {
+    nsec: ?record_mod.ResourceRecord = null,
+    rrsig: ?record_mod.ResourceRecord = null,
+};
+
 /// A denial a cached proof gives, with the zone SOA that arrived with the
 /// proof (RFC 2308 section 3). The SOA is null when the proof was cached
 /// without one, and such a denial must not be cached (RFC 2308 section 5).
+/// The proof is null when the upstream answer carried no proof that can be
+/// returned, and the denial is served all the same.
 pub const ProvenDenial = struct {
     denial: Denial,
     soa: ?record_mod.ResourceRecord,
+    proof: ?Proof = null,
 };
+
+/// Keep a proof record as the upstream answer published it, when it can be
+/// carried in another message unchanged. Every name in its RDATA must be
+/// written out in full: a compression pointer names a place in the message
+/// it came from and would name another place here.
+fn keepProof(out: *ProofRecord, record: record_mod.ResourceRecord) void {
+    const rdata = switch (record.rdata) {
+        .Unknown => |*unknown| unknown.bytes(),
+        else => return,
+    };
+    if (rdata.len > max_proof_rdata_len) return;
+    if (!proofNamesUncompressed(record.rrtype, rdata)) return;
+    var writer = dns_writer.Writer.init(&out.wire);
+    record.encode(&writer) catch return;
+    out.len = @intCast(writer.written().len);
+}
+
+/// True when every name in the RDATA of a proof record is written out in
+/// full. The NSEC RDATA starts with the next owner name (RFC 4034 section
+/// 4.1.2) and the RRSIG RDATA carries the signer's name after its
+/// 18-octet header (RFC 4034 section 3.2).
+fn proofNamesUncompressed(rrtype: RecordType, rdata: []const u8) bool {
+    const code = rrtype.code();
+    const offset: usize = if (code == RecordType.NSEC.code())
+        0
+    else if (code == RecordType.RRSIG.code())
+        18
+    else
+        return false;
+    if (rdata.len <= offset) return false;
+    var index = offset;
+    while (index < rdata.len) {
+        const len = rdata[index];
+        if (len == 0) return true;
+        if ((len & 0xc0) != 0 or len > 63) return false;
+        index += 1 + len;
+    }
+    return false;
+}
 
 /// Parent name with the leftmost label stripped; null for the root and for
 /// malformed wire input. Used to walk the ancestor chain toward the closest
@@ -378,6 +466,10 @@ pub const AggressiveCache = struct {
         /// carry it (RFC 2308 section 3), and a denial without one must not
         /// be cached (RFC 2308 section 5).
         soa: ?record_mod.ResourceRecord = null,
+        /// The NSEC as the upstream answer published it and the RRSIG that
+        /// covers it. RFC 8020 section 2 returns them with a cut answer.
+        nsec_proof: ProofRecord = .{},
+        rrsig_proof: ProofRecord = .{},
         /// Unix seconds after which the proof must no longer deny (RFC 8198
         /// section 4). Always derived as now + min(ttl, cap) at insert.
         expires_at: i64 = 0,
@@ -386,7 +478,10 @@ pub const AggressiveCache = struct {
     entries: [capacity]Entry = @splat(Entry{}),
     next_slot: usize = 0,
 
-    pub fn insertNsec(self: *AggressiveCache, owner: Name, next: Name, bitmap: []const u8, now: i64, ttl: u32, soa: ?record_mod.ResourceRecord) void {
+    /// Cache a proving NSEC RRset. The proof records the upstream answer
+    /// published are kept with it, so a cut answer can return them
+    /// (RFC 8020 section 2).
+    pub fn insertNsec(self: *AggressiveCache, owner: Name, next: Name, bitmap: []const u8, now: i64, ttl: u32, soa: ?record_mod.ResourceRecord, proof: NsecProof) void {
         const slot = &self.entries[self.next_slot];
         self.next_slot = (self.next_slot + 1) % capacity;
         slot.* = .{};
@@ -398,6 +493,13 @@ pub const AggressiveCache = struct {
         slot.bitmap_len = @intCast(len);
         slot.soa = soa;
         slot.expires_at = now +| @min(@as(i64, ttl), max_entry_ttl_seconds);
+        // A proof that names another owner is not this entry's proof.
+        if (proof.nsec) |nsec| {
+            if (nsec.owner.eql(&owner)) {
+                keepProof(&slot.nsec_proof, nsec);
+                if (proof.rrsig) |rrsig| keepProof(&slot.rrsig_proof, rrsig);
+            }
+        }
     }
 
     pub fn insertNsec3Hash(self: *AggressiveCache, hashed_owner: [20]u8, bitmap: []const u8, now: i64, ttl: u32) void {
@@ -438,6 +540,16 @@ pub const AggressiveCache = struct {
         return false;
     }
 
+    /// The cached NSEC whose span covers the name, which is the proof that
+    /// the name does not exist.
+    fn findCovering(self: *const AggressiveCache, name: Name) ?*const Entry {
+        for (&self.entries) |*entry| {
+            if (!entry.valid or entry.is_nsec3) continue;
+            if (nsecCovers(entry.owner, entry.next, name)) return entry;
+        }
+        return null;
+    }
+
     /// RFC 8198 sections 4-5 aggressive use of cached NSEC proofs.
     ///
     /// Exact path (section 4 NODATA): the QNAME must exactly match a cached
@@ -461,7 +573,9 @@ pub const AggressiveCache = struct {
     ///
     /// The denial carries the zone SOA that arrived with the proof that
     /// gave it (RFC 2308 section 3), and null when the proof was cached
-    /// without one.
+    /// without one. It carries the proof records the denial rests on
+    /// (RFC 8020 section 2) when every one of them came with the RRSIG
+    /// that covers it, and no proof at all otherwise.
     pub fn deny(self: *AggressiveCache, qname: Name, qtype: RecordType, now: i64) Error!?ProvenDenial {
         self.evictExpired(now);
         var exact_seen = false;
@@ -470,7 +584,16 @@ pub const AggressiveCache = struct {
             if (entry.owner.eql(&qname)) {
                 exact_seen = true;
                 if (try nsecBitmapDeniesType(entry.bitmap[0..entry.bitmap_len], qtype.code())) {
-                    return .{ .denial = .nodata, .soa = entry.soa };
+                    var proof = Proof{};
+                    if (entry.nsec_proof.len != 0 and entry.rrsig_proof.len != 0) {
+                        proof.add(entry.nsec_proof);
+                        proof.add(entry.rrsig_proof);
+                    }
+                    return .{
+                        .denial = .nodata,
+                        .soa = entry.soa,
+                        .proof = if (proof.len == 0) null else proof,
+                    };
                 }
             }
         }
@@ -481,10 +604,23 @@ pub const AggressiveCache = struct {
             if (self.findNsecOwner(closest_encloser)) |encloser| {
                 const wildcard = wildcardName(closest_encloser) orelse return null;
                 if (self.findNsecOwner(wildcard) != null) return null;
-                if (self.spanCovers(next_closer) and self.spanCovers(wildcard)) {
-                    return .{ .denial = .nxdomain, .soa = encloser.soa };
+                const next_cover = self.findCovering(next_closer) orelse return null;
+                const wildcard_cover = self.findCovering(wildcard) orelse return null;
+                var proof = Proof{};
+                var complete = true;
+                for ([_]*const Entry{ encloser, next_cover, wildcard_cover }) |entry| {
+                    if (entry.nsec_proof.len == 0 or entry.rrsig_proof.len == 0) {
+                        complete = false;
+                        break;
+                    }
+                    proof.add(entry.nsec_proof);
+                    proof.add(entry.rrsig_proof);
                 }
-                return null;
+                return .{
+                    .denial = .nxdomain,
+                    .soa = encloser.soa,
+                    .proof = if (complete and proof.len != 0) proof else null,
+                };
             }
             next_closer = closest_encloser;
             ancestor = parentName(closest_encloser);
@@ -614,7 +750,7 @@ test "aggressive NSEC cache synthesizes NODATA on exact match (RFC 8198 4)" {
     var cache = AggressiveCache{};
     // Window 0 bitmap with A(1) and NSEC(47): byte 5 carries 47 % 8.
     const bitmap = [_]u8{ 0x00, 0x06, 0x40, 0x00, 0x00, 0x00, 0x00, 0x01 };
-    cache.insertNsec(try Name.fromText("www.example."), try Name.fromText("zzz.example."), &bitmap, now, 3600, null);
+    cache.insertNsec(try Name.fromText("www.example."), try Name.fromText("zzz.example."), &bitmap, now, 3600, null, .{});
     try std.testing.expectEqual(Denial.nodata, (try cache.deny(try Name.fromText("www.example."), .{ .value = 16 }, now)).?.denial);
     try std.testing.expect((try cache.deny(try Name.fromText("www.example."), .A, now)) == null);
     try std.testing.expect((try cache.deny(try Name.fromText("www.example."), .NSEC, now)) == null);
@@ -630,8 +766,8 @@ test "aggressive NXDOMAIN needs closest-encloser and wildcard proofs (RFC 8198 5
     const bitmap = [_]u8{ 0x00, 0x06, 0x40, 0x00, 0x00, 0x00, 0x00, 0x01 };
     const now: i64 = 1_000_000;
     var cache = AggressiveCache{};
-    cache.insertNsec(try Name.fromText("example."), try Name.fromText("mail.example."), &bitmap, now, 3600, null);
-    cache.insertNsec(try Name.fromText("mail.example."), try Name.fromText("www.example."), &bitmap, now, 3600, null);
+    cache.insertNsec(try Name.fromText("example."), try Name.fromText("mail.example."), &bitmap, now, 3600, null, .{});
+    cache.insertNsec(try Name.fromText("mail.example."), try Name.fromText("www.example."), &bitmap, now, 3600, null, .{});
     const qnx = try Name.fromText("nx.example.");
     try std.testing.expectEqual(Denial.nxdomain, (try cache.deny(qnx, .A, now)).?.denial);
     // Names below the next-closer name share its denial.
@@ -642,28 +778,28 @@ test "aggressive NXDOMAIN needs closest-encloser and wildcard proofs (RFC 8198 5
 
     // Lone covering span without the closest-encloser proof denies nothing.
     var lone = AggressiveCache{};
-    lone.insertNsec(try Name.fromText("mail.example."), try Name.fromText("www.example."), &bitmap, now, 3600, null);
+    lone.insertNsec(try Name.fromText("mail.example."), try Name.fromText("www.example."), &bitmap, now, 3600, null, .{});
     try std.testing.expect((try lone.deny(qnx, .A, now)) == null);
 
     // Closest encloser without a wildcard cover denies nothing: the empty
     // (example., *.example.) span covers no name, so the wildcard proof is
     // missing even though the next-closer name stays covered.
     var no_wild = AggressiveCache{};
-    no_wild.insertNsec(try Name.fromText("example."), try Name.fromText("*.example."), &bitmap, now, 3600, null);
-    no_wild.insertNsec(try Name.fromText("mail.example."), try Name.fromText("www.example."), &bitmap, now, 3600, null);
+    no_wild.insertNsec(try Name.fromText("example."), try Name.fromText("*.example."), &bitmap, now, 3600, null, .{});
+    no_wild.insertNsec(try Name.fromText("mail.example."), try Name.fromText("www.example."), &bitmap, now, 3600, null, .{});
     try std.testing.expect((try no_wild.deny(qnx, .A, now)) == null);
 
     // Closest encloser without a next-closer cover denies nothing.
     var no_closer = AggressiveCache{};
-    no_closer.insertNsec(try Name.fromText("example."), try Name.fromText("mail.example."), &bitmap, now, 3600, null);
-    no_closer.insertNsec(try Name.fromText("a.example."), try Name.fromText("b.example."), &bitmap, now, 3600, null);
+    no_closer.insertNsec(try Name.fromText("example."), try Name.fromText("mail.example."), &bitmap, now, 3600, null, .{});
+    no_closer.insertNsec(try Name.fromText("a.example."), try Name.fromText("b.example."), &bitmap, now, 3600, null, .{});
     try std.testing.expect((try no_closer.deny(qnx, .A, now)) == null);
 
     // An existing wildcard at the closest encloser refuses NXDOMAIN.
     var wild = AggressiveCache{};
-    wild.insertNsec(try Name.fromText("example."), try Name.fromText("mail.example."), &bitmap, now, 3600, null);
-    wild.insertNsec(try Name.fromText("mail.example."), try Name.fromText("www.example."), &bitmap, now, 3600, null);
-    wild.insertNsec(try Name.fromText("*.example."), try Name.fromText("mail.example."), &bitmap, now, 3600, null);
+    wild.insertNsec(try Name.fromText("example."), try Name.fromText("mail.example."), &bitmap, now, 3600, null, .{});
+    wild.insertNsec(try Name.fromText("mail.example."), try Name.fromText("www.example."), &bitmap, now, 3600, null, .{});
+    wild.insertNsec(try Name.fromText("*.example."), try Name.fromText("mail.example."), &bitmap, now, 3600, null, .{});
     try std.testing.expect((try wild.deny(qnx, .A, now)) == null);
 }
 
@@ -673,7 +809,7 @@ test "exact deny requires the NSEC bit and a well-formed bitmap" {
     // is malformed and must error rather than deny TXT.
     var cache = AggressiveCache{};
     const bare = [_]u8{ 0x00, 0x01, 0x40 };
-    cache.insertNsec(try Name.fromText("www.example."), try Name.fromText("zzz.example."), &bare, now, 3600, null);
+    cache.insertNsec(try Name.fromText("www.example."), try Name.fromText("zzz.example."), &bare, now, 3600, null, .{});
     try std.testing.expectError(Error.MalformedNsec, cache.deny(try Name.fromText("www.example."), .{ .value = 16 }, now));
 
     // Each malformed shape errors instead of synthesizing a false NODATA.
@@ -687,14 +823,14 @@ test "exact deny requires the NSEC bit and a well-formed bitmap" {
     };
     for (malformed) |bitmap| {
         var bad = AggressiveCache{};
-        bad.insertNsec(try Name.fromText("www.example."), try Name.fromText("zzz.example."), bitmap, now, 3600, null);
+        bad.insertNsec(try Name.fromText("www.example."), try Name.fromText("zzz.example."), bitmap, now, 3600, null, .{});
         try std.testing.expectError(Error.MalformedNsec, bad.deny(try Name.fromText("www.example."), .{ .value = 16 }, now));
     }
 
     // A malformed bitmap on an unrelated owner is not consulted: no proof,
     // no error, fall through to the normal lookup path.
     var unrelated = AggressiveCache{};
-    unrelated.insertNsec(try Name.fromText("other.example."), try Name.fromText("zzz.example."), &[_]u8{ 0x00, 0x02, 0x40 }, now, 3600, null);
+    unrelated.insertNsec(try Name.fromText("other.example."), try Name.fromText("zzz.example."), &[_]u8{ 0x00, 0x02, 0x40 }, now, 3600, null, .{});
     try std.testing.expect((try unrelated.deny(try Name.fromText("www.example."), .{ .value = 16 }, now)) == null);
 }
 
@@ -841,7 +977,7 @@ test "aggressive cache proofs expire, cap, and refresh (RFC 8198 4)" {
     const qtxt = RecordType{ .value = 16 };
 
     var cache = AggressiveCache{};
-    cache.insertNsec(owner, next, &bitmap, 1_000, 60, null);
+    cache.insertNsec(owner, next, &bitmap, 1_000, 60, null, .{});
     try std.testing.expectEqual(Denial.nodata, (try cache.deny(owner, qtxt, 1_059)).?.denial);
     // At and past now+ttl the proof is evicted: no denial, no error.
     try std.testing.expect((try cache.deny(owner, qtxt, 1_060)) == null);
@@ -849,12 +985,12 @@ test "aggressive cache proofs expire, cap, and refresh (RFC 8198 4)" {
 
     // A zero TTL denies nothing, even immediately.
     var zero = AggressiveCache{};
-    zero.insertNsec(owner, next, &bitmap, 1_000, 0, null);
+    zero.insertNsec(owner, next, &bitmap, 1_000, 0, null, .{});
     try std.testing.expect((try zero.deny(owner, qtxt, 1_000)) == null);
 
     // Outsized TTLs are capped: usable just before the cap, gone at it.
     var capped = AggressiveCache{};
-    capped.insertNsec(owner, next, &bitmap, 0, std.math.maxInt(u32), null);
+    capped.insertNsec(owner, next, &bitmap, 0, std.math.maxInt(u32), null, .{});
     try std.testing.expectEqual(
         Denial.nodata,
         (try capped.deny(owner, qtxt, AggressiveCache.max_entry_ttl_seconds - 1)).?.denial,
@@ -862,7 +998,7 @@ test "aggressive cache proofs expire, cap, and refresh (RFC 8198 4)" {
     try std.testing.expect((try capped.deny(owner, qtxt, AggressiveCache.max_entry_ttl_seconds)) == null);
 
     // Re-inserting after expiry refreshes the proof.
-    cache.insertNsec(owner, next, &bitmap, 2_000, 60, null);
+    cache.insertNsec(owner, next, &bitmap, 2_000, 60, null, .{});
     try std.testing.expectEqual(Denial.nodata, (try cache.deny(owner, qtxt, 2_059)).?.denial);
 
     // NSEC3 proofs expire the same way: evicted entries return null.

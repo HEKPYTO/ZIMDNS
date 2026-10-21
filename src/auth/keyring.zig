@@ -1,5 +1,7 @@
 /// Contract: Parses a bounded BIND-compatible TSIG key file and owns secrets.
 /// Ownership: Keyring stores copied names and secret bytes; deinit clears secrets.
+/// The keyring also remembers the file it was parsed from, so a reload can
+/// re-read it; the keyring itself never reads the file.
 /// Errors: Malformed declarations and secret policy violations are typed; no I/O occurs.
 /// One key name may carry several algorithms; the name with the algorithm is the key.
 const std = @import("std");
@@ -11,6 +13,9 @@ const dns_writer = @import("../dns/writer.zig");
 
 pub const max_keys = 16;
 pub const max_secret_len = 64;
+/// The longest key file path a keyring remembers. The configuration
+/// directive that names the file bounds it the same way.
+pub const max_path_len = 256;
 
 pub const Error = error{
     BadSyntax,
@@ -20,6 +25,19 @@ pub const Error = error{
     SecretTooLong,
     DuplicateKey,
     TooManyKeys,
+    PathTooLong,
+};
+
+/// The file a keyring was parsed from. The path is inline, so a keyring
+/// carries the location wherever it is copied.
+pub const Source = struct {
+    dir: std.Io.Dir,
+    bytes: [max_path_len]u8 = undefined,
+    len: usize = 0,
+
+    pub fn path(self: *const Source) []const u8 {
+        return self.bytes[0..self.len];
+    }
 };
 
 pub const Key = struct {
@@ -41,6 +59,9 @@ pub const Key = struct {
 pub const Keyring = struct {
     keys: [max_keys]Key = undefined,
     len: usize = 0,
+    /// The file this keyring was parsed from. Null when the keyring was not
+    /// read from a file.
+    source: ?Source = null,
 
     pub fn parse(text: []const u8) Error!Keyring {
         var ring = Keyring{};
@@ -78,6 +99,25 @@ pub const Keyring = struct {
             if (key.name.eql(&name) and key.algorithm == algorithm) return key;
         }
         return null;
+    }
+
+    /// Records the file this keyring was parsed from, so a reload can
+    /// re-read it.
+    pub fn setSource(self: *Keyring, dir: std.Io.Dir, path: []const u8) Error!void {
+        if (path.len > max_path_len) return Error.PathTooLong;
+        var source = Source{ .dir = dir, .len = path.len };
+        @memcpy(source.bytes[0..path.len], path);
+        self.source = source;
+    }
+
+    /// Installs the keys of `other` and wipes the secrets this keyring
+    /// held, so a replaced key leaves no secret behind in the freed slot.
+    pub fn replace(self: *Keyring, other: *const Keyring) void {
+        self.deinit();
+        for (other.keys[0..other.len], 0..) |key, index| {
+            self.keys[index] = key;
+        }
+        self.len = other.len;
     }
 
     pub fn deinit(self: *Keyring) void {
