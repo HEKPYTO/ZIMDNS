@@ -880,8 +880,9 @@ pub const Runtime = struct {
 
     /// Serves one AXFR/IXFR query as an owned length-prefixed TCP blob, one
     /// two-octet frame per message. Unsigned and TSIG-signed requests share
-    /// this path; signed sequences chain one TSIG per message through the
-    /// chainedMac primitive starting from the request MAC. Non-transfer
+    /// this path; a signed sequence carries one TSIG per message, the first
+    /// message signed as a standard answer and every later one chained on the
+    /// MAC of the message before it (RFC 8945 section 5.3.1). Non-transfer
     /// queries and failures yield a single frame so the client always gets an
     /// answer. The caller owns the returned blob.
     pub fn encodeTransferFrames(
@@ -921,10 +922,19 @@ pub const Runtime = struct {
                 const qname_text = q.name.toText(&qname_text_buffer) catch return Error.BadQuery;
                 const zone = self.selectZone(qname_text) orelse {
                     var output: [transfer.tcp_max_frame_size]u8 = undefined;
-                    const single = try self.encodeMessage(
-                        try response.buildRefusedResponse(incoming.query),
-                        &output,
-                    );
+                    // RFC 8945 section 5.3: the answer to a signed request is
+                    // signed, so the refusal of an out-of-zone transfer is too.
+                    const single = if (incoming.auth) |auth|
+                        try self.encodeSignedMessage(
+                            try response.buildRefusedResponse(incoming.query),
+                            &output,
+                            auth,
+                            0,
+                            &.{},
+                            null,
+                        )
+                    else
+                        try self.encodeMessage(try response.buildRefusedResponse(incoming.query), &output);
                     return frameSingle(allocator, single);
                 };
                 return self.encodeZoneTransfer(allocator, arena.allocator(), &incoming, zone);
@@ -1007,6 +1017,7 @@ pub const Runtime = struct {
         defer for (sequence) |*message| message.deinit();
 
         var prior_mac: ?tsig.Mac = if (incoming.auth) |auth| auth.request_mac else null;
+        var first_frame = true;
         const now = self.currentTsigTime();
         var blob: std.ArrayList(u8) = .empty;
         errdefer blob.deinit(allocator);
@@ -1024,17 +1035,24 @@ pub const Runtime = struct {
             var writer = dns_writer.Writer.init(&frame);
             message.encode(&writer) catch return Error.EncodeFailed;
             if (writer.len() == 0 or writer.len() > transfer.tcp_max_frame_size) return Error.EncodeFailed;
-            if (prior_mac != null) {
-                const auth = incoming.auth.?;
-                const signed = transfer.signTransferMessage(
-                    frame[0..writer.len()],
-                    auth.key.algorithm,
-                    auth.key.secretBytes(),
-                    prior_mac.?.slice(),
-                ) catch return Error.EncodeFailed;
+            if (incoming.auth) |auth| {
+                // RFC 8945 section 5.3.1: the first message of a multi-message
+                // response is a standard answer, so its MAC covers the request
+                // MAC and the whole TSIG record, and only the later messages
+                // chain on the MAC of the message before them.
+                const signed = if (first_frame)
+                    try self.signFirstTransferFrame(frame[0..writer.len()], auth)
+                else
+                    try transfer.signTransferMessage(
+                        frame[0..writer.len()],
+                        auth.key.algorithm,
+                        auth.key.secretBytes(),
+                        prior_mac.?.slice(),
+                    );
                 var next = tsig.Mac{ .len = @intCast(signed.slice().len) };
                 @memcpy(next.bytes[0..signed.slice().len], signed.slice());
                 prior_mac = next;
+                first_frame = false;
             }
             var prefix: [2]u8 = undefined;
             std.mem.writeInt(u16, &prefix, @intCast(writer.len()), .big);
@@ -1042,6 +1060,24 @@ pub const Runtime = struct {
             blob.appendSlice(allocator, frame[0..writer.len()]) catch return Error.EncodeFailed;
         }
         return blob.toOwnedSlice(allocator) catch return Error.EncodeFailed;
+    }
+
+    /// Signs the first frame of a signed transfer sequence with the standard
+    /// answer MAC of RFC 8945 section 5.3: the request MAC and the whole TSIG
+    /// record are in the digest, which is what a client verifies the first
+    /// message of a multi-message response with.
+    fn signFirstTransferFrame(self: *const Runtime, frame: []u8, auth: TsigAuth) !tsig.Mac {
+        _ = self;
+        const final = (tsig.parseFinalAdditional(frame) catch return Error.EncodeFailed) orelse return Error.EncodeFailed;
+        const signed = tsig.sign(
+            frame,
+            auth.key.secretBytes(),
+            final.owner,
+            final.tsig,
+            auth.request_mac.slice(),
+        ) catch return Error.EncodeFailed;
+        tsig.patchMac(frame, final, signed.slice()) catch return Error.EncodeFailed;
+        return signed;
     }
 
     fn answerFromUnlocked(
@@ -1081,7 +1117,7 @@ pub const Runtime = struct {
             return self.encodeMessage(try response.buildRefusedResponse(query), output);
         }
         if (self.resolver) |*resolver| {
-            if (!resolver.policy.allows(client)) return self.encodeMessage(try response.buildRefusedResponse(query), output);
+            if (!resolver.policy.allows(client)) return self.encodeMessage(try response.buildProhibitedResponse(query), output);
             return resolver.answer(query_bytes, query, client, output) catch |err| switch (err) {
                 resolver_mod.Error.UpstreamFailure,
                 resolver_mod.Error.BadUpstreamResponse,
@@ -2327,6 +2363,103 @@ test "a refusal that is not a blocklist refusal carries no EDE option" {
     try std.testing.expectEqual(@as(usize, 0), opt.rdata.OPT.bytes().len);
 }
 
+test "a client outside the recursion ACL is refused with the RFC 8914 Prohibited EDE code" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // The operator's recursion ACL serves one network; the client below is
+    // outside it, so the refusal is the policy's and not the server's.
+    var policy = resolver_mod.Policy{};
+    policy.recursion_allow[0] = try @import("../config/parser.zig").Cidr.parse("192.0.2.0/24");
+    policy.recursion_allow_len = 1;
+    var zones = std.ArrayList(zone_index.Zone).empty;
+    var runtime = try Runtime.fromZonesWithPolicy(std.testing.allocator, &zones, .{}, io, policy);
+    defer runtime.deinit();
+
+    // The query carries an OPT pseudo-RR, so RFC 8914 section 2 allows the
+    // EDE option in the answer.
+    var output: [512]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("198.51.100.7", 41002);
+    const response_bytes = try runtime.answerFrom(&.{
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        7,    'o',  'u',  't',  's',  'i',  'd',  'e',  7,    'e',  'x',  'a',
+        'm',  'p',  'l',  'e',  0,    0x00, 0x01, 0x00, 0x01, 0,    0x00, 0x29,
+        0x04, 0xd0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    }, &output, &client);
+
+    const parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@import("../dns/header.zig").Rcode.refused, parsed.header.rcode);
+    try std.testing.expectEqual(@as(u16, 0), parsed.header.answer_count);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.additional_count);
+    const opt = parsed.additionals.items[0];
+    try std.testing.expect(opt.rrtype.eql(.OPT));
+    // RFC 8914 section 4.19: INFO-CODE 18 is "Prohibited", and the EXTRA-TEXT
+    // says why: the operator's recursion policy refused the client.
+    const ede = dns_rdata.findOption(opt.rdata.OPT.bytes(), 15);
+    try std.testing.expect(ede != null);
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x12 }, ede.?[0..2]);
+    try std.testing.expectEqualStrings("prohibited by policy", ede.?[2..]);
+}
+
+test "a client outside the recursion ACL without EDNS is refused without an EDE option" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var policy = resolver_mod.Policy{};
+    policy.recursion_allow[0] = try @import("../config/parser.zig").Cidr.parse("192.0.2.0/24");
+    policy.recursion_allow_len = 1;
+    var zones = std.ArrayList(zone_index.Zone).empty;
+    var runtime = try Runtime.fromZonesWithPolicy(std.testing.allocator, &zones, .{}, io, policy);
+    defer runtime.deinit();
+
+    // RFC 8914 section 2 allows the EDE option only in a response to a query
+    // that includes an OPT pseudo-RR, and this query carries none.
+    var output: [512]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("198.51.100.7", 41002);
+    const response_bytes = try runtime.answerFrom(&.{
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        7,    'o',  'u',  't',  's',  'i',  'd',  'e',  7,    'e',  'x',  'a',
+        'm',  'p',  'l',  'e',  0,    0x00, 0x01, 0x00, 0x01,
+    }, &output, &client);
+
+    const parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@import("../dns/header.zig").Rcode.refused, parsed.header.rcode);
+    try std.testing.expectEqual(@as(u16, 0), parsed.header.additional_count);
+    try std.testing.expect(parsed.edns == null);
+}
+
+test "a refused transfer carries no EDE option" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 3600
+        \\@ IN NS ns.example.
+        \\
+    );
+    defer runtime.deinit();
+
+    // The transfer is refused by the single-message path, and that refusal
+    // names no policy, so it carries no EDE option.
+    var output: [512]u8 = undefined;
+    const response_bytes = try runtime.answer(&.{
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        7,    'e',  'x',  'a',  'm',  'p',  'l',  'e',  0x00, 0x00, 0xfc, 0x00,
+        0x01, 0,    0x00, 0x29, 0x04, 0xd0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    }, &output);
+
+    const parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@import("../dns/header.zig").Rcode.refused, parsed.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.additional_count);
+    const opt = parsed.additionals.items[0];
+    try std.testing.expect(opt.rrtype.eql(.OPT));
+    try std.testing.expectEqual(@as(usize, 0), opt.rdata.OPT.bytes().len);
+}
+
 test "authoritative runtime returns NOTIMP for non-IN queries outside a zone" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2743,6 +2876,72 @@ fn encodeNotifyRequest(
     return writer.written();
 }
 
+/// The NOTIFY of `encodeNotifyRequest` with a TSIG the request is signed
+/// with, the shape a master that authenticates its NOTIFYs sends.
+fn encodeSignedNotifyRequest(
+    allocator: std.mem.Allocator,
+    buffer: []u8,
+    qname: []const u8,
+    serial: u32,
+    time_signed: u64,
+    key: TestKey,
+) ![]const u8 {
+    const dns_name = @import("../dns/name.zig");
+    const owner = try dns_name.Name.fromText(qname);
+    var request = dns_message.Message{
+        .allocator = allocator,
+        .header = .{
+            .id = 0x4321,
+            .opcode = .notify,
+            .question_count = 1,
+            .answer_count = 1,
+            .additional_count = 1,
+        },
+        .question = .{ .name = owner, .qtype = .SOA, .qclass = .IN },
+        .answers = try dns_message.RecordSection.init(allocator, 1),
+        .authorities = try dns_message.RecordSection.init(allocator, 0),
+        .additionals = try dns_message.RecordSection.init(allocator, 1),
+    };
+    try request.answers.append(.{
+        .owner = owner,
+        .rrtype = .SOA,
+        .class = .IN,
+        .ttl = 3600,
+        .rdata = .{ .SOA = .{
+            .mname = try dns_name.Name.fromText("ns.example."),
+            .rname = try dns_name.Name.fromText("hostmaster.example."),
+            .serial = serial,
+            .refresh = 3600,
+            .retry = 900,
+            .expire = 1209600,
+            .minimum = 3600,
+        } },
+    });
+    var zeros: [64]u8 = @splat(0);
+    const value = try @import("../dns/rdata.zig").Tsig.init(
+        try dns_name.Name.fromText(key.algorithm),
+        time_signed,
+        300,
+        zeros[0..32],
+        0x4321,
+        0,
+        &.{},
+    );
+    try request.additionals.append(.{
+        .owner = try dns_name.Name.fromText(key.name),
+        .rrtype = .TSIG,
+        .class = .ANY,
+        .ttl = 0,
+        .rdata = .{ .TSIG = value },
+    });
+    var writer = dns_writer.Writer.init(buffer);
+    try request.encode(&writer);
+    const final = (try tsig.parseFinalAdditional(writer.written())).?;
+    const signed = try tsig.sign(writer.written(), key.secret, final.owner, final.tsig, null);
+    try tsig.patchMac(buffer[0..writer.len()], final, signed.slice());
+    return writer.written();
+}
+
 test "runtime answers NOTIFY by comparing the serial and refuses transfers singly" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2807,6 +3006,144 @@ test "runtime answers NOTIFY by comparing the serial and refuses transfers singl
     try std.testing.expectEqual(@as(u16, 0), axfr_response.header.answer_count);
 }
 
+test "runtime signs the answer to a signed NOTIFY" {
+    const now = 1_700_000_000;
+    var keyring = try keyring_mod.Keyring.parse("key \"key.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };");
+    var runtime = try Runtime.fromZoneTextWithKeyring(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 10 3600 900 1209600 3600
+        \\@ IN NS ns.example.
+        \\
+    , &keyring);
+    defer runtime.deinit();
+    runtime.setTsigNow(now);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var request_buffer: [512]u8 = undefined;
+    const request = try encodeSignedNotifyRequest(arena.allocator(), &request_buffer, "example.", 11, now, sha256_test_key);
+    var output: [1024]u8 = undefined;
+    const response_bytes = try runtime.answer(request, &output);
+
+    // RFC 8945 section 5.3: the reply to a signed request is signed with the
+    // same key and algorithm. The TSIG is the last record of the message,
+    // which is what parseFinalAdditional accepts.
+    const request_final = (try tsig.parseFinalAdditional(request)) orelse return error.TestExpectedEqual;
+    const response_final = (try tsig.parseFinalAdditional(response_bytes)) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u16, 0), response_final.tsig.error_code);
+    try std.testing.expectEqual(@as(usize, 32), response_final.tsig.macBytes().len);
+    _ = try tsig.verify(response_bytes, sha256_test_key.secret, request_final.tsig.macBytes(), 32);
+
+    // The signed answer keeps the shape of the unsigned one: the same RCODE,
+    // the same echoed question, and the zone's own SOA in the answer section.
+    const signed = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expect(signed.header.qr);
+    try std.testing.expectEqual(@as(@TypeOf(signed.header.opcode), .notify), signed.header.opcode);
+    try std.testing.expectEqual(@as(@TypeOf(signed.header.rcode), .no_error), signed.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), signed.header.question_count);
+    try std.testing.expectEqual(@as(u16, 1), signed.header.answer_count);
+    try std.testing.expectEqual(@as(u32, 10), signed.answers.items[0].rdata.SOA.serial);
+
+    // The signed answer is the unsigned answer plus the TSIG record.
+    var unsigned_request_buffer: [512]u8 = undefined;
+    const unsigned_request = try encodeNotifyRequest(arena.allocator(), &unsigned_request_buffer, "example.", 11, .SOA);
+    var unsigned_output: [1024]u8 = undefined;
+    const unsigned_bytes = try runtime.answer(unsigned_request, &unsigned_output);
+    try std.testing.expectEqual(unsigned_bytes.len + response_final.record_end - response_final.record_start, response_bytes.len);
+    try std.testing.expectEqualSlices(u8, unsigned_bytes[0..10], response_bytes[0..10]);
+    try std.testing.expectEqualSlices(u8, unsigned_bytes[12..], response_bytes[12..unsigned_bytes.len]);
+    try std.testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, unsigned_bytes[10..12], .big));
+    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, response_bytes[10..12], .big));
+
+    // A signed NOTIFY whose serial is not newer is answered NOTAUTH, and
+    // that answer is signed too.
+    var stale_buffer: [512]u8 = undefined;
+    const stale = try encodeSignedNotifyRequest(arena.allocator(), &stale_buffer, "example.", 10, now, sha256_test_key);
+    var stale_output: [1024]u8 = undefined;
+    const stale_bytes = try runtime.answer(stale, &stale_output);
+    const stale_response = try dns_message.Message.parse(arena.allocator(), stale_bytes);
+    try std.testing.expectEqual(@as(@TypeOf(stale_response.header.rcode), .notauth), stale_response.header.rcode);
+    const stale_final = (try tsig.parseFinalAdditional(stale_bytes)) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 32), stale_final.tsig.macBytes().len);
+    const stale_request_final = (try tsig.parseFinalAdditional(stale)) orelse return error.TestExpectedEqual;
+    _ = try tsig.verify(stale_bytes, sha256_test_key.secret, stale_request_final.tsig.macBytes(), 32);
+}
+
+test "an unsigned NOTIFY is answered with no TSIG record" {
+    const now = 1_700_000_000;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var request_buffer: [512]u8 = undefined;
+    const request = try encodeNotifyRequest(arena.allocator(), &request_buffer, "example.", 11, .SOA);
+
+    // A runtime with a key configured answers an unsigned NOTIFY with the
+    // very same bytes as one without a key: no TSIG record is added.
+    var keyring = try keyring_mod.Keyring.parse("key \"key.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };");
+    var keyed = try Runtime.fromZoneTextWithKeyring(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 10 3600 900 1209600 3600
+        \\@ IN NS ns.example.
+        \\
+    , &keyring);
+    defer keyed.deinit();
+    keyed.setTsigNow(now);
+    var plain = try Runtime.fromZoneText(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 10 3600 900 1209600 3600
+        \\@ IN NS ns.example.
+        \\
+    );
+    defer plain.deinit();
+
+    var keyed_output: [1024]u8 = undefined;
+    var plain_output: [1024]u8 = undefined;
+    const keyed_bytes = try keyed.answer(request, &keyed_output);
+    const plain_bytes = try plain.answer(request, &plain_output);
+    try std.testing.expectEqualSlices(u8, plain_bytes, keyed_bytes);
+    try std.testing.expect((try tsig.parseFinalAdditional(keyed_bytes)) == null);
+    const parsed = try dns_message.Message.parse(arena.allocator(), keyed_bytes);
+    try std.testing.expectEqual(@as(u16, 0), parsed.header.additional_count);
+    try std.testing.expectEqual(@as(@TypeOf(parsed.header.rcode), .no_error), parsed.header.rcode);
+}
+
+test "a NOTIFY whose MAC does not verify is answered NOTAUTH with BADSIG" {
+    const now = 1_700_000_000;
+    var keyring = try keyring_mod.Keyring.parse("key \"key.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };");
+    var runtime = try Runtime.fromZoneTextWithKeyring(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 10 3600 900 1209600 3600
+        \\@ IN NS ns.example.
+        \\
+    , &keyring);
+    defer runtime.deinit();
+    runtime.setTsigNow(now);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var request_buffer: [512]u8 = undefined;
+    const request = try encodeSignedNotifyRequest(arena.allocator(), &request_buffer, "example.", 11, now, sha256_test_key);
+    var broken = request_buffer;
+    // The request MAC starts after the algorithm name and the fixed fields of
+    // the TSIG RDATA, so a flipped octet there breaks the MAC.
+    const request_final = (try tsig.parseFinalAdditional(request)) orelse return error.TestExpectedEqual;
+    const mac_start = request_final.rdata_start + request_final.tsig.algorithm.asWire().len + 10;
+    broken[mac_start] ^= 0xff;
+
+    var output: [1024]u8 = undefined;
+    const response_bytes = try runtime.answer(broken[0..request.len], &output);
+    const parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@as(@TypeOf(parsed.header.rcode), .notauth), parsed.header.rcode);
+    // RFC 8945 section 5.2.2: the error response carries the BADSIG code and
+    // is unsigned.
+    const response_final = (try tsig.parseFinalAdditional(response_bytes)) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u16, 16), response_final.tsig.error_code);
+    try std.testing.expectEqual(@as(usize, 0), response_final.tsig.macBytes().len);
+}
+
 test "runtime serves AXFR as one bounded TCP blob opening and closing with SOA" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2845,6 +3182,101 @@ test "runtime serves AXFR as one bounded TCP blob opening and closing with SOA" 
     try std.testing.expect(only.answers.items[only.answers.len - 1].rrtype.eql(.SOA));
     try std.testing.expectEqual(@as(u32, 10), only.answers.items[0].rdata.SOA.serial);
     try std.testing.expectEqual(@as(u32, 10), only.answers.items[only.answers.len - 1].rdata.SOA.serial);
+}
+
+/// The question of `transfer_test_axfr_query` on its own, for a request the
+/// test signs.
+const axfr_question_wire = [_]u8{
+    0x07, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0x00, 0x00, 0xfc, 0x00, 0x01,
+};
+
+/// The AXFR question of a name this server does not serve.
+const other_zone_question_wire = [_]u8{
+    0x05, 'o', 't', 'h', 'e', 'r', 0x00, 0x00, 0xfc, 0x00, 0x01,
+};
+
+test "a signed AXFR is answered with signed frames a client can verify" {
+    const now = 1_700_000_000;
+    var keyring = try keyring_mod.Keyring.parse("key \"key.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };");
+    // A zone with more records than one frame carries, so the answer is a
+    // sequence of messages and the chain between them is exercised.
+    var zone_text: std.ArrayList(u8) = .empty;
+    defer zone_text.deinit(std.testing.allocator);
+    try zone_text.appendSlice(std.testing.allocator,
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 10 3600 900 1209600 3600
+        \\@ IN NS ns.example.
+        \\
+    );
+    var index: usize = 0;
+    while (index < 70) : (index += 1) {
+        const line = try std.fmt.allocPrint(std.testing.allocator, "h{d} IN A 192.0.2.{d}\n", .{ index, index % 254 + 1 });
+        defer std.testing.allocator.free(line);
+        try zone_text.appendSlice(std.testing.allocator, line);
+    }
+    var runtime = try Runtime.fromZoneTextWithKeyring(zone_text.items, &keyring);
+    defer runtime.deinit();
+    runtime.setTsigNow(now);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const query = try makeSignedQueryWithQuestions(now, 32, false, 1, &axfr_question_wire, sha256_test_key);
+    const blob = try runtime.encodeTransferFrames(arena.allocator(), query.packet[0..query.len]);
+    const request_final = (try tsig.parseFinalAdditional(query.packet[0..query.len])) orelse return error.TestExpectedEqual;
+
+    var offset: usize = 0;
+    var frames: usize = 0;
+    var prior_bytes: [64]u8 = undefined;
+    var prior_len: usize = 0;
+    while (offset < blob.len) {
+        const frame_len = std.mem.readInt(u16, blob[offset..][0..2], .big);
+        const frame = blob[offset + 2 ..][0..frame_len];
+        // Every frame of a signed sequence carries a TSIG record.
+        const final = (try tsig.parseFinalAdditional(frame)) orelse return error.TestExpectedEqual;
+        if (frames == 0) {
+            // RFC 8945 section 5.3.1: the first message of a multi-message
+            // response is a standard answer, so it verifies with the request
+            // MAC and the whole TSIG record.
+            _ = try tsig.verify(frame, sha256_test_key.secret, request_final.tsig.macBytes(), 16);
+        } else {
+            // A later message chains on the MAC of the message before it.
+            _ = try tsig.verifyChained(&.{frame}, sha256_test_key.secret, prior_bytes[0..prior_len], 16);
+        }
+        prior_len = final.tsig.macBytes().len;
+        @memcpy(prior_bytes[0..prior_len], final.tsig.macBytes());
+        offset += 2 + frame_len;
+        frames += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), frames);
+}
+
+test "a signed out-of-zone AXFR is refused with a signed frame" {
+    const now = 1_700_000_000;
+    var keyring = try keyring_mod.Keyring.parse("key \"key.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };");
+    var runtime = try Runtime.fromZoneTextWithKeyring(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 10 3600 900 1209600 3600
+        \\@ IN NS ns.example.
+        \\
+    , &keyring);
+    defer runtime.deinit();
+    runtime.setTsigNow(now);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const query = try makeSignedQueryWithQuestions(now, 32, false, 1, &other_zone_question_wire, sha256_test_key);
+    const blob = try runtime.encodeTransferFrames(arena.allocator(), query.packet[0..query.len]);
+    const frame_len = std.mem.readInt(u16, blob[0..2], .big);
+    const frame = blob[2..][0..frame_len];
+    const parsed = try dns_message.Message.parse(arena.allocator(), frame);
+    try std.testing.expectEqual(@as(@TypeOf(parsed.header.rcode), .refused), parsed.header.rcode);
+    // The refusal of a signed request is signed too.
+    const final = (try tsig.parseFinalAdditional(frame)) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 32), final.tsig.macBytes().len);
+    const request_final = (try tsig.parseFinalAdditional(query.packet[0..query.len])) orelse return error.TestExpectedEqual;
+    _ = try tsig.verify(frame, sha256_test_key.secret, request_final.tsig.macBytes(), 16);
 }
 
 const reload_zone =

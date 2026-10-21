@@ -1226,6 +1226,18 @@ const Validator = struct {
     /// RFC 5155 sections 8.4 to 8.7, dispatched on what the response claims.
     fn checkNsec3Denial(self: *Validator, name: Name, qtype: u16, delegation: bool, nxdomain: bool) Error!Outcome {
         if (!self.nsec3ParamsConsistent()) return self.fail(dnssec.EDE_DNSSEC_BOGUS);
+        const outcome = try self.nsec3Denial(name, qtype, delegation, nxdomain);
+        // RFC 9276 section 3.2: a validator that processes NSEC3 records with
+        // an iteration count above 0 answers insecure, not secure, and says
+        // so with the EDE the RFC assigns to that answer.
+        if (self.nsec3s.items[0].iterations > 0) {
+            self.noteInsecure(dnssec.EDE_UNSUPPORTED_NSEC3_ITERATIONS);
+            if (outcome == .secure) return .insecure;
+        }
+        return outcome;
+    }
+
+    fn nsec3Denial(self: *Validator, name: Name, qtype: u16, delegation: bool, nxdomain: bool) Error!Outcome {
         if (delegation) return self.nsec3UnsignedReferral(name);
         const digest = self.hash(name);
         for (self.nsec3s.items) |*proof| {
@@ -2396,8 +2408,10 @@ test "RFC 5155 section 8.4: a closest-encloser proof is required, not just a cov
     const max_hash = "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv";
 
     // Control: apex plus the covering record is a complete proof, so it must
-    // validate secure. Without this, a negative test below would pass for the
-    // wrong reason (a validator that rejects everything).
+    // validate as one. Without this, a negative test below would pass for the
+    // wrong reason (a validator that rejects everything). The chain of this
+    // exchange carries the iteration count of RFC 5155 Appendix A, which is
+    // above 0, so RFC 9276 section 3.2 leaves the answer insecure.
     const complete = [_][]const u8{ h_example, zero_hash };
     const two_flags = [_]u8{ 0, 0 };
     const two_next = [_][]const u8{ h_ns1, max_hash };
@@ -2405,7 +2419,7 @@ test "RFC 5155 section 8.4: a closest-encloser proof is required, not just a cov
     var pair = try nsec3Exchange(std.testing.allocator, &key, "w.example.", .A, .nxdomain, &complete, &two_flags, &two_next, &two_bitmaps);
     defer pair.query.deinit();
     defer pair.response.deinit();
-    try expectStatus(.secure, try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds));
+    try expectStatus(.insecure, try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds));
 
     // Drop the apex NSEC3 and keep only the covering record. That is exactly
     // the section 8.4 attack: a span that covers the name but shows no
@@ -2422,6 +2436,35 @@ test "RFC 5155 section 8.4: a closest-encloser proof is required, not just a cov
     const result = try validate(std.testing.allocator, &anchors, incomplete.query, incomplete.response, &.{}, now_seconds);
     try expectStatus(.bogus, result);
     try std.testing.expectEqual(dnssec.EDE_DNSSEC_BOGUS, result.ede);
+}
+
+test "RFC 9276 section 3.2: an answer proven by an NSEC3 chain with an iteration count above 0 is insecure" {
+    var key = try zone_signer.parseKey(ed25519_secret);
+    defer key.deinit();
+    const dnskey_rdata = try key.dnskeyRdata(std.testing.allocator);
+    defer std.testing.allocator.free(dnskey_rdata);
+    var anchors = try dnskeyAnchor(std.testing.allocator, "example.", dnskey_rdata);
+    defer anchors.deinit(std.testing.allocator);
+
+    // The chain of this exchange is the one RFC 5155 Appendix A publishes:
+    // 12 iterations, above the count of 0 RFC 9276 section 3.1 asks a
+    // publisher to use. The proof itself is complete, so the answer is not
+    // bogus, but it is not secure either: a validator that processes NSEC3
+    // records with an iteration count above 0 treats the zone as insecure and
+    // says so with the EDE the RFC assigns to that answer.
+    const apex_bitmap = typeBitmap(&.{ .SOA, .NS, .RRSIG, .NSEC3, .DNSKEY });
+    const covering_bitmap = typeBitmap(&.{ .RRSIG, .NSEC3 });
+    const labels = [_][]const u8{ h_example, "00000000000000000000000000000000" };
+    const flags = [_]u8{ 0, 0 };
+    const next_labels = [_][]const u8{ h_ns1, "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv" };
+    const bitmaps = [_][]const u8{ &apex_bitmap, &covering_bitmap };
+    var pair = try nsec3Exchange(std.testing.allocator, &key, "w.example.", .A, .nxdomain, &labels, &flags, &next_labels, &bitmaps);
+    defer pair.query.deinit();
+    defer pair.response.deinit();
+
+    const result = try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds);
+    try expectStatus(.insecure, result);
+    try std.testing.expectEqual(dnssec.EDE_UNSUPPORTED_NSEC3_ITERATIONS, result.ede);
 }
 
 test "RFC 5155 section 8.6: a DS NODATA needs the Opt-Out bit or it is bogus" {
@@ -2732,7 +2775,7 @@ const nsec3_zonemd_absent_zone_text =
     \\$TTL 3600
     \\@ IN SOA ns1.example.com. hostmaster.example.com. 1 3600 900 1209600 3600
     \\@ IN NS ns1.example.com.
-    \\@ IN NSEC3PARAM 1 0 2 73616c74
+    \\@ IN NSEC3PARAM 1 0 0 73616c74
     \\ns1 IN A 192.0.2.1
 ;
 
@@ -2782,8 +2825,8 @@ const nsec3_rollover_zone_text =
     \\$TTL 3600
     \\@ IN SOA ns1.example.com. hostmaster.example.com. 1 3600 900 1209600 3600
     \\@ IN NS ns1.example.com.
-    \\@ IN NSEC3PARAM 1 0 2 73616c74
-    \\@ IN NSEC3PARAM 1 0 12 aabbccdd
+    \\@ IN NSEC3PARAM 1 0 0 73616c74
+    \\@ IN NSEC3PARAM 1 0 0 aabbccdd
     \\ns1 IN A 192.0.2.1
 ;
 

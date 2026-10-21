@@ -1106,6 +1106,25 @@ pub fn buildBlockedResponse(request: dns_message.Message) !dns_message.Message {
     return response;
 }
 
+/// RFC 8914 section 4.19: "An authoritative server or recursive resolver that
+/// receives a query from an 'unauthorized' client can annotate its REFUSED
+/// message with this code. Examples of 'unauthorized' clients are recursive
+/// queries from IP addresses outside the network, blocklisted IP addresses,
+/// local policy, etc."
+pub const EDE_PROHIBITED: u16 = 18;
+/// RFC 8914 section 3: the EXTRA-TEXT says why the answer is what it is.
+/// It names the operator's policy and nothing else, the way the Blocked
+/// refusal's text does.
+const ede_prohibited_text: []const u8 = "prohibited by policy";
+
+/// A refusal that says why: the operator's recursion ACL refused the client.
+pub fn buildProhibitedResponse(request: dns_message.Message) !dns_message.Message {
+    var response = try buildRefusedResponse(request);
+    errdefer response.deinit();
+    appendEde(&response, EDE_PROHIBITED, ede_prohibited_text);
+    return response;
+}
+
 /// RFC 8914 section 2: the EDE option rides in the OPT record, and the RFC
 /// allows it "in any response ... to a query that includes an OPT pseudo-RR",
 /// so a query that carried no OPT gets no EDE option. The OPTION-DATA is the
@@ -4525,6 +4544,44 @@ test "RFC 8914: the blocked refusal's EDE option carries its Extra Text" {
     // EXTRA-TEXT says why the name was refused.
     try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x0f }, options[4..6]);
     try std.testing.expectEqualStrings("blocked by policy", options[6..]);
+}
+
+test "RFC 8914: a prohibited refusal differs from a plain refusal only by the EDE option" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var request = try testQuery(arena.allocator(), "ads.home.arpa.", .A);
+    request.edns = .{ .udp_payload_size = 1232, .extended_rcode = 0, .version = 0, .dnssec_ok = false };
+    try request.additionals.append(.{
+        .owner = dns_name.Name.root(),
+        .rrtype = .OPT,
+        .class = dns_types.Class.fromCode(1232),
+        .ttl = 0,
+        .rdata = .{ .OPT = .{} },
+    });
+
+    const plain = try buildRefusedResponse(request);
+    const prohibited = try buildProhibitedResponse(request);
+    try std.testing.expectEqual(header.Rcode.refused, plain.header.rcode);
+    try std.testing.expectEqual(header.Rcode.refused, prohibited.header.rcode);
+
+    var plain_bytes: [512]u8 = undefined;
+    var plain_writer = dns_writer.Writer.init(&plain_bytes);
+    try plain.encode(&plain_writer);
+    var prohibited_bytes: [512]u8 = undefined;
+    var prohibited_writer = dns_writer.Writer.init(&prohibited_bytes);
+    try prohibited.encode(&prohibited_writer);
+
+    // The OPT record ends the answer, so its RDLENGTH is the last two octets:
+    // the prohibited answer is the plain one with the twenty-six octets of
+    // the EDE option and the RDLENGTH that counts them.
+    const plain_wire = plain_writer.written();
+    const prohibited_wire = prohibited_writer.written();
+    try std.testing.expectEqual(plain_wire.len + 26, prohibited_wire.len);
+    try std.testing.expectEqualSlices(u8, plain_wire[0 .. plain_wire.len - 2], prohibited_wire[0 .. plain_wire.len - 2]);
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x1a }, prohibited_wire[plain_wire.len - 2 ..][0..2]);
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x0f, 0x00, 0x16, 0x00, 0x12 }, prohibited_wire[plain_wire.len..][0..6]);
+    try std.testing.expectEqualStrings("prohibited by policy", prohibited_wire[plain_wire.len + 6 ..]);
 }
 
 test "RFC 8914: a plain refusal carries no EDE option" {

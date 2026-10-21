@@ -30,6 +30,10 @@ pub const Error = error{
     /// The operator's NSEC3 parameters contradict the ones the zone's own
     /// apex NSEC3PARAM states.
     BadChainParameters,
+    /// RFC 9276 section 3.1: a published NSEC3 chain uses an iteration count
+    /// of 0, so a chain that names another count is refused rather than
+    /// published.
+    InsecureChainParameters,
     AlreadySigned,
     KeyUsedForAnotherZone,
     SigningFailed,
@@ -471,6 +475,7 @@ fn selectChain(
 ) Error!ChainChoice {
     const wanted = policy orelse {
         const params = try apexNsec3Param(allocator, zone) orelse return .{ .kind = .nsec };
+        try checkPublishable(params);
         return .{ .kind = .nsec3, .params = params };
     };
     if (wanted.chain == .nsec) return .{ .kind = .nsec };
@@ -480,6 +485,7 @@ fn selectChain(
         .iterations = wanted.iterations,
         .salt = wanted.salt,
     };
+    try checkPublishable(params);
     const found = try apexNsec3Param(allocator, zone) orelse
         return .{ .kind = .nsec3, .params = params, .publish_param = true };
     // The zone states the parameters of its own chain, so the operator's
@@ -488,6 +494,14 @@ fn selectChain(
         return Error.BadChainParameters;
     }
     return .{ .kind = .nsec3, .params = found };
+}
+
+/// RFC 9276 section 3.1: "If NSEC3 must be used, then an iterations count of
+/// 0 MUST be used to alleviate computational burdens." A chain above that
+/// count is one a validator treats the answer it proves as insecure over
+/// (RFC 9276 section 3.2), so the signer refuses to publish one.
+fn checkPublishable(params: Nsec3Params) Error!void {
+    if (params.iterations != 0) return Error.InsecureChainParameters;
 }
 
 /// The chain the zone publishes, with the parameters of an NSEC3 chain.
@@ -1722,6 +1736,18 @@ const nsec3_sign_zone =
     \\$TTL 3600
     \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
     \\@ IN NS ns.example.
+    \\@ IN NSEC3PARAM 1 0 0 73616c74
+    \\www IN A 192.0.2.1
+    \\
+;
+
+/// A zone whose own apex NSEC3PARAM asks for an iteration count above 0
+/// (RFC 9276 section 3.1): the signer refuses it rather than publish it.
+const nsec3_iterations_sign_zone =
+    \\$ORIGIN example.
+    \\$TTL 3600
+    \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+    \\@ IN NS ns.example.
     \\@ IN NSEC3PARAM 1 0 2 73616c74
     \\www IN A 192.0.2.1
     \\
@@ -1739,9 +1765,9 @@ const nsec_sign_zone =
 
 /// The NSEC3 hashes of that zone, as the python hashlib oracle computed them:
 /// the iterated salted SHA-1 of the canonical wire name, with the salt "salt"
-/// and 2 iterations.
-const nsec3_apex_hash = [_]u8{ 0x76, 0xed, 0x9c, 0x9f, 0x42, 0xb4, 0xc9, 0x12, 0x2a, 0xcf, 0xc7, 0x5d, 0x39, 0xd9, 0x6e, 0x8d, 0x56, 0x6a, 0x14, 0xd0 };
-const nsec3_www_hash = [_]u8{ 0x31, 0x5f, 0x4a, 0x7c, 0xa2, 0xfc, 0xd7, 0xfe, 0x22, 0xd3, 0x10, 0x9d, 0x2e, 0x0e, 0xba, 0x23, 0xaf, 0x9b, 0xe5, 0x8f };
+/// and no extra iteration.
+const nsec3_apex_hash = [_]u8{ 0x1f, 0xbd, 0xa5, 0x68, 0xf1, 0x66, 0x17, 0x11, 0xab, 0x11, 0xf5, 0x24, 0x5c, 0xed, 0x50, 0x4a, 0x20, 0x19, 0xe8, 0x1a };
+const nsec3_www_hash = [_]u8{ 0x6b, 0xc0, 0x04, 0x6c, 0xcc, 0xac, 0xee, 0x16, 0x0c, 0xd9, 0x7d, 0x42, 0x69, 0xf8, 0x8b, 0x16, 0xc1, 0x55, 0xc9, 0x22 };
 
 /// One NSEC3 record of a signed zone, as the zone holds it.
 const Nsec3Record = struct {
@@ -1825,13 +1851,13 @@ test "an apex NSEC3PARAM makes the signer publish the NSEC3 chain (RFC 5155 7.1)
 
     const records = try nsec3Records(allocator, &zone);
     try std.testing.expectEqual(@as(usize, 2), records.len);
-    // The chain is in hash order: the hash of "www.example." sorts before the
-    // hash of the apex.
-    try std.testing.expectEqualStrings("65fkkv52vjbvs8mj22eis3lq4enpnpcf.example.", records[0].owner_text);
-    try std.testing.expectEqualStrings("ermpp7q2mj4h4amfotejjmbehlb6k56g.example.", records[1].owner_text);
+    // The chain is in hash order: the hash of the apex sorts before the hash
+    // of "www.example.".
+    try std.testing.expectEqualStrings("3uuqaq7hcobh3aohuki5prag98g1jq0q.example.", records[0].owner_text);
+    try std.testing.expectEqualStrings("df008r6cljn1c36pfl16ju4b2r0lbi92.example.", records[1].owner_text);
     // Each record names the next hash, and the last wraps to the first.
-    try std.testing.expectEqualSlices(u8, &nsec3_apex_hash, records[0].next_hash);
-    try std.testing.expectEqualSlices(u8, &nsec3_www_hash, records[1].next_hash);
+    try std.testing.expectEqualSlices(u8, &nsec3_www_hash, records[0].next_hash);
+    try std.testing.expectEqualSlices(u8, &nsec3_apex_hash, records[1].next_hash);
     // The zone publishes the NSEC3 chain, not an NSEC one.
     try std.testing.expect(!hasRecord(&zone, "example.", .NSEC));
     try std.testing.expect(!hasRecord(&zone, "www.example.", .NSEC));
@@ -1890,19 +1916,26 @@ test "the NSEC3 chain carries the hashes the hashlib oracle computed (RFC 5155 5
     try signZone(allocator, &zone, &key, rfc8080_window);
 
     // The owner label of an NSEC3 decodes back to the hash of the name it
-    // was built from.
+    // was built from. The chain is in hash order, so the two names are
+    // looked up by their hash and not by their place in it.
     const records = try nsec3Records(allocator, &zone);
-    const www = try Name.fromText(records[0].owner_text);
-    const apex = try Name.fromText(records[1].owner_text);
-    try std.testing.expectEqualSlices(u8, &nsec3_www_hash, &dns_validate.nsec3OwnerHash(www).?);
-    try std.testing.expectEqualSlices(u8, &nsec3_apex_hash, &dns_validate.nsec3OwnerHash(apex).?);
+    var saw_apex = false;
+    var saw_www = false;
+    for (records) |record| {
+        const owner = try Name.fromText(record.owner_text);
+        const hash = dns_validate.nsec3OwnerHash(owner).?;
+        if (std.mem.eql(u8, &hash, &nsec3_apex_hash)) saw_apex = true;
+        if (std.mem.eql(u8, &hash, &nsec3_www_hash)) saw_www = true;
+    }
+    try std.testing.expect(saw_apex);
+    try std.testing.expect(saw_www);
 
     // The project's own hash function computes the same two values, so the
     // signer and the serving path agree on every hash.
     var out: [20]u8 = undefined;
-    dns_dnssec.nsec3Hash(try Name.fromText("www.example."), "salt", 2, &out);
+    dns_dnssec.nsec3Hash(try Name.fromText("www.example."), "salt", 0, &out);
     try std.testing.expectEqualSlices(u8, &nsec3_www_hash, &out);
-    dns_dnssec.nsec3Hash(try Name.fromText("example."), "salt", 2, &out);
+    dns_dnssec.nsec3Hash(try Name.fromText("example."), "salt", 0, &out);
     try std.testing.expectEqualSlices(u8, &nsec3_apex_hash, &out);
 }
 
@@ -2086,7 +2119,7 @@ test "a zone that is signed again keeps the chain the served zone publishes" {
     const param = (try findOpaque(&zone, "example.", .NSEC3PARAM, null)).?;
     try std.testing.expectEqual(@as(u8, 1), param[0]);
     try std.testing.expectEqual(@as(u8, 0), param[1]);
-    try std.testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, param[2..4], .big));
+    try std.testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, param[2..4], .big));
     try std.testing.expectEqual(@as(u8, 4), param[4]);
     try std.testing.expectEqualSlices(u8, "salt", param[5..9]);
 
@@ -2149,6 +2182,29 @@ test "the operator's NSEC3 choice builds the chain in a zone that states no NSEC
     try std.testing.expect(found);
 }
 
+test "RFC 9276 section 3.1: the signer refuses an NSEC3 chain whose iteration count is not 0" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var key = try parseKey(rfc8080_ed25519_key);
+    defer key.deinit();
+
+    // A zone whose own apex NSEC3PARAM asks for an iteration count above 0:
+    // the chain it would publish is one a validator treats the answer it
+    // proves as insecure over, so the zone is refused.
+    var zone = try loadZone(nsec3_iterations_sign_zone);
+    defer zone.deinit();
+    try std.testing.expectError(error.InsecureChainParameters, signZone(allocator, &zone, &key, rfc8080_window));
+
+    // The operator's directive asking for one is refused the same way.
+    var directed = try loadZone(nsec_sign_zone);
+    defer directed.deinit();
+    var options = rfc8080_window;
+    options.chain = .{ .chain = .nsec3, .iterations = 2, .salt = "" };
+    try std.testing.expectError(error.InsecureChainParameters, signZone(allocator, &directed, &key, options));
+}
+
 /// A zone with an unsigned delegation whose apex NSEC3PARAM asks for the
 /// Opt-Out flag (RFC 5155 section 3.1.2.1): the chain leaves the delegation
 /// out and the record that covers it carries the flag.
@@ -2157,7 +2213,7 @@ const nsec3_optout_sign_zone =
     \\$TTL 3600
     \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
     \\@ IN NS ns.example.
-    \\@ IN NSEC3PARAM 1 1 2 73616c74
+    \\@ IN NSEC3PARAM 1 1 0 73616c74
     \\www IN A 192.0.2.1
     \\unsigned-sub IN NS ns.unsigned-sub.example.
     \\
@@ -2170,15 +2226,15 @@ const nsec3_optout_clear_sign_zone =
     \\$TTL 3600
     \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
     \\@ IN NS ns.example.
-    \\@ IN NSEC3PARAM 1 0 2 73616c74
+    \\@ IN NSEC3PARAM 1 0 0 73616c74
     \\www IN A 192.0.2.1
     \\unsigned-sub IN NS ns.unsigned-sub.example.
     \\
 ;
 
 /// The hash of the unsigned delegation of that zone, as the hashlib oracle
-/// computed it with the salt "salt" and 2 iterations.
-const nsec3_unsigned_sub_hash = [_]u8{ 0x61, 0xb9, 0xf0, 0x9a, 0xcd, 0x45, 0x1c, 0x93, 0x07, 0xf7, 0x77, 0xb1, 0xb8, 0x67, 0x9a, 0xc1, 0x58, 0x83, 0xe0, 0xc4 };
+/// computed it with the salt "salt" and no extra iteration.
+const nsec3_unsigned_sub_hash = [_]u8{ 0xe2, 0x1c, 0x7a, 0x83, 0x41, 0x05, 0x5c, 0xac, 0x88, 0xf5, 0x35, 0x31, 0x2a, 0x49, 0x0a, 0xe3, 0xf8, 0xc5, 0x47, 0xeb };
 
 test "a zone with an unsigned delegation and an Opt-Out NSEC3PARAM is signed with an Opt-Out chain (RFC 5155 7.1)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

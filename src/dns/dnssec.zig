@@ -37,6 +37,9 @@ pub const EDE_UNSUPPORTED_DS_DIGEST_TYPE: u16 = 2;
 pub const EDE_DNSSEC_INDETERMINATE: u16 = 5;
 /// RFC 8914 section 4.12: no DNSKEY of the zone carried the Zone Key flag.
 pub const EDE_NO_ZONE_KEY_BIT: u16 = 11;
+/// RFC 9276 section 6: the NSEC3 chain carries an iteration count this build
+/// does not treat the answer it proves as secure over.
+pub const EDE_UNSUPPORTED_NSEC3_ITERATIONS: u16 = 27;
 
 /// RFC 8914 EXTRA-TEXT purpose strings for the INFO-CODEs above.
 pub fn edeText(code: u16) []const u8 {
@@ -50,6 +53,7 @@ pub fn edeText(code: u16) []const u8 {
         EDE_UNSUPPORTED_DS_DIGEST_TYPE => "unsupported ds digest type",
         EDE_DNSSEC_INDETERMINATE => "dnssec indeterminate",
         EDE_NO_ZONE_KEY_BIT => "no zone key bit set",
+        EDE_UNSUPPORTED_NSEC3_ITERATIONS => "unsupported nsec3 iterations",
         else => "",
     };
 }
