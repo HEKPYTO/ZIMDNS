@@ -555,6 +555,53 @@ fn loadTransferTestOldZone() !zone_index.Zone {
     return zone_index.Zone.fromZoneFile(&zone_file);
 }
 
+/// A zone with enough records for its difference to be shorter than the
+/// full transfer: the difference carries two SOA records and the changed
+/// ones, the full transfer carries every record of the zone.
+const transfer_test_zone_wide =
+    \\$ORIGIN wide.example.
+    \\$TTL 3600
+    \\@ IN SOA ns.wide.example. hostmaster.wide.example. 10 3600 900 1209600 3600
+    \\@ IN NS ns.wide.example.
+    \\a IN A 192.0.2.1
+    \\b IN A 192.0.2.2
+    \\c IN A 192.0.2.3
+    \\d IN A 192.0.2.4
+    \\e IN A 192.0.2.5
+    \\f IN A 192.0.2.6
+    \\g IN A 192.0.2.7
+    \\h IN A 192.0.2.8
+    \\
+;
+
+/// The same zone before the change: the address of a is the one the change
+/// replaces.
+const transfer_test_zone_wide_old =
+    \\$ORIGIN wide.example.
+    \\$TTL 3600
+    \\@ IN SOA ns.wide.example. hostmaster.wide.example. 9 3600 900 1209600 3600
+    \\@ IN NS ns.wide.example.
+    \\a IN A 192.0.2.99
+    \\b IN A 192.0.2.2
+    \\c IN A 192.0.2.3
+    \\d IN A 192.0.2.4
+    \\e IN A 192.0.2.5
+    \\f IN A 192.0.2.6
+    \\g IN A 192.0.2.7
+    \\h IN A 192.0.2.8
+    \\
+;
+
+fn loadTransferTestWideZone() !zone_index.Zone {
+    var zone_file = try zone_parser.ZoneFile.parse(transfer_test_zone_wide);
+    return zone_index.Zone.fromZoneFile(&zone_file);
+}
+
+fn loadTransferTestWideOldZone() !zone_index.Zone {
+    var zone_file = try zone_parser.ZoneFile.parse(transfer_test_zone_wide_old);
+    return zone_index.Zone.fromZoneFile(&zone_file);
+}
+
 /// The difference the change from the old zone to the new one makes, in the
 /// journal's encoding: the older SOA and the records it removed, then the
 /// newer SOA and the records it added.
@@ -936,6 +983,73 @@ test "an IXFR for an unknown serial gets the full transfer" {
     try std.testing.expectEqual(new_zone.records.len + 1, messages[0].answers.len);
     try std.testing.expect(messages[0].answers.items[0].rrtype.eql(.SOA));
     try std.testing.expect(messages[0].answers.items[messages[0].answers.len - 1].rrtype.eql(.SOA));
+}
+
+test "a difference longer than the full transfer is answered with the full transfer" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var zone = try loadTransferTestZone();
+    defer zone.deinit();
+
+    var log = journal_mod.DeltaLog{};
+    log.setOrigin("example.");
+    try log.record(9, 10, transfer_test_difference);
+    // The server knows the size of the full transfer of the zone.
+    log.setFullTransferBytes(zone_index.fullTransferBytes(&zone));
+
+    // RFC 1995 section 5: the incremental answer would be longer than the
+    // full transfer it replaces, so the client gets the full transfer.
+    try std.testing.expectEqual(IxfrDecision.fallback_axfr, decideIxfr(10, 9, &log));
+
+    // The answer the client gets is the AXFR shape: the apex SOA first and
+    // last, and no SOA of the serial the client asked from.
+    const request = try ixfrRequest(arena.allocator(), "example.", 9);
+    const messages = try buildAxfrMessages(arena.allocator(), &request, &zone, 64);
+    defer {
+        for (messages) |*message| message.deinit();
+        arena.allocator().free(messages);
+    }
+    try std.testing.expectEqual(@as(usize, 1), messages.len);
+    try std.testing.expectEqual(zone.records.len + 1, messages[0].answers.len);
+    try std.testing.expect(messages[0].answers.items[0].rrtype.eql(.SOA));
+    try std.testing.expect(messages[0].answers.items[messages[0].answers.len - 1].rrtype.eql(.SOA));
+    for (messages[0].answers.slice()) |record| {
+        if (!record.rrtype.eql(.SOA)) continue;
+        try std.testing.expectEqual(@as(u32, 10), record.rdata.SOA.serial);
+    }
+}
+
+test "a difference shorter than the full transfer is answered incrementally" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var old_zone = try loadTransferTestWideOldZone();
+    defer old_zone.deinit();
+    var new_zone = try loadTransferTestWideZone();
+    defer new_zone.deinit();
+
+    const difference = try zone_index.difference(allocator, &old_zone, &new_zone);
+    defer allocator.free(difference);
+
+    var log = journal_mod.DeltaLog{};
+    log.setOrigin("wide.example.");
+    try log.record(9, 10, difference);
+    log.setFullTransferBytes(zone_index.fullTransferBytes(&new_zone));
+
+    // The incremental answer is shorter than the full transfer, so the
+    // client gets the difference.
+    try std.testing.expectEqual(IxfrDecision.incremental, decideIxfr(10, 9, &log));
+
+    // The answer is the incremental one: the current SOA, the difference
+    // with the older SOA first, and the current SOA again.
+    const request = try ixfrRequest(arena.allocator(), "wide.example.", 9);
+    var message = try buildIxfrIncrementalMessages(arena.allocator(), &request, &new_zone, 9);
+    defer message.deinit();
+    try std.testing.expectEqual(@as(usize, 6), message.answers.len);
+    try std.testing.expectEqual(@as(u32, 10), message.answers.items[0].rdata.SOA.serial);
+    try std.testing.expectEqual(@as(u32, 9), message.answers.items[1].rdata.SOA.serial);
+    try std.testing.expectEqual(@as(u32, 10), message.answers.items[message.answers.len - 1].rdata.SOA.serial);
 }
 
 /// A NOTIFY request for example. whose answer section hints at an SOA with

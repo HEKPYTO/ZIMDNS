@@ -50,6 +50,10 @@ pub const AnswerPolicy = struct {
     /// RFC 8482 section 4.2: the TTL of the synthesized HINFO in a minimal
     /// ANY answer. The RFC leaves it to the operator; a day is the default.
     minimal_any_ttl: u32 = 86400,
+    /// RFC 8482 section 4.4 lets a responder answer an ANY query differently
+    /// per transport. This is the TTL of the synthesized HINFO when the query
+    /// arrived over TCP; null means the same TTL as over UDP.
+    minimal_any_ttl_tcp: ?u32 = null,
     /// RFC 7828 section 3.3.2: the idle timeout signalled in the option, in
     /// units of 100 milliseconds. Zero asks the client to close the session.
     tcp_keepalive_timeout: u16 = TCP_IDLE_TIMEOUT_UNITS,
@@ -397,7 +401,11 @@ pub fn buildResponseWithPolicy(
                 q.qtype.eql(dns_types.RecordType.ANY) and
                 zone.hasOwner(qname_text);
             if (minimal_any) {
-                const answer = anyMinimalAnswer(q.name, policy.minimal_any_ttl);
+                // RFC 8482 section 4.4: the operator may answer an ANY query
+                // differently per transport. The TCP TTL applies to a query
+                // that arrived over TCP, the base TTL everywhere else.
+                const any_ttl = if (over_tcp) (policy.minimal_any_ttl_tcp orelse policy.minimal_any_ttl) else policy.minimal_any_ttl;
+                const answer = anyMinimalAnswer(q.name, any_ttl);
                 try response.answers.append(answer);
                 // RFC 8482 section 4.2: a signed zone must return a valid
                 // RRSIG for the RRsets in the answer when the query sets DO=1.
@@ -3358,6 +3366,56 @@ test "RFC 8482: a configured TTL reaches the synthesized HINFO" {
     try std.testing.expectEqual(@as(u32, 86400), default.answers.items[0].ttl);
 }
 
+test "RFC 8482: the minimal ANY answer takes the TTL of the transport it arrived over" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
+        \\
+    );
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    // Section 4.4: the operator's TCP TTL answers a query that arrived over
+    // TCP, the base TTL answers it over UDP.
+    const policy = AnswerPolicy{ .minimal_any_ttl = 300, .minimal_any_ttl_tcp = 3600 };
+    const udp = try buildResponseWithPolicy(try testQuery(arena.allocator(), "dns.home.arpa.", .ANY), &zone, policy, null, false);
+    const tcp = try buildResponseWithPolicy(try testQuery(arena.allocator(), "dns.home.arpa.", .ANY), &zone, policy, null, true);
+    try std.testing.expectEqual(@as(u32, 300), udp.answers.items[0].ttl);
+    try std.testing.expectEqual(@as(u32, 3600), tcp.answers.items[0].ttl);
+
+    // Without a TCP TTL the base TTL serves both transports.
+    const both = try buildResponseWithPolicy(try testQuery(arena.allocator(), "dns.home.arpa.", .ANY), &zone, .{ .minimal_any_ttl = 300 }, null, true);
+    try std.testing.expectEqual(@as(u32, 300), both.answers.items[0].ttl);
+
+    // Section 4.2: the synthesized HINFO is untouched, CPU "RFC8482" and the
+    // null OS string.
+    const hinfo = tcp.answers.items[0].rdata.HINFO;
+    try std.testing.expectEqualStrings("RFC8482", hinfo.cpuText());
+    try std.testing.expectEqualStrings("", hinfo.osText());
+
+    // Nothing but the TTL changes between the two answers.
+    var udp_wire: [512]u8 = undefined;
+    var udp_writer = dns_writer.Writer.init(&udp_wire);
+    try udp.encode(&udp_writer);
+    var tcp_wire: [512]u8 = undefined;
+    var tcp_writer = dns_writer.Writer.init(&tcp_wire);
+    try tcp.encode(&tcp_writer);
+    try std.testing.expectEqual(udp_writer.len(), tcp_writer.len());
+    const udp_ttl = [_]u8{ 0x00, 0x00, 0x01, 0x2C };
+    const ttl_at = std.mem.indexOf(u8, udp_writer.written(), &udp_ttl) orelse return error.TestUnexpectedResult;
+    for (udp_writer.written(), tcp_writer.written(), 0..) |udp_byte, tcp_byte, index| {
+        if (index >= ttl_at and index < ttl_at + 4) continue;
+        try std.testing.expectEqual(udp_byte, tcp_byte);
+    }
+    try std.testing.expectEqual(@as(u32, 3600), std.mem.readInt(u32, tcp_writer.written()[ttl_at..][0..4], .big));
+}
+
 test "RFC 8482: a DO=1 ANY query on a signed zone answers the HINFO with a valid RRSIG" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -3424,6 +3482,17 @@ test "RFC 8482: a DO=1 ANY query on a signed zone answers the HINFO with a valid
     const plain_answer = try buildResponseWithPolicy(plain_query, &zone, .{}, &session, false);
     try std.testing.expectEqual(@as(u16, 1), plain_answer.header.answer_count);
     try std.testing.expect(plain_answer.answers.items[0].rrtype.eql(hinfo_type));
+
+    // The signed path takes the transport's TTL too, and the RRSIG carries
+    // that TTL as its original TTL.
+    const tcp_query = try testDoQuery(arena.allocator(), 0x4a04, "www.example.", .ANY, true);
+    const tcp_answer = try buildResponseWithPolicy(tcp_query, &zone, .{ .minimal_any_ttl_tcp = 120 }, &session, true);
+    try std.testing.expectEqual(@as(u32, 120), tcp_answer.answers.items[0].ttl);
+    const tcp_rrsig = switch (tcp_answer.answers.items[1].rdata) {
+        .Unknown => |*unknown| unknown.bytes(),
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(u32, 120), std.mem.readInt(u32, tcp_rrsig[4..8], .big));
 }
 
 test "RFC 8482: an unsigned zone answers the HINFO with no RRSIG" {

@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const dns_name = @import("../dns/name.zig");
 const dns_record = @import("../dns/record.zig");
 const dns_types = @import("../dns/types.zig");
+const dns_writer = @import("../dns/writer.zig");
 const zone_parser = @import("parser.zig");
 
 pub const SerialOrder = enum {
@@ -95,6 +96,8 @@ const StoredDelta = struct {
     to_serial: u32 = 0,
     text: [max_delta_bytes]u8 = undefined,
     text_len: usize = 0,
+    /// The wire size of the records the difference carries.
+    wire_bytes: usize = 0,
 };
 
 /// The differences the running server keeps. The store is bounded: the
@@ -110,6 +113,8 @@ pub const Delta = struct {
     /// The records the transition removed and added, in the journal's
     /// encoding.
     text: []const u8,
+    /// The wire size of the records the difference carries.
+    wire_bytes: usize,
 };
 
 /// Keeps the difference of one transition. A difference that does not fit the
@@ -124,6 +129,7 @@ fn storeDelta(origin: []const u8, from_serial: u32, to_serial: u32, text: []cons
     // client at that serial gets the full transfer, never an incremental
     // answer built from records that are not records.
     if (!differenceIsUsable(text)) return;
+    const wire_bytes = differenceBytes(text);
     // A transition the store already holds keeps its place: the difference
     // that comes later is the one the answer is built from.
     for (stored[0..stored_len]) |*entry| {
@@ -131,6 +137,7 @@ fn storeDelta(origin: []const u8, from_serial: u32, to_serial: u32, text: []cons
         if (!std.ascii.eqlIgnoreCase(entry.origin[0..entry.origin_len], origin)) continue;
         @memcpy(entry.text[0..text.len], text);
         entry.text_len = text.len;
+        entry.wire_bytes = wire_bytes;
         return;
     }
     if (stored_len == max_stored_deltas) {
@@ -144,7 +151,36 @@ fn storeDelta(origin: []const u8, from_serial: u32, to_serial: u32, text: []cons
     entry.to_serial = to_serial;
     @memcpy(entry.text[0..text.len], text);
     entry.text_len = text.len;
+    entry.wire_bytes = wire_bytes;
     stored_len += 1;
+}
+
+/// The wire size of one record: the bytes the record takes in a DNS
+/// message, the same count the answer carries.
+pub fn recordBytes(record: dns_record.ResourceRecord) usize {
+    var buffer: [max_record_bytes]u8 = undefined;
+    var writer = dns_writer.Writer.init(&buffer);
+    // A record that does not fit the wire is malformed, and the buffer is
+    // the largest a record can be.
+    record.encode(&writer) catch return buffer.len;
+    return writer.len();
+}
+
+/// The longest a record can be on the wire.
+const max_record_bytes = 65535;
+
+/// The wire size of the records a difference carries: the bytes the
+/// difference takes in an incremental answer.
+fn differenceBytes(text: []const u8) usize {
+    var total: usize = 0;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const record = parseDeltaRecord(line) orelse continue;
+        const converted = toResourceRecord(record) catch continue;
+        total += recordBytes(converted);
+    }
+    return total;
 }
 
 /// The difference one transition carries, or null when the store does not
@@ -168,9 +204,45 @@ pub fn nextDelta(origin: []const u8, from_serial: u32) ?Delta {
             .from_serial = entry.from_serial,
             .to_serial = entry.to_serial,
             .text = entry.text[0..entry.text_len],
+            .wire_bytes = entry.wire_bytes,
         };
     }
     return null;
+}
+
+/// The wire size of the differences on the way from `from_serial` to
+/// `to_serial`: the bytes the incremental answer carries besides its two
+/// current SOA records.
+pub fn differenceChainBytes(origin: []const u8, from_serial: u32, to_serial: u32) usize {
+    var total: usize = 0;
+    var next = from_serial;
+    var hops: usize = 0;
+    while (next != to_serial) : (hops += 1) {
+        if (hops > max_stored_deltas) return total;
+        const delta = nextDelta(origin, next) orelse return total;
+        total += delta.wire_bytes;
+        next = delta.to_serial;
+    }
+    return total;
+}
+
+/// Drops the difference of the oldest version on the way out of
+/// `from_serial`: the information about that version does not stay in the
+/// store, so the storage stays bounded the way RFC 1995 section 5
+/// describes.
+fn purgeOldestDifference(origin: []const u8, from_serial: u32) void {
+    for (stored[0..stored_len], 0..) |entry, index| {
+        if (entry.from_serial != from_serial) continue;
+        if (!std.ascii.eqlIgnoreCase(entry.origin[0..entry.origin_len], origin)) continue;
+        dropStored(index);
+        return;
+    }
+}
+
+/// Removes one difference from the store.
+fn dropStored(index: usize) void {
+    std.mem.copyForwards(StoredDelta, stored[index .. stored_len - 1], stored[index + 1 .. stored_len]);
+    stored_len -= 1;
 }
 
 /// Reports whether the store holds every difference on the way from
@@ -523,6 +595,9 @@ pub const DeltaLog = struct {
     /// of every zone, and the apex says which zone a record belongs to.
     origin: [max_origin_len]u8 = undefined,
     origin_len: usize = 0,
+    /// The wire size of the records a full transfer of the zone carries, or
+    /// zero when the server does not know it yet.
+    full_transfer_bytes: usize = 0,
 
     /// Names the zone this log belongs to, so a transition can be written to
     /// the journal with the zone it belongs to.
@@ -534,6 +609,13 @@ pub const DeltaLog = struct {
 
     pub fn originText(self: *const DeltaLog) []const u8 {
         return self.origin[0..self.origin_len];
+    }
+
+    /// Records the wire size of the records a full transfer of the zone
+    /// carries, so the incremental answer is measured against the full
+    /// transfer it replaces (RFC 1995 section 5).
+    pub fn setFullTransferBytes(self: *DeltaLog, bytes: usize) void {
+        self.full_transfer_bytes = bytes;
     }
 
     /// Records that the zone moved from `from_serial` to `to_serial`, with
@@ -596,7 +678,24 @@ pub const DeltaLog = struct {
         if (!self.chainConnects(client_serial, current_serial)) return false;
         // Every transition on the way carries the difference the incremental
         // answer is built from.
-        return differenceChainHolds(self.originText(), client_serial, current_serial);
+        if (!differenceChainHolds(self.originText(), client_serial, current_serial)) return false;
+        // RFC 1995 section 5: the incremental answer must not be longer
+        // than the full transfer it replaces.
+        return self.incrementalIsShorter(client_serial, current_serial);
+    }
+
+    /// Reports whether the incremental answer for `client_serial` is
+    /// shorter than the full transfer of the zone. Both answers carry the
+    /// two current SOA records, so only the other records are compared.
+    fn incrementalIsShorter(self: *const DeltaLog, client_serial: u32, current_serial: u32) bool {
+        if (self.full_transfer_bytes == 0) return true;
+        const chain = differenceChainBytes(self.originText(), client_serial, current_serial);
+        if (chain < self.full_transfer_bytes) return true;
+        // RFC 1995 section 5: the information about the older version goes,
+        // so the storage stays bounded and the client gets the full
+        // transfer.
+        purgeOldestDifference(self.originText(), client_serial);
+        return false;
     }
 
     /// Reports whether the recorded transitions connect `client_serial` to
@@ -636,6 +735,22 @@ test "delta log serves incremental answers only across recorded transitions" {
     try std.testing.expect(log.canServeIncremental(11, 12));
     try std.testing.expect(!log.canServeIncremental(9, 12));
     try std.testing.expect(!log.canServeIncremental(10, 13));
+}
+
+test "a difference that is not shorter than the full transfer is purged" {
+    var log = DeltaLog{};
+    log.setOrigin("purge.example.");
+    try log.record(10, 11, test_difference);
+    try std.testing.expect(differenceFor("purge.example.", 10, 11) != null);
+
+    // The server knows the size of the full transfer of the zone, and the
+    // difference is longer: the client at the old serial gets the full
+    // transfer, and the difference is purged so the storage stays bounded.
+    log.setFullTransferBytes(16);
+    try std.testing.expect(!log.canServeIncremental(10, 11));
+    try std.testing.expect(differenceFor("purge.example.", 10, 11) == null);
+    try std.testing.expect(log.len <= max_deltas);
+    try std.testing.expect(stored_len <= max_stored_deltas);
 }
 
 test "delta log rejects transitions that are not RFC 1982 newer" {

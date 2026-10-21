@@ -2587,6 +2587,41 @@ test "RFC 7828: a TCP query with the keepalive option is answered with it, the s
     try std.testing.expect(findKeepaliveOption(udp_response) == null);
 }
 
+test "RFC 8482: the minimal ANY TTL follows the transport the query arrived over" {
+    var runtime = try Runtime.fromZoneText(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\www IN A 192.168.1.1
+        \\
+    );
+    defer runtime.deinit();
+    runtime.answer_policy.minimal_any_ttl = 300;
+    runtime.answer_policy.minimal_any_ttl_tcp = 3600;
+
+    // A QTYPE=ANY query for an owner the zone carries.
+    const any_query = [_]u8{
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        3,    'w',  'w',  'w',  4,    'h',  'o',  'm',  'e',  4,    'a',  'r',
+        'p',  'a',  0,    0x00, 0xff, 0x00, 0x01,
+    };
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 53004);
+    var output: [512]u8 = undefined;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // The same query over UDP and over TCP carries the TTL of its transport.
+    const udp_bytes = try runtime.answerFrom(&any_query, &output, &client);
+    const udp_response = try dns_message.Message.parse(arena.allocator(), udp_bytes);
+    try std.testing.expectEqual(@as(u32, 300), udp_response.answers.items[0].ttl);
+
+    const tcp_bytes = try runtime.answerFromTcp(&any_query, &output, &client, null);
+    const tcp_response = try dns_message.Message.parse(arena.allocator(), tcp_bytes);
+    try std.testing.expectEqual(@as(u32, 3600), tcp_response.answers.items[0].ttl);
+}
+
 test "authoritative runtime dispatches to the longest matching zone" {
     var runtime = try Runtime.fromZoneTexts(&.{
         \\$ORIGIN example.

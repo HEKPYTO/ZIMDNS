@@ -20,6 +20,23 @@ pub const Error = error{
 
 pub const Transport = enum { udp, tcp, dot, doh };
 
+/// The chain a signed zone publishes: the RFC 4034 NSEC chain or the
+/// RFC 5155 NSEC3 chain.
+pub const Chain = enum { nsec, nsec3 };
+
+/// The chain an operator chose for the signed zones, with the parameters of
+/// an NSEC3 chain (RFC 5155 section 4.1).
+pub const ChainConfig = struct {
+    chain: Chain,
+    iterations: u16 = 0,
+    salt: [255]u8 = undefined,
+    salt_len: u8 = 0,
+
+    pub fn saltBytes(self: *const ChainConfig) []const u8 {
+        return self.salt[0..self.salt_len];
+    }
+};
+
 /// RFC 9520 section 3.2: a resolution failure is cached for at least one
 /// second and never longer than five minutes, so the operator's cache time
 /// is a number of seconds inside those bounds.
@@ -319,6 +336,11 @@ pub const Config = struct {
     /// (see AnswerPolicy.minimal_any_ttl); set via `minimal-any-ttl <seconds>`.
     minimal_any_ttl: ?u32 = null,
 
+    /// RFC 8482 section 4.4: the TTL of the synthesized HINFO when the ANY
+    /// query arrived over TCP. Null means the same TTL as over UDP; set via
+    /// `minimal-any-ttl-tcp <seconds>`.
+    minimal_any_ttl_tcp: ?u32 = null,
+
     /// RFC 6147 DNS64 synthesis prefixes, in the RFC 6052 section 2.2 format,
     /// each with the IPv4 address range it serves. No prefix means the
     /// forwarder never synthesizes an AAAA, which is the default; set via
@@ -345,6 +367,10 @@ pub const Config = struct {
     /// client subnet option. Null means the client's own prefix length is
     /// forwarded unchanged; set via `client-subnet-max-prefix <length>`.
     max_cacheable_prefix: ?u8 = null,
+
+    /// The chain the signed zones publish. Null means the zone's own apex
+    /// NSEC3PARAM decides, as it always did; set via `dnssec-chain`.
+    chain: ?ChainConfig = null,
 
     pub fn tlsCertFileText(self: *const Config) ?[]const u8 {
         if (!self.has_tls_cert_file) return null;
@@ -413,11 +439,13 @@ pub const Config = struct {
         if (std.mem.eql(u8, first, "nsid")) return self.parseNsid(&tokens);
         if (std.mem.eql(u8, first, "zoneversion")) return self.parseZoneversion(&tokens);
         if (std.mem.eql(u8, first, "minimal-any-ttl")) return self.parseMinimalAnyTtl(&tokens);
+        if (std.mem.eql(u8, first, "minimal-any-ttl-tcp")) return self.parseMinimalAnyTtlTcp(&tokens);
         if (std.mem.eql(u8, first, "nat64-prefix")) return self.parseNat64Prefix(&tokens);
         if (std.mem.eql(u8, first, "dns64-exclude")) return self.parseDns64Exclude(&tokens);
         if (std.mem.eql(u8, first, "minimum-failure-cache-time")) return self.parseMinimumFailureCacheTime(&tokens);
         if (std.mem.eql(u8, first, "forwarder-deny-port")) return self.parseForwarderDenyPort(&tokens);
         if (std.mem.eql(u8, first, "client-subnet-max-prefix")) return self.parseClientSubnetMaxPrefix(&tokens);
+        if (std.mem.eql(u8, first, "dnssec-chain")) return self.parseChain(&tokens);
         return Error.UnknownDirective;
     }
 
@@ -613,6 +641,15 @@ pub const Config = struct {
         self.minimal_any_ttl = parsed;
     }
 
+    fn parseMinimalAnyTtlTcp(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        if (self.minimal_any_ttl_tcp != null) return Error.BadDirective;
+        const value = tokens.next() orelse return Error.BadDirective;
+        try requireNoTrailingTokens(tokens);
+        const parsed = std.fmt.parseInt(u32, value, 10) catch return Error.BadDirective;
+        if (parsed > 0x7fffffff) return Error.BadDirective;
+        self.minimal_any_ttl_tcp = parsed;
+    }
+
     fn parseNat64Prefix(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
         const value = tokens.next() orelse return Error.BadDirective;
         var prefix = try Nat64Prefix.parse(value);
@@ -652,6 +689,26 @@ pub const Config = struct {
         self.max_cacheable_prefix = parsed;
     }
 
+    fn parseChain(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        if (self.chain != null) return Error.BadDirective;
+        const value = tokens.next() orelse return Error.BadDirective;
+        if (std.mem.eql(u8, value, "nsec")) {
+            try requireNoTrailingTokens(tokens);
+            self.chain = .{ .chain = .nsec };
+            return;
+        }
+        if (!std.mem.eql(u8, value, "nsec3")) return Error.BadDirective;
+        const iterations = tokens.next() orelse return Error.BadDirective;
+        const salt = tokens.next() orelse return Error.BadDirective;
+        try requireNoTrailingTokens(tokens);
+        var chain = ChainConfig{
+            .chain = .nsec3,
+            .iterations = std.fmt.parseInt(u16, iterations, 10) catch return Error.BadDirective,
+        };
+        chain.salt_len = try parseSalt(salt, &chain.salt);
+        self.chain = chain;
+    }
+
     fn parseMinimumFailureCacheTime(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
         if (self.minimum_failure_cache_time != null) return Error.BadDirective;
         const value = tokens.next() orelse return Error.BadDirective;
@@ -666,6 +723,21 @@ pub const Config = struct {
 
 fn requireNoTrailingTokens(tokens: *std.mem.TokenIterator(u8, .any)) Error!void {
     if (tokens.next() != null) return Error.BadDirective;
+}
+
+/// RFC 5155 section 4.3: the salt is a sequence of hexadecimal digits, or
+/// "-" when the chain has no salt. The salt length is one octet, so the salt
+/// itself is at most 255 octets.
+fn parseSalt(text: []const u8, out: *[255]u8) Error!u8 {
+    if (std.mem.eql(u8, text, "-")) return 0;
+    if (text.len == 0 or text.len % 2 != 0 or text.len > 510) return Error.BadDirective;
+    var index: usize = 0;
+    while (index < text.len) : (index += 2) {
+        const high = std.fmt.charToDigit(text[index], 16) catch return Error.BadDirective;
+        const low = std.fmt.charToDigit(text[index + 1], 16) catch return Error.BadDirective;
+        out[index / 2] = (high << 4) | low;
+    }
+    return @intCast(text.len / 2);
 }
 
 fn parseTransport(text: []const u8) !Transport {
@@ -951,6 +1023,35 @@ test "config parser accepts minimal-any-ttl as a guarded unsigned TTL" {
     try std.testing.expectEqual(@as(u32, 7200), config.minimal_any_ttl.?);
 }
 
+test "config parser accepts minimal-any-ttl-tcp as a guarded unsigned TTL" {
+    const implicit = try Config.parse("zone one.example primary one.zone\n");
+    try std.testing.expect(implicit.minimal_any_ttl_tcp == null);
+
+    const configured = try Config.parse("minimal-any-ttl-tcp 3600\n");
+    try std.testing.expectEqual(@as(u32, 3600), configured.minimal_any_ttl_tcp.?);
+
+    const zero = try Config.parse("minimal-any-ttl-tcp 0\n");
+    try std.testing.expectEqual(@as(u32, 0), zero.minimal_any_ttl_tcp.?);
+
+    for ([_][]const u8{
+        "minimal-any-ttl-tcp\n",
+        "minimal-any-ttl-tcp 3600 extra\n",
+        "minimal-any-ttl-tcp abc\n",
+        "minimal-any-ttl-tcp -1\n",
+        "minimal-any-ttl-tcp 2147483648\n",
+        "minimal-any-ttl-tcp 0x12\n",
+    }) |text| {
+        try std.testing.expectError(error.BadDirective, Config.parse(text));
+    }
+    try std.testing.expectError(error.BadDirective, Config.parse(
+        "minimal-any-ttl-tcp 3600\nminimal-any-ttl-tcp 7200\n",
+    ));
+    // The base TTL and the TCP TTL are two directives, not one.
+    const config = try Config.parse("minimal-any-ttl 300\nminimal-any-ttl-tcp 3600\n");
+    try std.testing.expectEqual(@as(u32, 300), config.minimal_any_ttl.?);
+    try std.testing.expectEqual(@as(u32, 3600), config.minimal_any_ttl_tcp.?);
+}
+
 test "config parser takes one RFC 9520 failure cache time and rejects every other shape" {
     // No directive means the resolver's own default.
     try std.testing.expect((try Config.parse("zone one.example primary one.zone\n")).minimum_failure_cache_time == null);
@@ -1119,4 +1220,41 @@ test "config parser takes one maximum cacheable prefix length and refuses malfor
     try std.testing.expectError(error.BadDirective, Config.parse(
         "client-subnet-max-prefix 24\nclient-subnet-max-prefix 16\n",
     ));
+}
+
+test "config parser takes one signed chain and refuses every other shape" {
+    // Without the directive the zone's own apex NSEC3PARAM decides.
+    try std.testing.expect((try Config.parse("zone one.example primary one.zone\n")).chain == null);
+
+    const nsec = try Config.parse("dnssec-chain nsec\n");
+    try std.testing.expectEqual(Chain.nsec, nsec.chain.?.chain);
+
+    // RFC 5155 section 4.1: an NSEC3 chain names its iteration count and
+    // its salt; the salt is hexadecimal digits, or "-" when it has none.
+    const nsec3 = try Config.parse("dnssec-chain nsec3 2 73616c74\n");
+    try std.testing.expectEqual(Chain.nsec3, nsec3.chain.?.chain);
+    try std.testing.expectEqual(@as(u16, 2), nsec3.chain.?.iterations);
+    try std.testing.expectEqualStrings("salt", nsec3.chain.?.saltBytes());
+
+    const no_salt = try Config.parse("dnssec-chain nsec3 0 -\n");
+    try std.testing.expectEqual(@as(usize, 0), no_salt.chain.?.saltBytes().len);
+
+    for ([_][]const u8{
+        "dnssec-chain\n",
+        "dnssec-chain maybe\n",
+        "dnssec-chain nsec 0 -\n",
+        "dnssec-chain nsec3\n",
+        "dnssec-chain nsec3 2\n",
+        "dnssec-chain nsec3 2 73616c74 extra\n",
+        "dnssec-chain nsec3 2 73616c7\n",
+        "dnssec-chain nsec3 2 73616c7z\n",
+        "dnssec-chain nsec3 -1 -\n",
+        "dnssec-chain nsec3 65536 -\n",
+    }) |text| {
+        try std.testing.expectError(error.BadDirective, Config.parse(text));
+    }
+    try std.testing.expectError(error.BadDirective, Config.parse(
+        "dnssec-chain nsec\ndnssec-chain nsec3 0 -\n",
+    ));
+    try std.testing.expectError(error.UnknownDirective, Config.parse("dnssec-chain-kind nsec\n"));
 }

@@ -115,6 +115,13 @@ pub const ServerContext = struct {
             std.time.ns_per_s,
         ));
 
+        // The chain the operator chose for the signed zones, or null when the
+        // zone's own apex NSEC3PARAM decides, as it always did.
+        const chain_policy: ?signer.ChainPolicy = if (context.config.chain) |*chain| switch (chain.chain) {
+            .nsec => .{ .chain = .nsec },
+            .nsec3 => .{ .chain = .nsec3, .iterations = chain.iterations, .salt = chain.saltBytes() },
+        } else null;
+
         var zone_index_value: usize = 0;
         while (zone_index_value < context.config.zones.len) : (zone_index_value += 1) {
             const zone_path = context.config.zones.items[zone_index_value].fileText();
@@ -135,7 +142,19 @@ pub const ServerContext = struct {
                 signer.signZone(context.allocator, &zone, key, .{
                     .inception = now_seconds,
                     .expiration = now_seconds + signature_validity_seconds,
-                }) catch return Error.BadDnssecKey;
+                    .chain = chain_policy,
+                }) catch |err| switch (err) {
+                    // The zone states the parameters of its own chain and the
+                    // configuration names other ones: the zone is refused
+                    // rather than served as two chains.
+                    error.BadChainParameters => {
+                        var report: [256]u8 = undefined;
+                        const message = std.fmt.bufPrint(&report, "zone {s}: the configuration names NSEC3 parameters the zone's apex NSEC3PARAM contradicts", .{zone.originText()}) catch "zone: the configuration names NSEC3 parameters the zone's apex NSEC3PARAM contradicts";
+                        printStartupError(io, message);
+                        return Error.BadDnssecKey;
+                    },
+                    else => return Error.BadDnssecKey,
+                };
             }
             // RFC 8976 section 4 steps 1 to 3: a zone that carries an apex
             // ZONEMD record and is named by a configured trust anchor is
@@ -260,6 +279,7 @@ pub const ServerContext = struct {
         runtime.answer_policy.nsid = nsid;
         runtime.answer_policy.zoneversion = self.config.zoneversion;
         if (self.config.minimal_any_ttl) |ttl| runtime.answer_policy.minimal_any_ttl = ttl;
+        if (self.config.minimal_any_ttl_tcp) |ttl| runtime.answer_policy.minimal_any_ttl_tcp = ttl;
         // The signing key moves into the runtime, which owns it from here on
         // and wipes it when it is deinited.
         runtime.dnssec_session = self.dnssec_session;
@@ -633,6 +653,67 @@ test "server context signs every zone named by the configured DNSSEC key file" {
     try std.testing.expect(hasRrsigCovering(zone, "*.signed.example.", RecordType.A.code()));
 }
 
+test "server context publishes the chain the configuration names" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{ .sub_path = "zsk.key", .data = dnssec_test_key });
+    // A zone that states an apex NSEC3PARAM, and a configuration that asks
+    // for the NSEC chain: the zone publishes the RFC 4034 chain.
+    try dir.dir.writeFile(io, .{ .sub_path = "signed.example.zone", .data = dnssec_test_zone ++ "\n@ IN NSEC3PARAM 1 0 0 -\n" });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone signed.example primary signed.example.zone\ndnssec-key-file zsk.key\ndnssec-chain nsec\n" });
+
+    var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+    defer context.deinit();
+    const zone = context.zones.items[0];
+    try std.testing.expectEqual(@as(usize, 4), countType(zone, .NSEC));
+    try std.testing.expectEqual(@as(usize, 0), countType(zone, .NSEC3));
+
+    // The NSEC3 chain the configuration names, in a zone that states no
+    // NSEC3PARAM: the signer publishes the apex NSEC3PARAM that states the
+    // chain's parameters.
+    try dir.dir.writeFile(io, .{ .sub_path = "signed.example.zone", .data = dnssec_test_zone });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone signed.example primary signed.example.zone\ndnssec-key-file zsk.key\ndnssec-chain nsec3 0 -\n" });
+
+    var nsec3_context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+    defer nsec3_context.deinit();
+    const nsec3_zone = nsec3_context.zones.items[0];
+    try std.testing.expectEqual(@as(usize, 0), countType(nsec3_zone, .NSEC));
+    try std.testing.expectEqual(@as(usize, 4), countType(nsec3_zone, .NSEC3));
+    try std.testing.expectEqual(@as(usize, 1), countType(nsec3_zone, .NSEC3PARAM));
+
+    // The same chain in a zone that states the parameters itself: the zone
+    // keeps its own apex NSEC3PARAM, and the chain is the one it describes.
+    try dir.dir.writeFile(io, .{ .sub_path = "signed.example.zone", .data = dnssec_test_zone ++ "\n@ IN NSEC3PARAM 1 0 0 -\n" });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone signed.example primary signed.example.zone\ndnssec-key-file zsk.key\ndnssec-chain nsec3 0 -\n" });
+
+    var stated_context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+    defer stated_context.deinit();
+    const stated_zone = stated_context.zones.items[0];
+    try std.testing.expectEqual(@as(usize, 0), countType(stated_zone, .NSEC));
+    try std.testing.expectEqual(@as(usize, 4), countType(stated_zone, .NSEC3));
+    try std.testing.expectEqual(@as(usize, 1), countType(stated_zone, .NSEC3PARAM));
+}
+
+test "server context refuses a configuration whose NSEC3 parameters the zone contradicts" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{ .sub_path = "zsk.key", .data = dnssec_test_key });
+    try dir.dir.writeFile(io, .{ .sub_path = "signed.example.zone", .data = dnssec_test_zone ++ "\n@ IN NSEC3PARAM 1 0 2 73616c74\n" });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone signed.example primary signed.example.zone\ndnssec-key-file zsk.key\ndnssec-chain nsec3 0 -\n" });
+
+    // The zone states the parameters of its own chain and the configuration
+    // names other ones, so the zone is refused rather than served as two
+    // chains.
+    try std.testing.expectError(
+        error.BadDnssecKey,
+        ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator),
+    );
+}
+
 test "server context refuses an unusable DNSSEC key file and an already signed zone" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var dir = std.testing.tmpDir(.{});
@@ -976,6 +1057,29 @@ test "server context carries the NAT64 prefix into the forwarding policy" {
     try std.testing.expectEqual(@as(usize, 1), policy.dns64_excluded.len);
     try std.testing.expectEqual(@as(u8, 48), policy.dns64_excluded.items[0].prefix);
     try std.testing.expectEqualSlices(u8, &.{ 0x20, 0x01, 0x0d, 0xb8 }, policy.dns64_excluded.items[0].bytes[0..4]);
+}
+
+test "server context carries the minimal ANY TTLs into the answer policy" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{ .sub_path = "one.zone", .data = "$ORIGIN one.example.\n$TTL 3600\n@ IN SOA ns.one.example. hostmaster.one.example. 1 3600 900 1209600 3600\n@ IN NS ns.one.example.\n" });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data =
+        \\zone one.example primary one.zone
+        \\minimal-any-ttl 300
+        \\minimal-any-ttl-tcp 3600
+        \\
+    });
+
+    var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+    defer context.deinit();
+    var runtime = try context.takeRuntime(io);
+    defer runtime.deinit();
+
+    // The TTLs reach the policy that builds the minimal ANY answer.
+    try std.testing.expectEqual(@as(u32, 300), runtime.answer_policy.minimal_any_ttl);
+    try std.testing.expectEqual(@as(u32, 3600), runtime.answer_policy.minimal_any_ttl_tcp.?);
 }
 
 test "server context carries the RFC 9520 failure cache time into the forwarding policy" {

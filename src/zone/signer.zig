@@ -26,6 +26,9 @@ pub const Error = error{
     BadKeyFile,
     BadSecret,
     BadZoneRecord,
+    /// The operator's NSEC3 parameters contradict the ones the zone's own
+    /// apex NSEC3PARAM states.
+    BadChainParameters,
     AlreadySigned,
     KeyUsedForAnotherZone,
     SigningFailed,
@@ -288,6 +291,26 @@ const Rrset = struct {
 pub const Options = struct {
     inception: u32,
     expiration: u32,
+    /// The chain the operator chose for the signed zones. Null leaves the
+    /// zone's own apex NSEC3PARAM in charge, which is what the server did
+    /// before the operator could choose.
+    chain: ?ChainPolicy = null,
+};
+
+/// The chain a signed zone publishes: the RFC 4034 section 6.1 NSEC chain or
+/// the RFC 5155 section 7.1 NSEC3 chain. The choice is the operator's, not
+/// the RFC's: both chains are valid, and the RFCs say how a chain is built
+/// once a zone publishes one.
+pub const Chain = enum { nsec, nsec3 };
+
+/// The operator's chain, with the parameters of an NSEC3 chain
+/// (RFC 5155 section 4.1): the iteration count and the salt. The hash
+/// algorithm is SHA-1 and the Opt-Out flag is clear, the only ones this build
+/// implements.
+pub const ChainPolicy = struct {
+    chain: Chain,
+    iterations: u16 = 0,
+    salt: []const u8 = "",
 };
 
 /// The signing material the serving path keeps once the zone has been signed:
@@ -370,14 +393,64 @@ pub fn signZone(
 
     // An apex NSEC3PARAM is the opt-in: the zone states the parameters of the
     // chain it publishes, and the signer builds that chain (RFC 5155 section
-    // 7.1). A zone without one keeps the NSEC chain it always had.
-    if (try apexNsec3Param(work, zone)) |params| {
-        try appendNsec3Chain(work, &rrsets, origin_wire, soa_ttl, params);
-    } else {
-        try appendNsecChain(work, &rrsets, soa_ttl);
+    // 7.1). A zone without one keeps the NSEC chain it always had. The
+    // operator's choice, when there is one, replaces that opt-in.
+    const chain = try selectChain(work, zone, options.chain);
+    switch (chain.kind) {
+        .nsec => try appendNsecChain(work, &rrsets, soa_ttl),
+        .nsec3 => {
+            // RFC 5155 section 7.3: the parameters of the chain are stated by
+            // the NSEC3PARAM at the zone apex, so a zone that states none gets
+            // the one the operator named.
+            if (chain.publish_param) {
+                try appendSingle(work, origin_wire, RecordType.NSEC3PARAM.code(), soa_ttl, try nsec3paramRdata(work, chain.params), &rrsets);
+                std.mem.sort(Rrset, rrsets.items, {}, rrsetLessThan);
+            }
+            try appendNsec3Chain(work, &rrsets, origin_wire, soa_ttl, chain.params);
+        },
     }
-    try emit(work, allocator, zone, key, dns_dnssec.keyTag(dnskey_rdata), options, rrsets.items);
+    try emit(work, allocator, zone, key, dns_dnssec.keyTag(dnskey_rdata), options, rrsets.items, chain.publish_param);
 }
+
+/// The chain the zone publishes. Without the operator's choice the zone's own
+/// apex NSEC3PARAM is the opt-in, as it always was. With it the operator's
+/// chain wins, and an NSEC3 chain takes its parameters from the zone's own
+/// NSEC3PARAM when the zone states one, because that record states the
+/// parameters of the chain (RFC 5155 section 4.1).
+fn selectChain(
+    allocator: std.mem.Allocator,
+    zone: *const zone_index.Zone,
+    policy: ?ChainPolicy,
+) Error!ChainChoice {
+    const wanted = policy orelse {
+        const params = try apexNsec3Param(allocator, zone) orelse return .{ .kind = .nsec };
+        return .{ .kind = .nsec3, .params = params };
+    };
+    if (wanted.chain == .nsec) return .{ .kind = .nsec };
+    const params = Nsec3Params{
+        .algorithm = 1,
+        .flags = 0,
+        .iterations = wanted.iterations,
+        .salt = wanted.salt,
+    };
+    const found = try apexNsec3Param(allocator, zone) orelse
+        return .{ .kind = .nsec3, .params = params, .publish_param = true };
+    // The zone states the parameters of its own chain, so the operator's
+    // choice must name the same ones.
+    if (found.iterations != params.iterations or !std.mem.eql(u8, found.salt, params.salt)) {
+        return Error.BadChainParameters;
+    }
+    return .{ .kind = .nsec3, .params = found };
+}
+
+/// The chain the zone publishes, with the parameters of an NSEC3 chain.
+const ChainChoice = struct {
+    kind: Chain,
+    params: Nsec3Params = .{ .algorithm = 1, .flags = 0, .iterations = 0, .salt = "" },
+    /// True when the signer publishes the apex NSEC3PARAM itself, because the
+    /// zone states none.
+    publish_param: bool = false,
+};
 
 /// Sign one RRset the caller already holds and return the RRSIG RDATA to
 /// publish beside it (RFC 4034 section 3.1). `signZone` deliberately refuses a
@@ -676,6 +749,18 @@ fn apexNsec3Param(allocator: std.mem.Allocator, zone: *const zone_index.Zone) Er
     return found;
 }
 
+/// RFC 5155 section 4.2: the NSEC3PARAM RDATA is the hash algorithm, the
+/// flags, the iteration count, the salt length, and the salt.
+fn nsec3paramRdata(allocator: std.mem.Allocator, params: Nsec3Params) Error![]const u8 {
+    const rdata = try allocator.alloc(u8, 5 + params.salt.len);
+    rdata[0] = params.algorithm;
+    rdata[1] = params.flags;
+    std.mem.writeInt(u16, rdata[2..4], params.iterations, .big);
+    rdata[4] = @intCast(params.salt.len);
+    @memcpy(rdata[5..], params.salt);
+    return rdata;
+}
+
 /// RFC 5155 section 3: the owner name of an NSEC3 is the SHA-1 hash of the
 /// original owner name in unpadded base32hex (RFC 4648 section 7), so 20
 /// octets are exactly 32 characters.
@@ -945,6 +1030,7 @@ fn emit(
     key_tag: u16,
     options: Options,
     rrsets: []const Rrset,
+    publish_param: bool,
 ) Error!void {
     const algorithm = key.algorithm();
     const signer_wire = try scratch.dupe(u8, (Name.fromText(zone.originText()) catch return Error.BadZoneRecord).asWire());
@@ -959,6 +1045,13 @@ fn emit(
             // the zone file and is already published there.
             RecordType.NSEC.code(), RecordType.NSEC3.code(), RecordType.DNSKEY.code(), RecordType.DS.code() => for (rrset.rdata) |rdata| {
                 try generated.append(scratch, try genericRecord(records, rrset.owner_wire, rrset.rrtype, rrset.ttl, rdata));
+            },
+            // The apex NSEC3PARAM the signer publishes states the chain's
+            // parameters; a zone that states one of its own keeps it.
+            RecordType.NSEC3PARAM.code() => if (publish_param) {
+                for (rrset.rdata) |rdata| {
+                    try generated.append(scratch, try genericRecord(records, rrset.owner_wire, rrset.rrtype, rrset.ttl, rdata));
+                }
             },
             else => {},
         }
@@ -1843,4 +1936,74 @@ fn findZoneRecord(zone: *const zone_index.Zone, owner_text: []const u8, rrtype: 
         return record;
     }
     return null;
+}
+
+test "the operator's NSEC choice publishes the NSEC chain in a zone that states an NSEC3PARAM" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var key = try parseKey(rfc8080_ed25519_key);
+    defer key.deinit();
+
+    var zone = try loadZone(nsec3_sign_zone);
+    defer zone.deinit();
+    var options = rfc8080_window;
+    options.chain = .{ .chain = .nsec };
+    try signZone(allocator, &zone, &key, options);
+
+    // The zone publishes the RFC 4034 chain, one NSEC per owner, and no NSEC3
+    // record at all.
+    try std.testing.expect(hasRecord(&zone, "example.", .NSEC));
+    try std.testing.expect(hasRecord(&zone, "www.example.", .NSEC));
+    try std.testing.expect(!hasRecord(&zone, "example.", .NSEC3));
+    try std.testing.expect(!hasRecord(&zone, "www.example.", .NSEC3));
+    const apex = (try findOpaque(&zone, "example.", .NSEC, null)).?;
+    const next = try Name.fromText("www.example.");
+    try std.testing.expectEqualSlices(u8, next.asWire(), apex[0..next.asWire().len]);
+    // The zone's own apex NSEC3PARAM stays published: it is zone data, and the
+    // ZONEMD digest of RFC 8976 section 3.3.1 covers it.
+    try std.testing.expect(hasRecord(&zone, "example.", .NSEC3PARAM));
+}
+
+test "the operator's NSEC3 choice builds the chain in a zone that states no NSEC3PARAM" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var key = try parseKey(rfc8080_ed25519_key);
+    defer key.deinit();
+
+    var zone = try loadZone(nsec_sign_zone);
+    defer zone.deinit();
+    var options = rfc8080_window;
+    options.chain = .{ .chain = .nsec3, .iterations = 0, .salt = "" };
+    try signZone(allocator, &zone, &key, options);
+
+    // The zone publishes the NSEC3 chain and no NSEC record at all.
+    try std.testing.expect(!hasRecord(&zone, "example.", .NSEC));
+    const records = try nsec3Records(allocator, &zone);
+    try std.testing.expectEqual(@as(usize, 2), records.len);
+
+    // RFC 5155 section 7.3: the parameters of the chain are stated by the
+    // NSEC3PARAM at the zone apex, which the signer publishes for a zone
+    // that states none.
+    const param = (try findOpaque(&zone, "example.", .NSEC3PARAM, null)).?;
+    try std.testing.expectEqual(@as(u8, 1), param[0]);
+    try std.testing.expectEqual(@as(u8, 0), param[1]);
+    try std.testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, param[2..4], .big));
+    try std.testing.expectEqual(@as(u8, 0), param[4]);
+
+    // The chain is built with the parameters the operator named: the
+    // unsalted hash of the apex name is one of its owner names.
+    var out: [20]u8 = undefined;
+    dns_dnssec.nsec3Hash(try Name.fromText("example."), "", 0, &out);
+    var found = false;
+    for (records) |record| {
+        const owner = try Name.fromText(record.owner_text);
+        const hash = dns_validate.nsec3OwnerHash(owner) orelse return error.TestUnexpectedResult;
+        if (!std.mem.eql(u8, &hash, &out)) continue;
+        found = true;
+    }
+    try std.testing.expect(found);
 }

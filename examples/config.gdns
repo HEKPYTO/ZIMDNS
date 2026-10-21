@@ -18,10 +18,17 @@ blocklist file examples/blocklists/ads.txt
 zone home.arpa primary examples/zones/home.arpa.zone
 
 # Optional bounded forwarding policy. Both an ACL and a forwarder are required
-# before UDP recursion is enabled; inbound TCP remains authoritative-only.
+# before recursion is enabled, on the UDP and the TCP ingress alike.
 # recursion allow 127.0.0.0/8
 # forwarder 127.0.0.1:5353
 # cookies validate current-secret previous-secret
+#
+# The source ports the forwarder may not use for its outgoing queries.
+# forwarder-deny-port 53
+#
+# The client subnet source prefix is trimmed to this many bits before the
+# query goes upstream (RFC 7871 section 7.1.1).
+# client-subnet-max-prefix 24
 #
 # RFC 6303/6761/7793/8375 locally served zones are answered from this host by
 # default, ahead of the cache and the forwarder above. 'local-zones off' is the
@@ -32,3 +39,16 @@ zone home.arpa primary examples/zones/home.arpa.zone
 # The IXFR delta log file: an old client is still answered incrementally. The
 # file sits beside this configuration, so the name is a bare one.
 # ixfr-journal-file ixfr.log
+
+# The TSIG key file: a signed request is verified and its answer is signed
+# back. The file is re-read on SIGHUP, so a key can be added, changed, or
+# removed without a restart.
+# tsig-key-file tsig.key
+
+# The NAT64 prefix the forwarder synthesizes AAAA records into, and the IPv4
+# range it serves. Without one, nothing is synthesized.
+# nat64-prefix 2001:db8:64::/96
+#
+# An IPv6 range whose AAAA records are not real data, so a name that holds
+# only such records is answered with a synthesized address.
+# dns64-exclude 2001:db8:1::/48

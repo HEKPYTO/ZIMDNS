@@ -2,8 +2,10 @@
 /// Ownership: Zone owns moved ZoneFile backing and records; call Zone.deinit; lookup results own allocator storage and need deinit.
 /// Errors: In-memory lookup has typed results; loading and file I/O are outside this module.
 const std = @import("std");
-const RecordType = @import("../dns/types.zig").RecordType;
+const dns_types = @import("../dns/types.zig");
+const RecordType = dns_types.RecordType;
 const dns_name = @import("../dns/name.zig");
+const dns_record = @import("../dns/record.zig");
 const parser = @import("parser.zig");
 const journal_mod = @import("journal.zig");
 
@@ -405,6 +407,30 @@ pub const Zone = struct {
 fn failResult(result: *LookupResult, allocator: std.mem.Allocator) LookupResult {
     result.deinit(allocator);
     return .{ .kind = .servfail };
+}
+
+/// The wire size of the records a full transfer of the zone carries, the
+/// two apex SOA records aside: the bytes the AXFR answer adds to the two
+/// current SOA records it shares with the incremental answer.
+pub fn fullTransferBytes(zone: *const Zone) usize {
+    var total: usize = 0;
+    for (zone.records.items[0..zone.records.len]) |record| {
+        if (record.rrtype.eql(.SOA)) continue;
+        const converted = toResourceRecord(record) orelse continue;
+        total += journal_mod.recordBytes(converted);
+    }
+    return total;
+}
+
+/// Turns one zone record into the DNS record the transfer answers carry.
+fn toResourceRecord(record: parser.ZoneRecord) ?dns_record.ResourceRecord {
+    return .{
+        .owner = dns_name.Name.fromText(record.ownerText()) catch return null,
+        .rrtype = record.rrtype,
+        .class = dns_types.Class.IN,
+        .ttl = record.ttl,
+        .rdata = parser.parseRData(record.rrtype, record.rdataText()) catch return null,
+    };
 }
 
 /// The difference between two zone snapshots, in the journal's encoding: the

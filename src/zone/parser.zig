@@ -499,12 +499,27 @@ fn decodeGenericRdata(allocator: std.mem.Allocator, text: []const u8) ![]const u
 
 /// DNSSEC zone RDATA is served opaque (RFC 4034/5155 wire bytes in an Unknown
 /// slot). Every parser below also accepts the RFC 3597 generic form
-/// `\# <hex>` so operators can paste wire bytes directly.
+/// `\# <length> <hex>` so operators can paste wire bytes directly, and the
+/// project's shorter `\# <hex>` form.
 fn parseDnssecGeneric(text: []const u8) ?dns_rdata.Unknown {
     const input = std.mem.trim(u8, text, " \t\r\n");
     if (input.len < 2 or input[0] != '\\' or input[1] != '#') return null;
-    const hex = std.mem.trim(u8, input[2..], " \t\r\n");
-    return decodeHexBlob(hex) catch null;
+    const body = input[2..];
+    if (decodeGenericLengthForm(body)) |generic| return generic;
+    return decodeHexBlob(body) catch null;
+}
+
+/// RFC 3597 section 5: the generic form of a record is the \# token, the
+/// RDATA length in octets, and the hexadecimal data. A length that does not
+/// match the data is not a length token, so the shorter form is read instead
+/// and the record is refused when that data is not hexadecimal.
+fn decodeGenericLengthForm(body: []const u8) ?dns_rdata.Unknown {
+    var words = std.mem.tokenizeAny(u8, body, " \t\r\n()");
+    const first = words.next() orelse return null;
+    const length = parseStrictDecimal(usize, first) orelse return null;
+    const data = decodeHexBlob(words.rest()) catch return null;
+    if (data.len != length) return null;
+    return data;
 }
 
 fn decodeHexBlob(hex: []const u8) Error!dns_rdata.Unknown {
@@ -1727,6 +1742,100 @@ test "zone parser loads opaque DNSSEC records in presentation and generic form" 
     try std.testing.expectError(Error.BadRecord, parseRData(.DNSKEY, "257 3"));
     try std.testing.expectError(Error.BadRecord, parseRData(.NSEC, "next.example."));
     try std.testing.expectError(Error.BadRecord, parseRData(.DS, "1 2 3 ODD"));
+}
+
+/// The RDLENGTH a zone record carries on the wire, read back from the record
+/// the response path builds.
+fn wireRdataLength(record: dns_record.ResourceRecord, rdata_len: usize) !u16 {
+    var buffer: [512]u8 = undefined;
+    var writer = dns_writer.Writer.init(&buffer);
+    try record.encode(&writer);
+    const wire = writer.written();
+    return std.mem.readInt(u16, wire[wire.len - rdata_len - 2 ..][0..2], .big);
+}
+
+test "zone parser loads DNSSEC records in the RFC 3597 length form" {
+    // RFC 3597 section 5: the generic form of a record is the \# token, the
+    // RDATA length in octets, and the hexadecimal data.
+    var zone = try ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns hostmaster 1 3600 900 1209600 3600
+        \\@ IN NS ns
+        \\@ IN DNSKEY \# 4 0A0B0C0D
+        \\@ IN DS \# 3 010203
+        \\@ IN RRSIG \# 2 AABB
+        \\@ IN NSEC \# 2 CCDD
+        \\@ IN NSEC3 \# 1 00
+        \\
+    );
+    defer zone.deinit();
+    try std.testing.expectEqual(@as(usize, 7), zone.records.len);
+
+    const expected = [_][]const u8{
+        &.{ 0x0a, 0x0b, 0x0c, 0x0d },
+        &.{ 0x01, 0x02, 0x03 },
+        &.{ 0xaa, 0xbb },
+        &.{ 0xcc, 0xdd },
+        &.{0x00},
+    };
+    for (zone.records.items[2..zone.records.len], expected) |record, bytes| {
+        const rdata = try parseRData(record.rrtype, record.rdataText());
+        try std.testing.expectEqualSlices(u8, bytes, rdata.Unknown.bytes());
+        // The record is served with the RDLENGTH the data has.
+        const resource = dns_record.ResourceRecord{
+            .owner = try dns_name.Name.fromText(record.ownerText()),
+            .rrtype = record.rrtype,
+            .class = Class.IN,
+            .ttl = record.ttl,
+            .rdata = rdata,
+        };
+        try std.testing.expectEqual(@as(u16, @intCast(bytes.len)), try wireRdataLength(resource, bytes.len));
+    }
+}
+
+test "zone parser still loads the short generic form of a DNSSEC record" {
+    var zone = try ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns hostmaster 1 3600 900 1209600 3600
+        \\@ IN NS ns
+        \\@ IN DNSKEY \# 00010003 08AABBCC
+        \\
+    );
+    defer zone.deinit();
+    const record = zone.records.items[2];
+    const rdata = try parseRData(record.rrtype, record.rdataText());
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x01, 0x00, 0x03, 0x08, 0xaa, 0xbb, 0xcc }, rdata.Unknown.bytes());
+
+    const resource = dns_record.ResourceRecord{
+        .owner = try dns_name.Name.fromText(record.ownerText()),
+        .rrtype = record.rrtype,
+        .class = Class.IN,
+        .ttl = record.ttl,
+        .rdata = rdata,
+    };
+    try std.testing.expectEqual(@as(u16, 8), try wireRdataLength(resource, rdata.Unknown.bytes().len));
+}
+
+test "zone parser refuses a DNSSEC record whose generic length disagrees with the data" {
+    // A length that is not the data's length is a malformed record.
+    try std.testing.expectError(Error.BadRecord, ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns hostmaster 1 3600 900 1209600 3600
+        \\@ IN NS ns
+        \\@ IN DNSKEY \# 4 0A0B
+        \\
+    ));
+    try std.testing.expectError(Error.BadRecord, ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns hostmaster 1 3600 900 1209600 3600
+        \\@ IN NS ns
+        \\@ IN NSEC3 \# 3 0102
+        \\
+    ));
 }
 
 /// The RFC 3597 section 5 generic form of an opaque record whose octets count

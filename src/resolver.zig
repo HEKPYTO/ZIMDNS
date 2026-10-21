@@ -787,6 +787,53 @@ fn inDomainOf(name: []const u8, query_name: []const u8) bool {
     return isDescendant(name, query_name) or isDescendant(query_name, name);
 }
 
+/// RFC 5452 section 6: the authority section of an upstream answer may hold
+/// only data in the domain of the query, so a record for any other name is
+/// dropped before the answer is cached and relayed. The records the answer
+/// cannot be used without survive: the SOA of a negative answer (RFC 2308
+/// section 5), the NS records of a referral (RFC 1034 section 4.3.2), and
+/// the DNSSEC denial proofs that ride with them.
+fn dropOutOfDomainAuthorities(message: *dns_message.Message, query_name: []const u8) void {
+    const referral = isReferral(message);
+    const denial = hasSoa(message);
+    var write_index: usize = 0;
+    var read_index: usize = 0;
+    while (read_index < message.authorities.len) : (read_index += 1) {
+        const record = message.authorities.items[read_index];
+        if (!inDomainOf(record.owner.asWire(), query_name) and
+            !isOwnAuthorityData(record, referral, denial)) continue;
+        message.authorities.items[write_index] = record;
+        write_index += 1;
+    }
+    message.authorities.len = write_index;
+    message.header.authority_count = @intCast(write_index);
+}
+
+/// True when the record is the answer's own authority data, which no client
+/// can use the answer without: the SOA of a negative answer (RFC 2308
+/// section 5), the NS records of a referral (RFC 1034 section 4.3.2), and
+/// the DNSSEC denial proofs that ride with them (RFC 2308 section 5 for the
+/// NXT record, RFC 4034 section 4 and RFC 5155 section 7.2 for NSEC and
+/// NSEC3, whose covering RRSIG the validator needs).
+fn isOwnAuthorityData(record: dns_record.ResourceRecord, referral: bool, denial: bool) bool {
+    if (record.rrtype.eql(dns_types.RecordType.SOA)) return true;
+    if (referral and record.rrtype.eql(dns_types.RecordType.NS)) return true;
+    if (!referral and !denial) return false;
+    return record.rrtype.eql(dns_types.RecordType.RRSIG) or
+        record.rrtype.eql(dns_types.RecordType.NSEC) or
+        record.rrtype.eql(dns_types.RecordType.NSEC3) or
+        record.rrtype.eql(dns_types.RecordType.NSEC3PARAM);
+}
+
+/// True when the authority section carries the SOA of a negative answer
+/// (RFC 2308 sections 2.1 and 2.2).
+fn hasSoa(message: *const dns_message.Message) bool {
+    for (message.authorities.slice()) |record| {
+        if (record.rrtype.eql(dns_types.RecordType.SOA)) return true;
+    }
+    return false;
+}
+
 /// RFC 5452 section 6: the additional section of an upstream answer may hold
 /// only data in the domain of the query, so a record for any other name is
 /// dropped before the answer is cached and relayed.
@@ -1017,7 +1064,7 @@ pub const Resolver = struct {
             if (cookie == .valid) return self.addCachedCookie(output, query, cookie.valid);
             return bytes;
         }
-        var response = self.queryUdp(query_bytes, query, scope) catch |err| switch (err) {
+        const exchange = self.queryUpstream(query_bytes, query, scope) catch |err| switch (err) {
             Error.UpstreamFailure,
             Error.BadUpstreamResponse,
             => {
@@ -1033,6 +1080,7 @@ pub const Resolver = struct {
             },
             else => return err,
         };
+        var response = exchange.response;
         defer response.deinit();
 
         // RFC 4035 section 3.2.3: the name server side of a validating
@@ -1048,17 +1096,20 @@ pub const Resolver = struct {
         response.question = query.question;
         // RFC 7871 section 6: the scope of the answer is the scope the
         // upstream reported, so it is read before the options are stripped.
-        const upstream_scope = upstreamEcsScope(response, key.ecs);
+        // The scope of the query that fetched it bounds it, so an answer
+        // fetched without an ADDRESS never reports a scope of its own.
+        const upstream_scope = upstreamEcsScope(response, exchange.scope orelse EcsScope{});
         stripOptions(&response);
         // RFC 5452 section 6: only data in the domain of the query may be
-        // accepted, so the additional section keeps the records whose owner
-        // name is the query name or one of its ancestors or descendants. The
-        // answer and the authority section are not touched. A referral is not
+        // accepted, so the authority and the additional section keep the
+        // records whose owner name is the query name or one of its ancestors
+        // or descendants. The answer section is not touched. A referral is not
         // an answer: its additional section holds the glue of the delegated
         // name servers, which the client needs to follow the delegation, so
         // it keeps the glue of the delegation the authority section names and
         // loses everything else.
         if (query.question) |question| {
+            dropOutOfDomainAuthorities(&response, question.name.asWire());
             if (isReferral(&response)) {
                 filterReferralAdditionals(&response, question.name.asWire());
             } else {
@@ -1127,7 +1178,12 @@ pub const Resolver = struct {
         // The harvest runs before the client copy is stripped, so it
         // still sees the full proofs.
         if (response.header.authenticated_data) self.harvestNsecProofs(response, now);
-        self.cache.put(key, &response, now, upstream_scope) catch {};
+        // RFC 7871 section 7.3.1: the answer is cached under the network it
+        // was fetched for, which is the /0 of the retry that carried no
+        // ADDRESS, so it is served to the /0 queries only.
+        var answer_key = key;
+        answer_key.ecs = exchange.scope orelse EcsScope{};
+        self.cache.put(answer_key, &response, now, upstream_scope) catch {};
         // RFC 3225 section 3: a query with the DO bit clear must not be answered
         // with DNSSEC security RRs. The cached copy keeps them, so the removal
         // happens on the way out only.
@@ -1346,6 +1402,31 @@ pub const Resolver = struct {
         message.header.id = query.header.id;
         message.encode(&writer) catch return Error.ResponseTooLarge;
         return writer.written();
+    }
+
+    /// The answer the upstream gave, and the scope of the query that fetched
+    /// it. RFC 7871 section 7.3.1 ties an answer to the network it was
+    /// fetched for, and the retry of section 7.1.3 fetches it for /0.
+    const UpstreamAnswer = struct {
+        response: dns_message.Message,
+        scope: ?EcsScope,
+    };
+
+    /// RFC 7871 section 7.1.3: an upstream that refuses a query that carried
+    /// a non-zero ADDRESS is asked once more with the same query and no
+    /// ADDRESS, so it can answer the question without the scope. The retry is
+    /// bounded: it happens once, and a second REFUSED ends the exchange the
+    /// way it ends without a client subnet.
+    fn queryUpstream(self: *Resolver, query_bytes: []const u8, query: dns_message.Message, scope: ?EcsScope) !UpstreamAnswer {
+        var response = try self.queryUdp(query_bytes, query, scope);
+        const sent = scope orelse return .{ .response = response, .scope = scope };
+        if (sent.prefix == 0 or response.header.rcode != .refused) return .{ .response = response, .scope = scope };
+        // RFC 7871 section 6: an option whose SOURCE PREFIX-LENGTH is 0
+        // carries no ADDRESS, which is the query the retry is.
+        var without_address = sent;
+        without_address.prefix = 0;
+        response.deinit();
+        return .{ .response = try self.queryUdp(query_bytes, query, without_address), .scope = without_address };
     }
 
     fn queryUdp(self: *Resolver, query_bytes: []const u8, query: dns_message.Message, scope: ?EcsScope) !dns_message.Message {
@@ -6100,6 +6181,12 @@ const UpstreamShape = enum {
     /// An answer whose additional section holds records inside and outside
     /// the domain of the query.
     answer,
+    /// An answer whose authority section holds a record inside and outside
+    /// the domain of the query.
+    answer_with_authority,
+    /// A negative answer whose authority section holds the zone SOA beside a
+    /// record for an unrelated name.
+    negative_answer,
     /// A referral whose glue names a name server inside the zone the
     /// delegation names.
     referral,
@@ -6139,7 +6226,10 @@ fn serveAdditionalUpstream(args: *AdditionalUpstream) void {
 
 /// The answer the upstream sends: the A record the client asked for, and an
 /// additional section that holds a record for an unrelated name beside
-/// records for the query name and for a name below it. A referral instead
+/// records for the query name and for a name below it. The shape with an
+/// authority section adds to it a record for the query name and one for an
+/// unrelated name. A negative answer instead carries the zone SOA in the
+/// authority section beside a record for an unrelated name. A referral
 /// carries the NS record of the delegated zone in the authority section and
 /// the glue of its name server in the additional section, beside a record for
 /// the query name and one for an unrelated name.
@@ -6160,7 +6250,11 @@ fn buildAdditionalUpstreamAnswer(buffer: []u8, query: dns_message.Message, shape
         .additionals = try dns_message.RecordSection.init(query.allocator, 0),
     };
     defer message.deinit();
-    if (shape != .answer) {
+    const referral_shape = switch (shape) {
+        .referral, .referral_out_of_zone, .referral_out_of_domain => true,
+        else => false,
+    };
+    if (referral_shape) {
         // The delegation the query is about names the zone the query sits
         // in; the out-of-domain shape delegates a zone of its own.
         const zone_text = switch (shape) {
@@ -6171,7 +6265,7 @@ fn buildAdditionalUpstreamAnswer(buffer: []u8, query: dns_message.Message, shape
             .referral => "ns.example.com.",
             .referral_out_of_zone => "ns.other.example.",
             .referral_out_of_domain => "ns.elsewhere.example.",
-            .answer => unreachable,
+            else => unreachable,
         };
         const server = try dns_name.Name.fromText(server_text);
         try message.authorities.append(.{
@@ -6205,6 +6299,39 @@ fn buildAdditionalUpstreamAnswer(buffer: []u8, query: dns_message.Message, shape
         try message.encode(&writer);
         return writer.written();
     }
+    if (shape == .negative_answer) {
+        // A negative answer carries the zone SOA in the authority section
+        // (RFC 2308 section 5). The SOA sits in a zone of its own, so it
+        // survives only because it is the SOA of the negative answer, and the
+        // record beside it has nothing to do with the query.
+        message.header.rcode = .nxdomain;
+        try message.authorities.append(.{
+            .owner = try dns_name.Name.fromText("elsewhere.example."),
+            .rrtype = .SOA,
+            .class = .IN,
+            .ttl = 60,
+            .rdata = .{ .SOA = .{
+                .mname = try dns_name.Name.fromText("ns.elsewhere.example."),
+                .rname = try dns_name.Name.fromText("hostmaster.elsewhere.example."),
+                .serial = 1,
+                .refresh = 3600,
+                .retry = 900,
+                .expire = 1209600,
+                .minimum = 60,
+            } },
+        });
+        try message.authorities.append(.{
+            .owner = try dns_name.Name.fromText("mail.elsewhere.example."),
+            .rrtype = .A,
+            .class = .IN,
+            .ttl = 60,
+            .rdata = .{ .A = .{ 192, 0, 2, 4 } },
+        });
+        message.header.authority_count = 2;
+        var writer = dns_writer.Writer.init(buffer);
+        try message.encode(&writer);
+        return writer.written();
+    }
     try message.answers.append(.{
         .owner = question.name,
         .rrtype = .A,
@@ -6213,6 +6340,26 @@ fn buildAdditionalUpstreamAnswer(buffer: []u8, query: dns_message.Message, shape
         .rdata = .{ .A = .{ 192, 0, 2, 1 } },
     });
     message.header.answer_count = 1;
+    if (shape == .answer_with_authority) {
+        // The authority section holds a record for the query name, which is
+        // in the domain of the query, and one for an unrelated name, which is
+        // not.
+        try message.authorities.append(.{
+            .owner = question.name,
+            .rrtype = .A,
+            .class = .IN,
+            .ttl = 60,
+            .rdata = .{ .A = .{ 192, 0, 2, 4 } },
+        });
+        try message.authorities.append(.{
+            .owner = try dns_name.Name.fromText("mail.elsewhere.example."),
+            .rrtype = .A,
+            .class = .IN,
+            .ttl = 60,
+            .rdata = .{ .A = .{ 192, 0, 2, 5 } },
+        });
+        message.header.authority_count = 2;
+    }
     for ([_][]const u8{ "mail.elsewhere.example.", "www.example.com.", "mail.www.example.com." }) |owner| {
         try message.additionals.append(.{
             .owner = try dns_name.Name.fromText(owner),
@@ -6384,6 +6531,86 @@ test "RFC 5452 section 6: a referral for another domain keeps none of its glue" 
     // the query, so its glue is not the query's data and none of it is
     // relayed.
     try std.testing.expectEqual(@as(u16, 1), message.header.authority_count);
+    try std.testing.expectEqual(@as(u16, 0), message.header.additional_count);
+}
+
+test "RFC 5452 section 6: an authority record outside the domain of the query is not relayed" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const fixture = try AdditionalFixture.create(io, .answer_with_authority);
+    defer fixture.destroy();
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42719);
+
+    const bytes = try fixture.resolver.answer(fixture.encoded, fixture.query, &client, &output);
+    const message = try dns_message.Message.parse(fixture.arena.allocator(), bytes);
+
+    // The answer section is relayed as the upstream sent it.
+    try std.testing.expectEqual(@as(u16, 1), message.header.answer_count);
+    // The authority section keeps the record whose owner name is in the
+    // domain of the query and drops the one that is not.
+    try std.testing.expectEqual(@as(u16, 1), message.header.authority_count);
+    var text: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("www.example.com.", try message.authorities.items[0].owner.toText(&text));
+}
+
+test "RFC 5452 section 6: a negative answer keeps its SOA" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const fixture = try AdditionalFixture.create(io, .negative_answer);
+    defer fixture.destroy();
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42720);
+
+    const bytes = try fixture.resolver.answer(fixture.encoded, fixture.query, &client, &output);
+    const message = try dns_message.Message.parse(fixture.arena.allocator(), bytes);
+
+    // A negative answer is carried by the zone SOA (RFC 2308 section 5), so
+    // the SOA survives even though its owner name is not in the domain of the
+    // query, and the record beside it is dropped.
+    try std.testing.expectEqual(dns_header.Rcode.nxdomain, message.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), message.header.authority_count);
+    try std.testing.expect(dns_types.RecordType.SOA.eql(message.authorities.items[0].rrtype));
+    var text: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("elsewhere.example.", try message.authorities.items[0].owner.toText(&text));
+}
+
+test "RFC 5452 section 6: the cached answer holds the filtered authority section" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const fixture = try AdditionalFixture.create(io, .answer_with_authority);
+    defer fixture.destroy();
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42721);
+
+    _ = try fixture.resolver.answer(fixture.encoded, fixture.query, &client, &output);
+    // The upstream is done, so the next client can only be answered from the
+    // cache.
+    fixture.join();
+    const bytes = try fixture.resolver.answer(fixture.encoded, fixture.query, &client, &output);
+    const message = try dns_message.Message.parse(fixture.arena.allocator(), bytes);
+    try std.testing.expectEqual(dns_header.Rcode.no_error, message.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), message.header.authority_count);
+    var text: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("www.example.com.", try message.authorities.items[0].owner.toText(&text));
+    try std.testing.expectEqual(@as(usize, 1), fixture.upstream.requests);
+}
+
+test "RFC 5452 section 6: a referral keeps the NS records of its delegation" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const fixture = try AdditionalFixture.create(io, .referral_out_of_domain);
+    defer fixture.destroy();
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42722);
+
+    const bytes = try fixture.resolver.answer(fixture.encoded, fixture.query, &client, &output);
+    const message = try dns_message.Message.parse(fixture.arena.allocator(), bytes);
+
+    // The delegation is not in the domain of the query, but the client
+    // follows the delegation with the NS records the referral carries
+    // (RFC 1034 section 4.3.2), so they survive, and the glue rule is
+    // unchanged: a delegation the query is not about keeps none of it.
+    try std.testing.expectEqual(@as(u16, 1), message.header.authority_count);
+    try std.testing.expect(dns_types.RecordType.NS.eql(message.authorities.items[0].rrtype));
+    var text: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("elsewhere.example.", try message.authorities.items[0].owner.toText(&text));
     try std.testing.expectEqual(@as(u16, 0), message.header.additional_count);
 }
 
@@ -6692,4 +6919,182 @@ test "RFC 7871 section 7.3.1: a trimmed scope keys the cache, so another scope i
     _ = try resolver.answer(other_encoded, other, &client, &output);
     thread.join();
     try std.testing.expectEqual(@as(usize, 2), upstream.requests);
+}
+
+/// The fake upstream the client subnet retry tests forward to. It refuses a
+/// query that carries an ADDRESS, the way a resolver with a policy against
+/// forwarding it does, and it records the option of every query it saw.
+const RefusingUpstream = struct {
+    io: std.Io,
+    udp: *const std.Io.net.Socket,
+    /// The number of queries the fake answers before it stops.
+    max_requests: usize = 2,
+    /// The SOURCE PREFIX-LENGTH of the client subnet option of each query.
+    seen_prefix: [4]u8 = @splat(0),
+    /// The length of the client subnet option of each query.
+    seen_len: [4]usize = @splat(0),
+    requests: usize = 0,
+    /// The upstream refuses the query even when it carries no ADDRESS.
+    refuse_all: bool = false,
+};
+
+fn serveRefusingUpstream(args: *RefusingUpstream) void {
+    const timeout: std.Io.Timeout = .{ .duration = .{
+        .raw = .fromSeconds(2),
+        .clock = .awake,
+    } };
+    var request_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
+    while (args.requests < args.max_requests) {
+        const incoming = args.udp.receiveTimeout(args.io, &request_buffer, timeout) catch return;
+        args.requests += 1;
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const query = dns_message.Message.parseQuery(arena.allocator(), incoming.data) catch return;
+        var prefix: u8 = 0;
+        var option_len: usize = 0;
+        if (findOption(query, dns_rdata.EDNS_ECS_OPTION_CODE)) |option| {
+            option_len = option.len;
+            if (option.len >= 4) prefix = option[2];
+        }
+        const index = args.requests - 1;
+        if (index < args.seen_prefix.len) {
+            args.seen_prefix[index] = prefix;
+            args.seen_len[index] = option_len;
+        }
+        const question = query.question orelse return;
+        var answer_slot: [1]dns_record.ResourceRecord = undefined;
+        answer_slot[0] = .{
+            .owner = question.name,
+            .rrtype = .A,
+            .class = .IN,
+            .ttl = 60,
+            .rdata = .{ .A = .{ 192, 0, 2, 1 } },
+        };
+        var answers: []const dns_record.ResourceRecord = &.{};
+        var rcode: dns_header.Rcode = .no_error;
+        if (args.refuse_all or prefix > 0) {
+            rcode = .refused;
+        } else {
+            answers = answer_slot[0..1];
+        }
+        var response_buffer: [2048]u8 = undefined;
+        const bytes = buildDns64UpstreamAnswer(&response_buffer, query, answers, &.{}, rcode, null) catch return;
+        args.udp.send(args.io, &incoming.from, bytes) catch return;
+    }
+}
+
+test "RFC 7871 section 7.1.3: a refused query with a client subnet is asked again without the address" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    var upstream = RefusingUpstream{ .io = io, .udp = &upstream_socket };
+    const thread = try std.Thread.spawn(.{}, serveRefusingUpstream, .{&upstream});
+
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = upstream_socket.address },
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2616, "example.com.", true);
+    defer query.deinit();
+    try appendOption(&query, dns_rdata.EDNS_ECS_OPTION_CODE, &.{ 0, 1, 24, 0, 192, 0, 2 });
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42650);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    thread.join();
+
+    // The upstream was asked twice: the first query carried the address, the
+    // retry carried the option with no address in it.
+    try std.testing.expectEqual(@as(usize, 2), upstream.requests);
+    try std.testing.expectEqual(@as(u8, 24), upstream.seen_prefix[0]);
+    try std.testing.expectEqual(@as(usize, 7), upstream.seen_len[0]);
+    try std.testing.expectEqual(@as(u8, 0), upstream.seen_prefix[1]);
+    try std.testing.expectEqual(@as(usize, 4), upstream.seen_len[1]);
+
+    // The client gets the answer of the retry.
+    const response = try dns_message.Message.parse(arena.allocator(), bytes);
+    try std.testing.expectEqual(dns_header.Rcode.no_error, response.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+    // RFC 7871 section 6: the answer reports the scope the upstream answered
+    // with, and an answer fetched without an address covers every network.
+    const ecs = findOption(response, dns_rdata.EDNS_ECS_OPTION_CODE).?;
+    try std.testing.expectEqual(@as(u8, 24), ecs[2]);
+    try std.testing.expectEqual(@as(u8, 0), ecs[3]);
+}
+
+test "RFC 7871 section 7.1.3: a second refusal ends the exchange" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    var upstream = RefusingUpstream{ .io = io, .udp = &upstream_socket, .refuse_all = true };
+    const thread = try std.Thread.spawn(.{}, serveRefusingUpstream, .{&upstream});
+
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = upstream_socket.address },
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2617, "example.com.", true);
+    defer query.deinit();
+    try appendOption(&query, dns_rdata.EDNS_ECS_OPTION_CODE, &.{ 0, 1, 24, 0, 192, 0, 2 });
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42651);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+
+    // The retry is bounded: the upstream was asked twice and no more.
+    const response = try dns_message.Message.parse(arena.allocator(), bytes);
+    try std.testing.expectEqual(dns_header.Rcode.refused, response.header.rcode);
+
+    // RFC 9520 section 3.2: the refusal is a failure, so the next client
+    // for the same question is answered with it and no query goes upstream.
+    const again = try resolver.answer(encoded, query, &client, &output);
+    thread.join();
+    try std.testing.expectEqual(@as(usize, 2), upstream.requests);
+    const refusal = try dns_message.Message.parse(arena.allocator(), again);
+    try std.testing.expectEqual(dns_header.Rcode.refused, refusal.header.rcode);
+}
+
+test "RFC 7871 section 7.1.3: a query without a client subnet is not retried" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    var upstream = RefusingUpstream{ .io = io, .udp = &upstream_socket, .refuse_all = true };
+    const thread = try std.Thread.spawn(.{}, serveRefusingUpstream, .{&upstream});
+
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = upstream_socket.address },
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2618, "example.com.", true);
+    defer query.deinit();
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42652);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    thread.join();
+
+    // The query carried no address, so there was nothing to retry without.
+    try std.testing.expectEqual(@as(usize, 1), upstream.requests);
+    try std.testing.expectEqual(@as(usize, 0), upstream.seen_len[0]);
+    const response = try dns_message.Message.parse(arena.allocator(), bytes);
+    try std.testing.expectEqual(dns_header.Rcode.refused, response.header.rcode);
+    try std.testing.expect(findOption(response, dns_rdata.EDNS_ECS_OPTION_CODE) == null);
 }
