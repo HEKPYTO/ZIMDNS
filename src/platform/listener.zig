@@ -41,6 +41,20 @@ pub const Error = error{
     UnsupportedPlatform,
 };
 
+/// The connection limits the operator configured. One process serves one
+/// configuration, so the TCP policy lives here instead of in every listener.
+var tcp_limits: config.TcpLimits = .{};
+
+/// Points the TCP listener at the limits the operator configured.
+pub fn setTcpLimits(limits: config.TcpLimits) void {
+    tcp_limits = limits;
+}
+
+/// The limits the TCP listener enforces.
+pub fn tcpLimits() config.TcpLimits {
+    return tcp_limits;
+}
+
 pub fn validateTcpFrameLength(length: usize) Error!void {
     if (length == 0 or length > TCP_MAX_FRAME_SIZE) return Error.BadTcpFrame;
 }
@@ -210,8 +224,9 @@ pub fn serveTcpLoop(server: anytype, io: std.Io, runtime: *Runtime, max_requests
     return serveTcpLoopWithTimeout(server, io, runtime, max_requests, TCP_IO_TIMEOUT);
 }
 
-fn serveTcpStreamWorker(stream: std.Io.net.Stream, io: std.Io, runtime: *Runtime, timeout: TcpIoTimeout) void {
+fn serveTcpStreamWorker(stream: std.Io.net.Stream, io: std.Io, runtime: *Runtime, timeout: TcpIoTimeout, sources: *SourceCounter) void {
     defer stream.close(io);
+    defer sources.release(&stream.socket.address);
     serveTcpStreamOnceWithTimeout(stream, io, runtime, timeout, null) catch {};
 }
 
@@ -219,14 +234,121 @@ fn serveTcpLoopWithTimeout(server: anytype, io: std.Io, runtime: *Runtime, max_r
     var group: std.Io.Group = .init;
     defer group.await(io) catch unreachable;
 
+    var sources = SourceCounter{};
     var accepted: usize = 0;
     while (max_requests == null or accepted < max_requests.?) {
         const stream = try server.accept(io);
         accepted += 1;
-        group.concurrent(io, serveTcpStreamWorker, .{ stream, io, runtime, timeout }) catch |err| switch (err) {
-            error.ConcurrencyUnavailable => stream.close(io),
+        // RFC 9210 section 4.2: a source address holds only so many
+        // connections at once, and a connection over the limit is closed at
+        // once, the way a connection with no worker slot is closed.
+        if (!sources.admit(&stream.socket.address)) {
+            stream.close(io);
+            continue;
+        }
+        group.concurrent(io, serveTcpStreamWorker, .{ stream, io, runtime, timeout, &sources }) catch |err| switch (err) {
+            error.ConcurrencyUnavailable => {
+                sources.release(&stream.socket.address);
+                stream.close(io);
+            },
         };
     }
+}
+
+/// The connections one source address holds, so the per-source limit of
+/// RFC 9210 section 4.2 is enforced across the workers.
+const SourceCounter = struct {
+    const max_sources = 64;
+
+    const Key = struct {
+        v6: bool = false,
+        bytes: [16]u8 = @splat(0),
+
+        fn eql(a: Key, b: Key) bool {
+            return a.v6 == b.v6 and std.mem.eql(u8, &a.bytes, &b.bytes);
+        }
+    };
+
+    const Entry = struct {
+        key: Key = .{},
+        count: u32 = 0,
+    };
+
+    mutex: std.Io.Mutex = .init,
+    entries: [max_sources]Entry = @splat(.{}),
+    len: usize = 0,
+
+    /// Takes a slot for the source of a connection, or refuses the
+    /// connection when the source already holds as many as the limit allows.
+    fn admit(self: *SourceCounter, address: *const std.Io.net.IpAddress) bool {
+        const limit = tcp_limits.max_connections_per_source orelse return true;
+        const key = sourceKey(address);
+        self.lock();
+        defer self.unlock();
+        for (self.entries[0..self.len]) |*entry| {
+            if (!entry.key.eql(key)) continue;
+            if (entry.count >= limit) return false;
+            entry.count += 1;
+            return true;
+        }
+        // A source that cannot be counted is refused rather than served
+        // without a count.
+        if (self.len >= self.entries.len) return false;
+        self.entries[self.len] = .{ .key = key, .count = 1 };
+        self.len += 1;
+        return true;
+    }
+
+    /// Gives the slot back when the connection closes.
+    fn release(self: *SourceCounter, address: *const std.Io.net.IpAddress) void {
+        const key = sourceKey(address);
+        self.lock();
+        defer self.unlock();
+        for (self.entries[0..self.len], 0..) |*entry, index| {
+            if (!entry.key.eql(key)) continue;
+            entry.count -= 1;
+            if (entry.count == 0) {
+                self.entries[index] = self.entries[self.len - 1];
+                self.len -= 1;
+            }
+            return;
+        }
+    }
+
+    fn lock(self: *SourceCounter) void {
+        std.Io.Threaded.mutexLockUncancelable(&self.mutex);
+    }
+
+    fn unlock(self: *SourceCounter) void {
+        std.Io.Threaded.mutexUnlock(&self.mutex);
+    }
+};
+
+/// The address a connection comes from: its IP address without the port.
+fn sourceKey(address: *const std.Io.net.IpAddress) SourceCounter.Key {
+    var key = SourceCounter.Key{};
+    switch (address.*) {
+        .ip4 => |ip4| @memcpy(key.bytes[0..4], &ip4.bytes),
+        .ip6 => |ip6| {
+            key.v6 = true;
+            @memcpy(&key.bytes, &ip6.bytes);
+        },
+    }
+    return key;
+}
+
+/// The time one frame may take: the per-frame deadline, shortened to what is
+/// left of the connection's lifetime. Null means the connection is over.
+fn frameTimeout(io: std.Io, connection_deadline: ?std.Io.Clock.Timestamp, timeout: TcpIoTimeout) ?TcpIoTimeout {
+    const deadline = connection_deadline orelse return timeout;
+    const remaining = deadline.durationFromNow(io).raw.nanoseconds;
+    if (remaining <= 0) return null;
+    const frame_nanoseconds = @as(i96, timeout.seconds) * std.time.ns_per_s + @as(i96, timeout.microseconds) * std.time.ns_per_us;
+    const nanoseconds = @min(frame_nanoseconds, remaining);
+    return .{
+        .seconds = @intCast(@divTrunc(nanoseconds, std.time.ns_per_s)),
+        .microseconds = @intCast(@divTrunc(@rem(nanoseconds, std.time.ns_per_s), std.time.ns_per_us)),
+    };
 }
 
 pub fn serveTcpLoopOnAddress(io: std.Io, runtime: *Runtime, address: *const std.Io.net.IpAddress, max_requests: ?usize) !void {
@@ -452,7 +574,7 @@ test "classic UDP signed response retains TSIG and verifies after truncation" {
     try expectSignedUdpTruncation(false);
 }
 
-test "EDNS UDP signed response drops OPT and retains TSIG after truncation" {
+test "EDNS UDP signed response keeps OPT and retains TSIG after truncation" {
     try expectSignedUdpTruncation(true);
 }
 
@@ -497,8 +619,10 @@ fn expectSignedUdpTruncation(include_edns: bool) !void {
     try std.testing.expect(parsed.header.truncated);
     try std.testing.expectEqual(@as(@TypeOf(parsed.header.rcode), .no_error), parsed.header.rcode);
     try std.testing.expectEqual(@as(u16, 0), parsed.header.answer_count);
-    try std.testing.expectEqual(@as(usize, 1), parsed.additionals.len);
-    try std.testing.expect(parsed.edns == null);
+    try std.testing.expectEqual(@as(usize, if (include_edns) 2 else 1), parsed.additionals.len);
+    // RFC 6891 section 6.1.1: a request that carried an OPT record is
+    // answered with one, and the truncated reply keeps it.
+    try std.testing.expectEqual(include_edns, parsed.edns != null);
     const request_final = (try dns_tsig.parseFinalAdditional(query.bytes[0..query.len])).?;
     const response_final = (try dns_tsig.parseFinalAdditional(incoming.data)).?;
     try std.testing.expectEqual(@as(u16, 0x1234), response_final.tsig.original_id);
@@ -820,6 +944,156 @@ test "TCP connection cap serves sixteen frames and closes before the seventeenth
     if (response_reader.interface.takeArray(2)) |_| {
         return error.UnexpectedSeventeenthResponse;
     } else |_| {}
+}
+
+/// Serves the TCP connections of one listener on a thread of its own, so a
+/// test can watch the connections while the loop accepts them.
+fn serveTcpLoopThread(server: *std.Io.net.Server, io: std.Io, runtime: *Runtime, max_requests: usize) void {
+    serveTcpLoopWithTimeout(server, io, runtime, max_requests, TCP_IO_TIMEOUT) catch {};
+}
+
+test "TCP loop refuses a connection from a source over the per-source limit" {
+    var io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{
+        .concurrent_limit = .limited(TCP_MAX_CONNECTION_WORKERS),
+    });
+    defer io_backend.deinit();
+    const io = io_backend.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+
+    const previous_limits = tcpLimits();
+    defer setTcpLimits(previous_limits);
+    // RFC 9210 section 4.2: one source address holds one connection.
+    setTcpLimits(.{ .max_connections_per_source = 1 });
+
+    var listen_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try std.Io.net.IpAddress.listen(&listen_addr, io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const server_thread = try std.Thread.spawn(.{}, serveTcpLoopThread, .{ &server, io, &runtime, 2 });
+    defer server_thread.join();
+
+    // The first connection holds the only slot of its source.
+    var held = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer held.close(io);
+
+    // The second connection of the same source is over the limit and is
+    // closed without an answer.
+    var refused = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer refused.close(io);
+    tcp_deadline.setSocketTimeout(refused.socket.handle, .{ .seconds = 2 });
+
+    var refused_buffer: [64]u8 = undefined;
+    var refused_reader = refused.reader(io, &refused_buffer);
+    try std.testing.expectError(error.EndOfStream, refused_reader.interface.takeArray(2));
+
+    // A connection from another source address is not over the limit.
+    var listen_addr6: std.Io.net.IpAddress = .{ .ip6 = .loopback(0) };
+    var server6 = try std.Io.net.IpAddress.listen(&listen_addr6, io, .{ .reuse_address = true });
+    defer server6.deinit(io);
+    const server6_thread = try std.Thread.spawn(.{}, serveTcpLoopThread, .{ &server6, io, &runtime, 1 });
+    defer server6_thread.join();
+
+    var other = try std.Io.net.IpAddress.connect(&server6.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer other.close(io);
+    var query_buffer: [512]u8 = undefined;
+    const query = try @import("../cli/query.zig").buildQueryPacket(&query_buffer, 0x6801, "dns.home.arpa.", .A, false);
+    try @import("../cli/query.zig").sendTcpQuery(other, io, query);
+    try other.shutdown(io, .send);
+
+    var response_buffer: [512]u8 = undefined;
+    const response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), other, io, &response_buffer, query);
+    try std.testing.expectEqual(@as(u16, 0x6801), response.header.id);
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+}
+
+test "TCP connection is closed after the configured connection duration" {
+    var io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{
+        .concurrent_limit = .limited(TCP_MAX_CONNECTION_WORKERS),
+    });
+    defer io_backend.deinit();
+    const io = io_backend.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+
+    const previous_limits = tcpLimits();
+    defer setTcpLimits(previous_limits);
+    // RFC 9210 section 4.2: one connection lives for a second.
+    setTcpLimits(.{ .max_connection_duration = 1 });
+
+    var listen_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try std.Io.net.IpAddress.listen(&listen_addr, io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    const started = std.Io.Clock.real.now(io).nanoseconds;
+    var client = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer client.close(io);
+
+    var query_buffer: [512]u8 = undefined;
+    const query = try @import("../cli/query.zig").buildQueryPacket(&query_buffer, 0x6802, "dns.home.arpa.", .A, false);
+    try @import("../cli/query.zig").sendTcpQuery(client, io, query);
+
+    const server_thread = try std.Thread.spawn(.{}, serveTcpLoopThread, .{ &server, io, &runtime, 1 });
+    defer server_thread.join();
+
+    var response_buffer: [512]u8 = undefined;
+    const response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), client, io, &response_buffer, query);
+    try std.testing.expectEqual(@as(u16, 0x6802), response.header.id);
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+
+    // The answer arrived, and the connection behind it is closed when the
+    // duration is over, not when the five-second frame deadline is.
+    var client_buffer: [64]u8 = undefined;
+    var client_reader = client.reader(io, &client_buffer);
+    try std.testing.expectError(error.EndOfStream, client_reader.interface.takeArray(2));
+    const elapsed = std.Io.Clock.real.now(io).nanoseconds - started;
+    try std.testing.expect(elapsed < @as(i96, 4) * std.time.ns_per_s);
+}
+
+test "TCP loop without a configured per-source limit serves two connections of one source" {
+    var io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{
+        .concurrent_limit = .limited(TCP_MAX_CONNECTION_WORKERS),
+    });
+    defer io_backend.deinit();
+    const io = io_backend.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+
+    var listen_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try std.Io.net.IpAddress.listen(&listen_addr, io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    var first = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer first.close(io);
+    var second = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer second.close(io);
+
+    var first_buffer: [512]u8 = undefined;
+    const first_query = try @import("../cli/query.zig").buildQueryPacket(&first_buffer, 0x6803, "dns.home.arpa.", .A, false);
+    var second_buffer: [512]u8 = undefined;
+    const second_query = try @import("../cli/query.zig").buildQueryPacket(&second_buffer, 0x6804, "dns.home.arpa.", .A, false);
+    try @import("../cli/query.zig").sendTcpQuery(first, io, first_query);
+    try first.shutdown(io, .send);
+    try @import("../cli/query.zig").sendTcpQuery(second, io, second_query);
+    try second.shutdown(io, .send);
+
+    try serveTcpLoop(&server, io, &runtime, 2);
+
+    var response_buffer: [512]u8 = undefined;
+    const first_response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), first, io, &response_buffer, first_query);
+    try std.testing.expectEqual(@as(u16, 0x6803), first_response.header.id);
+    try std.testing.expectEqual(@as(u16, 1), first_response.header.answer_count);
+    const second_response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), second, io, &response_buffer, second_query);
+    try std.testing.expectEqual(@as(u16, 0x6804), second_response.header.id);
+    try std.testing.expectEqual(@as(u16, 1), second_response.header.answer_count);
 }
 
 test "TCP framing accepts the largest u16 length-prefixed frame" {
@@ -1339,12 +1613,21 @@ fn buildSignedListenerQueryWithEdns(time_signed: u64, include_edns: bool) !Signe
 const unix_tcp_deadlines = if (TCP_DEADLINES_SUPPORTED) struct {
     fn serve(stream: std.Io.net.Stream, io: std.Io, runtime: *Runtime, timeout: TcpIoTimeout, counters: ?*metrics.Counters) !void {
         tcp_deadline.setSocketTimeout(stream.socket.handle, timeout);
+        // RFC 9210 section 4.2: the operator may bound the lifetime of one
+        // connection, and that deadline covers the whole connection.
+        const connection_deadline: ?std.Io.Clock.Timestamp = if (tcp_limits.max_connection_duration) |seconds|
+            tcp_deadline.deadline(io, .{ .seconds = seconds })
+        else
+            null;
 
         var request_buffer: [TCP_MAX_FRAME_SIZE]u8 = undefined;
         var response_buffer: [TCP_MAX_FRAME_SIZE]u8 = undefined;
         var frame_count: usize = 0;
         while (frame_count < TCP_MAX_FRAMES_PER_CONNECTION) : (frame_count += 1) {
-            const read_deadline = tcp_deadline.deadline(io, timeout);
+            // A connection that has outlived its duration ends here, whatever
+            // the per-frame deadline says.
+            const frame_timeout = frameTimeout(io, connection_deadline, timeout) orelse return;
+            const read_deadline = tcp_deadline.deadline(io, frame_timeout);
             const request = readFrame(stream.socket.handle, io, &request_buffer, read_deadline) catch |err| {
                 if (err == error.EndOfStream) {
                     if (frame_count == 0) return error.EndOfStream;
@@ -1354,7 +1637,7 @@ const unix_tcp_deadlines = if (TCP_DEADLINES_SUPPORTED) struct {
                 return err;
             };
             if (transfer_mod.peekIsTransferRequest(request)) {
-                try serveTransfer(request, stream, io, runtime, timeout, counters);
+                try serveTransfer(request, stream, io, runtime, frame_timeout, counters);
                 continue;
             }
             // RFC 9210 section 3: a query that arrived over TCP is answered
@@ -1369,7 +1652,7 @@ const unix_tcp_deadlines = if (TCP_DEADLINES_SUPPORTED) struct {
 
             var prefix: [2]u8 = undefined;
             std.mem.writeInt(u16, &prefix, @intCast(response_bytes.len), .big);
-            const write_deadline = tcp_deadline.deadline(io, timeout);
+            const write_deadline = tcp_deadline.deadline(io, frame_timeout);
             try tcp_deadline.writeExact(stream.socket.handle, io, &prefix, write_deadline);
             try tcp_deadline.writeExact(stream.socket.handle, io, response_bytes, write_deadline);
         }

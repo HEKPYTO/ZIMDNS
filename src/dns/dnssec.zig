@@ -3,8 +3,10 @@
 /// - DO-bit helpers and DNSSEC RRset inclusion rules for authoritative answers.
 /// - Opaque-wire helpers: RRSIG validity-window check, NSEC type-bitmap denial,
 ///   NSEC3 (SHA-1, RFC 5155) hash and denial.
-/// - A bounded aggressive-NSEC cache (RFC 8198 sections 4-5) for validators.
-/// - EDE DNSSEC-bogus INFO-CODEs (RFC 8914 codes 6-10) for validation failures.
+/// - A bounded aggressive cache of NSEC and NSEC3 proofs (RFC 8198
+///   sections 4-5) for validators.
+/// - EDE INFO-CODEs (RFC 8914): the DNSSEC-bogus codes 6-10 and the codes
+///   that explain an answer the server returns without a signed verification.
 /// What this module does NOT do: zone signing, cryptographic validation (no
 /// RSA/ECDSA chain building and no trust-anchor management). A full-validating
 /// resolver MUST NOT claim `secure` from this module alone. Presence,
@@ -24,8 +26,19 @@ pub const EDE_SIGNATURE_EXPIRED: u16 = 7;
 pub const EDE_SIGNATURE_NOT_YET_VALID: u16 = 8;
 pub const EDE_DNSKEY_MISSING: u16 = 9;
 pub const EDE_RRSIGS_MISSING: u16 = 10;
+/// RFC 8914 section 4.2: the zone's DNSKEY RRset held only algorithms this
+/// server cannot verify with.
+pub const EDE_UNSUPPORTED_DNSKEY_ALGORITHM: u16 = 1;
+/// RFC 8914 section 4.3: the zone's DS RRset held only digest types this
+/// server cannot compute.
+pub const EDE_UNSUPPORTED_DS_DIGEST_TYPE: u16 = 2;
+/// RFC 8914 section 4.6: the security status of the answer could not be
+/// determined.
+pub const EDE_DNSSEC_INDETERMINATE: u16 = 5;
+/// RFC 8914 section 4.12: no DNSKEY of the zone carried the Zone Key flag.
+pub const EDE_NO_ZONE_KEY_BIT: u16 = 11;
 
-/// RFC 8914 EXTRA-TEXT purpose strings for the DNSSEC-bogus INFO-CODEs above.
+/// RFC 8914 EXTRA-TEXT purpose strings for the INFO-CODEs above.
 pub fn edeText(code: u16) []const u8 {
     return switch (code) {
         EDE_DNSSEC_BOGUS => "dnssec bogus",
@@ -33,6 +46,10 @@ pub fn edeText(code: u16) []const u8 {
         EDE_SIGNATURE_NOT_YET_VALID => "signature not yet valid",
         EDE_DNSKEY_MISSING => "dnskey missing",
         EDE_RRSIGS_MISSING => "rrsigs missing",
+        EDE_UNSUPPORTED_DNSKEY_ALGORITHM => "unsupported dnskey algorithm",
+        EDE_UNSUPPORTED_DS_DIGEST_TYPE => "unsupported ds digest type",
+        EDE_DNSSEC_INDETERMINATE => "dnssec indeterminate",
+        EDE_NO_ZONE_KEY_BIT => "no zone key bit set",
         else => "",
     };
 }
@@ -355,12 +372,34 @@ pub const Proof = struct {
     }
 };
 
-/// The proof records an upstream answer carried with a proving NSEC: the
-/// NSEC itself and the RRSIG that covers it (RFC 4035 section 3.1.3).
-pub const NsecProof = struct {
-    nsec: ?record_mod.ResourceRecord = null,
+/// The proof record an upstream answer carried with a proving NSEC or NSEC3:
+/// the record itself and the RRSIG that covers it (RFC 4035 section 3.1.3).
+pub const SignedProof = struct {
+    record: ?record_mod.ResourceRecord = null,
     rrsig: ?record_mod.ResourceRecord = null,
 };
+
+/// The NSEC3 chain a cached proof belongs to (RFC 5155 section 7.1): the
+/// zone it covers, the iteration count, and the salt. The hash algorithm is
+/// always SHA-1 here.
+pub const Nsec3Chain = struct {
+    zone: Name = Name.root(),
+    iterations: u16 = 0,
+    salt: [255]u8 = @as([255]u8, @splat(@as(u8, 0))),
+    salt_len: u8 = 0,
+};
+
+/// RFC 5155 section 7.1: the NSEC3 span test. The chain is ordered by the
+/// hash read as an unsigned octet sequence, and the last NSEC3 of a chain
+/// points back at the first, so the span wraps.
+pub fn nsec3Covers(owner: [20]u8, next: [20]u8, target: [20]u8) bool {
+    const order = std.mem.order(u8, &owner, &next);
+    if (order == .eq) return !std.mem.eql(u8, &owner, &target);
+    if (order == .lt) {
+        return std.mem.order(u8, &owner, &target) == .lt and std.mem.order(u8, &target, &next) == .lt;
+    }
+    return std.mem.order(u8, &owner, &target) == .lt or std.mem.order(u8, &target, &next) == .lt;
+}
 
 /// A denial a cached proof gives, with the zone SOA that arrived with the
 /// proof (RFC 2308 section 3). The SOA is null when the proof was cached
@@ -392,13 +431,17 @@ fn keepProof(out: *ProofRecord, record: record_mod.ResourceRecord) void {
 /// True when every name in the RDATA of a proof record is written out in
 /// full. The NSEC RDATA starts with the next owner name (RFC 4034 section
 /// 4.1.2) and the RRSIG RDATA carries the signer's name after its
-/// 18-octet header (RFC 4034 section 3.2).
+/// 18-octet header (RFC 4034 section 3.2). The NSEC3 RDATA carries the
+/// next hashed owner name in binary form (RFC 5155 section 3.1.7), so it
+/// holds no name at all.
 fn proofNamesUncompressed(rrtype: RecordType, rdata: []const u8) bool {
     const code = rrtype.code();
     const offset: usize = if (code == RecordType.NSEC.code())
         0
     else if (code == RecordType.RRSIG.code())
         18
+    else if (code == RecordType.NSEC3.code())
+        return true
     else
         return false;
     if (rdata.len <= offset) return false;
@@ -441,11 +484,33 @@ fn wildcardName(closest_encloser: Name) ?Name {
     return out;
 }
 
-/// Bounded aggressive-NSEC cache (RFC 8198 sections 4-5). Stores proving NSEC
-/// RRs; `deny` synthesizes NXDOMAIN/NODATA without an upstream query. NSEC3
-/// entries are matched on exact hashed-owner plus a type-bitmap miss in this
-/// minimum; anything more complex (closest-encloser proofs, opt-out) returns
-/// null so the caller falls through to the normal lookup path.
+/// True when two NSEC3 chains are the same chain: the same zone, the same
+/// iteration count, and the same salt (RFC 5155 section 7.1).
+fn sameChain(a: Nsec3Chain, b: Nsec3Chain) bool {
+    if (!a.zone.eql(&b.zone)) return false;
+    if (a.iterations != b.iterations) return false;
+    return std.mem.eql(u8, a.salt[0..a.salt_len], b.salt[0..b.salt_len]);
+}
+
+/// The hash a name has in an NSEC3 chain (RFC 5155 section 5).
+fn nsec3HashIn(chain: Nsec3Chain, name: Name) [20]u8 {
+    var out: [20]u8 = undefined;
+    nsec3Hash(name, chain.salt[0..chain.salt_len], chain.iterations, &out);
+    return out;
+}
+
+/// True when `zone` is an ancestor of `name`, or the name itself.
+fn isWithin(name: Name, zone: Name) bool {
+    var current = name;
+    while (true) {
+        if (current.eql(&zone)) return true;
+        current = parentName(current) orelse return false;
+    }
+}
+
+/// Bounded aggressive cache of NSEC and NSEC3 proofs (RFC 8198 sections
+/// 4-5). Stores proving NSEC and NSEC3 RRs; `deny` synthesizes
+/// NXDOMAIN/NODATA without an upstream query.
 pub const AggressiveCache = struct {
     pub const capacity = 16;
 
@@ -462,14 +527,22 @@ pub const AggressiveCache = struct {
         bitmap_len: u8 = 0,
         hashed_owner: [20]u8 = @as([20]u8, @as([20]u8, @splat(@as(u8, 0)))),
         is_nsec3: bool = false,
+        /// The NSEC3 chain this entry belongs to (RFC 5155 section 7.1).
+        nsec3_chain: Nsec3Chain = .{},
+        /// The next hashed owner name of the NSEC3 record (RFC 5155
+        /// section 3.1.7): the hash the chain is ordered by.
+        nsec3_next: [20]u8 = @as([20]u8, @as([20]u8, @splat(@as(u8, 0)))),
+        /// The Opt-Out flag of the NSEC3 record (RFC 5155 section 3.1.2.1).
+        nsec3_opt_out: bool = false,
         /// The zone SOA that arrived with this proof. A negative answer must
         /// carry it (RFC 2308 section 3), and a denial without one must not
         /// be cached (RFC 2308 section 5).
         soa: ?record_mod.ResourceRecord = null,
-        /// The NSEC as the upstream answer published it and the RRSIG that
-        /// covers it. RFC 8020 section 2 returns them with a cut answer.
-        nsec_proof: ProofRecord = .{},
-        rrsig_proof: ProofRecord = .{},
+        /// The proof record as the upstream answer published it and the
+        /// RRSIG that covers it. RFC 8020 section 2 returns them with a cut
+        /// answer.
+        proof_record: ProofRecord = .{},
+        proof_rrsig: ProofRecord = .{},
         /// Unix seconds after which the proof must no longer deny (RFC 8198
         /// section 4). Always derived as now + min(ttl, cap) at insert.
         expires_at: i64 = 0,
@@ -481,7 +554,7 @@ pub const AggressiveCache = struct {
     /// Cache a proving NSEC RRset. The proof records the upstream answer
     /// published are kept with it, so a cut answer can return them
     /// (RFC 8020 section 2).
-    pub fn insertNsec(self: *AggressiveCache, owner: Name, next: Name, bitmap: []const u8, now: i64, ttl: u32, soa: ?record_mod.ResourceRecord, proof: NsecProof) void {
+    pub fn insertNsec(self: *AggressiveCache, owner: Name, next: Name, bitmap: []const u8, now: i64, ttl: u32, soa: ?record_mod.ResourceRecord, proof: SignedProof) void {
         const slot = &self.entries[self.next_slot];
         self.next_slot = (self.next_slot + 1) % capacity;
         slot.* = .{};
@@ -494,25 +567,45 @@ pub const AggressiveCache = struct {
         slot.soa = soa;
         slot.expires_at = now +| @min(@as(i64, ttl), max_entry_ttl_seconds);
         // A proof that names another owner is not this entry's proof.
-        if (proof.nsec) |nsec| {
-            if (nsec.owner.eql(&owner)) {
-                keepProof(&slot.nsec_proof, nsec);
-                if (proof.rrsig) |rrsig| keepProof(&slot.rrsig_proof, rrsig);
+        if (proof.record) |record| {
+            if (record.owner.eql(&owner)) {
+                keepProof(&slot.proof_record, record);
+                if (proof.rrsig) |rrsig| keepProof(&slot.proof_rrsig, rrsig);
             }
         }
     }
 
-    pub fn insertNsec3Hash(self: *AggressiveCache, hashed_owner: [20]u8, bitmap: []const u8, now: i64, ttl: u32) void {
+    /// Cache a proving NSEC3 record (RFC 5155 section 3). The chain it
+    /// belongs to, its next hashed owner name, and its type bitmap are kept,
+    /// so a later query the record covers can be denied from it.
+    pub fn insertNsec3(self: *AggressiveCache, owner: Name, owner_hash: [20]u8, next_hash: [20]u8, opt_out: bool, iterations: u16, salt: []const u8, bitmap: []const u8, now: i64, ttl: u32, soa: ?record_mod.ResourceRecord, proof: SignedProof) void {
         const slot = &self.entries[self.next_slot];
         self.next_slot = (self.next_slot + 1) % capacity;
         slot.* = .{};
         slot.valid = true;
         slot.is_nsec3 = true;
-        slot.hashed_owner = hashed_owner;
+        slot.owner = owner;
+        slot.hashed_owner = owner_hash;
+        slot.nsec3_next = next_hash;
+        slot.nsec3_opt_out = opt_out;
+        const salt_len = @min(salt.len, slot.nsec3_chain.salt.len);
+        slot.nsec3_chain = .{
+            .zone = parentName(owner) orelse Name.root(),
+            .iterations = iterations,
+            .salt_len = @intCast(salt_len),
+        };
+        @memcpy(slot.nsec3_chain.salt[0..salt_len], salt[0..salt_len]);
         const len = @min(bitmap.len, slot.bitmap.len);
         @memcpy(slot.bitmap[0..len], bitmap[0..len]);
         slot.bitmap_len = @intCast(len);
+        slot.soa = soa;
         slot.expires_at = now +| @min(@as(i64, ttl), max_entry_ttl_seconds);
+        if (proof.record) |record| {
+            if (record.owner.eql(&owner)) {
+                keepProof(&slot.proof_record, record);
+                if (proof.rrsig) |rrsig| keepProof(&slot.proof_rrsig, rrsig);
+            }
+        }
     }
 
     /// Drop proofs past their expiry. Lazy eviction on every deny path, so
@@ -542,7 +635,20 @@ pub const AggressiveCache = struct {
         return null;
     }
 
-    /// RFC 8198 sections 4-5 aggressive use of cached NSEC proofs.
+    /// RFC 8198 sections 5.1 and 5.2 aggressive use of cached NSEC and
+    /// NSEC3 proofs. The NSEC proof is tried first: a zone is signed with
+    /// one scheme or the other, so the two never answer the same name.
+    ///
+    /// Expired proofs are evicted first and never deny (RFC 8198 section 4);
+    /// `now` is unix seconds on the same clock the insert TTLs were stored
+    /// against.
+    pub fn deny(self: *AggressiveCache, qname: Name, qtype: RecordType, now: i64) Error!?ProvenDenial {
+        self.evictExpired(now);
+        if (try self.denyNsec(qname, qtype)) |denial| return denial;
+        return try self.denyNsec3(qname, qtype);
+    }
+
+    /// RFC 8198 section 5.1 aggressive use of cached NSEC proofs.
     ///
     /// Exact path (section 4 NODATA): the QNAME must exactly match a cached
     /// NSEC owner whose bitmap is well-formed, lists NSEC (RFC 4035 section
@@ -559,17 +665,12 @@ pub const AggressiveCache = struct {
     /// exists, so NXDOMAIN is refused. Anything less returns null and the
     /// caller falls through to the normal lookup path.
     ///
-    /// Expired proofs are evicted first and never deny (RFC 8198 section 4);
-    /// `now` is unix seconds on the same clock the insert TTLs were stored
-    /// against.
-    ///
     /// The denial carries the zone SOA that arrived with the proof that
     /// gave it (RFC 2308 section 3), and null when the proof was cached
     /// without one. It carries the proof records the denial rests on
     /// (RFC 8020 section 2) when every one of them came with the RRSIG
     /// that covers it, and no proof at all otherwise.
-    pub fn deny(self: *AggressiveCache, qname: Name, qtype: RecordType, now: i64) Error!?ProvenDenial {
-        self.evictExpired(now);
+    pub fn denyNsec(self: *AggressiveCache, qname: Name, qtype: RecordType) Error!?ProvenDenial {
         var exact_seen = false;
         for (&self.entries) |*entry| {
             if (!entry.valid or entry.is_nsec3) continue;
@@ -577,9 +678,9 @@ pub const AggressiveCache = struct {
                 exact_seen = true;
                 if (try nsecBitmapDeniesType(entry.bitmap[0..entry.bitmap_len], qtype.code())) {
                     var proof = Proof{};
-                    if (entry.nsec_proof.len != 0 and entry.rrsig_proof.len != 0) {
-                        proof.add(entry.nsec_proof);
-                        proof.add(entry.rrsig_proof);
+                    if (entry.proof_record.len != 0 and entry.proof_rrsig.len != 0) {
+                        proof.add(entry.proof_record);
+                        proof.add(entry.proof_rrsig);
                     }
                     return .{
                         .denial = .nodata,
@@ -601,12 +702,12 @@ pub const AggressiveCache = struct {
                 var proof = Proof{};
                 var complete = true;
                 for ([_]*const Entry{ encloser, next_cover, wildcard_cover }) |entry| {
-                    if (entry.nsec_proof.len == 0 or entry.rrsig_proof.len == 0) {
+                    if (entry.proof_record.len == 0 or entry.proof_rrsig.len == 0) {
                         complete = false;
                         break;
                     }
-                    proof.add(entry.nsec_proof);
-                    proof.add(entry.rrsig_proof);
+                    proof.add(entry.proof_record);
+                    proof.add(entry.proof_rrsig);
                 }
                 return .{
                     .denial = .nxdomain,
@@ -620,24 +721,143 @@ pub const AggressiveCache = struct {
         return null;
     }
 
-    /// NSEC3 exact-match denial only: the hashed qname must equal a cached
-    /// hashed owner whose strictly well-formed bitmap lacks the QTYPE. Span
-    /// proofs need the closest-encloser NSEC3 set, which this minimum does
-    /// not synthesize. A matching entry with an empty or malformed bitmap
-    /// is Error.MalformedNsec, never a denial: the lenient lookup below
-    /// reports malformed input as absent, which would otherwise deny on
-    /// zero proof. Unknown hashes return null (no proof either way).
-    pub fn denyNsec3(self: *AggressiveCache, hashed_qname: [20]u8, qtype_code: u16, now: i64) Error!?Denial {
-        self.evictExpired(now);
-        for (&self.entries) |*entry| {
-            if (!entry.valid or !entry.is_nsec3) continue;
-            if (!std.mem.eql(u8, &entry.hashed_owner, &hashed_qname)) continue;
-            const bitmap = entry.bitmap[0..entry.bitmap_len];
-            try nsecBitmapValidate(bitmap);
-            if (!nsecBitmapHasType(bitmap, qtype_code)) return .nodata;
-            return null;
+    /// RFC 8198 section 5.2 aggressive use of cached NSEC3 records.
+    ///
+    /// The proof follows RFC 5155 sections 8.3 to 8.6. A NODATA needs an
+    /// NSEC3 that matches the QNAME whose bitmap leaves the QTYPE and the
+    /// CNAME bit clear (section 8.5, and section 8.6 for a DS query). An
+    /// NXDOMAIN needs a closest encloser proof: the longest ancestor of the
+    /// QNAME that an NSEC3 matches, the next closer name covered by an
+    /// NSEC3, and an NSEC3 that covers the wildcard at the closest encloser
+    /// (section 8.4). A covering NSEC3 with the Opt-Out flag set proves
+    /// nothing (RFC 8198 section 5.2), and neither does a closest encloser
+    /// whose NSEC3 carries the DNAME bit (RFC 5155 section 8.3).
+    pub fn denyNsec3(self: *AggressiveCache, qname: Name, qtype: RecordType) Error!?ProvenDenial {
+        var index: usize = 0;
+        while (index < self.entries.len) : (index += 1) {
+            const head = &self.entries[index];
+            if (!head.valid or !head.is_nsec3) continue;
+            // One chain at a time: a record of another chain cannot prove
+            // this one (RFC 5155 section 8.2).
+            if (self.chainSeen(head, index)) continue;
+            if (try self.denyNsec3Chain(head, qname, qtype)) |denial| return denial;
         }
         return null;
+    }
+
+    /// True when an earlier entry belongs to the same NSEC3 chain.
+    fn chainSeen(self: *const AggressiveCache, head: *const Entry, index: usize) bool {
+        var earlier: usize = 0;
+        while (earlier < index) : (earlier += 1) {
+            const other = &self.entries[earlier];
+            if (!other.valid or !other.is_nsec3) continue;
+            if (sameChain(other.nsec3_chain, head.nsec3_chain)) return true;
+        }
+        return false;
+    }
+
+    /// The denial one NSEC3 chain proves, or null when it proves none.
+    fn denyNsec3Chain(self: *AggressiveCache, head: *const Entry, qname: Name, qtype: RecordType) Error!?ProvenDenial {
+        const chain = head.nsec3_chain;
+        // A chain speaks only for the names inside its zone (RFC 5155
+        // section 7.1): the hash of a name outside the zone proves nothing.
+        if (!isWithin(qname, chain.zone)) return null;
+
+        // RFC 5155 section 8.5: a NODATA needs an NSEC3 that matches the
+        // QNAME, with the QTYPE and the CNAME bit clear.
+        if (self.findNsec3Match(&chain, nsec3HashIn(chain, qname))) |entry| {
+            const denies = try bitmapDeniesTypeAndCname(entry.bitmap[0..entry.bitmap_len], qtype.code());
+            if (!denies) return null;
+            return .{
+                .denial = .nodata,
+                .soa = entry.soa,
+                .proof = self.proofOf(entry),
+            };
+        }
+
+        // RFC 5155 section 8.4: an NXDOMAIN needs a closest encloser proof
+        // and an NSEC3 that covers the wildcard at that encloser.
+        var closest: ?*const Entry = null;
+        var closest_name: Name = Name.root();
+        var next_closer: ?*const Entry = null;
+        var candidate = qname;
+        var child_cover: ?*const Entry = null;
+        while (true) {
+            const digest = nsec3HashIn(chain, candidate);
+            if (self.findNsec3Match(&chain, digest)) |entry| {
+                // The QNAME itself exists, so it is never denied.
+                if (candidate.eql(&qname)) return null;
+                closest = entry;
+                closest_name = candidate;
+                next_closer = child_cover;
+                break;
+            }
+            child_cover = self.findNsec3Cover(&chain, digest);
+            // The apex of the zone is the last ancestor the chain covers.
+            if (candidate.eql(&chain.zone)) return null;
+            candidate = parentName(candidate) orelse return null;
+        }
+        const encloser = closest orelse return null;
+        const cover = next_closer orelse return null;
+        // RFC 8198 section 5.2: a covering NSEC3 with the Opt-Out flag set
+        // does not prove the non-existence of the name.
+        if (cover.nsec3_opt_out) return null;
+        // RFC 5155 section 8.3: the encloser's NSEC3 must not carry the
+        // DNAME bit, and the NS bit only alongside the SOA bit.
+        const encloser_bitmap = encloser.bitmap[0..encloser.bitmap_len];
+        try nsecBitmapValidate(encloser_bitmap);
+        if (nsecBitmapHasType(encloser_bitmap, RecordType.DNAME.code())) return null;
+        if (nsecBitmapHasType(encloser_bitmap, RecordType.NS.code()) and
+            !nsecBitmapHasType(encloser_bitmap, RecordType.SOA.code())) return null;
+        const wildcard = wildcardName(closest_name) orelse return null;
+        const wildcard_cover = self.findNsec3Cover(&chain, nsec3HashIn(chain, wildcard)) orelse return null;
+        if (wildcard_cover.nsec3_opt_out) return null;
+        var proof = Proof{};
+        var complete = true;
+        for ([_]*const Entry{ encloser, cover, wildcard_cover }) |entry| {
+            if (entry.proof_record.len == 0 or entry.proof_rrsig.len == 0) {
+                complete = false;
+                break;
+            }
+            proof.add(entry.proof_record);
+            proof.add(entry.proof_rrsig);
+        }
+        return .{
+            .denial = .nxdomain,
+            .soa = encloser.soa,
+            .proof = if (complete and proof.len != 0) proof else null,
+        };
+    }
+
+    /// The cached NSEC3 of the chain whose hashed owner is the digest.
+    fn findNsec3Match(self: *const AggressiveCache, chain: *const Nsec3Chain, digest: [20]u8) ?*const Entry {
+        for (&self.entries) |*entry| {
+            if (!entry.valid or !entry.is_nsec3) continue;
+            if (!sameChain(entry.nsec3_chain, chain.*)) continue;
+            if (!std.mem.eql(u8, &entry.hashed_owner, &digest)) continue;
+            return entry;
+        }
+        return null;
+    }
+
+    /// The cached NSEC3 of the chain whose span covers the digest.
+    fn findNsec3Cover(self: *const AggressiveCache, chain: *const Nsec3Chain, digest: [20]u8) ?*const Entry {
+        for (&self.entries) |*entry| {
+            if (!entry.valid or !entry.is_nsec3) continue;
+            if (!sameChain(entry.nsec3_chain, chain.*)) continue;
+            if (nsec3Covers(entry.hashed_owner, entry.nsec3_next, digest)) return entry;
+        }
+        return null;
+    }
+
+    /// The proof records a denial rests on, when the entry kept both.
+    fn proofOf(self: *const AggressiveCache, entry: *const Entry) ?Proof {
+        _ = self;
+        if (entry.proof_record.len == 0 or entry.proof_rrsig.len == 0) return null;
+        var proof = Proof{};
+        proof.add(entry.proof_record);
+        proof.add(entry.proof_rrsig);
+        return if (proof.len == 0) null else proof;
     }
 };
 
@@ -651,6 +871,17 @@ test "EDE DNSSEC-bogus codes use RFC 8914 INFO-CODEs 6 through 10" {
     try std.testing.expectEqualStrings("signature expired", edeText(7));
     try std.testing.expectEqualStrings("rrsigs missing", edeText(10));
     try std.testing.expectEqualStrings("", edeText(99));
+}
+
+test "EDE codes for an insecure answer use RFC 8914 INFO-CODEs 1, 2, 5 and 11" {
+    try std.testing.expectEqual(@as(u16, 1), EDE_UNSUPPORTED_DNSKEY_ALGORITHM);
+    try std.testing.expectEqual(@as(u16, 2), EDE_UNSUPPORTED_DS_DIGEST_TYPE);
+    try std.testing.expectEqual(@as(u16, 5), EDE_DNSSEC_INDETERMINATE);
+    try std.testing.expectEqual(@as(u16, 11), EDE_NO_ZONE_KEY_BIT);
+    try std.testing.expectEqualStrings("unsupported dnskey algorithm", edeText(1));
+    try std.testing.expectEqualStrings("unsupported ds digest type", edeText(2));
+    try std.testing.expectEqualStrings("dnssec indeterminate", edeText(5));
+    try std.testing.expectEqualStrings("no zone key bit set", edeText(11));
 }
 
 test "DO-bit inclusion keeps explicit queries and gates proof RRsets" {
@@ -826,15 +1057,142 @@ test "exact deny requires the NSEC bit and a well-formed bitmap" {
     try std.testing.expect((try unrelated.deny(try Name.fromText("www.example."), .{ .value = 16 }, now)) == null);
 }
 
-test "aggressive NSEC3 cache denies only types missing from the bitmap" {
+/// The NSEC3 chain the aggressive-cache tests use: the salt "salt" and two
+/// iterations, so every hash in the test is a real one (RFC 5155 section 5).
+const test_chain_salt = [_]u8{ 0x73, 0x61, 0x6c, 0x74 };
+const test_chain_iterations: u16 = 2;
+
+/// The hash a name has in the test chain.
+fn testChainHash(name: Name) [20]u8 {
+    var out: [20]u8 = undefined;
+    nsec3Hash(name, &test_chain_salt, test_chain_iterations, &out);
+    return out;
+}
+
+/// The hash just above or below the given one, so a test span covers the
+/// hash it is built around and nothing else.
+fn testHashNeighbour(hash: [20]u8, up: bool) [20]u8 {
+    var out = hash;
+    var index: usize = out.len;
+    while (index > 0) {
+        index -= 1;
+        if (up) {
+            if (out[index] != 0xff) {
+                out[index] += 1;
+                break;
+            }
+            out[index] = 0;
+        } else {
+            if (out[index] != 0x00) {
+                out[index] -= 1;
+                break;
+            }
+            out[index] = 0xff;
+        }
+    }
+    return out;
+}
+
+/// The owner name an NSEC3 record of the test chain carries: a 32-character
+/// base32hex hash label over the zone (RFC 5155 section 3.1).
+fn testChainOwner(index: u8, zone: Name) !Name {
+    var label: [32]u8 = @splat('a');
+    label[31] = '0' + index;
+    var zone_text: [256]u8 = undefined;
+    const zone_wire = try zone.toText(&zone_text);
+    var text: [300]u8 = undefined;
+    const written = try std.fmt.bufPrint(&text, "{s}.{s}", .{ label, zone_wire });
+    return Name.fromText(written);
+}
+
+test "aggressive NSEC3 cache denies from a closest encloser proof (RFC 8198 5.2)" {
     const now: i64 = 1_000_000;
+    const zone = try Name.fromText("example.");
+    const encloser = try Name.fromText("example.");
+    const next_closer = try Name.fromText("nx.example.");
+    const wildcard = try Name.fromText("*.example.");
+    const encloser_hash = testChainHash(encloser);
+    const next_closer_hash = testChainHash(next_closer);
+    const wildcard_hash = testChainHash(wildcard);
+    // The type bitmap of an apex: A(1), RRSIG(46), DNSKEY(48), NSEC3(50).
+    const bitmap = [_]u8{ 0x00, 0x07, 0x40, 0x00, 0x00, 0x00, 0x02, 0xa0, 0x00 };
     var cache = AggressiveCache{};
-    const hashed = @as([20]u8, @splat(@as(u8, 0xab)));
-    // Window 0 bitmap with A(1) only.
-    cache.insertNsec3Hash(hashed, &[_]u8{ 0x00, 0x01, 0x40 }, now, 3600);
-    try std.testing.expectEqual(Denial.nodata, (try cache.denyNsec3(hashed, 16, now)).?);
-    try std.testing.expect((try cache.denyNsec3(hashed, 1, now)) == null);
-    try std.testing.expect((try cache.denyNsec3(@as([20]u8, @splat(@as(u8, 0xcd))), 16, now)) == null);
+    // The encloser's own NSEC3 matches it and covers nothing else.
+    cache.insertNsec3(try testChainOwner(1, zone), encloser_hash, testHashNeighbour(encloser_hash, true), false, test_chain_iterations, &test_chain_salt, &bitmap, now, 3600, null, .{});
+    // The next closer name and the wildcard are covered by their own NSEC3.
+    cache.insertNsec3(try testChainOwner(2, zone), testHashNeighbour(next_closer_hash, false), testHashNeighbour(next_closer_hash, true), false, test_chain_iterations, &test_chain_salt, &bitmap, now, 3600, null, .{});
+    cache.insertNsec3(try testChainOwner(3, zone), testHashNeighbour(wildcard_hash, false), testHashNeighbour(wildcard_hash, true), false, test_chain_iterations, &test_chain_salt, &bitmap, now, 3600, null, .{});
+
+    // The name the next closer name covers does not exist: NXDOMAIN.
+    try std.testing.expectEqual(Denial.nxdomain, (try cache.deny(try Name.fromText("nx.example."), .A, now)).?.denial);
+    // A name below it shares the denial.
+    try std.testing.expectEqual(Denial.nxdomain, (try cache.deny(try Name.fromText("deep.nx.example."), .A, now)).?.denial);
+    // The encloser exists, so a type it does not hold is a NODATA.
+    try std.testing.expectEqual(Denial.nodata, (try cache.deny(encloser, .{ .value = 16 }, now)).?.denial);
+    // The type it does hold is never denied.
+    try std.testing.expect((try cache.deny(encloser, .A, now)) == null);
+    // A name the proof does not cover is not denied.
+    try std.testing.expect((try cache.deny(try Name.fromText("other.example."), .A, now)) == null);
+    // A name outside the zone the chain covers is not denied either.
+    try std.testing.expect((try cache.deny(try Name.fromText("nx.other.example."), .A, now)) == null);
+}
+
+test "an NSEC3 proof that does not establish the denial is not used (RFC 8198 5.2)" {
+    const now: i64 = 1_000_000;
+    const zone = try Name.fromText("example.");
+    const encloser = try Name.fromText("example.");
+    const next_closer = try Name.fromText("nx.example.");
+    const wildcard = try Name.fromText("*.example.");
+    const encloser_hash = testChainHash(encloser);
+    const next_closer_hash = testChainHash(next_closer);
+    const wildcard_hash = testChainHash(wildcard);
+    const bitmap = [_]u8{ 0x00, 0x07, 0x40, 0x00, 0x00, 0x00, 0x02, 0xa0, 0x00 };
+    // The type bitmap of a name that carries a DNAME: DNAME(39).
+    const dname_bitmap = [_]u8{ 0x00, 0x07, 0x40, 0x00, 0x00, 0x00, 0x01, 0x00, 0x20 };
+
+    // A covering NSEC3 with the Opt-Out flag set proves no non-existence
+    // (RFC 8198 section 5.2), so the denial is refused.
+    var opt_out = AggressiveCache{};
+    opt_out.insertNsec3(try testChainOwner(1, zone), encloser_hash, testHashNeighbour(encloser_hash, true), false, test_chain_iterations, &test_chain_salt, &bitmap, now, 3600, null, .{});
+    opt_out.insertNsec3(try testChainOwner(2, zone), testHashNeighbour(next_closer_hash, false), testHashNeighbour(next_closer_hash, true), true, test_chain_iterations, &test_chain_salt, &bitmap, now, 3600, null, .{});
+    opt_out.insertNsec3(try testChainOwner(3, zone), testHashNeighbour(wildcard_hash, false), testHashNeighbour(wildcard_hash, true), false, test_chain_iterations, &test_chain_salt, &bitmap, now, 3600, null, .{});
+    try std.testing.expect((try opt_out.deny(try Name.fromText("nx.example."), .A, now)) == null);
+
+    // Without the NSEC3 that covers the wildcard at the encloser, the
+    // closest encloser proof is incomplete (RFC 5155 section 8.4).
+    var no_wildcard = AggressiveCache{};
+    no_wildcard.insertNsec3(try testChainOwner(1, zone), encloser_hash, testHashNeighbour(encloser_hash, true), false, test_chain_iterations, &test_chain_salt, &bitmap, now, 3600, null, .{});
+    no_wildcard.insertNsec3(try testChainOwner(2, zone), testHashNeighbour(next_closer_hash, false), testHashNeighbour(next_closer_hash, true), false, test_chain_iterations, &test_chain_salt, &bitmap, now, 3600, null, .{});
+    try std.testing.expect((try no_wildcard.deny(try Name.fromText("nx.example."), .A, now)) == null);
+
+    // Without the NSEC3 that covers the next closer name, the proof is
+    // incomplete as well.
+    var no_next_closer = AggressiveCache{};
+    no_next_closer.insertNsec3(try testChainOwner(1, zone), encloser_hash, testHashNeighbour(encloser_hash, true), false, test_chain_iterations, &test_chain_salt, &bitmap, now, 3600, null, .{});
+    no_next_closer.insertNsec3(try testChainOwner(3, zone), testHashNeighbour(wildcard_hash, false), testHashNeighbour(wildcard_hash, true), false, test_chain_iterations, &test_chain_salt, &bitmap, now, 3600, null, .{});
+    try std.testing.expect((try no_next_closer.deny(try Name.fromText("nx.example."), .A, now)) == null);
+
+    // An encloser whose NSEC3 carries the DNAME bit is not an encloser
+    // (RFC 5155 section 8.3).
+    var dname = AggressiveCache{};
+    dname.insertNsec3(try testChainOwner(1, zone), encloser_hash, testHashNeighbour(encloser_hash, true), false, test_chain_iterations, &test_chain_salt, &dname_bitmap, now, 3600, null, .{});
+    dname.insertNsec3(try testChainOwner(2, zone), testHashNeighbour(next_closer_hash, false), testHashNeighbour(next_closer_hash, true), false, test_chain_iterations, &test_chain_salt, &bitmap, now, 3600, null, .{});
+    dname.insertNsec3(try testChainOwner(3, zone), testHashNeighbour(wildcard_hash, false), testHashNeighbour(wildcard_hash, true), false, test_chain_iterations, &test_chain_salt, &bitmap, now, 3600, null, .{});
+    try std.testing.expect((try dname.deny(try Name.fromText("nx.example."), .A, now)) == null);
+}
+
+test "an NSEC3 proof with a malformed bitmap denies nothing" {
+    const now: i64 = 1_000_000;
+    const zone = try Name.fromText("example.");
+    const encloser = try Name.fromText("example.");
+    const encloser_hash = testChainHash(encloser);
+    var cache = AggressiveCache{};
+    // An empty bitmap on a matching hash is no proof, so it errors rather
+    // than deny.
+    cache.insertNsec3(try testChainOwner(1, zone), encloser_hash, testHashNeighbour(encloser_hash, true), false, test_chain_iterations, &test_chain_salt, &[_]u8{}, now, 3600, null, .{});
+    try std.testing.expectError(Error.MalformedNsec, cache.deny(encloser, .{ .value = 16 }, now));
+    // A hash the chain does not hold proves nothing either way.
+    try std.testing.expect((try cache.deny(try Name.fromText("nx.example."), .A, now)) == null);
 }
 
 test "NSEC3 hash matches an independent SHA-1 recomputation (RFC 5155 5)" {
@@ -939,26 +1297,17 @@ test "nsecDeniesType fails closed on trailing garbage (no false denial)" {
     try std.testing.expectError(Error.MalformedNsec, nsecDeniesType(short[0..15], 16));
 }
 
-test "denyNsec3 fails closed without a well-formed bitmap proof" {
-    const now: i64 = 1_000_000;
-    const hashed = @as([20]u8, @splat(@as(u8, 0xab)));
-    // Empty bitmap on a matching hash: no proof, so error (never NODATA).
-    var empty = AggressiveCache{};
-    empty.insertNsec3Hash(hashed, &[_]u8{}, now, 3600);
-    try std.testing.expectError(Error.MalformedNsec, empty.denyNsec3(hashed, 16, now));
-    // Truncated window and trailing garbage likewise error on a match.
-    const malformed = [_][]const u8{
-        &[_]u8{ 0x00, 0x02, 0x40 },
-        &[_]u8{ 0x00, 0x01, 0x40, 0xff },
-        &[_]u8{0x00},
-    };
-    for (malformed) |bitmap| {
-        var bad = AggressiveCache{};
-        bad.insertNsec3Hash(hashed, bitmap, now, 3600);
-        try std.testing.expectError(Error.MalformedNsec, bad.denyNsec3(hashed, 16, now));
-        // Unknown hashes still prove nothing either way: null, not error.
-        try std.testing.expect((try bad.denyNsec3(@as([20]u8, @splat(@as(u8, 0xcd))), 16, now)) == null);
-    }
+test "aggressive NSEC3 cache proofs expire like the NSEC ones (RFC 8198 4)" {
+    const zone = try Name.fromText("example.");
+    const encloser = try Name.fromText("example.");
+    const encloser_hash = testChainHash(encloser);
+    const bitmap = [_]u8{ 0x00, 0x07, 0x40, 0x00, 0x00, 0x00, 0x02, 0xa0, 0x00 };
+    var cache = AggressiveCache{};
+    cache.insertNsec3(try testChainOwner(1, zone), encloser_hash, testHashNeighbour(encloser_hash, true), false, test_chain_iterations, &test_chain_salt, &bitmap, 1_000, 60, null, .{});
+    try std.testing.expectEqual(Denial.nodata, (try cache.deny(encloser, .{ .value = 16 }, 1_059)).?.denial);
+    // At and past the TTL the proof is evicted: no denial, no error.
+    try std.testing.expect((try cache.deny(encloser, .{ .value = 16 }, 1_060)) == null);
+    try std.testing.expect((try cache.deny(encloser, .{ .value = 16 }, 9_999)) == null);
 }
 
 test "aggressive cache proofs expire, cap, and refresh (RFC 8198 4)" {
@@ -992,11 +1341,4 @@ test "aggressive cache proofs expire, cap, and refresh (RFC 8198 4)" {
     // Re-inserting after expiry refreshes the proof.
     cache.insertNsec(owner, next, &bitmap, 2_000, 60, null, .{});
     try std.testing.expectEqual(Denial.nodata, (try cache.deny(owner, qtxt, 2_059)).?.denial);
-
-    // NSEC3 proofs expire the same way: evicted entries return null.
-    var nsec3 = AggressiveCache{};
-    const hashed = @as([20]u8, @splat(@as(u8, 0xab)));
-    nsec3.insertNsec3Hash(hashed, &[_]u8{ 0x00, 0x01, 0x40 }, 1_000, 60);
-    try std.testing.expectEqual(Denial.nodata, (try nsec3.denyNsec3(hashed, 16, 1_059)).?);
-    try std.testing.expect((try nsec3.denyNsec3(hashed, 16, 1_060)) == null);
 }

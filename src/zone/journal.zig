@@ -222,6 +222,7 @@ const max_record_bytes = 65535;
 /// records: the bytes the incremental answer adds to the two current SOA
 /// records it shares with the full transfer. Both answers carry those two
 /// records, so only the other records are compared (RFC 1995 section 5).
+/// The full transfer drops its own SOA for the same reason.
 fn differenceBytes(text: []const u8) usize {
     var total: usize = 0;
     var lines = std.mem.splitScalar(u8, text, '\n');

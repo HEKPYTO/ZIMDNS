@@ -24,6 +24,7 @@ Accepted 2026-09-09 for the authoritative-serving-minimum profile; partially
 superseded 2026-10-19. What landed since: zone signing (`dnssec-key-file`,
 `src/zone/signer.zig`), chain validation on the forwarding path
 (`trust-anchor-file`, `src/dns/validate.zig`, AD on secure / SERVFAIL+EDE on
-bogus), and a static trust-anchor store (`Anchors.parse`). Still deferred:
+bogus / EDE on an insecure answer that says why it is insecure), and a static
+trust-anchor store (`Anchors.parse`). Still deferred:
 iterative recursion, root priming, RFC 5011 automated rollover, KSK/ZSK
 rollover tooling. Matrix rows 77/91/96 describe the shipped split.

@@ -10,6 +10,7 @@ const dns_message = @import("../dns/message.zig");
 const keyring_mod = @import("../auth/keyring.zig");
 const blocklist_mod = @import("../blocklist.zig");
 const parser = @import("parser.zig");
+const listener = @import("../platform/listener.zig");
 const zone_index = @import("../zone/index.zig");
 const zone_parser = @import("../zone/parser.zig");
 const resolver_mod = @import("../resolver.zig");
@@ -73,6 +74,10 @@ pub const ServerContext = struct {
             .config = try parser.Config.parse(config_text),
         };
         errdefer context.deinit();
+
+        // RFC 9210 section 4.2: the connection limits the operator configured
+        // are the ones the TCP listener enforces.
+        listener.setTcpLimits(context.config.tcp_limits);
 
         // RFC 1995 section 3: the delta log can be kept in a file, so an
         // IXFR client at an old serial is still answered incrementally after
@@ -453,6 +458,32 @@ fn parseKeyTextAndClear(key_text: []u8) keyring_mod.Error!keyring_mod.Keyring {
 fn parseDnssecKeyTextAndClear(key_text: []u8) signer.Error!signer.Key {
     defer std.crypto.secureZero(u8, key_text);
     return signer.parseKey(key_text);
+}
+
+test "server context applies the configured TCP limits to the listener" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    const previous_limits = listener.tcpLimits();
+    defer listener.setTcpLimits(previous_limits);
+
+    try dir.dir.writeFile(io, .{
+        .sub_path = "limits.gdns",
+        .data = "tcp-max-connections-per-source 25\ntcp-max-connection-duration 60\n",
+    });
+    var context = try ServerContext.load(dir.dir, io, "limits.gdns", std.testing.allocator);
+    defer context.deinit();
+    try std.testing.expectEqual(@as(u32, 25), listener.tcpLimits().max_connections_per_source.?);
+    try std.testing.expectEqual(@as(u32, 60), listener.tcpLimits().max_connection_duration.?);
+
+    // A configuration without the directives leaves the project's own policy
+    // in force.
+    try dir.dir.writeFile(io, .{ .sub_path = "plain.gdns", .data = "listen dns udp 127.0.0.1:1053\n" });
+    var plain = try ServerContext.load(dir.dir, io, "plain.gdns", std.testing.allocator);
+    defer plain.deinit();
+    try std.testing.expect(listener.tcpLimits().max_connections_per_source == null);
+    try std.testing.expect(listener.tcpLimits().max_connection_duration == null);
 }
 
 test "server context loads the configured TSIG key file during startup" {

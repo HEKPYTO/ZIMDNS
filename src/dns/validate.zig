@@ -6,7 +6,8 @@
 /// What this module does: DS and DNSKEY anchors, RFC 4034 section 6 canonical
 /// signed-data assembly, ECDSA P-256/P-384 and Ed25519 verification, NSEC
 /// NXDOMAIN and NODATA proofs, NSEC3 closest-encloser and opt-out proofs, and
-/// the secure/insecure/bogus outcome with an RFC 8914 INFO-CODE for bogus.
+/// the secure/insecure/bogus outcome with an RFC 8914 INFO-CODE for a bogus
+/// answer and for an answer the server returns without a signed verification.
 /// The NSEC3 RDATA decoder and the hash span test are shared with the
 /// authoritative path, which picks the NSEC3 denial proofs a zone serves.
 /// `zoneSignedToAnchor` answers the same question for a loaded zone: do the
@@ -61,8 +62,10 @@ pub const Status = enum {
 
 pub const Result = struct {
     status: Status,
-    /// RFC 8914 INFO-CODE to relay, or 0. Only a bogus status carries one:
-    /// insecure is a normal outcome, not a failure to report.
+    /// RFC 8914 INFO-CODE to relay, or 0. A bogus status carries the code of
+    /// the failure; an insecure status carries the code that says why the
+    /// answer could not be signed-verified, and rides on the answer the
+    /// client still gets (RFC 4035 section 5.2).
     ede: u16 = 0,
 };
 
@@ -455,6 +458,36 @@ fn verifyEd25519(key: []const u8, signature: []const u8, data: []const u8) Error
     Ed25519.Signature.fromBytes(raw).verifyStrict(data, public_key) catch return Error.SignatureInvalid;
 }
 
+/// The DNSSEC algorithms this build verifies: 13 and 14 (RFC 6605) and 15
+/// (RFC 8080). A DNSKEY RRset of any other algorithm is the case RFC 8914
+/// section 4.2 names; a DS RRset of them is the case RFC 4035 section 5.2
+/// names. Either way the zone has no supported authentication path.
+fn algorithmSupported(number: u8) bool {
+    return switch (number) {
+        13, 14, 15 => true,
+        else => false,
+    };
+}
+
+/// RFC 4034 section 2.1.1: bit 7 of the DNSKEY Flags field is the Zone Key
+/// flag, and a DNSKEY without it must not be used to verify an RRset. Bit 7
+/// is the low bit of the first flags octet (0x0100); bit 15, the Secure
+/// Entry Point flag, is the low bit of the second (0x0001).
+fn dnskeyZoneKeyBit(raw: []const u8) bool {
+    return raw.len >= 4 and (raw[0] & 0x01) != 0;
+}
+
+/// The DS digest types this build computes: 1 (SHA-1), 2 (SHA-256), and 4
+/// (SHA-384). RFC 6840 section 5.2 names an unknown digest type a deliberate
+/// downgrade signal.
+fn dsDigestTypeSupported(ds_rdata: []const u8) bool {
+    if (ds_rdata.len < 5) return false;
+    return switch (ds_rdata[3]) {
+        1, 2, 4 => true,
+        else => false,
+    };
+}
+
 /// Check one RRSIG over `data` against one DNSKEY. The key tag and algorithm
 /// are matched first so a key that cannot possibly have made the signature is
 /// never handed to the curve arithmetic.
@@ -482,6 +515,7 @@ fn dsMatches(ds_rdata: []const u8, owner: Name, dnskey_rdata: []const u8) bool {
     if (ds_rdata.len < 5 or dnskey_rdata.len < 4) return false;
     if (std.mem.readInt(u16, ds_rdata[0..2], .big) != dnssec.keyTag(dnskey_rdata)) return false;
     if (ds_rdata[2] != dnskey_rdata[3]) return false;
+    if (!dsDigestTypeSupported(ds_rdata)) return false;
     const digest = ds_rdata[4..];
     var computed: [std.crypto.hash.sha2.Sha384.digest_length]u8 = undefined;
     switch (ds_rdata[3]) {
@@ -720,6 +754,10 @@ const Validator = struct {
     secure: usize = 0,
     insecure: usize = 0,
     ede: u16 = 0,
+    /// The RFC 8914 INFO-CODE that explains an insecure answer. RFC 4035
+    /// section 5.2 keeps these answers insecure, so the code rides on the
+    /// answer the client still gets.
+    insecure_ede: u16 = 0,
 
     fn count(self: *Validator, outcome: Outcome) void {
         switch (outcome) {
@@ -732,6 +770,10 @@ const Validator = struct {
     fn fail(self: *Validator, code: u16) Outcome {
         if (self.ede == 0) self.ede = code;
         return .bogus;
+    }
+
+    fn noteInsecure(self: *Validator, code: u16) void {
+        if (self.insecure_ede == 0) self.insecure_ede = code;
     }
 
     // ------------------------------------------------------------ indexing
@@ -837,9 +879,19 @@ const Validator = struct {
         var keys: std.ArrayList([]const u8) = .empty;
         for (self.anchors.items[0..self.anchors.len]) |anchor| {
             if (!anchor.rrtype.eql(.DNSKEY) or !anchor.owner.eql(&signer)) continue;
+            // RFC 4034 section 2.1.1: a key without the Zone Key flag must
+            // not verify an RRset, and RFC 4035 section 5.2 leaves a zone
+            // whose algorithm this build cannot verify unsigned.
+            if (!dnskeyZoneKeyBit(anchor.rdata)) continue;
+            if (!algorithmSupported(anchor.rdata[3])) continue;
             try keys.append(self.allocator, anchor.rdata);
         }
         if (keys.items.len == 0) try self.keysFromDs(&keys, signer);
+        if (keys.items.len == 0) {
+            // No chain to the zone: the reason the answer is insecure is
+            // worth reporting (RFC 8914 sections 4.2, 4.3, 4.6 and 4.12).
+            if (self.chainReason(signer)) |code| self.noteInsecure(code);
+        }
         try self.chains.append(self.allocator, .{ .signer = signer, .keys = keys.items });
         return keys.items;
     }
@@ -853,6 +905,70 @@ const Validator = struct {
             return true;
         }
         return false;
+    }
+
+    /// Why the chain to `signer` could not be built, as an RFC 8914
+    /// INFO-CODE. RFC 4035 section 5.2 keeps the answer insecure in each of
+    /// these cases, so the code explains an answer the client still gets
+    /// instead of failing it. Null when no anchor speaks for the zone: a
+    /// zone outside the trust domain is honestly unsigned.
+    fn chainReason(self: *Validator, signer: Name) ?u16 {
+        var speaks_for_zone = false;
+        for (self.anchors.items[0..self.anchors.len]) |anchor| {
+            if (!anchor.owner.eql(&signer)) continue;
+            if (anchor.rrtype.eql(.DS) or anchor.rrtype.eql(.DNSKEY)) speaks_for_zone = true;
+        }
+        if (!speaks_for_zone) return null;
+
+        // The keys the zone publishes: the DNSKEY RRset the response carried
+        // for the apex, and the configured DNSKEY anchor that stands for it.
+        var saw_key = false;
+        var saw_zone_key = false;
+        var saw_supported_algorithm = false;
+        for (self.anchors.items[0..self.anchors.len]) |anchor| {
+            if (!anchor.rrtype.eql(.DNSKEY) or !anchor.owner.eql(&signer)) continue;
+            if (anchor.rdata.len < 4) continue;
+            saw_key = true;
+            if (dnskeyZoneKeyBit(anchor.rdata)) saw_zone_key = true;
+            if (algorithmSupported(anchor.rdata[3])) saw_supported_algorithm = true;
+        }
+        for (self.rrsets.items) |*rrset| {
+            if (rrset.rrtype != RecordType.DNSKEY.code() or !rrset.owner.eql(&signer)) continue;
+            for (rrset.records.items) |record| {
+                const raw = encodeRdata(self.allocator, record.rdata) catch continue;
+                if (raw.len < 4) continue;
+                saw_key = true;
+                if (dnskeyZoneKeyBit(raw)) saw_zone_key = true;
+                if (algorithmSupported(raw[3])) saw_supported_algorithm = true;
+            }
+        }
+        // RFC 8914 section 4.12: no DNSKEY of the zone carried the Zone Key
+        // flag, so no key could sign the zone.
+        if (saw_key and !saw_zone_key) return dnssec.EDE_NO_ZONE_KEY_BIT;
+        // RFC 8914 section 4.2: the DNSKEY RRset held only algorithms this
+        // build cannot verify with.
+        if (saw_key and !saw_supported_algorithm) return dnssec.EDE_UNSUPPORTED_DNSKEY_ALGORITHM;
+
+        // The DS the parent published for the zone.
+        var saw_ds = false;
+        var saw_supported_digest = false;
+        var saw_supported_ds_algorithm = false;
+        for (self.anchors.items[0..self.anchors.len]) |anchor| {
+            if (!anchor.rrtype.eql(.DS) or !anchor.owner.eql(&signer)) continue;
+            saw_ds = true;
+            if (dsDigestTypeSupported(anchor.rdata)) saw_supported_digest = true;
+            if (anchor.rdata.len >= 3 and algorithmSupported(anchor.rdata[2])) saw_supported_ds_algorithm = true;
+        }
+        // RFC 8914 section 4.3: the DS RRset held only digest types this
+        // build cannot compute.
+        if (saw_ds and !saw_supported_digest) return dnssec.EDE_UNSUPPORTED_DS_DIGEST_TYPE;
+        // The DS names a (key tag, algorithm) pair no DNSKEY of the zone
+        // carries, and that algorithm is one this build cannot verify with.
+        if (saw_ds and !saw_supported_ds_algorithm) return dnssec.EDE_UNSUPPORTED_DNSKEY_ALGORITHM;
+        // The anchor speaks for the zone, so the answer should be signed, but
+        // no chain to a verdict exists: RFC 4035 section 4.3 calls that
+        // state Indeterminate.
+        return dnssec.EDE_DNSSEC_INDETERMINATE;
     }
 
     // Called only when keySet found zero keys, which already covers every
@@ -875,7 +991,10 @@ const Validator = struct {
                     // RFC 4035 section 5.2 names the Zone Flag as one of the
                     // three conditions; a bare key could sign the apex RRset
                     // without being authoritative for the zone.
-                    if (raw.len < 4 or raw[1] & 0x01 == 0) continue;
+                    if (!dnskeyZoneKeyBit(raw)) continue;
+                    // A key this build cannot verify with is no key at all:
+                    // RFC 4035 section 5.2 leaves the zone unsigned.
+                    if (!algorithmSupported(raw[3])) continue;
                     if (!dsMatches(anchor.rdata, signer, raw)) continue;
                     try keys.append(self.allocator, raw);
                 }
@@ -910,6 +1029,7 @@ const Validator = struct {
     fn checkRrset(self: *Validator, rrset: *const Rrset) Error!Outcome {
         var saw_signature = false;
         var has_keys = false;
+        var unsupported_algorithm = false;
         for (self.rrsigs.items) |rrsig| {
             if (rrsig.covered != rrset.rrtype or !rrsig.owner.eql(&rrset.owner)) continue;
             saw_signature = true;
@@ -926,6 +1046,13 @@ const Validator = struct {
                 continue;
             }
             has_keys = true;
+            // RFC 4035 section 5.2: a signature this build cannot verify
+            // leaves the zone with no supported authentication path, so the
+            // answer is insecure rather than bogus.
+            if (!algorithmSupported(rrsig.algorithm)) {
+                unsupported_algorithm = true;
+                continue;
+            }
             const status = dnssec.rrsigTimeStatus(rrsig.raw, self.now) catch return self.fail(dnssec.EDE_DNSSEC_BOGUS);
             if (status != .valid) return self.fail(dnssec.rrsigTimeEde(status).?);
             const data = try signedData(self.allocator, rrset.records.items, rrsig);
@@ -945,6 +1072,10 @@ const Validator = struct {
             return .insecure;
         }
         if (!has_keys) return .insecure;
+        if (unsupported_algorithm) {
+            self.noteInsecure(dnssec.EDE_UNSUPPORTED_DNSKEY_ALGORITHM);
+            return .insecure;
+        }
         return self.fail(dnssec.EDE_DNSSEC_BOGUS);
     }
 
@@ -1266,10 +1397,10 @@ pub fn validate(
     }
 
     if (self.ede != 0) return .{ .status = .bogus, .ede = self.ede };
-    if (self.secure == 0) return .{ .status = .insecure };
+    if (self.secure == 0) return .{ .status = .insecure, .ede = self.insecure_ede };
     // AD covers every RRset in the answer, so one unanchored RRset in the mix
     // is enough to withhold it.
-    if (self.insecure != 0) return .{ .status = .insecure };
+    if (self.insecure != 0) return .{ .status = .insecure, .ede = self.insecure_ede };
     return .{ .status = .secure };
 }
 
@@ -1748,6 +1879,55 @@ fn dsAnchor(allocator: std.mem.Allocator, owner_text: []const u8, dnskey_rdata: 
     return anchors;
 }
 
+/// A DS for `dnskey_rdata` whose digest type this build cannot compute
+/// (RFC 6840 section 5.2 names an unknown digest type a downgrade signal).
+fn dsAnchorWithDigestType(allocator: std.mem.Allocator, owner_text: []const u8, dnskey_rdata: []const u8, digest_type: u8) !Anchors {
+    var rdata: [4 + std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.mem.writeInt(u16, rdata[0..2], dnssec.keyTag(dnskey_rdata), .big);
+    rdata[2] = dnskey_rdata[3];
+    rdata[3] = digest_type;
+    @memset(rdata[4..], 0);
+    var anchors = Anchors{};
+    anchors.items[0] = .{
+        .owner = try Name.fromText(owner_text),
+        .rrtype = .DS,
+        .rdata = try allocator.dupe(u8, &rdata),
+    };
+    anchors.len = 1;
+    return anchors;
+}
+
+/// A DNSKEY RDATA (RFC 4034 section 2.1.1) with the given flags and
+/// algorithm, carrying a key body no signature of this build made.
+fn dnskeyRdata(flags: u16, algorithm: u8) [8]u8 {
+    var rdata: [8]u8 = undefined;
+    std.mem.writeInt(u16, rdata[0..2], flags, .big);
+    rdata[2] = 3;
+    rdata[3] = algorithm;
+    @memset(rdata[4..], 0);
+    return rdata;
+}
+
+/// Put `rdata` in place of every DNSKEY the response carried for the zone
+/// apex, so a test can state the key material the zone publishes.
+fn setApexDnskey(response: *dns_message.Message, rdata: []const u8) !void {
+    var kept: usize = 0;
+    for (response.authorities.items) |record| {
+        if (record.rrtype.eql(.DNSKEY)) continue;
+        response.authorities.items[kept] = record;
+        kept += 1;
+    }
+    response.authorities.len = kept;
+    try response.authorities.append(.{
+        .owner = try Name.fromText("example.com."),
+        .rrtype = .DNSKEY,
+        .class = .IN,
+        .ttl = 3600,
+        .rdata = .{ .Unknown = .{ .len = @intCast(rdata.len), .borrowed = rdata } },
+    });
+    response.header.authority_count = @intCast(response.authorities.len);
+}
+
 /// Reduce a response's Authority section to the denial proof an attacker can
 /// lift from a public zone: the NSEC RRsets and the RRSIGs that cover them.
 /// Everything else (the delegation NS, the SOA) is what a real server would
@@ -1848,6 +2028,102 @@ test "a DS anchor whose child publishes no DNSKEY is bogus with the DNSKEY Missi
     const result = try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds);
     try expectStatus(.bogus, result);
     try std.testing.expectEqual(dnssec.EDE_DNSKEY_MISSING, result.ede);
+}
+
+test "a DNSKEY RRset with only an unsupported algorithm leaves the answer insecure with the Unsupported DNSKEY Algorithm EDE (RFC 8914 4.2)" {
+    var signed = try signZoneText(std.testing.allocator, child_zone_text, p256_secret);
+    defer signed.deinit(std.testing.allocator);
+
+    // The zone publishes one DNSKEY, whose algorithm this build cannot
+    // verify with, and the DS at the parent names it.
+    const key = dnskeyRdata(256, 8);
+    var anchors = try dsAnchor(std.testing.allocator, "example.com.", &key, false);
+    defer anchors.deinit(std.testing.allocator);
+
+    var pair = try exchange(std.testing.allocator, &signed.zone, "www.example.com.", .A, .no_error, "www.example.com.", null);
+    defer pair.query.deinit();
+    defer pair.response.deinit();
+    try setApexDnskey(&pair.response, &key);
+
+    // RFC 4035 section 5.2: an unsupported algorithm leaves the zone with no
+    // authentication path, so the answer is insecure and the client still
+    // gets it -- not a SERVFAIL.
+    const result = try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds);
+    try expectStatus(.insecure, result);
+    try std.testing.expectEqual(dnssec.EDE_UNSUPPORTED_DNSKEY_ALGORITHM, result.ede);
+}
+
+test "a DS whose digest type this build cannot compute leaves the answer insecure with the Unsupported DS Digest Type EDE (RFC 8914 4.3)" {
+    var signed = try signZoneText(std.testing.allocator, child_zone_text, p256_secret);
+    defer signed.deinit(std.testing.allocator);
+
+    // Digest type 3 is not one this build computes, so the DS matches no
+    // DNSKEY the zone publishes.
+    var anchors = try dsAnchorWithDigestType(std.testing.allocator, "example.com.", signed.dnskey, 3);
+    defer anchors.deinit(std.testing.allocator);
+
+    var pair = try exchange(std.testing.allocator, &signed.zone, "www.example.com.", .A, .no_error, "www.example.com.", null);
+    defer pair.query.deinit();
+    defer pair.response.deinit();
+
+    // The answer stays insecure rather than bogus, and the reason rides on
+    // the answer the client still gets.
+    const result = try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds);
+    try expectStatus(.insecure, result);
+    try std.testing.expectEqual(dnssec.EDE_UNSUPPORTED_DS_DIGEST_TYPE, result.ede);
+}
+
+test "a DNSKEY without the Zone Key flag leaves the answer insecure with the No Zone Key Bit Set EDE (RFC 8914 4.12)" {
+    var signed = try signZoneText(std.testing.allocator, child_zone_text, p256_secret);
+    defer signed.deinit(std.testing.allocator);
+
+    // RFC 4034 section 2.1.1: a key without the Zone Key flag must not
+    // verify an RRset, so the zone has no authentication path.
+    const key = dnskeyRdata(0, 13);
+    var anchors = try dsAnchor(std.testing.allocator, "example.com.", &key, false);
+    defer anchors.deinit(std.testing.allocator);
+
+    var pair = try exchange(std.testing.allocator, &signed.zone, "www.example.com.", .A, .no_error, "www.example.com.", null);
+    defer pair.query.deinit();
+    defer pair.response.deinit();
+    try setApexDnskey(&pair.response, &key);
+
+    const result = try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds);
+    try expectStatus(.insecure, result);
+    try std.testing.expectEqual(dnssec.EDE_NO_ZONE_KEY_BIT, result.ede);
+}
+
+test "a DS that matches no DNSKEY leaves the status indeterminate with the DNSSEC Indeterminate EDE (RFC 8914 4.6)" {
+    var signed = try signZoneText(std.testing.allocator, child_zone_text, p256_secret);
+    defer signed.deinit(std.testing.allocator);
+
+    // The DS names a digest the zone's key does not produce, so no chain to
+    // the zone exists and the security status cannot be determined.
+    var anchors = try dsAnchor(std.testing.allocator, "example.com.", signed.dnskey, true);
+    defer anchors.deinit(std.testing.allocator);
+
+    var pair = try exchange(std.testing.allocator, &signed.zone, "www.example.com.", .A, .no_error, "www.example.com.", null);
+    defer pair.query.deinit();
+    defer pair.response.deinit();
+
+    const result = try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds);
+    try expectStatus(.insecure, result);
+    try std.testing.expectEqual(dnssec.EDE_DNSSEC_INDETERMINATE, result.ede);
+}
+
+test "a chain that validates cleanly carries no EDE" {
+    var signed = try signZoneText(std.testing.allocator, child_zone_text, p256_secret);
+    defer signed.deinit(std.testing.allocator);
+    var anchors = try dsAnchor(std.testing.allocator, "example.com.", signed.dnskey, false);
+    defer anchors.deinit(std.testing.allocator);
+
+    var pair = try exchange(std.testing.allocator, &signed.zone, "www.example.com.", .A, .no_error, "www.example.com.", null);
+    defer pair.query.deinit();
+    defer pair.response.deinit();
+
+    const result = try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds);
+    try expectStatus(.secure, result);
+    try std.testing.expectEqual(@as(u16, 0), result.ede);
 }
 
 test "a DNSKEY fetched out of band authenticates the answer as a DS chain does" {

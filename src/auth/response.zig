@@ -104,7 +104,7 @@ pub fn truncateClassicUdpResponse(response_bytes: []const u8, output: []u8) Erro
     return writer.written();
 }
 
-/// Truncate a signed response while retaining its final TSIG RR.
+/// Truncate a signed response while retaining its OPT record and its final TSIG RR.
 /// The caller must recompute the response MAC after this wire-level rewrite.
 pub fn truncateSignedClassicUdpResponse(response_bytes: []const u8, output: []u8) Error![]const u8 {
     const payload_limit = responsePayloadLimit(response_bytes);
@@ -139,14 +139,21 @@ pub fn truncateSignedClassicUdpResponse(response_bytes: []const u8, output: []u8
 
     @memcpy(output[0..question_end], response_bytes[0..question_end]);
     var flags = std.mem.readInt(u16, output[2..4], .big);
-    flags = (flags | header.Flags.tc) & 0xfff0;
+    // The RCODE stays: the OPT record's extended-rcode byte holds the upper eight bits of the twelve-bit code.
+    flags |= header.Flags.tc;
     std.mem.writeInt(u16, output[2..4], flags, .big);
     std.mem.writeInt(u16, output[6..8], 0, .big);
     std.mem.writeInt(u16, output[8..10], 0, .big);
 
-    std.mem.writeInt(u16, output[10..12], 1, .big);
+    // RFC 6891 section 6.1.1: the request carried an OPT record, so the
+    // reply must carry one too, and its DO bit, its payload size, and its
+    // extended RCODE are header fields of the record, not of the option.
+    const opt = shortened.record;
+    std.mem.writeInt(u16, output[10..12], if (opt != null) 2 else 1, .big);
     var writer = @import("../dns/writer.zig").Writer.init(output);
     writer.rewind(question_end);
+    if (opt) |record| record.encode(&writer) catch return Error.ResponseTooLarge;
+    // RFC 8945 section 4.2: the TSIG is the last record of the message.
     writer.writeBytes(response_bytes[final.record_start..final.record_end]) catch return Error.ResponseTooLarge;
     if (writer.len() > payload_limit) return Error.ResponseTooLarge;
     return writer.written();
@@ -2709,6 +2716,171 @@ test "RFC 8914 section 3: the signed path drops the EDE option the same way" {
     const resigned = try tsig.sign(reply, secret, reply_final.owner, reply_final.tsig, null);
     try tsig.patchMac(@constCast(reply), reply_final, resigned.slice());
     _ = try tsig.verify(reply, secret, null, tsig.minimumMacLength(.hmac_sha256));
+}
+
+/// The secret the truncation tests sign the reply with.
+const truncation_test_secret = "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=";
+
+/// A signed reply for the truncation tests: the OPT record a request with
+/// EDNS(0) is answered with, the TSIG record the signed path ends with, and
+/// `answers` A records in the answer section.
+fn signedTruncationTestMessage(allocator: std.mem.Allocator, answers: usize) !dns_message.Message {
+    var message = try truncationTestMessage(allocator, true, answers, 0, 0);
+    errdefer message.deinit();
+    message.edns = .{ .udp_payload_size = 512, .extended_rcode = 0, .version = 0, .dnssec_ok = true };
+    try appendOpt(&message);
+    var mac_bytes: [32]u8 = undefined;
+    @memset(&mac_bytes, 0);
+    try message.additionals.append(.{
+        .owner = try dns_name.Name.fromText("key."),
+        .rrtype = .TSIG,
+        .class = .ANY,
+        .ttl = 0,
+        .rdata = .{ .TSIG = try dns_rdata.Tsig.init(
+            try dns_name.Name.fromText("hmac-sha256."),
+            1_700_000_000,
+            300,
+            &mac_bytes,
+            0x1234,
+            0,
+            &.{},
+        ) },
+    });
+    try setHeaderCounts(&message);
+    return message;
+}
+
+/// Sign the message the way the server signs a reply, so the truncation
+/// tests start from a message a client would accept.
+fn signTruncationTestMessage(encoded: []u8, length: usize) !void {
+    const tsig = @import("../dns/tsig.zig");
+    const final = (try tsig.parseFinalAdditional(encoded[0..length])).?;
+    const signed = try tsig.sign(encoded[0..length], truncation_test_secret, final.owner, final.tsig, null);
+    try tsig.patchMac(encoded[0..length], final, signed.slice());
+}
+
+test "RFC 6891 section 6.1.1: a signed answer too large for the datagram keeps its OPT record" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var message = try signedTruncationTestMessage(arena.allocator(), 40);
+    defer message.deinit();
+    message.header.rcode = .nxdomain;
+
+    var encoded: [2048]u8 = undefined;
+    var writer = @import("../dns/writer.zig").Writer.init(&encoded);
+    try message.encode(&writer);
+    try std.testing.expect(writer.len() > CLASSIC_UDP_MESSAGE_SIZE);
+    try signTruncationTestMessage(&encoded, writer.len());
+
+    var output: [2048]u8 = undefined;
+    const reply = try truncateSignedClassicUdpResponse(writer.written(), &output);
+    const parsed = try dns_message.Message.parse(arena.allocator(), reply);
+
+    // The answer section does not fit, so it is gone and the TC bit says
+    // the message is not the whole one.
+    try std.testing.expect(parsed.header.truncated);
+    try std.testing.expectEqual(@as(u16, 0), parsed.header.answer_count);
+    // The RCODE is what the client sees, so it stays: the OPT record's
+    // extended-rcode byte holds the upper eight bits of the twelve-bit code.
+    try std.testing.expectEqual(header.Rcode.nxdomain, parsed.header.rcode);
+    try std.testing.expectEqual(@as(u8, 0), parsed.edns.?.extended_rcode);
+    // The OPT record stays: the request carried one, so the reply must
+    // carry one too, and the DO bit and the payload size are header fields
+    // of that record.
+    try std.testing.expectEqual(@as(u16, 2), parsed.header.additional_count);
+    try std.testing.expect(parsed.additionals.items[0].rrtype.eql(.OPT));
+    try std.testing.expect(parsed.edns != null);
+    try std.testing.expect(parsed.edns.?.dnssec_ok);
+    try std.testing.expectEqual(@as(u16, 512), parsed.edns.?.udp_payload_size);
+}
+
+test "RFC 8945 section 4.2: the TSIG is the last record of a truncated signed reply" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const tsig = @import("../dns/tsig.zig");
+
+    var message = try signedTruncationTestMessage(arena.allocator(), 40);
+    defer message.deinit();
+
+    var encoded: [2048]u8 = undefined;
+    var writer = @import("../dns/writer.zig").Writer.init(&encoded);
+    try message.encode(&writer);
+    try std.testing.expect(writer.len() > CLASSIC_UDP_MESSAGE_SIZE);
+    try signTruncationTestMessage(&encoded, writer.len());
+
+    var output: [2048]u8 = undefined;
+    const reply = try truncateSignedClassicUdpResponse(writer.written(), &output);
+    const parsed = try dns_message.Message.parse(arena.allocator(), reply);
+
+    // The additional section is the OPT record and the TSIG a signed
+    // message ends with.
+    try std.testing.expectEqual(@as(usize, 2), parsed.additionals.len);
+    try std.testing.expect(parsed.additionals.items[1].rrtype.eql(.TSIG));
+
+    // The MAC is computed over the reply as it goes on the wire, so the
+    // caller recomputes it and the message still authenticates.
+    const reply_final = (try tsig.parseFinalAdditional(reply)).?;
+    const resigned = try tsig.sign(reply, truncation_test_secret, reply_final.owner, reply_final.tsig, null);
+    try tsig.patchMac(@constCast(reply), reply_final, resigned.slice());
+    _ = try tsig.verify(reply, truncation_test_secret, null, tsig.minimumMacLength(.hmac_sha256));
+}
+
+test "RFC 8914 section 3: the signed truncation drops the EDE option and keeps the OPT record" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var message = try signedTruncationTestMessage(arena.allocator(), 40);
+    defer message.deinit();
+    appendEde(&message, EDE_BLOCKED, ede_blocked_text);
+    try setHeaderCounts(&message);
+
+    var encoded: [2048]u8 = undefined;
+    var writer = @import("../dns/writer.zig").Writer.init(&encoded);
+    try message.encode(&writer);
+    try std.testing.expect(writer.len() > CLASSIC_UDP_MESSAGE_SIZE);
+    try signTruncationTestMessage(&encoded, writer.len());
+
+    var output: [2048]u8 = undefined;
+    const reply = try truncateSignedClassicUdpResponse(writer.written(), &output);
+    const parsed = try dns_message.Message.parse(arena.allocator(), reply);
+
+    // The EDE option is the first thing a shortened message drops, and the
+    // OPT record it rode in stays.
+    try std.testing.expect(edeOptionOf(&parsed) == null);
+    try std.testing.expect(parsed.header.truncated);
+    try std.testing.expectEqual(@as(u16, 2), parsed.header.additional_count);
+    try std.testing.expect(parsed.edns != null);
+    try std.testing.expect(parsed.edns.?.dnssec_ok);
+    try std.testing.expectEqual(@as(u16, 512), parsed.edns.?.udp_payload_size);
+}
+
+test "the unsigned truncation sends the bytes it has always sent" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var message = try truncationTestMessage(arena.allocator(), true, 40, 0, 0);
+    defer message.deinit();
+    message.edns = .{ .udp_payload_size = 512, .extended_rcode = 0, .version = 0, .dnssec_ok = true };
+    try appendOpt(&message);
+    try setHeaderCounts(&message);
+
+    var encoded: [2048]u8 = undefined;
+    var writer = @import("../dns/writer.zig").Writer.init(&encoded);
+    try message.encode(&writer);
+    try std.testing.expect(writer.len() > CLASSIC_UDP_MESSAGE_SIZE);
+
+    var output: [2048]u8 = undefined;
+    const reply = try truncateClassicUdpResponse(writer.written(), &output);
+
+    // The header with the TC bit set, the question, and the OPT record.
+    const expected = [_]u8{
+        0x12, 0x34, 0x86, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        0x03, 'w',  'w',  'w',  0x07, 'e',  'x',  'a',  'm',  'p',  'l',  'e',
+        0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x29, 0x02, 0x00, 0x00, 0x00,
+        0x80, 0x00, 0x00, 0x00,
+    };
+    try std.testing.expectEqualSlices(u8, &expected, reply);
 }
 
 test "RFC 8914 section 3: the RRSIGs over the records that remain still verify" {

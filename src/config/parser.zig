@@ -234,6 +234,15 @@ pub const PortRange = struct {
     }
 };
 
+/// RFC 9210 section 4.2: the connection limits an operator may set. A null
+/// field is the project's own policy, which the operator did not change.
+pub const TcpLimits = struct {
+    /// The connections one source address may hold at once.
+    max_connections_per_source: ?u32 = null,
+    /// The total duration of one connection, in seconds.
+    max_connection_duration: ?u32 = null,
+};
+
 pub const CookieConfig = struct {
     enabled: bool = false,
     current: Text = .{},
@@ -357,6 +366,11 @@ pub const Config = struct {
     /// `minimum-failure-cache-time <seconds>`.
     minimum_failure_cache_time: ?u32 = null,
 
+    /// RFC 9210 section 4.2: the connection limits the operator set. The
+    /// defaults are the project's own policy; see `tcp-max-connections-per-
+    /// source` and `tcp-max-connection-duration` in the loader.
+    tcp_limits: TcpLimits = .{},
+
     /// RFC 5452 section 9.2: the source ports the forwarder must not use.
     /// Empty means every ephemeral port is allowed, which is what the
     /// forwarder does without the directive; set via
@@ -446,6 +460,8 @@ pub const Config = struct {
         if (std.mem.eql(u8, first, "forwarder-deny-port")) return self.parseForwarderDenyPort(&tokens);
         if (std.mem.eql(u8, first, "client-subnet-max-prefix")) return self.parseClientSubnetMaxPrefix(&tokens);
         if (std.mem.eql(u8, first, "dnssec-chain")) return self.parseChain(&tokens);
+        if (std.mem.eql(u8, first, "tcp-max-connections-per-source")) return self.parseTcpMaxConnectionsPerSource(&tokens);
+        if (std.mem.eql(u8, first, "tcp-max-connection-duration")) return self.parseTcpMaxConnectionDuration(&tokens);
         return Error.UnknownDirective;
     }
 
@@ -718,6 +734,26 @@ pub const Config = struct {
         if (parsed < FAILURE_CACHE_MIN_SECONDS or parsed > FAILURE_CACHE_MAX_SECONDS) return Error.BadDirective;
         try requireNoTrailingTokens(tokens);
         self.minimum_failure_cache_time = parsed;
+    }
+
+    fn parseTcpMaxConnectionsPerSource(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        if (self.tcp_limits.max_connections_per_source != null) return Error.BadDirective;
+        const value = tokens.next() orelse return Error.BadDirective;
+        try requireNoTrailingTokens(tokens);
+        const parsed = std.fmt.parseInt(u32, value, 10) catch return Error.BadDirective;
+        // A limit below one connection would refuse every client.
+        if (parsed == 0) return Error.BadDirective;
+        self.tcp_limits.max_connections_per_source = parsed;
+    }
+
+    fn parseTcpMaxConnectionDuration(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        if (self.tcp_limits.max_connection_duration != null) return Error.BadDirective;
+        const value = tokens.next() orelse return Error.BadDirective;
+        try requireNoTrailingTokens(tokens);
+        const parsed = std.fmt.parseInt(u32, value, 10) catch return Error.BadDirective;
+        // A connection that is over before it starts serves nothing.
+        if (parsed == 0) return Error.BadDirective;
+        self.tcp_limits.max_connection_duration = parsed;
     }
 };
 
@@ -1078,6 +1114,40 @@ test "config parser takes one RFC 9520 failure cache time and rejects every othe
         "minimum-failure-cache-time 30\nminimum-failure-cache-time 60\n",
     ));
     try std.testing.expectError(error.UnknownDirective, Config.parse("failure-cache-time 30\n"));
+}
+
+test "config parser takes one TCP per-source limit and one connection duration" {
+    // No directive means the project's own policy, which the operator did
+    // not change.
+    const implicit = try Config.parse("zone one.example primary one.zone\n");
+    try std.testing.expect(implicit.tcp_limits.max_connections_per_source == null);
+    try std.testing.expect(implicit.tcp_limits.max_connection_duration == null);
+
+    const configured = try Config.parse("tcp-max-connections-per-source 25\ntcp-max-connection-duration 60\n");
+    try std.testing.expectEqual(@as(u32, 25), configured.tcp_limits.max_connections_per_source.?);
+    try std.testing.expectEqual(@as(u32, 60), configured.tcp_limits.max_connection_duration.?);
+
+    for ([_][]const u8{
+        "tcp-max-connections-per-source\n",
+        "tcp-max-connections-per-source 25 extra\n",
+        "tcp-max-connections-per-source abc\n",
+        "tcp-max-connections-per-source -1\n",
+        "tcp-max-connections-per-source 0\n",
+        "tcp-max-connection-duration\n",
+        "tcp-max-connection-duration 60 extra\n",
+        "tcp-max-connection-duration abc\n",
+        "tcp-max-connection-duration -1\n",
+        "tcp-max-connection-duration 0\n",
+    }) |text| {
+        try std.testing.expectError(error.BadDirective, Config.parse(text));
+    }
+    try std.testing.expectError(error.BadDirective, Config.parse(
+        "tcp-max-connections-per-source 25\ntcp-max-connections-per-source 50\n",
+    ));
+    try std.testing.expectError(error.BadDirective, Config.parse(
+        "tcp-max-connection-duration 60\ntcp-max-connection-duration 120\n",
+    ));
+    try std.testing.expectError(error.UnknownDirective, Config.parse("tcp-max-connection 60\n"));
 }
 
 test "config parser takes RFC 6052 NAT64 prefixes with their IPv4 ranges" {

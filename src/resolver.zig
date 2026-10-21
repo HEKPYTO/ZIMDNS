@@ -74,13 +74,10 @@ pub fn edeText(code: u16) []const u8 {
         EDE_STALE_ANSWER => "stale answer",
         EDE_STALE_NXDOMAIN => "stale nxdomain",
         EDE_NETWORK_ERROR => "network error",
-        EDE_DNSSEC_BOGUS,
-        EDE_SIGNATURE_EXPIRED,
-        EDE_SIGNATURE_NOT_YET_VALID,
-        EDE_DNSKEY_MISSING,
-        EDE_RRSIGS_MISSING,
-        => dnssec.edeText(code),
-        else => "",
+        // The DNSSEC codes the validator produces (6-10 on a bogus answer,
+        // 1, 2, 5 and 11 on an answer the server could not verify) carry
+        // their own purpose text.
+        else => dnssec.edeText(code),
     };
 }
 
@@ -490,6 +487,9 @@ const CacheEntry = struct {
     /// RFC 7871 section 6: the scope the upstream answered with, which the
     /// cached copy reports to the clients it serves.
     ecs_scope: u8 = 0,
+    /// RFC 8914: the code that says why the cached answer is not signed
+    /// verified, which every client of the entry is told.
+    ede: u16 = 0,
 };
 
 /// RFC 9520 section 3.2: a resolution failure, kept so the next client for
@@ -627,11 +627,11 @@ const Cache = struct {
 
     /// The scope is the one the upstream answered with (RFC 7871 section 6),
     /// which the cached copy reports to every client it serves.
-    fn put(self: *Cache, key: CacheKey, message: *dns_message.Message, now: i64, ecs_scope: u8) !void {
+    fn put(self: *Cache, key: CacheKey, message: *dns_message.Message, now: i64, ecs_scope: u8, ede: u16) !void {
         if (message.header.truncated or (message.header.rcode != .no_error and message.header.rcode != .nxdomain)) return;
         const ttl_info = cacheTtl(message) orelse return;
         if (ttl_info.ttl == 0) return;
-        try self.store(key, message, now, ttl_info, ecs_scope);
+        try self.store(key, message, now, ttl_info, ecs_scope, ede);
     }
 
     /// Stores a denial this server synthesized (RFC 8198). Its TTL is the
@@ -643,10 +643,10 @@ const Cache = struct {
             .ttl = ttl,
             .negative = true,
             .nxdomain = message.header.rcode == .nxdomain,
-        }, 0);
+        }, 0, 0);
     }
 
-    fn store(self: *Cache, key: CacheKey, message: *dns_message.Message, now: i64, ttl_info: TtlInfo, ecs_scope: u8) !void {
+    fn store(self: *Cache, key: CacheKey, message: *dns_message.Message, now: i64, ttl_info: TtlInfo, ecs_scope: u8, ede: u16) !void {
         var raw: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
         stripOptions(message);
         var writer = dns_writer.Writer.init(&raw);
@@ -686,6 +686,7 @@ const Cache = struct {
             .negative = ttl_info.negative,
             .nxdomain = ttl_info.nxdomain,
             .ecs_scope = ecs_scope,
+            .ede = ede,
         };
     }
 
@@ -717,6 +718,10 @@ const Cache = struct {
             stripProofsForClient(&message, query);
             if (query.edns != null) try appendOpt(&message, query.edns.?);
             try appendEcsScope(&message, key.ecs, entry.ecs_scope);
+            // RFC 8914: the code that says why the answer is not signed
+            // verified rides with the cached copy, so every client of the
+            // entry is told the same thing.
+            if (entry.ede != 0) try appendEde(&message, entry.ede);
             if (!fresh) try appendEde(&message, if (entry.nxdomain) EDE_STALE_NXDOMAIN else EDE_STALE_ANSWER);
             var writer = dns_writer.Writer.init(output);
             message.encode(&writer) catch return Error.ResponseTooLarge;
@@ -996,9 +1001,10 @@ pub const Resolver = struct {
     policy: Policy,
     upstream: ?std.Io.net.IpAddress,
     cache: Cache,
-    /// RFC 8198 aggressive-NSEC cache. Fed from upstream NSEC proofs on the
-    /// forward path and consulted before forwarding when the client set DO
-    /// without CD. No cryptographic validation is claimed for its denials:
+    /// RFC 8198 aggressive cache of NSEC and NSEC3 proofs. Fed from the
+    /// proofs an upstream answer carries on the forward path and consulted
+    /// before forwarding when the client set DO without CD. No
+    /// cryptographic validation is claimed for its denials:
     /// they restate proofs a signed zone already published.
     dnssec_aggressive: dnssec.AggressiveCache = .{},
 
@@ -1062,10 +1068,11 @@ pub const Resolver = struct {
         if (wantsDnssecProofs(query)) {
             if (query.question) |question| {
                 const denial = self.dnssec_aggressive.deny(question.name, question.qtype, now) catch {
-                    // Fail closed: an exact-owner NSEC proof is cached but its
-                    // bitmap is malformed, so no denial can be synthesized.
-                    // Answer SERVFAIL with a DNSSEC-bogus EDE (RFC 8914)
-                    // instead of forwarding as if the cache were clean.
+                    // Fail closed: an exact-owner NSEC or NSEC3 proof is
+                    // cached but its bitmap is malformed, so no denial can be
+                    // synthesized. Answer SERVFAIL with a DNSSEC-bogus EDE
+                    // (RFC 8914) instead of forwarding as if the cache were
+                    // clean.
                     var bogus = try Resolver.buildDnssecBogusResponse(query, EDE_DNSSEC_BOGUS);
                     defer bogus.deinit();
                     var writer = dns_writer.Writer.init(output);
@@ -1150,6 +1157,9 @@ pub const Resolver = struct {
         // (RFC 4035 section 4.7) and so the AD bit a client sees is the one
         // this server computed rather than one re-derived on a cache hit.
         const validated = self.validating(query);
+        // RFC 8914: the code that says why the answer could not be signed
+        // verified rides on the answer the client still gets.
+        var insecure_ede: u16 = 0;
         if (validated) {
             const result = try self.checkDnssec(query, response, @intCast(@max(now, 0)));
             switch (result.status) {
@@ -1172,7 +1182,11 @@ pub const Resolver = struct {
                     self.cache.failures.put(key, .{ .rcode = .servfail, .ede = result.ede }, now);
                     return self.relayBogus(query, cookie, result.ede, output);
                 },
-                .insecure => {},
+                .insecure => {
+                    // RFC 4035 section 5.2: an answer the server cannot
+                    // verify is still the answer; the code says why.
+                    insecure_ede = result.ede;
+                },
             }
         }
         // RFC 9520 sections 2.1, 2.2, 2.7 and 3.2: an upstream SERVFAIL,
@@ -1218,13 +1232,16 @@ pub const Resolver = struct {
         // ADDRESS, so it is served to the /0 queries only.
         var answer_key = key;
         answer_key.ecs = exchange.scope orelse EcsScope{};
-        self.cache.put(answer_key, &response, now, upstream_scope) catch {};
+        self.cache.put(answer_key, &response, now, upstream_scope, insecure_ede) catch {};
         // RFC 3225 section 3: a query with the DO bit clear must not be answered
         // with DNSSEC security RRs. The cached copy keeps them, so the removal
         // happens on the way out only.
         stripProofsForClient(&response, query);
         if (query.edns) |edns| try appendOpt(&response, edns);
         try appendEcsScope(&response, key.ecs, upstream_scope);
+        // RFC 8914 section 2: the code rides on the answer itself, so the
+        // client learns that the answer is not signed verified.
+        if (insecure_ede != 0) try appendEde(&response, insecure_ede);
         // DNSSEC presence signals (RFC 8914 6-10) ride along as informational
         // EDE on a relayed response this server did NOT validate. Once the
         // validator has spoken above, its verdict is the answer: emitting a
@@ -1303,7 +1320,8 @@ pub const Resolver = struct {
     // RFC 8198 sections 5 and 9: only a proof that DNSSEC validation has
     // made trustworthy may be used aggressively. The call site sets AD only
     // on a validated-secure answer; the gate lives here too so no future
-    // caller can bypass it.
+    // caller can bypass it. The NSEC and the NSEC3 proofs of the answer are
+    // harvested alike (RFC 8198 sections 5.1 and 5.2).
     fn harvestNsecProofs(self: *Resolver, response: dns_message.Message, now: i64) void {
         if (!response.header.authenticated_data) return;
         harvestSectionNsec(&self.dnssec_aggressive, response.answers.slice(), now);
@@ -2268,23 +2286,41 @@ fn harvestSectionNsec(cache: *dnssec.AggressiveCache, records: []const dns_recor
     // arrived with it, so a denial the proof gives can carry it.
     const soa = sectionSoa(records);
     for (records) |*record| {
-        if (!record.rrtype.eql(.NSEC)) continue;
+        if (record.rrtype.eql(.NSEC)) {
+            const raw = switch (record.rdata) {
+                .Unknown => |*unknown| unknown.bytes(),
+                else => continue,
+            };
+            const next = dns_name.Name.parse(raw, 0) catch continue;
+            cache.insertNsec(record.owner, next.name, raw[next.next_offset..], now, record.ttl, soa, .{
+                .record = record.*,
+                .rrsig = coveringRrsig(records, record.owner, .NSEC),
+            });
+            continue;
+        }
+        if (!record.rrtype.eql(.NSEC3)) continue;
         const raw = switch (record.rdata) {
             .Unknown => |*unknown| unknown.bytes(),
             else => continue,
         };
-        const next = dns_name.Name.parse(raw, 0) catch continue;
-        cache.insertNsec(record.owner, next.name, raw[next.next_offset..], now, record.ttl, soa, .{
-            .nsec = record.*,
-            .rrsig = coveringRrsig(records, record.owner),
+        // RFC 5155 section 3.2: the chain parameters, the next hashed owner
+        // name, and the type bitmap the proof rests on.
+        const rdata = validate.parseNsec3Rdata(raw) orelse continue;
+        if (rdata.next_hash.len != 20) continue;
+        const owner_hash = validate.nsec3OwnerHash(record.owner) orelse continue;
+        var next_hash: [20]u8 = undefined;
+        @memcpy(&next_hash, rdata.next_hash);
+        cache.insertNsec3(record.owner, owner_hash, next_hash, rdata.flags & 1 != 0, rdata.iterations, rdata.salt, rdata.bitmap, now, record.ttl, soa, .{
+            .record = record.*,
+            .rrsig = coveringRrsig(records, record.owner, .NSEC3),
         });
     }
 }
 
-/// The RRSIG that covers the NSEC at `owner` in the same section. RFC 4035
+/// The RRSIG that covers the record at `owner` in the same section. RFC 4035
 /// section 3.1.3 wants the proof returned with the signature that covers
 /// it, and RFC 8020 section 2 returns that signature with a cut answer.
-fn coveringRrsig(records: []const dns_record.ResourceRecord, owner: dns_name.Name) ?dns_record.ResourceRecord {
+fn coveringRrsig(records: []const dns_record.ResourceRecord, owner: dns_name.Name, covered: dns_types.RecordType) ?dns_record.ResourceRecord {
     for (records) |*record| {
         if (!record.rrtype.eql(.RRSIG)) continue;
         if (!record.owner.eql(&owner)) continue;
@@ -2292,8 +2328,8 @@ fn coveringRrsig(records: []const dns_record.ResourceRecord, owner: dns_name.Nam
             .Unknown => |*unknown| unknown.bytes(),
             else => continue,
         };
-        const covered = dnssec.rrsigCovers(raw) catch continue;
-        if (covered != dns_types.RecordType.NSEC.code()) continue;
+        const covers = dnssec.rrsigCovers(raw) catch continue;
+        if (covers != covered.code()) continue;
         return record.*;
     }
     return null;
@@ -2488,7 +2524,7 @@ test "cache ages positive and negative responses and emits stale EDE" {
 
     var positive = try makePositiveResponse(arena.allocator(), 60);
     defer positive.deinit();
-    try cache.put(key, &positive, 1000, 0);
+    try cache.put(key, &positive, 1000, 0, 0);
     var output: [2048]u8 = undefined;
     const fresh = (try cache.lookup(&key, query, 1030, &output, false)).?;
     const fresh_message = try dns_message.Message.parse(arena.allocator(), fresh.bytes);
@@ -2506,7 +2542,7 @@ test "cache ages positive and negative responses and emits stale EDE" {
     var negative = try makeNegativeResponse(arena.allocator(), 60, 30);
     defer negative.deinit();
     const negative_key = try CacheKey.fromQuestion(negative);
-    try cache.put(negative_key, &negative, 2000, 0);
+    try cache.put(negative_key, &negative, 2000, 0, 0);
     var negative_query = try makeTestQuery(arena.allocator(), 0x2201, "missing.example.", true);
     defer negative_query.deinit();
     const negative_stale = (try cache.lookup(&negative_key, negative_query, 2100, &output, true)).?;
@@ -2518,7 +2554,7 @@ test "cache ages positive and negative responses and emits stale EDE" {
     var nodata = try makeNegativeResponse(arena.allocator(), 60, 30);
     defer nodata.deinit();
     nodata.header.rcode = .no_error;
-    try cache.put(negative_key, &nodata, 3000, 0);
+    try cache.put(negative_key, &nodata, 3000, 0, 0);
     const nodata_stale = (try cache.lookup(&negative_key, negative_query, 3100, &output, true)).?;
     const nodata_message = try dns_message.Message.parse(arena.allocator(), nodata_stale.bytes);
     try expectEde(nodata_message, EDE_STALE_ANSWER, "stale answer");
@@ -2537,13 +2573,13 @@ test "the answer cache excludes failures truncation and upstream option data" {
     var failure = try makePositiveResponse(arena.allocator(), 60);
     defer failure.deinit();
     failure.header.rcode = .servfail;
-    try cache.put(key, &failure, 1000, 0);
+    try cache.put(key, &failure, 1000, 0, 0);
     try std.testing.expect((try cache.lookup(&key, query, 1001, &output, true)) == null);
 
     var truncated = try makePositiveResponse(arena.allocator(), 60);
     defer truncated.deinit();
     truncated.header.truncated = true;
-    try cache.put(key, &truncated, 1000, 0);
+    try cache.put(key, &truncated, 1000, 0, 0);
     try std.testing.expect((try cache.lookup(&key, query, 1001, &output, true)) == null);
 
     var with_opt = try makePositiveResponse(arena.allocator(), 60);
@@ -2557,7 +2593,7 @@ test "the answer cache excludes failures truncation and upstream option data" {
         .rdata = .{ .OPT = .{} },
     });
     with_opt.header.additional_count = 1;
-    try cache.put(key, &with_opt, 1000, 0);
+    try cache.put(key, &with_opt, 1000, 0, 0);
     const hit = (try cache.lookup(&key, query, 1001, &output, false)).?;
     const hit_message = try dns_message.Message.parse(arena.allocator(), hit.bytes);
     try std.testing.expect(hit_message.edns == null);
@@ -2597,7 +2633,7 @@ test "cache reuses an expired slot instead of evicting a live entry" {
         });
         responses[index].header.answer_count = 1;
         keys[index] = try CacheKey.fromQuestion(queries[index]);
-        try cache.put(keys[index], &responses[index], 1000, 0);
+        try cache.put(keys[index], &responses[index], 1000, 0, 0);
     }
     try std.testing.expectEqual(MAX_CACHE_ENTRIES, cache.len);
 
@@ -2619,7 +2655,7 @@ test "cache reuses an expired slot instead of evicting a live entry" {
     });
     newcomer_response.header.answer_count = 1;
     const newcomer_key = try CacheKey.fromQuestion(newcomer);
-    try cache.put(newcomer_key, &newcomer_response, 1061, 0);
+    try cache.put(newcomer_key, &newcomer_response, 1061, 0, 0);
     try std.testing.expectEqual(MAX_CACHE_ENTRIES, cache.len);
 
     const survivor = (try cache.lookup(&keys[0], queries[0], 1062, &output, false)).?;
@@ -2640,7 +2676,7 @@ test "RFC 8020 section 2: a cached NXDOMAIN cuts the names below it" {
     var denial = try makeNxdomainResponse(arena.allocator(), "a.example.", 60, 30);
     defer denial.deinit();
     const denied_key = try CacheKey.fromQuestion(denied);
-    try cache.put(denied_key, &denial, 1000, 0);
+    try cache.put(denied_key, &denial, 1000, 0, 0);
 
     // A direct child of the denied name is cut.
     var child = try makeTestQuery(arena.allocator(), 0x2801, "b.a.example.", false);
@@ -2688,14 +2724,14 @@ test "RFC 8020 section 2: a cached answer below a cut name still wins" {
     var denial = try makeNxdomainResponse(arena.allocator(), "a.example.", 60, 30);
     defer denial.deinit();
     const denied_key = try CacheKey.fromQuestion(denied);
-    try cache.put(denied_key, &denial, 1000, 0);
+    try cache.put(denied_key, &denial, 1000, 0, 0);
 
     var positive_query = try makeTestQuery(arena.allocator(), 0x2811, "b.a.example.", false);
     defer positive_query.deinit();
     var positive = try makePositiveResponseFor(arena.allocator(), "b.a.example.", 120);
     defer positive.deinit();
     const positive_key = try CacheKey.fromQuestion(positive_query);
-    try cache.put(positive_key, &positive, 1000, 0);
+    try cache.put(positive_key, &positive, 1000, 0, 0);
 
     const hit = (try cache.lookup(&positive_key, positive_query, 1000, &output, false)).?;
     const message = try dns_message.Message.parse(arena.allocator(), hit.bytes);
@@ -2716,7 +2752,7 @@ test "RFC 8020 section 2: the cut expires with the cached entry" {
     var denial = try makeNxdomainResponse(arena.allocator(), "a.example.", 60, 30);
     defer denial.deinit();
     const denied_key = try CacheKey.fromQuestion(denied);
-    try cache.put(denied_key, &denial, 1000, 0);
+    try cache.put(denied_key, &denial, 1000, 0, 0);
 
     var child = try makeTestQuery(arena.allocator(), 0x2821, "b.a.example.", false);
     defer child.deinit();
@@ -2740,7 +2776,7 @@ test "RFC 2308 section 5: the negative TTL is the smaller of the SOA TTL and the
     var denial = try makeNxdomainResponse(arena.allocator(), "a.example.", 60, 30);
     defer denial.deinit();
     const denied_key = try CacheKey.fromQuestion(denied);
-    try cache.put(denied_key, &denial, 1000, 0);
+    try cache.put(denied_key, &denial, 1000, 0, 0);
 
     const exact = (try cache.lookup(&denied_key, denied, 1000, &output, false)).?;
     const exact_message = try dns_message.Message.parse(arena.allocator(), exact.bytes);
@@ -2762,7 +2798,7 @@ test "RFC 2308 section 5: the negative TTL is the smaller of the SOA TTL and the
     var short_denial = try makeNxdomainResponse(arena.allocator(), "c.example.", 20, 300);
     defer short_denial.deinit();
     const short_key = try CacheKey.fromQuestion(short);
-    try cache.put(short_key, &short_denial, 1000, 0);
+    try cache.put(short_key, &short_denial, 1000, 0, 0);
     const short_hit = (try cache.lookup(&short_key, short, 1000, &output, false)).?;
     const short_message = try dns_message.Message.parse(arena.allocator(), short_hit.bytes);
     try std.testing.expectEqual(@as(u32, 20), short_message.authorities.items[0].ttl);
@@ -2784,7 +2820,7 @@ test "RFC 8020 section 2: a descendant of a cached NXDOMAIN is answered without 
     var denial = try makeNxdomainResponse(arena.allocator(), "a.example.", 60, 30);
     defer denial.deinit();
     const denied_key = try CacheKey.fromQuestion(denied);
-    try resolver.cache.put(denied_key, &denial, now, 0);
+    try resolver.cache.put(denied_key, &denial, now, 0, 0);
 
     var query = try makeTestQuery(arena.allocator(), 0x2841, "b.a.example.", false);
     defer query.deinit();
@@ -3132,7 +3168,7 @@ test "a cached answer reports the scope the upstream answered with" {
     defer response.deinit();
     var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
     defer cache.deinit();
-    try cache.put(try CacheKey.fromQuestion(scoped), &response, 4000, 20);
+    try cache.put(try CacheKey.fromQuestion(scoped), &response, 4000, 20, 0);
 
     var output: [2048]u8 = undefined;
     const key = try CacheKey.fromQuestion(scoped);
@@ -3164,7 +3200,7 @@ test "the answer cache keeps the client subnet scopes apart" {
     defer response.deinit();
     var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
     defer cache.deinit();
-    try cache.put(try CacheKey.fromQuestion(scoped), &response, 4000, 0);
+    try cache.put(try CacheKey.fromQuestion(scoped), &response, 4000, 0, 0);
 
     var output: [2048]u8 = undefined;
     const scoped_key = try CacheKey.fromQuestion(scoped);
@@ -3194,7 +3230,7 @@ test "a client without the client subnet option keeps today's behavior" {
     defer response.deinit();
     var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
     defer cache.deinit();
-    try cache.put(try CacheKey.fromQuestion(plain), &response, 4000, 0);
+    try cache.put(try CacheKey.fromQuestion(plain), &response, 4000, 0, 0);
 
     var cache_output: [2048]u8 = undefined;
     const plain_key = try CacheKey.fromQuestion(plain);
@@ -3515,7 +3551,7 @@ test "cache separates CD and EDNS DO variants" {
     defer response.deinit();
     var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
     defer cache.deinit();
-    try cache.put(try CacheKey.fromQuestion(base), &response, 4000, 0);
+    try cache.put(try CacheKey.fromQuestion(base), &response, 4000, 0, 0);
 
     var output: [2048]u8 = undefined;
     const cd_key = try CacheKey.fromQuestion(cd);
@@ -3562,6 +3598,26 @@ fn makeTestRrsig(now_expired: bool) dns_rdata.Unknown {
     @memcpy(raw.data[18..27], &[_]u8{ 0x07, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0x00 });
     raw.data[27] = 0xAB;
     raw.len = 28;
+    return raw;
+}
+
+/// An RRSIG over an A record whose algorithm this build cannot verify with
+/// (8 is RSAMD5, which RFC 4035 section 5.2 leaves unsupported), signed by
+/// the zone the trust anchor speaks for.
+fn makeUnsupportedAlgorithmRrsig() dns_rdata.Unknown {
+    var raw = dns_rdata.Unknown{};
+    raw.data[0] = 0x00;
+    raw.data[1] = 0x01;
+    raw.data[2] = 0x08;
+    raw.data[3] = 0x03;
+    std.mem.writeInt(u32, raw.data[4..8], 3600, .big);
+    std.mem.writeInt(u32, raw.data[8..12], 2_000_000_000, .big);
+    std.mem.writeInt(u32, raw.data[12..16], 1_000_000_000, .big);
+    std.mem.writeInt(u16, raw.data[16..18], 1234, .big);
+    const signer = [_]u8{ 0x07, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0x03, 'c', 'o', 'm', 0x00 };
+    @memcpy(raw.data[18..][0..signer.len], &signer);
+    raw.data[18 + signer.len] = 0xAB;
+    raw.len = @intCast(19 + signer.len);
     return raw;
 }
 
@@ -3692,6 +3748,171 @@ test "aggressive NSEC answers denials without upstream and honors CD" {
     cd_query.header.checking_disabled = true;
     cd_query.edns.?.dnssec_ok = true;
     try std.testing.expect(!wantsDnssecProofs(cd_query));
+}
+
+/// The hash a name has in an NSEC3 chain (RFC 5155 section 5).
+fn nsec3TestHash(name: dns_name.Name, salt: []const u8, iterations: u16) [20]u8 {
+    var out: [20]u8 = undefined;
+    dnssec.nsec3Hash(name, salt, iterations, &out);
+    return out;
+}
+
+/// The hash just above or below the given one.
+fn nsec3TestNeighbour(hash: [20]u8, up: bool) [20]u8 {
+    var out = hash;
+    var index: usize = out.len;
+    while (index > 0) {
+        index -= 1;
+        if (up) {
+            if (out[index] != 0xff) {
+                out[index] += 1;
+                break;
+            }
+            out[index] = 0;
+        } else {
+            if (out[index] != 0x00) {
+                out[index] -= 1;
+                break;
+            }
+            out[index] = 0xff;
+        }
+    }
+    return out;
+}
+
+/// The base32hex label an NSEC3 owner name carries (RFC 4648 section 7).
+fn nsec3TestLabel(hash: [20]u8) [32]u8 {
+    const alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUV";
+    var out: [32]u8 = undefined;
+    var accumulator: u64 = 0;
+    var bits: u6 = 0;
+    var index: usize = 0;
+    for (hash) |byte| {
+        accumulator = (accumulator << 8) | byte;
+        bits += 8;
+        while (bits >= 5) {
+            bits -= 5;
+            out[index] = alphabet[@intCast((accumulator >> bits) & 0x1f)];
+            index += 1;
+        }
+        accumulator &= (@as(u64, 1) << @intCast(bits)) - 1;
+    }
+    return out;
+}
+
+/// One NSEC3 record of the test chain, with the RRSIG that covers it.
+fn appendNsec3Record(allocator: std.mem.Allocator, message: *dns_message.Message, owner_hash: [20]u8, next_hash: [20]u8, salt: []const u8, iterations: u16, bitmap: []const u8) !void {
+    const label = nsec3TestLabel(owner_hash);
+    var text: [64]u8 = undefined;
+    const written = try std.fmt.bufPrint(&text, "{s}.example.", .{label});
+    const owner = try dns_name.Name.fromText(written);
+
+    const rdata = try allocator.alloc(u8, 6 + salt.len + 20 + bitmap.len);
+    var index: usize = 0;
+    rdata[index] = 1; // hash algorithm: SHA-1
+    index += 1;
+    rdata[index] = 0; // flags
+    index += 1;
+    std.mem.writeInt(u16, rdata[index..][0..2], iterations, .big);
+    index += 2;
+    rdata[index] = @intCast(salt.len);
+    index += 1;
+    @memcpy(rdata[index..][0..salt.len], salt);
+    index += salt.len;
+    rdata[index] = 20; // hash length
+    index += 1;
+    @memcpy(rdata[index..][0..20], &next_hash);
+    index += 20;
+    @memcpy(rdata[index..][0..bitmap.len], bitmap);
+    index += bitmap.len;
+    try message.authorities.append(.{
+        .owner = owner,
+        .rrtype = .NSEC3,
+        .class = .IN,
+        .ttl = 3600,
+        .rdata = .{ .Unknown = .{ .len = @intCast(index), .borrowed = rdata } },
+    });
+
+    // The RRSIG that covers it (RFC 4035 section 3.1.3): the 18-octet
+    // header and the signer's name, written out in full.
+    const signer = (try dns_name.Name.fromText("example.")).asWire();
+    const sig = try allocator.alloc(u8, 18 + signer.len + 1);
+    std.mem.writeInt(u16, sig[0..2], dns_types.RecordType.NSEC3.code(), .big);
+    sig[2] = 8; // algorithm
+    sig[3] = 2; // labels
+    std.mem.writeInt(u32, sig[4..8], 3600, .big);
+    std.mem.writeInt(u32, sig[8..12], 2_000_000_000, .big);
+    std.mem.writeInt(u32, sig[12..16], 1_000_000_000, .big);
+    std.mem.writeInt(u16, sig[16..18], 1234, .big);
+    @memcpy(sig[18..][0..signer.len], signer);
+    @memcpy(sig[18 + signer.len ..][0..1], &[_]u8{0});
+    try message.authorities.append(.{
+        .owner = owner,
+        .rrtype = .RRSIG,
+        .class = .IN,
+        .ttl = 3600,
+        .rdata = .{ .Unknown = .{ .len = @intCast(sig.len), .borrowed = sig } },
+    });
+}
+
+test "RFC 8198 section 5.2: an NSEC3 proof in an upstream answer denies without a second query" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = try std.Io.net.IpAddress.parse("127.0.0.1", 9) },
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const now: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+    const salt = [_]u8{ 0x73, 0x61, 0x6c, 0x74 };
+    const iterations: u16 = 2;
+    // The type bitmap of a name that holds A(1), RRSIG(46), DNSKEY(48),
+    // and NSEC3(50).
+    const bitmap = [_]u8{ 0x00, 0x07, 0x40, 0x00, 0x00, 0x00, 0x02, 0xa0, 0x00 };
+
+    // The upstream answer carries the NSEC3 chain of the zone: the encloser
+    // itself, the span that covers the next closer name, and the span that
+    // covers the wildcard at the encloser (RFC 5155 section 8.4).
+    var response = try makeTestQuery(arena.allocator(), 0x2860, "nx.example.", true);
+    defer response.deinit();
+    response.header.qr = true;
+    response.header.authenticated_data = true;
+    const encloser_hash = nsec3TestHash(try dns_name.Name.fromText("example."), &salt, iterations);
+    const next_closer_hash = nsec3TestHash(try dns_name.Name.fromText("nx.example."), &salt, iterations);
+    const wildcard_hash = nsec3TestHash(try dns_name.Name.fromText("*.example."), &salt, iterations);
+    try appendNsec3Record(arena.allocator(), &response, encloser_hash, nsec3TestNeighbour(encloser_hash, true), &salt, iterations, &bitmap);
+    try appendNsec3Record(arena.allocator(), &response, nsec3TestNeighbour(next_closer_hash, false), nsec3TestNeighbour(next_closer_hash, true), &salt, iterations, &bitmap);
+    try appendNsec3Record(arena.allocator(), &response, nsec3TestNeighbour(wildcard_hash, false), nsec3TestNeighbour(wildcard_hash, true), &salt, iterations, &bitmap);
+    try response.authorities.append(try makeTestSoa(3600, 3600));
+    resolver.harvestNsecProofs(response, now);
+
+    // The query the proof covers is answered from the cache. The forwarder
+    // points at a closed port, so an upstream attempt would fail instead.
+    var query = try makeTestQuery(arena.allocator(), 0x2861, "nx.example.", true);
+    defer query.deinit();
+    query.edns.?.dnssec_ok = true;
+    query.additionals.items[0].ttl |= 0x8000;
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [4096]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42611);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    const parsed = try dns_message.Message.parse(arena.allocator(), bytes);
+    try std.testing.expectEqual(dns_header.Rcode.nxdomain, parsed.header.rcode);
+    // The SOA and the proof the denial rests on ride in the authority
+    // section (RFC 2308 section 3, RFC 8020 section 2).
+    try std.testing.expectEqual(@as(u16, 7), parsed.header.authority_count);
+    try std.testing.expectEqual(dns_types.RecordType.NSEC3, parsed.authorities.items[1].rrtype);
+
+    // A name the proof does not cover is not denied: it goes upstream.
+    var other = try makeTestQuery(arena.allocator(), 0x2862, "other.example.", true);
+    defer other.deinit();
+    other.edns.?.dnssec_ok = true;
+    other.additionals.items[0].ttl |= 0x8000;
+    var other_bytes: [1024]u8 = undefined;
+    const other_encoded = try encodeTestMessage(other, &other_bytes);
+    try std.testing.expectError(Error.UpstreamFailure, resolver.answer(other_encoded, other, &client, &output));
 }
 
 test "RFC 8198 section 4: a synthesized denial is reused from the negative cache" {
@@ -6065,6 +6286,65 @@ fn buildUnsignedUpstreamAnswer(buffer: []u8, query: dns_message.Message) ![]cons
     return writer.written();
 }
 
+/// An upstream that answers with a record and a signature this build cannot
+/// verify with.
+const UnsupportedAlgorithmUpstream = struct {
+    io: std.Io,
+    udp: *const std.Io.net.Socket,
+    requests: usize = 0,
+};
+
+fn serveUnsupportedAlgorithmUpstream(args: *UnsupportedAlgorithmUpstream) void {
+    var request_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
+    const incoming = args.udp.receiveTimeout(args.io, &request_buffer, FailingUpstreamTimeout) catch return;
+    args.requests += 1;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const query = dns_message.Message.parseQuery(arena.allocator(), incoming.data) catch return;
+    var response_buffer: [512]u8 = undefined;
+    const bytes = buildUnsupportedAlgorithmAnswer(&response_buffer, query) catch return;
+    args.udp.send(args.io, &incoming.from, bytes) catch return;
+}
+
+/// The answer the upstream sends: the A record the client asked for and a
+/// signature over it whose algorithm this build cannot verify with.
+fn buildUnsupportedAlgorithmAnswer(buffer: []u8, query: dns_message.Message) ![]const u8 {
+    const question = query.question orelse return Error.BadUpstreamResponse;
+    var message = dns_message.Message{
+        .allocator = query.allocator,
+        .header = .{
+            .id = query.header.id,
+            .qr = true,
+            .recursion_desired = true,
+            .recursion_available = true,
+            .question_count = 1,
+        },
+        .question = query.question,
+        .answers = try dns_message.RecordSection.init(query.allocator, 0),
+        .authorities = try dns_message.RecordSection.init(query.allocator, 0),
+        .additionals = try dns_message.RecordSection.init(query.allocator, 0),
+    };
+    defer message.deinit();
+    try message.answers.append(.{
+        .owner = question.name,
+        .rrtype = .A,
+        .class = .IN,
+        .ttl = 60,
+        .rdata = .{ .A = .{ 192, 0, 2, 1 } },
+    });
+    try message.answers.append(.{
+        .owner = question.name,
+        .rrtype = .RRSIG,
+        .class = .IN,
+        .ttl = 60,
+        .rdata = .{ .Unknown = makeUnsupportedAlgorithmRrsig() },
+    });
+    message.header.answer_count = 2;
+    var writer = dns_writer.Writer.init(buffer);
+    try message.encode(&writer);
+    return writer.written();
+}
+
 /// A response that fails the question the upstream was asked.
 fn buildFailingUpstreamAnswer(buffer: []u8, query: dns_message.Message, rcode: dns_header.Rcode) ![]const u8 {
     var message = dns_message.Message{
@@ -6268,7 +6548,7 @@ test "RFC 9520 section 3.2: the failure cache keeps the answer cache's own bound
     var response = try makePositiveResponse(arena.allocator(), 60);
     defer response.deinit();
     const key = try CacheKey.fromQuestion(query);
-    try cache.put(key, &response, 1000, 0);
+    try cache.put(key, &response, 1000, 0, 0);
 
     // A full table of failures leaves the answer cache alone.
     var name_buffer: [32]u8 = undefined;
@@ -6459,7 +6739,7 @@ test "RFC 1035 section 2.3.3: the NXDOMAIN cut ignores the case of the ancestor"
     var denial = try makeNxdomainResponse(arena.allocator(), "a.example.", 60, 30);
     defer denial.deinit();
     const denied_key = try CacheKey.fromQuestion(denied);
-    try cache.put(denied_key, &denial, 1000, 0);
+    try cache.put(denied_key, &denial, 1000, 0, 0);
 
     // The descendant spells the ancestor in another case, which names the
     // same node: the cut applies.
@@ -7397,4 +7677,85 @@ test "RFC 7871 section 7.1.3: a query without a client subnet is not retried" {
     const response = try dns_message.Message.parse(arena.allocator(), bytes);
     try std.testing.expectEqual(dns_header.Rcode.refused, response.header.rcode);
     try std.testing.expect(findOption(response, dns_rdata.EDNS_ECS_OPTION_CODE) == null);
+}
+
+test "RFC 8914 section 4.2: an answer the server cannot verify carries the code that says why" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    var upstream = UnsupportedAlgorithmUpstream{ .io = io, .udp = &upstream_socket };
+    const thread = try std.Thread.spawn(.{}, serveUnsupportedAlgorithmUpstream, .{&upstream});
+
+    // A DNSKEY anchor whose algorithm this build cannot verify with: RFC
+    // 4035 section 5.2 leaves the zone unsigned, and RFC 8914 section 4.2
+    // names the code the client is told.
+    const anchors = try validate.Anchors.parse(std.testing.allocator,
+        \\example.com. DNSKEY 256 3 8 AwEAAQ==
+        \\
+    );
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = upstream_socket.address },
+        .anchors = anchors,
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2960, "www.example.com.", true);
+    defer query.deinit();
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42760);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    thread.join();
+
+    const response = try dns_message.Message.parse(arena.allocator(), bytes);
+    // RFC 4035 section 5.2: the answer is still the answer, not a SERVFAIL.
+    try std.testing.expectEqual(dns_header.Rcode.no_error, response.header.rcode);
+    try std.testing.expectEqual(@as(usize, 1), response.answers.len);
+    try expectEde(response, dnssec.EDE_UNSUPPORTED_DNSKEY_ALGORITHM, "unsupported dnskey algorithm");
+}
+
+test "the cached copy of an unverifiable answer carries the same code" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    var upstream = UnsupportedAlgorithmUpstream{ .io = io, .udp = &upstream_socket };
+    const thread = try std.Thread.spawn(.{}, serveUnsupportedAlgorithmUpstream, .{&upstream});
+
+    const anchors = try validate.Anchors.parse(std.testing.allocator,
+        \\example.com. DNSKEY 256 3 8 AwEAAQ==
+        \\
+    );
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = upstream_socket.address },
+        .anchors = anchors,
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2961, "www.example.com.", true);
+    defer query.deinit();
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42761);
+
+    const first = try resolver.answer(encoded, query, &client, &output);
+    thread.join();
+    const first_response = try dns_message.Message.parse(arena.allocator(), first);
+    try expectEde(first_response, dnssec.EDE_UNSUPPORTED_DNSKEY_ALGORITHM, "unsupported dnskey algorithm");
+
+    // The second client is answered from the cache, and it is told the same
+    // thing: the code belongs to the answer, not to the fetch.
+    const second = try resolver.answer(encoded, query, &client, &output);
+    const second_response = try dns_message.Message.parse(arena.allocator(), second);
+    try expectEde(second_response, dnssec.EDE_UNSUPPORTED_DNSKEY_ALGORITHM, "unsupported dnskey algorithm");
+    try std.testing.expectEqual(@as(usize, 1), upstream.requests);
 }
