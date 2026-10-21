@@ -4,6 +4,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const dns_message = @import("../dns/message.zig");
+const dns_types = @import("../dns/types.zig");
 const dns_writer = @import("../dns/writer.zig");
 const response = @import("response.zig");
 const zone_parser = @import("../zone/parser.zig");
@@ -1071,10 +1072,15 @@ pub const Runtime = struct {
         const q = query.question orelse return response.Error.MissingQuestion;
         if (query.header.opcode == .notify) {
             if (!transfer.isNotifyMessage(&query)) return response.buildFormerrResponse(query);
+            // RFC 1996 section 3.7: the question of a NOTIFY is the zone's
+            // SOA, so a question for anything else is malformed.
+            if (!q.qtype.eql(dns_types.RecordType.SOA)) return response.buildFormerrResponse(query);
             // RFC 1996 section 3.7: the master hints at its new SOA in the
             // answer section, and that serial is what the zone's own is
-            // compared against; without it there is no serial to compare.
-            const notify_serial = transfer.notifySerialFromMessage(&query) orelse return response.buildFormerrResponse(query);
+            // compared against. A NOTIFY with an empty answer section carries
+            // no hint, which is legal: the slave then asks its masters for
+            // the new data.
+            const notify_serial = transfer.notifySerialFromMessage(&query);
             var notify_name_buffer: [256]u8 = undefined;
             const notify_name = q.name.toText(&notify_name_buffer) catch return response.Error.BadQName;
             if (self.blocklist.blocks(notify_name)) return response.buildBlockedResponse(query);
@@ -2121,7 +2127,6 @@ test "authoritative runtime answers unassigned opcodes with local NOTIMP" {
 test "authoritative runtime answers RFC 2136 UPDATE with NOTIMP" {
     const dns_name = @import("../dns/name.zig");
     const dns_record = @import("../dns/record.zig");
-    const dns_types = @import("../dns/types.zig");
 
     var runtime = try Runtime.fromZoneText(
         \\$ORIGIN home.arpa.
@@ -2349,13 +2354,14 @@ fn encodeNotifyRequest(
     buffer: []u8,
     qname: []const u8,
     serial: ?u32,
+    qtype: dns_types.RecordType,
 ) ![]const u8 {
     const dns_name = @import("../dns/name.zig");
     const owner = try dns_name.Name.fromText(qname);
     var request = dns_message.Message{
         .allocator = allocator,
         .header = .{ .id = 0x4321, .opcode = .notify, .question_count = 1 },
-        .question = .{ .name = owner, .qtype = .SOA, .qclass = .IN },
+        .question = .{ .name = owner, .qtype = qtype, .qclass = .IN },
         .answers = try dns_message.RecordSection.init(allocator, 0),
         .authorities = try dns_message.RecordSection.init(allocator, 0),
         .additionals = try dns_message.RecordSection.init(allocator, 0),
@@ -2399,7 +2405,7 @@ test "runtime answers NOTIFY by comparing the serial and refuses transfers singl
     var output: [512]u8 = undefined;
     var request_buffer: [512]u8 = undefined;
 
-    const newer = try encodeNotifyRequest(arena.allocator(), &request_buffer, "example.", 11);
+    const newer = try encodeNotifyRequest(arena.allocator(), &request_buffer, "example.", 11, .SOA);
     const newer_bytes = try runtime.answer(newer, &output);
     const newer_response = try dns_message.Message.parse(arena.allocator(), newer_bytes);
     try std.testing.expect(newer_response.header.qr);
@@ -2409,22 +2415,33 @@ test "runtime answers NOTIFY by comparing the serial and refuses transfers singl
     try std.testing.expectEqual(@as(u16, 1), newer_response.header.answer_count);
     try std.testing.expectEqual(@as(u32, 10), newer_response.answers.items[0].rdata.SOA.serial);
 
-    const equal = try encodeNotifyRequest(arena.allocator(), &request_buffer, "example.", 10);
+    const equal = try encodeNotifyRequest(arena.allocator(), &request_buffer, "example.", 10, .SOA);
     const equal_bytes = try runtime.answer(equal, &output);
     const equal_response = try dns_message.Message.parse(arena.allocator(), equal_bytes);
     try std.testing.expectEqual(@as(@TypeOf(equal_response.header.rcode), .notauth), equal_response.header.rcode);
 
-    const older = try encodeNotifyRequest(arena.allocator(), &request_buffer, "example.", 9);
+    const older = try encodeNotifyRequest(arena.allocator(), &request_buffer, "example.", 9, .SOA);
     const older_bytes = try runtime.answer(older, &output);
     const older_response = try dns_message.Message.parse(arena.allocator(), older_bytes);
     try std.testing.expectEqual(@as(@TypeOf(older_response.header.rcode), .notauth), older_response.header.rcode);
 
-    const without_soa = try encodeNotifyRequest(arena.allocator(), &request_buffer, "example.", null);
+    // RFC 1996 section 3.7: a NOTIFY with an empty answer section is legal
+    // and carries no hint, so it is answered like any other accepted NOTIFY.
+    const without_soa = try encodeNotifyRequest(arena.allocator(), &request_buffer, "example.", null, .SOA);
     const without_soa_bytes = try runtime.answer(without_soa, &output);
     const without_soa_response = try dns_message.Message.parse(arena.allocator(), without_soa_bytes);
-    try std.testing.expectEqual(@as(@TypeOf(without_soa_response.header.rcode), .formerr), without_soa_response.header.rcode);
+    try std.testing.expect(without_soa_response.header.qr);
+    try std.testing.expect(without_soa_response.header.opcode == .notify);
+    try std.testing.expectEqual(@as(@TypeOf(without_soa_response.header.rcode), .no_error), without_soa_response.header.rcode);
 
-    const unserved = try encodeNotifyRequest(arena.allocator(), &request_buffer, "other.", 11);
+    // RFC 1996 section 3.7: the question of a NOTIFY is the zone's SOA, so a
+    // question for anything else is malformed.
+    const wrong_type = try encodeNotifyRequest(arena.allocator(), &request_buffer, "example.", 11, .A);
+    const wrong_type_bytes = try runtime.answer(wrong_type, &output);
+    const wrong_type_response = try dns_message.Message.parse(arena.allocator(), wrong_type_bytes);
+    try std.testing.expectEqual(@as(@TypeOf(wrong_type_response.header.rcode), .formerr), wrong_type_response.header.rcode);
+
+    const unserved = try encodeNotifyRequest(arena.allocator(), &request_buffer, "other.", 11, .SOA);
     const unserved_bytes = try runtime.answer(unserved, &output);
     const unserved_response = try dns_message.Message.parse(arena.allocator(), unserved_bytes);
     try std.testing.expectEqual(@as(@TypeOf(unserved_response.header.rcode), .refused), unserved_response.header.rcode);

@@ -147,16 +147,44 @@ fn replyWithoutAdditionalSection(
     const flags = std.mem.readInt(u16, response_bytes[2..4], .big);
     if ((flags & header.Flags.aa) == 0) return null;
     const core_len = coreLength(response_bytes) orelse return null;
-    const kept = if (final_tsig) |record| record.len else 0;
+    // RFC 6891 section 6.1.1: a response to a request that carried an OPT
+    // record must carry one too, so the OPT stays and only the data records
+    // of the additional section are dropped.
+    const opt = findEdnsOpt(response_bytes);
+    const opt_len: usize = if (opt) |record| ednsOptWireLength(record) else 0;
+    const tsig_len: usize = if (final_tsig) |record| record.len else 0;
+    const kept = opt_len + tsig_len;
     if (core_len + kept > payload_limit) return null;
     if (core_len + kept > output.len) return null;
 
     @memcpy(output[0..core_len], response_bytes[0..core_len]);
-    if (final_tsig) |record| @memcpy(output[core_len..][0..record.len], record);
+    var offset = core_len;
+    if (opt) |record| {
+        var opt_writer = dns_writer.Writer.init(output[offset..]);
+        record.encode(&opt_writer) catch return null;
+        offset += opt_writer.len();
+    }
+    // RFC 8945 section 4.2: the TSIG is the last record of the message.
+    if (final_tsig) |record| {
+        @memcpy(output[offset..][0..record.len], record);
+        offset += record.len;
+    }
     const reply_flags = std.mem.readInt(u16, output[2..4], .big) & ~header.Flags.tc;
     std.mem.writeInt(u16, output[2..4], reply_flags, .big);
-    std.mem.writeInt(u16, output[10..12], if (final_tsig == null) 0 else 1, .big);
-    return output[0 .. core_len + kept];
+    const additional_count: u16 = @intCast((if (opt != null) @as(u16, 1) else 0) +
+        (if (final_tsig != null) @as(u16, 1) else 0));
+    std.mem.writeInt(u16, output[10..12], additional_count, .big);
+    return output[0..offset];
+}
+
+/// The wire length of an OPT record: the root owner name, the type, class,
+/// TTL, and RDLENGTH fields, and the option bytes themselves.
+fn ednsOptWireLength(record: dns_record.ResourceRecord) usize {
+    const rdata_len: usize = switch (record.rdata) {
+        .OPT => |*opt| opt.bytes().len,
+        else => 0,
+    };
+    return 11 + rdata_len;
 }
 
 /// The wire length of the header, the question, and the answer and authority
@@ -2172,6 +2200,37 @@ test "RFC 2181 section 9: an answer whose additional section does not fit is sen
     try std.testing.expectEqualSlices(u8, &.{ 192, 0, 2, 1 }, &parsed.answers.items[0].rdata.A);
     try std.testing.expectEqualSlices(u8, &.{ 192, 0, 2, 2 }, &parsed.authorities.items[0].rdata.A);
     try std.testing.expect(reply.len <= CLASSIC_UDP_MESSAGE_SIZE);
+}
+
+test "RFC 6891 section 6.1.1: a reply without the additional section keeps the OPT record" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var message = try truncationTestMessage(arena.allocator(), true, 1, 1, 40);
+    defer message.deinit();
+    message.edns = .{ .udp_payload_size = 512, .extended_rcode = 0, .version = 0, .dnssec_ok = true };
+    try appendOpt(&message);
+    try setHeaderCounts(&message);
+
+    var encoded: [2048]u8 = undefined;
+    var writer = @import("../dns/writer.zig").Writer.init(&encoded);
+    try message.encode(&writer);
+    try std.testing.expect(writer.len() > CLASSIC_UDP_MESSAGE_SIZE);
+
+    var output: [2048]u8 = undefined;
+    const reply = try truncateClassicUdpResponse(writer.written(), &output);
+    const parsed = try dns_message.Message.parse(arena.allocator(), reply);
+
+    // The data records of the additional section are gone and the TC bit is
+    // clear, but the OPT stays: the request carried one, so the reply must
+    // carry one too.
+    try std.testing.expect(!parsed.header.truncated);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.answer_count);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.authority_count);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.additional_count);
+    try std.testing.expect(parsed.additionals.items[0].rrtype.eql(.OPT));
+    try std.testing.expectEqual(@as(u16, 512), parsed.edns.?.udp_payload_size);
+    try std.testing.expect(parsed.edns.?.dnssec_ok);
 }
 
 test "RFC 2181 section 9: an answer whose answer section does not fit still sets TC" {

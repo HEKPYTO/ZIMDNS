@@ -618,6 +618,33 @@ pub fn parseNsec3Rdata(raw: []const u8) ?Nsec3Rdata {
     };
 }
 
+/// The NSEC3 parameters a chain is built with (RFC 5155 section 7.1): the
+/// hash algorithm, the iteration count, and the salt.
+const Nsec3Params = struct {
+    hash_algorithm: u8,
+    iterations: u16,
+    salt: []const u8,
+};
+
+/// The parameters the zone's apex NSEC3PARAM states (RFC 5155 section 3.2):
+/// hash algorithm, flags, iterations, salt length, and salt. Null when the
+/// record's RDATA is not a well-formed NSEC3PARAM.
+fn zoneNsec3Param(record: zone_parser.ZoneRecord) ?Nsec3Params {
+    const rdata = zone_parser.parseRData(record.rrtype, record.rdataText()) catch return null;
+    const bytes = switch (rdata) {
+        .Unknown => |*unknown| unknown.bytes(),
+        else => return null,
+    };
+    if (bytes.len < 5) return null;
+    const salt_len = bytes[4];
+    if (5 + salt_len > bytes.len) return null;
+    return .{
+        .hash_algorithm = bytes[0],
+        .iterations = std.mem.readInt(u16, bytes[2..4], .big),
+        .salt = bytes[5 .. 5 + salt_len],
+    };
+}
+
 /// The hash an NSEC3 owner name carries (RFC 5155 section 3): the first label
 /// of the owner name is the unpadded base32hex encoding of the 20-octet hash
 /// of the original owner name.
@@ -1279,6 +1306,195 @@ pub fn zoneSignedToAnchor(
         if (try validator.checkRrset(rrset) != .secure) return false;
     }
     return true;
+}
+
+/// RFC 8976 section 4 step 2: what the zone's own DNSSEC records say about the
+/// apex ZONEMD RRset of a zone that publishes no ZONEMD record.
+pub const ZonemdAbsence = enum {
+    /// The zone's own NSEC or NSEC3 records deny the ZONEMD type at the apex,
+    /// so the zone publishes no ZONEMD. RFC 8976 section 4 step 2 says digest
+    /// verification cannot occur, which is an answer and not a failure.
+    proven,
+    /// No configured anchor names the zone, so RFC 8976 section 4 step 1 does
+    /// not expect DNSSEC records and the absence needs no proof.
+    not_expected,
+    /// An anchor names the zone, but no record of the zone denies the ZONEMD
+    /// type at the apex: absent and unknown cannot be told apart, so the
+    /// caller must fail closed.
+    unknown,
+};
+
+/// One zone record a denial proof rests on, with the owner and the type the
+/// signature over it must carry.
+const Denial = struct {
+    owner: Name,
+    rrtype: RecordType,
+    record: dns_record.ResourceRecord,
+};
+
+/// RFC 8976 section 4 step 2: the existence of the apex ZONEMD record must be
+/// validated for a zone where signatures are expected. The zone's own DNSSEC
+/// records carry the proof: the NSEC at the apex, or the NSEC3 whose owner
+/// hash matches the apex, must deny the ZONEMD type. The denial is the one the
+/// validator already applies to a response, so a zone cannot prove an absence
+/// it could not have proved over the wire.
+pub fn zoneZonemdAbsence(
+    allocator: std.mem.Allocator,
+    anchors: *const Anchors,
+    zone: *const zone_index.Zone,
+    now: u32,
+) Error!ZonemdAbsence {
+    const apex = Name.fromText(zone.originText()) catch return Error.MalformedRdata;
+    // RFC 8976 section 4 step 1: an anchor for the zone says DNSSEC records
+    // are expected, an anchor for a zone above it does not.
+    if (!anchors.anchorsZone(apex)) return .not_expected;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+
+    var validator = Validator{ .allocator = scratch, .anchors = anchors, .now = now };
+
+    // RFC 5155 section 7.1: the apex NSEC3PARAM states the hash algorithm,
+    // the flags, the iteration count, and the salt that govern the chain, so
+    // the parameters come from there and not from an arbitrary record of the
+    // chain. A zone that carries a second NSEC3PARAM, as a rollover does,
+    // cannot say which chain it publishes, and a chain that names a hash
+    // algorithm this build does not compute can never be proven; both leave
+    // the absence unproven.
+    var salt: [255]u8 = undefined;
+    var salt_len: usize = 0;
+    var iterations: u16 = 0;
+    var has_chain = false;
+    var declares_params = false;
+    var unproven_chain = false;
+    var param_count: usize = 0;
+    for (zone.records.items[0..zone.records.len]) |record| {
+        if (!record.rrtype.eql(.NSEC3PARAM)) continue;
+        if (!std.ascii.eqlIgnoreCase(record.ownerText(), zone.originText())) continue;
+        param_count += 1;
+        if (param_count > 1) {
+            unproven_chain = true;
+            break;
+        }
+        declares_params = true;
+        const params = zoneNsec3Param(record) orelse {
+            unproven_chain = true;
+            break;
+        };
+        // RFC 5155 section 3.1.1: this build computes SHA-1 only.
+        if (params.hash_algorithm != 1) {
+            unproven_chain = true;
+            break;
+        }
+        salt_len = params.salt.len;
+        @memcpy(salt[0..salt_len], params.salt);
+        iterations = params.iterations;
+        has_chain = true;
+    }
+    if (unproven_chain) return .unknown;
+    if (!declares_params) {
+        // The zone states no parameters of its own, so the chain's own
+        // records are the only source; RFC 5155 section 7.2 requires every
+        // record of a chain to use the same salt and iteration count.
+        for (zone.records.items[0..zone.records.len]) |record| {
+            if (!record.rrtype.eql(.NSEC3)) continue;
+            const rdata = zone_parser.parseRData(record.rrtype, record.rdataText()) catch continue;
+            const bytes = switch (rdata) {
+                .Unknown => |*unknown| unknown.bytes(),
+                else => continue,
+            };
+            const parsed = parseNsec3Rdata(bytes) orelse continue;
+            salt_len = parsed.salt.len;
+            @memcpy(salt[0..salt_len], parsed.salt);
+            iterations = parsed.iterations;
+            has_chain = true;
+            break;
+        }
+    }
+
+    // The hash of the apex, which the NSEC3 that matches it carries as its
+    // owner name.
+    var digest: [20]u8 = undefined;
+    if (has_chain) dnssec.nsec3Hash(apex, salt[0..salt_len], iterations, &digest);
+
+    // The records that can prove the absence: the NSEC at the apex, the NSEC3
+    // that matches the apex, and the apex DNSKEY RRset a DS anchor needs to
+    // reach the zone's own key.
+    var proofs: std.ArrayList(Denial) = .empty;
+    for (zone.records.items[0..zone.records.len]) |record| {
+        if (!record.rrtype.eql(.NSEC) and !record.rrtype.eql(.NSEC3) and !record.rrtype.eql(.DNSKEY)) continue;
+        const owner = Name.fromText(record.ownerText()) catch continue;
+        if (record.rrtype.eql(.NSEC)) {
+            if (!owner.eql(&apex)) continue;
+        } else if (record.rrtype.eql(.NSEC3)) {
+            if (!has_chain) continue;
+            const owner_hash = nsec3OwnerHash(owner) orelse continue;
+            if (!std.mem.eql(u8, &owner_hash, &digest)) continue;
+        } else if (!owner.eql(&apex)) continue;
+        const rdata = zone_parser.parseRData(record.rrtype, record.rdataText()) catch continue;
+        try proofs.append(scratch, .{
+            .owner = owner,
+            .rrtype = record.rrtype,
+            .record = .{
+                .owner = owner,
+                .rrtype = record.rrtype,
+                .class = Class.IN,
+                .ttl = record.ttl,
+                .rdata = rdata,
+            },
+        });
+    }
+
+    // A proof is worthless without the signature that covers it (RFC 4035
+    // section 5.4), so the RRSIG over each proof is collected with it.
+    var signatures: std.ArrayList(dns_record.ResourceRecord) = .empty;
+    for (zone.records.items[0..zone.records.len]) |record| {
+        if (!record.rrtype.eql(.RRSIG)) continue;
+        const owner = Name.fromText(record.ownerText()) catch continue;
+        var wanted = false;
+        for (proofs.items) |proof| {
+            if (proof.owner.eql(&owner)) wanted = true;
+        }
+        if (!wanted) continue;
+        const rdata = zone_parser.parseRData(record.rrtype, record.rdataText()) catch continue;
+        const bytes = switch (rdata) {
+            .Unknown => |*unknown| unknown.bytes(),
+            else => continue,
+        };
+        const covered = dnssec.rrsigCovers(bytes) catch continue;
+        var covers_proof = false;
+        for (proofs.items) |proof| {
+            if (proof.rrtype.code() == covered and proof.owner.eql(&owner)) covers_proof = true;
+        }
+        if (!covers_proof) continue;
+        try signatures.append(scratch, .{
+            .owner = owner,
+            .rrtype = .RRSIG,
+            .class = Class.IN,
+            .ttl = record.ttl,
+            .rdata = rdata,
+        });
+    }
+
+    // The signatures are indexed first: a proof is read only once the
+    // signature that covers it is known.
+    for (signatures.items) |*record| try validator.addSignature(record);
+    for (proofs.items) |*proof| try validator.addRecord(&proof.record);
+
+    // RFC 4035 section 3.1.3 and RFC 5155 section 8.6: the record at the name
+    // must deny the type, and the denial must reach the trust anchor.
+    for (validator.nsecs.items) |*proof| {
+        if (!proof.owner.eql(&apex)) continue;
+        if (try validator.nsecNoData(proof, RecordType.ZONEMD.code()) == .secure) return .proven;
+    }
+    if (has_chain) {
+        for (validator.nsec3s.items) |*proof| {
+            if (!std.mem.eql(u8, &proof.owner_hash, &digest)) continue;
+            if (try validator.nsec3NoData(proof, RecordType.ZONEMD.code()) == .secure) return .proven;
+        }
+    }
+    return .unknown;
 }
 
 /// The apex records the chain check reads, in the wire form the validator
@@ -2220,4 +2436,142 @@ test "RFC 8976 section 4 step 3: a zone file carrying the publisher's own signat
     defer anchors.deinit(allocator);
 
     try std.testing.expect(try zoneSignedToAnchor(allocator, &anchors, &zone, &zonemd_chain_types, now_seconds));
+}
+
+/// A zone that publishes no ZONEMD record, so the absence of the RRset is
+/// what RFC 8976 section 4 step 2 has to resolve.
+const zonemd_absent_zone_text =
+    \\$ORIGIN example.com.
+    \\$TTL 3600
+    \\@ IN SOA ns1.example.com. hostmaster.example.com. 1 3600 900 1209600 3600
+    \\@ IN NS ns1.example.com.
+    \\ns1 IN A 192.0.2.1
+;
+
+/// The same zone with an apex NSEC3PARAM, which is the opt-in that makes the
+/// signer publish an NSEC3 chain instead of an NSEC chain (RFC 5155
+/// section 4).
+const nsec3_zonemd_absent_zone_text =
+    \\$ORIGIN example.com.
+    \\$TTL 3600
+    \\@ IN SOA ns1.example.com. hostmaster.example.com. 1 3600 900 1209600 3600
+    \\@ IN NS ns1.example.com.
+    \\@ IN NSEC3PARAM 1 0 2 73616c74
+    \\ns1 IN A 192.0.2.1
+;
+
+test "RFC 8976 section 4 step 2: the zone's own NSEC proves the apex ZONEMD RRset does not exist" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var signed = try signZoneText(allocator, zonemd_absent_zone_text, ed25519_secret);
+    defer signed.deinit(allocator);
+
+    var anchors = try Anchors.parse(allocator, try dnskeyAnchorText(allocator, "example.com.", signed.dnskey));
+    defer anchors.deinit(allocator);
+
+    // The NSEC the signer writes at the apex denies the ZONEMD type, so the
+    // absence is proven and the zone publishes no ZONEMD.
+    try std.testing.expectEqual(
+        ZonemdAbsence.proven,
+        try zoneZonemdAbsence(allocator, &anchors, &signed.zone, now_seconds),
+    );
+}
+
+test "RFC 8976 section 4 step 2: the zone's own NSEC3 proves the apex ZONEMD RRset does not exist" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var signed = try signZoneText(allocator, nsec3_zonemd_absent_zone_text, ed25519_secret);
+    defer signed.deinit(allocator);
+
+    var anchors = try Anchors.parse(allocator, try dnskeyAnchorText(allocator, "example.com.", signed.dnskey));
+    defer anchors.deinit(allocator);
+
+    // The NSEC3 whose owner hash matches the apex denies the ZONEMD type, so
+    // the absence is proven the same way the NSEC chain proves it.
+    try std.testing.expectEqual(
+        ZonemdAbsence.proven,
+        try zoneZonemdAbsence(allocator, &anchors, &signed.zone, now_seconds),
+    );
+}
+
+/// The same zone with a second apex NSEC3PARAM, as a rollover carries, so
+/// the zone states two sets of parameters and cannot say which chain it
+/// publishes.
+const nsec3_rollover_zone_text =
+    \\$ORIGIN example.com.
+    \\$TTL 3600
+    \\@ IN SOA ns1.example.com. hostmaster.example.com. 1 3600 900 1209600 3600
+    \\@ IN NS ns1.example.com.
+    \\@ IN NSEC3PARAM 1 0 2 73616c74
+    \\@ IN NSEC3PARAM 1 0 12 aabbccdd
+    \\ns1 IN A 192.0.2.1
+;
+
+test "RFC 5155 section 7.1: a zone with a second apex NSEC3PARAM leaves the absence unproven" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var signed = try signZoneText(allocator, nsec3_rollover_zone_text, ed25519_secret);
+    defer signed.deinit(allocator);
+
+    var anchors = try Anchors.parse(allocator, try dnskeyAnchorText(allocator, "example.com.", signed.dnskey));
+    defer anchors.deinit(allocator);
+
+    // Two apex NSEC3PARAM records leave the chain unproven, so the absence
+    // of the ZONEMD RRset cannot be shown and the caller fails closed.
+    try std.testing.expectEqual(
+        ZonemdAbsence.unknown,
+        try zoneZonemdAbsence(allocator, &anchors, &signed.zone, now_seconds),
+    );
+}
+
+test "RFC 8976 section 4 step 2: a zone that holds no proof leaves the absence unknown" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var signed = try signZoneText(allocator, zonemd_absent_zone_text, ed25519_secret);
+    defer signed.deinit(allocator);
+
+    var anchors = try Anchors.parse(allocator, try dnskeyAnchorText(allocator, "example.com.", signed.dnskey));
+    defer anchors.deinit(allocator);
+
+    // The same zone without the records the signer adds: the anchor names the
+    // zone, so DNSSEC records are expected, but nothing proves the absence.
+    var zone_file = try zone_parser.ZoneFile.parse(zonemd_absent_zone_text);
+    defer zone_file.deinit();
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    try std.testing.expectEqual(
+        ZonemdAbsence.unknown,
+        try zoneZonemdAbsence(allocator, &anchors, &zone, now_seconds),
+    );
+}
+
+test "RFC 8976 section 4 step 2: a zone no anchor names needs no proof of the absence" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var signed = try signZoneText(allocator, zonemd_absent_zone_text, ed25519_secret);
+    defer signed.deinit(allocator);
+
+    // An anchor for a zone above says nothing about this one, so RFC 8976
+    // section 4 step 1 does not expect DNSSEC records here.
+    var anchors = try Anchors.parse(allocator,
+        \\. DNSKEY 257 3 15 zPnZ/QwEe7S8C5SPz2OfS5RR40ATk2/rYnE9xHIEijs=
+        \\
+    );
+    defer anchors.deinit(allocator);
+
+    try std.testing.expectEqual(
+        ZonemdAbsence.not_expected,
+        try zoneZonemdAbsence(allocator, &anchors, &signed.zone, now_seconds),
+    );
 }

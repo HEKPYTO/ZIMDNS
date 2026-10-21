@@ -27,6 +27,7 @@ pub const Error = error{
     BadSecret,
     BadZoneRecord,
     AlreadySigned,
+    KeyUsedForAnotherZone,
     SigningFailed,
     OutOfMemory,
 };
@@ -66,9 +67,11 @@ const DigestType = enum(u8) {
     }
 };
 
-/// RFC 4034 section 2.1.1: bit 7 marks a zone-signing key and bit 8 marks a
-/// key a parent publishes as a trust anchor. One key does both here, which is
-/// why every example key file uses 257.
+/// RFC 4034 section 2.1.1: bit 7 (0x0100) marks a zone-signing key and bit 15
+/// (0x0001) marks a key a parent publishes as a trust anchor. One key does both
+/// here, which is why every example key file uses 257, the value RFC 8080
+/// section 6.1 publishes; RFC 6781 section 3.2.3 asks a single-type signing
+/// scheme to set the Secure Entry Point bit on every key, which is this one.
 const dnskey_flags: u16 = 257;
 /// RFC 4034 section 2.1.2 fixes protocol at 3; other values MUST NOT be used.
 const dnskey_protocol: u8 = 3;
@@ -86,6 +89,10 @@ const Material = union(Algorithm) {
 
 pub const Key = struct {
     material: Material,
+    /// The zone this key has signed, if any. RFC 8080 section 8: a private key
+    /// used for a DNSSEC zone must not be used for any other purpose than for
+    /// that zone, so one key signs one zone.
+    signed_zone: ?Name = null,
 
     pub fn algorithm(self: *const Key) Algorithm {
         return self.material;
@@ -309,6 +316,10 @@ pub const Session = struct {
 /// unchanged and a serial that moved on every restart would only churn
 /// secondaries for no content change.
 ///
+/// A key signs one zone only: RFC 8080 section 8 forbids a private key that
+/// signs a DNSSEC zone from being used for any other purpose, so a key that
+/// has already signed a zone is refused for a second one.
+///
 /// Only the records handed to the zone outlive the call, and the zone owns
 /// them. Everything else -- canonical RDATA, sorted RRsets, preimages -- is
 /// built in an arena released here, so a caller that is not itself an arena
@@ -316,11 +327,21 @@ pub const Session = struct {
 pub fn signZone(
     allocator: std.mem.Allocator,
     zone: *zone_index.Zone,
-    key: *const Key,
+    key: *Key,
     options: Options,
 ) Error!void {
     if (zone.soa == null) return Error.BadZoneRecord;
     if (alreadySigned(zone)) return Error.AlreadySigned;
+
+    const origin = Name.fromText(zone.originText()) catch return Error.BadZoneRecord;
+    // RFC 8080 section 8: a private key used for a DNSSEC zone must not be
+    // used for any other purpose than for that zone, so a key that has signed
+    // one zone is refused for a second one.
+    if (key.signed_zone) |signed| {
+        if (!std.mem.eql(u8, signed.asWire(), origin.asWire())) return Error.KeyUsedForAnotherZone;
+    } else {
+        key.signed_zone = origin;
+    }
 
     var scratch = std.heap.ArenaAllocator.init(allocator);
     defer scratch.deinit();
@@ -330,7 +351,6 @@ pub fn signZone(
     try collectEntries(work, zone, &entries);
 
     const soa_ttl = try soaMinimum(zone);
-    const origin = Name.fromText(zone.originText()) catch return Error.BadZoneRecord;
     const origin_wire = try work.dupe(u8, origin.asWire());
 
     var authoritative: std.ArrayList(Entry) = .empty;
@@ -1160,6 +1180,84 @@ test "RFC 8080 section 6.1: the signed Ed25519 zone matches the published vector
         std.debug.print("produced {x}\n", .{rrsig});
         return error.TestExpectedEqual;
     }
+}
+
+test "RFC 4034 section 2.1.1: the DNSKEY the signer emits carries the Zone Key flag" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var key = try parseKey(rfc8080_ed25519_key);
+    defer key.deinit();
+
+    var zone = try loadZone(rfc8080_zone);
+    defer zone.deinit();
+    try signZone(allocator, &zone, &key, rfc8080_window);
+
+    const dnskey = (try findOpaque(&zone, "example.com.", .DNSKEY, null)).?;
+    const flags = std.mem.readInt(u16, dnskey[0..2], .big);
+    // The Zone Key bit (0x0100) marks a key that signs a zone; the Secure
+    // Entry Point bit (0x0001) is the hint RFC 6781 section 3.2.3 asks a
+    // single-type signing scheme to set on every key. RFC 8080 section 6.1
+    // publishes exactly this pair.
+    try std.testing.expect(flags & 0x0100 != 0);
+    try std.testing.expectEqual(@as(u16, 257), flags);
+    try std.testing.expectEqual(@as(u8, 3), dnskey[2]);
+    try std.testing.expectEqual(@as(u8, 15), dnskey[3]);
+}
+
+const second_zone =
+    \\$ORIGIN other.example.
+    \\$TTL 3600
+    \\@ IN SOA ns1.other.example. hostmaster.other.example. 1 3600 900 1209600 3600
+    \\@ IN NS ns1.other.example.
+    \\ns1 IN A 192.0.2.3
+;
+
+test "RFC 8080 section 8: a key that has signed one zone is refused for a second one" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var key = try parseKey(rfc8080_ed25519_key);
+    defer key.deinit();
+
+    var first = try loadZone(rfc8080_zone);
+    defer first.deinit();
+    try signZone(allocator, &first, &key, rfc8080_window);
+
+    var second = try loadZone(second_zone);
+    defer second.deinit();
+    try std.testing.expectError(Error.KeyUsedForAnotherZone, signZone(allocator, &second, &key, rfc8080_window));
+    // The refused zone carries no DNSKEY, DS, or RRSIG: the refusal comes
+    // before the zone is touched.
+    try std.testing.expect(!hasRecord(&second, "other.example.", .DNSKEY));
+    try std.testing.expect(!hasRecord(&second, "other.example.", .DS));
+}
+
+test "RFC 8080 section 8: one key signs one zone, and that zone is signed as before" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var key = try parseKey(rfc8080_ed25519_key);
+    defer key.deinit();
+
+    var zone = try loadZone(rfc8080_zone);
+    defer zone.deinit();
+    try signZone(allocator, &zone, &key, rfc8080_window);
+
+    // The DNSKEY, the DS, and the RRSIGs are the ones this zone always got.
+    const dnskey = (try findOpaque(&zone, "example.com.", .DNSKEY, null)).?;
+    try std.testing.expectEqualStrings(rfc8080_ed25519_dnskey, try encodeBase64(allocator, dnskey[4..]));
+    try std.testing.expectEqual(rfc8080_ed25519_key_tag, dns_dnssec.keyTag(dnskey));
+    const ds = (try findOpaque(&zone, "example.com.", .DS, null)).?;
+    try std.testing.expect(hexEquals(rfc8080_ed25519_ds, ds[4..]));
+    const rrsig = (try findOpaque(&zone, "example.com.", .RRSIG, RecordType.MX.code())).?;
+    try std.testing.expect(hexEquals(rfc8080_mx_rrsig_hex, rrsig));
+
+    // The same zone signed again is the old refusal, not the new one.
+    try std.testing.expectError(Error.AlreadySigned, signZone(allocator, &zone, &key, rfc8080_window));
 }
 
 test "RFC 6605 section 6.1: the P-256 DNSKEY, key tag, and DS digest match the published vector" {

@@ -36,6 +36,9 @@ pub const Error = error{
     ZonemdMismatch,
     /// The apex ZONEMD record is signed, but not to a configured trust anchor.
     ZonemdSignatureInvalid,
+    /// The zone publishes no ZONEMD record, and none of its own DNSSEC
+    /// records proves that the RRset does not exist.
+    ZonemdAbsenceUnproven,
     BadDnssecKey,
     BadTrustAnchorFile,
 };
@@ -150,6 +153,27 @@ pub const ServerContext = struct {
                     const message = std.fmt.bufPrint(&report, "zone {s}: the SOA and ZONEMD RRsets do not carry valid signatures chaining to a configured trust anchor", .{zone.originText()}) catch "zone: the SOA and ZONEMD RRsets are not signed to a configured trust anchor";
                     printStartupError(io, message);
                     return Error.ZonemdSignatureInvalid;
+                }
+            } else {
+                // RFC 8976 section 4 step 2: for a zone where signatures are
+                // expected, the existence of the apex ZONEMD record must be
+                // validated. A zone that publishes no ZONEMD is a different
+                // answer from a zone whose ZONEMD does not match, and the zone
+                // tells the two apart with its own denial records: the absence
+                // is proven only when an NSEC or NSEC3 record of the zone
+                // denies the RRset. An unproven absence leaves absent and
+                // unknown indistinguishable, so the server refuses to start.
+                const absence = validate_mod.zoneZonemdAbsence(
+                    allocator,
+                    &context.anchors,
+                    &zone,
+                    now_seconds,
+                ) catch .unknown;
+                if (absence == .unknown) {
+                    var report: [256]u8 = undefined;
+                    const message = std.fmt.bufPrint(&report, "zone {s}: no apex ZONEMD record, and no NSEC or NSEC3 record of the zone proves that it does not exist", .{zone.originText()}) catch "zone: the absence of the apex ZONEMD record is not proven";
+                    printStartupError(io, message);
+                    return Error.ZonemdAbsenceUnproven;
                 }
             }
             // RFC 8976 section 4: refuse to serve a zone whose apex ZONEMD
@@ -736,6 +760,17 @@ const zonemd_verified_zone_text =
     \\
 ;
 
+/// The same zone without the ZONEMD record, so the absence of the RRset is
+/// what RFC 8976 section 4 step 2 has to resolve.
+const zonemd_absent_zone_text =
+    \\$ORIGIN example.
+    \\$TTL 86400
+    \\@ IN SOA ns1 admin 2018031900 1800 900 604800 86400
+    \\@ IN NS ns1
+    \\ns1 3600 IN A 203.0.113.63
+    \\
+;
+
 /// The same zone with every digest digit changed to zero, so the zone loads
 /// but no longer matches its ZONEMD record.
 const zonemd_zone_text =
@@ -847,6 +882,64 @@ test "server context checks the ZONEMD digest only when no trust anchor covers t
     var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
     defer context.deinit();
     try std.testing.expectEqual(@as(usize, 1), context.zones.items.len);
+}
+
+test "server context loads a signed zone that publishes no ZONEMD" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    // RFC 8976 section 4 step 2: the zone publishes no ZONEMD record, and the
+    // NSEC the signer writes at the apex denies the type, so the absence is
+    // proven. That is an answer, not a failed verification, so the zone
+    // loads.
+    try dir.dir.writeFile(io, .{ .sub_path = "example.zone", .data = zonemd_absent_zone_text });
+    try dir.dir.writeFile(io, .{ .sub_path = "zsk.key", .data = dnssec_test_key });
+    try dir.dir.writeFile(io, .{ .sub_path = "anchors.txt", .data = dnssec_test_anchor });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone example. primary example.zone\ndnssec-key-file zsk.key\ntrust-anchor-file anchors.txt\n" });
+
+    var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 1), context.zones.items.len);
+}
+
+test "server context refuses to start when the absence of the apex ZONEMD is not proven" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    // The same zone, but signed by nobody: the anchor names the zone, so
+    // RFC 8976 section 4 step 1 expects DNSSEC records, and with no NSEC or
+    // NSEC3 record the absence of the ZONEMD cannot be told from the unknown,
+    // so the server refuses to start.
+    try dir.dir.writeFile(io, .{ .sub_path = "example.zone", .data = zonemd_absent_zone_text });
+    try dir.dir.writeFile(io, .{ .sub_path = "anchors.txt", .data = dnssec_test_anchor });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone example. primary example.zone\ntrust-anchor-file anchors.txt\n" });
+
+    try std.testing.expectError(
+        Error.ZonemdAbsenceUnproven,
+        ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator),
+    );
+}
+
+test "server context still refuses a ZONEMD that does not match" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    // The zone publishes a ZONEMD record whose digest is wrong. The record is
+    // signed to the anchor, so the chain holds and the digest decides, and a
+    // zone that publishes a ZONEMD that does not match is a failed
+    // verification rather than a zone that publishes none.
+    try dir.dir.writeFile(io, .{ .sub_path = "example.zone", .data = zonemd_zone_text });
+    try dir.dir.writeFile(io, .{ .sub_path = "zsk.key", .data = dnssec_test_key });
+    try dir.dir.writeFile(io, .{ .sub_path = "anchors.txt", .data = dnssec_test_anchor });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone example. primary example.zone\ndnssec-key-file zsk.key\ntrust-anchor-file anchors.txt\n" });
+
+    try std.testing.expectError(
+        Error.ZonemdMismatch,
+        ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator),
+    );
 }
 
 test "server context carries the NAT64 prefix into the forwarding policy" {

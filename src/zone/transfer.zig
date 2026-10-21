@@ -370,12 +370,18 @@ pub fn buildIxfrIncrementalMessages(
 }
 
 /// Extracts the sender's serial from a NOTIFY request: the SOA the master
-/// hints at in its answer section (RFC 1996 section 3.7). Returns null when
-/// the request carries no SOA.
+/// hints at in its answer section (RFC 1996 section 3.7). The hint is for
+/// the question's own name, so an SOA owned by another name is no hint.
+/// Returns null when the request carries no such SOA.
 pub fn notifySerialFromMessage(message: *const dns_message.Message) ?u32 {
+    const question = message.question orelse return null;
     for (message.answers.slice()) |record| {
         if (!record.rrtype.eql(dns_types.RecordType.SOA)) continue;
         if (record.rdata != .SOA) continue;
+        // RFC 1996 section 3.7: the answer section is "an unsecure hint at
+        // the new RRset for this <QNAME,QCLASS,QTYPE>", so the hint SOA is
+        // the one owned by the question name.
+        if (!record.owner.eql(&question.name)) continue;
         return record.rdata.SOA.serial;
     }
     return null;
@@ -385,11 +391,13 @@ pub fn notifySerialFromMessage(message: *const dns_message.Message) ?u32 {
 /// echoed question, and the zone's own SOA in the answer section. The RCODE
 /// follows the RFC 1982 serial comparison of the NOTIFY's serial against the
 /// zone's own: a newer serial is answered NOERROR, any other serial NOTAUTH.
+/// A NOTIFY with no hint carries no serial to compare, and RFC 1996 section
+/// 4.7 answers it NOERROR.
 pub fn buildNotifyResponse(
     allocator: std.mem.Allocator,
     request: *const dns_message.Message,
     zone: *const zone_index.Zone,
-    notify_serial: u32,
+    notify_serial: ?u32,
 ) Error!dns_message.Message {
     if (!isNotifyMessage(request)) return Error.BadTransferQuery;
     const question = request.question orelse return Error.BadTransferQuery;
@@ -397,7 +405,10 @@ pub fn buildNotifyResponse(
     const zone_serial = zone.soaSerial() orelse return Error.MissingSoa;
     // RFC 1982 ordering: only a serial newer than the zone's own counts as
     // an update, and the undefined half-range does not.
-    const newer = journal_mod.compareSerial(notify_serial, zone_serial) == .newer;
+    const newer = if (notify_serial) |serial|
+        journal_mod.compareSerial(serial, zone_serial) == .newer
+    else
+        true;
     var message = dns_message.Message{
         .allocator = allocator,
         .header = .{
@@ -824,6 +835,34 @@ test "transfer answers a NOTIFY whose serial wrapped past 2^32 NOERROR" {
     defer response.deinit();
     try std.testing.expectEqual(header_mod.Rcode.no_error, response.header.rcode);
     try std.testing.expectEqual(@as(u32, 0xffff_ffff), response.answers.items[0].rdata.SOA.serial);
+}
+
+test "RFC 1996 section 4.7: a NOTIFY with no hint is answered NOERROR" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var zone = try loadTransferTestZone();
+    defer zone.deinit();
+    var request = try buildNotifyRequest(arena.allocator(), 11);
+    request.answers.len = 0;
+    request.header.answer_count = 0;
+
+    // RFC 1996 section 3.7: an empty answer section is a legal NOTIFY, so
+    // there is no serial to compare and the request is answered.
+    try std.testing.expectEqual(@as(?u32, null), notifySerialFromMessage(&request));
+    var response = try buildNotifyResponse(arena.allocator(), &request, &zone, null);
+    defer response.deinit();
+    try std.testing.expectEqual(header_mod.Rcode.no_error, response.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), response.header.question_count);
+}
+
+test "RFC 1996 section 3.7: the hint SOA is the one owned by the question name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var request = try buildNotifyRequest(arena.allocator(), 11);
+    // The answer section is "an unsecure hint at the new RRset for this
+    // <QNAME,QCLASS,QTYPE>", so an SOA owned by another name is no hint.
+    request.answers.items[0].owner = try dns_name.Name.fromText("other.example.");
+    try std.testing.expectEqual(@as(?u32, null), notifySerialFromMessage(&request));
 }
 
 test "transfer chains one TSIG per message through the chainedMac primitive" {
