@@ -443,7 +443,7 @@ pub fn buildResponseWithPolicy(
     if (dnssec_ok) {
         // The minimal ANY answer signs its own RRsets, so the covering
         // signatures are attached with it.
-        if (!any_answer) appendCoveringRrsigs(&response, zone, q.qtype, lookup.answer_owner) catch {};
+        if (!any_answer) appendCoveringRrsigs(&response, zone, .ANY, lookup.answer_owner) catch {};
         if (lookup.kind == .nodata or lookup.kind == .nxdomain) {
             const proved = appendDenialProofs(&response, zone, qname_text, q.qtype, lookup.kind) catch false;
             if (!proved) refuseUnprovenDenial(&response);
@@ -510,8 +510,10 @@ fn buildMinimalAnyAnswer(
         const before = response.answers.len;
         try appendOwnerRecords(response, zone, owner_text, rrtype);
         // RFC 8482 section 4.1: the zone's own signature over the RRset
-        // rides along with the answer.
-        if (dnssec_ok) appendCoveringRrsigs(response, zone, .ANY, answer_owner) catch {};
+        // rides along with the answer. Only the signature over the RRset that
+        // just joined: the synthesized HINFO carries its own signature, and
+        // the zone's signature over its own HINFO does not cover it.
+        if (dnssec_ok) appendCoveringRrsigs(response, zone, rrtype, answer_owner) catch {};
         if (!anyAnswerFits(response, limit)) {
             // The RRset and its signature do not fit the payload the client
             // advertised, and the answer carries no TC bit (section 7), so
@@ -584,10 +586,10 @@ fn anyMinimalAnswer(owner: dns_name.Name, ttl: u32) dns_record.ResourceRecord {
 }
 
 /// RFC 8482 section 4.3 names the types a best-guess answer keeps, in the
-/// order the RFC lists them, and every other type is suppressed. The CNAME
-/// never reaches the subset: an owner that carries one is answered with that
-/// RRset alone (section 4.1).
-const any_subset_types = [_]dns_types.RecordType{ .CNAME, .MX, .A, .AAAA };
+/// order the RFC lists them, and every other type is suppressed. The CNAME is
+/// not one of them: an owner that carries one is answered with that RRset
+/// alone (section 4.1), so the ANY path never reaches the subset with one.
+const any_subset_types = [_]dns_types.RecordType{ .MX, .A, .AAAA };
 
 /// The RRsets at the owner that RFC 8482 section 4.3 names.
 const AnySubset = struct {
@@ -683,8 +685,9 @@ fn appendMinimalAnyRrsig(
 const max_covering_rrsigs: usize = 8;
 
 /// Append zone RRSIGs whose owner matches an answer record and whose
-/// type-covered field equals that record's type. Malformed candidates are
-/// skipped so one bad RRSIG cannot fail the whole response.
+/// type-covered field equals that record's type. `covered` names the type
+/// whose signature may be attached; `.ANY` allows any type. Malformed
+/// candidates are skipped so one bad RRSIG cannot fail the whole response.
 /// An RRSIG at `rrsig_owner` covers an answer owned by `answer_owner` when
 /// the owners match, or when the RRSIG sits at a wildcard (`*.example.`)
 /// whose parent suffix-matches the answer owner.
@@ -706,8 +709,7 @@ fn wildcardOwnerIsAnswer(owner: []const u8, answers: []const dns_record.Resource
     return false;
 }
 
-fn appendCoveringRrsigs(response: *dns_message.Message, zone: *const zone_index.Zone, qtype: dns_types.RecordType, answer_owner: ?[]const u8) !void {
-    _ = qtype;
+fn appendCoveringRrsigs(response: *dns_message.Message, zone: *const zone_index.Zone, covered: dns_types.RecordType, answer_owner: ?[]const u8) !void {
     // Snapshot the pre-proof length: appended RRSIGs must not be rescanned,
     // and section storage may move on append.
     const original_len = response.answers.len;
@@ -732,6 +734,9 @@ fn appendCoveringRrsigs(response: *dns_message.Message, zone: *const zone_index.
             else => continue,
         };
         const covers = @import("../dns/dnssec.zig").rrsigCovers(raw) catch continue;
+        // RFC 4035 section 5.3.1: an RRSIG authenticates the RRset of its
+        // type covered, so a signature over another type never rides along.
+        if (!covered.eql(.ANY) and covers != covered.code()) continue;
         var answer_index: usize = 0;
         var covers_answer = false;
         var covered_owner: dns_name.Name = undefined;
@@ -824,15 +829,20 @@ fn appendDenialProofs(
 
 /// The apex NSEC3PARAM of the zone: the parameters every record of the chain
 /// shares (RFC 5155 section 7.3), so a validator can check the hash a proof
-/// was built with.
+/// was built with. It rides with the RRSIG that covers it: an RRset of a zone
+/// the operator anchored that carries no signature is bogus, not unsigned
+/// (RFC 4035 section 5.5), so a zone that does not sign its NSEC3PARAM has
+/// none served.
 fn appendApexNsec3Param(response: *dns_message.Message, zone: *const zone_index.Zone) !void {
     var index: usize = 0;
     while (index < zone.records.len) : (index += 1) {
         const candidate = zone.records.items[index];
         if (!candidate.rrtype.eql(.NSEC3PARAM)) continue;
         if (!std.ascii.eqlIgnoreCase(candidate.ownerText(), zone.originText())) continue;
+        const signature = rrsigOver(zone, candidate.ownerText(), dns_types.RecordType.NSEC3PARAM.code()) orelse return;
         const rr = toResourceRecord(candidate, null) catch continue;
         try response.authorities.append(rr);
+        try response.authorities.append(signature);
         return;
     }
 }
@@ -948,17 +958,23 @@ fn nsec3Cover(chain: *const Nsec3Chain, target: [20]u8) ?usize {
     return null;
 }
 
+/// The type bitmap of a chain entry (RFC 5155 section 3).
+fn nsec3Bitmap(chain: *const Nsec3Chain, index: usize) ?[]const u8 {
+    const entries = chain.entries orelse return null;
+    const raw = zone_parser.parseRData(entries[index].record.rrtype, entries[index].record.rdataText()) catch return null;
+    const bytes = switch (raw) {
+        .Unknown => |*unknown| unknown.bytes(),
+        else => return null,
+    };
+    const rdata = dns_validate.parseNsec3Rdata(bytes) orelse return null;
+    return rdata.bitmap;
+}
+
 /// True when the NSEC3 record's bitmap leaves the QTYPE and CNAME bits clear
 /// (RFC 5155 section 7.2.3, section 8.5).
 fn nsec3DeniesType(chain: *const Nsec3Chain, index: usize, qtype: u16) bool {
-    const entries = chain.entries orelse return false;
-    const raw = zone_parser.parseRData(entries[index].record.rrtype, entries[index].record.rdataText()) catch return false;
-    const bytes = switch (raw) {
-        .Unknown => |*unknown| unknown.bytes(),
-        else => return false,
-    };
-    const rdata = dns_validate.parseNsec3Rdata(bytes) orelse return false;
-    return dns_dnssec.bitmapDeniesTypeAndCname(rdata.bitmap, qtype) catch false;
+    const bitmap = nsec3Bitmap(chain, index) orelse return false;
+    return dns_dnssec.bitmapDeniesTypeAndCname(bitmap, qtype) catch false;
 }
 
 /// The closest encloser the chain proves (RFC 5155 section 7.2.1): the
@@ -1111,7 +1127,7 @@ fn appendNsec3(
 ) !bool {
     const entries = chain.entries orelse return false;
     const record = entries[index].record;
-    const signature = nsec3Signature(zone, record.ownerText()) orelse return false;
+    const signature = rrsigOver(zone, record.ownerText(), dns_types.RecordType.NSEC3.code()) orelse return false;
     const rr = try toResourceRecord(record, null);
     try response.authorities.append(rr);
     try response.authorities.append(signature);
@@ -1119,10 +1135,11 @@ fn appendNsec3(
 }
 
 /// RFC 5155 section 7.2.7: a referral to an unsigned subzone carries the
-/// proof that the delegation may be unsigned. Under an Opt-Out chain the
-/// delegation has no NSEC3 of its own, so the proof is the closest provable
-/// encloser proof of the delegation name, whose NSEC3 that covers the next
-/// closer name carries the Opt-Out flag. A chain that cannot prove that
+/// proof that the delegation may be unsigned. A chain that holds the
+/// delegation's own NSEC3 proves it with that record. Under an Opt-Out chain
+/// the delegation has no NSEC3 of its own, so the proof is the closest
+/// provable encloser proof of the delegation name, whose NSEC3 that covers the
+/// next closer name carries the Opt-Out flag. A chain that cannot prove that
 /// leaves the referral the way it was.
 fn appendReferralProofs(
     response: *dns_message.Message,
@@ -1136,6 +1153,31 @@ fn appendReferralProofs(
     if (!chain.consistent) return;
     const name = dns_name.Name.fromText(delegation) catch return;
     const origin = dns_name.Name.fromText(zone.originText()) catch return;
+
+    // RFC 5155 section 7.2.7: a chain that holds the delegation's own NSEC3
+    // proves the delegation unsigned with that record.
+    if (nsec3Match(&chain, nsec3HashOf(&chain, name))) |index| {
+        const bitmap = nsec3Bitmap(&chain, index) orelse return;
+        // RFC 5155 section 8.9: the record that proves an unsigned delegation
+        // has the NS bit set and the DS bit clear. A record with the DS bit
+        // set proves a secure delegation, whose NSEC3 is not served, and a
+        // record with the NS bit clear proves nothing at all, so the Opt-Out
+        // path below looks for the proof that does.
+        if (dns_dnssec.nsecBitmapHasType(bitmap, dns_types.RecordType.DS.code())) return;
+        if (dns_dnssec.nsecBitmapHasType(bitmap, dns_types.RecordType.NS.code())) {
+            const before = response.authorities.len;
+            if (!try appendNsec3(response, zone, &chain, index)) {
+                response.authorities.len = before;
+                return;
+            }
+            // RFC 5155 section 7.3: the apex NSEC3PARAM states the parameters
+            // of the chain, so a validator can check the hash the proof was
+            // built with.
+            try appendApexNsec3Param(response, zone);
+            return;
+        }
+    }
+
     const encloser = nsec3ClosestEncloser(&chain, name, origin) orelse return;
     // RFC 5155 section 7.2.7: the NSEC3 that covers the next closer name
     // for the delegation must carry the Opt-Out flag.
@@ -1161,8 +1203,9 @@ fn delegationOwner(authorities: []const zone_parser.ZoneRecord) ?[]const u8 {
     return null;
 }
 
-/// The RRSIG that covers an NSEC3 RRset (RFC 4035 section 5.4).
-fn nsec3Signature(zone: *const zone_index.Zone, owner_text: []const u8) ?dns_record.ResourceRecord {
+/// The RRSIG that covers the RRset of type `covered` at `owner_text`
+/// (RFC 4034 section 3.1.8.1, RFC 4035 section 5.4).
+fn rrsigOver(zone: *const zone_index.Zone, owner_text: []const u8, covered: u16) ?dns_record.ResourceRecord {
     var index: usize = 0;
     while (index < zone.records.len) : (index += 1) {
         const candidate = zone.records.items[index];
@@ -1173,8 +1216,8 @@ fn nsec3Signature(zone: *const zone_index.Zone, owner_text: []const u8) ?dns_rec
             .Unknown => |*unknown| unknown.bytes(),
             else => continue,
         };
-        const covered = dns_dnssec.rrsigCovers(raw) catch continue;
-        if (covered != dns_types.RecordType.NSEC3.code()) continue;
+        const covers = dns_dnssec.rrsigCovers(raw) catch continue;
+        if (covers != covered) continue;
         return rr;
     }
     return null;
@@ -1797,6 +1840,21 @@ const dnssec_test_zone =
     \\
 ;
 
+/// A zone with an NSEC chain (RFC 4034) and a delegation: the zone publishes
+/// no NSEC3 chain, so a referral to the delegation has no NSEC3 to carry.
+const nsec_delegation_test_zone =
+    \\$ORIGIN example.
+    \\$TTL 3600
+    \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+    \\@ IN NS ns.example.
+    \\@ IN DNSKEY 257 3 8 QUJDRA==
+    \\@ IN NSEC example. SOA NS DNSKEY RRSIG NSEC
+    \\child IN NS ns.child.example.
+    \\child IN NSEC example. NS RRSIG NSEC
+    \\ns.child.example. IN A 192.0.2.10
+    \\
+;
+
 fn testDoQuery(allocator: std.mem.Allocator, id: u16, name_text: []const u8, qtype: dns_types.RecordType, dnssec_ok: bool) !dns_message.Message {
     var message = try testQuery(allocator, name_text, qtype);
     message.header.id = id;
@@ -1984,6 +2042,7 @@ const nsec3_test_zone =
     \\@ IN NS ns.example.
     \\@ IN DNSKEY 257 3 8 QUJDRA==
     \\@ IN NSEC3PARAM 1 0 2 73616c74
+    \\@ IN RRSIG NSEC3PARAM 8 1 3600 2000000000 1000000000 1234 example. QUJD
     \\www IN A 192.0.2.1
     \\65fkkv52vjbvs8mj22eis3lq4enpnpcf IN NSEC3 1 0 2 73616c74 ermpp7q2mj4h4amfotejjmbehlb6k56g A RRSIG
     \\ermpp7q2mj4h4amfotejjmbehlb6k56g IN NSEC3 1 0 2 73616c74 65fkkv52vjbvs8mj22eis3lq4enpnpcf SOA NS DNSKEY RRSIG
@@ -2000,6 +2059,7 @@ const nsec3_incomplete_test_zone =
     \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
     \\@ IN NS ns.example.
     \\@ IN NSEC3PARAM 1 0 2 73616c74
+    \\@ IN RRSIG NSEC3PARAM 8 1 3600 2000000000 1000000000 1234 example. QUJD
     \\www IN A 192.0.2.1
     \\ermpp7q2mj4h4amfotejjmbehlb6k56g IN NSEC3 1 0 2 73616c74 ermpp7q2mj4h4amfotejjmbehlb6k56g SOA NS DNSKEY RRSIG
     \\
@@ -2014,6 +2074,7 @@ const nsec3_unsigned_test_zone =
     \\@ IN NS ns.example.
     \\@ IN DNSKEY 257 3 8 QUJDRA==
     \\@ IN NSEC3PARAM 1 0 2 73616c74
+    \\@ IN RRSIG NSEC3PARAM 8 1 3600 2000000000 1000000000 1234 example. QUJD
     \\www IN A 192.0.2.1
     \\65fkkv52vjbvs8mj22eis3lq4enpnpcf IN NSEC3 1 0 2 73616c74 ermpp7q2mj4h4amfotejjmbehlb6k56g A RRSIG
     \\ermpp7q2mj4h4amfotejjmbehlb6k56g IN NSEC3 1 0 2 73616c74 65fkkv52vjbvs8mj22eis3lq4enpnpcf SOA NS DNSKEY RRSIG
@@ -2029,6 +2090,7 @@ const nsec3_wildcard_test_zone =
     \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
     \\@ IN NS ns.example.
     \\@ IN NSEC3PARAM 1 0 2 73616c74
+    \\@ IN RRSIG NSEC3PARAM 8 1 3600 2000000000 1000000000 1234 example. QUJD
     \\b IN A 192.0.2.5
     \\*.example. IN A 192.0.2.9
     \\ermpp7q2mj4h4amfotejjmbehlb6k56g IN NSEC3 1 0 2 73616c74 mj2i9hhr1es2j0u1on9bhgvdkepn9sgk SOA NS DNSKEY RRSIG
@@ -2049,6 +2111,7 @@ const nsec3_optout_test_zone =
     \\@ IN NS ns.example.
     \\@ IN DNSKEY 257 3 8 QUJDRA==
     \\@ IN NSEC3PARAM 1 0 2 73616c74
+    \\@ IN RRSIG NSEC3PARAM 8 1 3600 2000000000 1000000000 1234 example. QUJD
     \\www IN A 192.0.2.1
     \\unsigned-sub IN NS ns.unsigned-sub.example.
     \\65fkkv52vjbvs8mj22eis3lq4enpnpcf IN NSEC3 1 1 2 73616c74 ermpp7q2mj4h4amfotejjmbehlb6k56g A RRSIG
@@ -2069,11 +2132,35 @@ const nsec3_optout_clear_test_zone =
     \\@ IN NS ns.example.
     \\@ IN DNSKEY 257 3 8 QUJDRA==
     \\@ IN NSEC3PARAM 1 0 2 73616c74
+    \\@ IN RRSIG NSEC3PARAM 8 1 3600 2000000000 1000000000 1234 example. QUJD
     \\www IN A 192.0.2.1
     \\unsigned-sub IN NS ns.unsigned-sub.example.
     \\65fkkv52vjbvs8mj22eis3lq4enpnpcf IN NSEC3 1 0 2 73616c74 ermpp7q2mj4h4amfotejjmbehlb6k56g A RRSIG
     \\ermpp7q2mj4h4amfotejjmbehlb6k56g IN NSEC3 1 0 2 73616c74 65fkkv52vjbvs8mj22eis3lq4enpnpcf SOA NS DNSKEY RRSIG
     \\65fkkv52vjbvs8mj22eis3lq4enpnpcf IN RRSIG NSEC3 8 2 3600 2000000000 1000000000 1234 example. QUJD
+    \\ermpp7q2mj4h4amfotejjmbehlb6k56g IN RRSIG NSEC3 8 1 3600 2000000000 1000000000 1234 example. QUJD
+    \\
+;
+
+/// A zone whose NSEC3 chain holds the NSEC3 of its own delegation
+/// "unsigned-sub.example.": the delegation is unsigned (it holds an NS RRset
+/// and no DS), so the chain holds the record that proves it (RFC 5155
+/// section 7.2.7). Every hash is the one the python hashlib oracle produced.
+const nsec3_delegation_test_zone =
+    \\$ORIGIN example.
+    \\$TTL 3600
+    \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+    \\@ IN NS ns.example.
+    \\@ IN DNSKEY 257 3 8 QUJDRA==
+    \\@ IN NSEC3PARAM 1 0 2 73616c74
+    \\@ IN RRSIG NSEC3PARAM 8 1 3600 2000000000 1000000000 1234 example. QUJD
+    \\www IN A 192.0.2.1
+    \\unsigned-sub IN NS ns.unsigned-sub.example.
+    \\65fkkv52vjbvs8mj22eis3lq4enpnpcf IN NSEC3 1 0 2 73616c74 c6sv16md8ke961vneuorgpsqo5c87o64 A RRSIG
+    \\c6sv16md8ke961vneuorgpsqo5c87o64 IN NSEC3 1 0 2 73616c74 ermpp7q2mj4h4amfotejjmbehlb6k56g NS RRSIG
+    \\ermpp7q2mj4h4amfotejjmbehlb6k56g IN NSEC3 1 0 2 73616c74 65fkkv52vjbvs8mj22eis3lq4enpnpcf SOA NS DNSKEY RRSIG
+    \\65fkkv52vjbvs8mj22eis3lq4enpnpcf IN RRSIG NSEC3 8 2 3600 2000000000 1000000000 1234 example. QUJD
+    \\c6sv16md8ke961vneuorgpsqo5c87o64 IN RRSIG NSEC3 8 2 3600 2000000000 1000000000 1234 example. QUJD
     \\ermpp7q2mj4h4amfotejjmbehlb6k56g IN RRSIG NSEC3 8 1 3600 2000000000 1000000000 1234 example. QUJD
     \\
 ;
@@ -2207,12 +2294,13 @@ test "an NSEC3 zone proves NXDOMAIN with the closest encloser proof (RFC 5155 7.
     try std.testing.expect(servedNsec3Match(&response, nsec3_missing_hash) == null);
 }
 
-/// Every NSEC3 record of a proof must ride with the RRSIG that covers it
+/// Every record of an NSEC3 proof must ride with the RRSIG that covers it
 /// (RFC 4035 section 5.4): a proof that carries no signature authenticates
-/// nothing.
+/// nothing, and an RRset of a zone the operator anchored that carries no
+/// signature is bogus, not merely unsigned (RFC 4035 section 5.5).
 fn expectNsec3ProofsSigned(response: *const dns_message.Message) !void {
     for (response.authorities.slice()) |record| {
-        if (!record.rrtype.eql(.NSEC3)) continue;
+        if (!record.rrtype.eql(.NSEC3) and !record.rrtype.eql(.NSEC3PARAM)) continue;
         var owner: [256]u8 = undefined;
         const owner_text = try record.owner.toText(&owner);
         var signed = false;
@@ -2225,7 +2313,7 @@ fn expectNsec3ProofsSigned(response: *const dns_message.Message) !void {
                 else => continue,
             };
             const covered = dns_dnssec.rrsigCovers(raw) catch continue;
-            if (covered == dns_types.RecordType.NSEC3.code()) signed = true;
+            if (covered == record.rrtype.code()) signed = true;
         }
         try std.testing.expect(signed);
     }
@@ -4293,6 +4381,122 @@ test "RFC 8482 section 4.1: a DO=1 ANY query on a signed zone signs every RRset 
     try std.testing.expectEqual(dns_validate.Status.secure, result.status);
 }
 
+test "RFC 4035 section 5.3.1: the ANY answer carries no signature over a record it does not hold" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+        \\@ IN NS ns.example.
+        \\ns IN A 192.0.2.1
+        \\www IN A 192.0.2.2
+        \\www IN AAAA 2001:db8::2
+        \\www IN HINFO "Intel" "Linux"
+        \\
+    );
+    defer zone_file.deinit();
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    // The RFC 8080 section 6.1 Ed25519 key, so nothing secret enters the
+    // repository and the DNSKEY it derives is the one the RFC pins.
+    var key = try zone_signer.parseKey("ed25519 DSSF3o0s0f+ElWzj9E/Osxw8hLpk55chkmx0LYN5WiY=\n");
+    defer key.deinit();
+    const dnskey_rdata = try key.dnskeyRdata(arena.allocator());
+    const window = zone_signer.Options{ .inception = 1_000_000_000, .expiration = 2_000_000_000 };
+    try zone_signer.signZone(arena.allocator(), &zone, &key, window);
+    var session = zone_signer.Session.start(&key, window);
+    defer session.deinit();
+
+    const query = try testDoQuery(arena.allocator(), 0x4a06, "www.example.", .ANY, true);
+    const answer = try buildResponseWithPolicy(query, &zone, .{}, &session, false);
+
+    // The zone holds an HINFO at this owner, so it publishes a signature over
+    // that HINFO as well. The answer holds the synthesized HINFO, which the
+    // zone never signed, and RFC 4035 section 5.3.1 says an RRSIG
+    // authenticates the RRset it accompanies: the zone's signature over its
+    // own HINFO must not ride along beside the synthesized one.
+    var hinfo_signatures: usize = 0;
+    for (answer.answers.items) |record| {
+        if (!record.rrtype.eql(.RRSIG)) continue;
+        const raw = switch (record.rdata) {
+            .Unknown => |*unknown| unknown.bytes(),
+            else => return error.TestUnexpectedResult,
+        };
+        if (std.mem.readInt(u16, raw[0..2], .big) == hinfo_type.code()) hinfo_signatures += 1;
+    }
+    // The one signature over the HINFO is the one the server made for it.
+    try std.testing.expectEqual(@as(usize, 1), hinfo_signatures);
+
+    // The answer is judged by the project's own validator, which rebuilds the
+    // canonical RR form from the answer and verifies it against the zone's own
+    // DNSKEY: the answer is secure, not bogus.
+    var anchors = dns_validate.Anchors{};
+    anchors.items[0] = .{ .owner = try dns_name.Name.fromText("example."), .rrtype = .DNSKEY, .rdata = dnskey_rdata };
+    anchors.len = 1;
+    const result = try dns_validate.validate(arena.allocator(), &anchors, query, answer, &.{}, 1_500_000_000);
+    try std.testing.expectEqual(dns_validate.Status.secure, result.status);
+    try std.testing.expectEqual(@as(u16, 0), result.ede);
+}
+
+test "RFC 8482 section 4.1: the ANY answer signs every RRset it returns, one signature each" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+        \\@ IN NS ns.example.
+        \\ns IN A 192.0.2.1
+        \\www IN A 192.0.2.2
+        \\www IN AAAA 2001:db8::2
+        \\www IN HINFO "Intel" "Linux"
+        \\
+    );
+    defer zone_file.deinit();
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    var key = try zone_signer.parseKey("ed25519 DSSF3o0s0f+ElWzj9E/Osxw8hLpk55chkmx0LYN5WiY=\n");
+    defer key.deinit();
+    const dnskey_rdata = try key.dnskeyRdata(arena.allocator());
+    const window = zone_signer.Options{ .inception = 1_000_000_000, .expiration = 2_000_000_000 };
+    try zone_signer.signZone(arena.allocator(), &zone, &key, window);
+    var session = zone_signer.Session.start(&key, window);
+    defer session.deinit();
+
+    const query = try testDoQuery(arena.allocator(), 0x4a07, "www.example.", .ANY, true);
+    const answer = try buildResponseWithPolicy(query, &zone, .{}, &session, false);
+
+    // The zone's own RRsets joined the synthesized HINFO, and each of them
+    // carries the zone's signature over it, one each (RFC 8482 section 4.1).
+    var a_signatures: usize = 0;
+    var aaaa_signatures: usize = 0;
+    for (answer.answers.items) |record| {
+        if (!record.rrtype.eql(.RRSIG)) continue;
+        const raw = switch (record.rdata) {
+            .Unknown => |*unknown| unknown.bytes(),
+            else => return error.TestUnexpectedResult,
+        };
+        const covered = std.mem.readInt(u16, raw[0..2], .big);
+        if (covered == dns_types.RecordType.A.code()) a_signatures += 1;
+        if (covered == dns_types.RecordType.AAAA.code()) aaaa_signatures += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), a_signatures);
+    try std.testing.expectEqual(@as(usize, 1), aaaa_signatures);
+
+    // The answer as a whole still validates: every RRset in it carries a
+    // signature that verifies against the zone's own DNSKEY.
+    var anchors = dns_validate.Anchors{};
+    anchors.items[0] = .{ .owner = try dns_name.Name.fromText("example."), .rrtype = .DNSKEY, .rdata = dnskey_rdata };
+    anchors.len = 1;
+    const result = try dns_validate.validate(arena.allocator(), &anchors, query, answer, &.{}, 1_500_000_000);
+    try std.testing.expectEqual(dns_validate.Status.secure, result.status);
+}
+
 test "RFC 8482: the answers the subset does not reach keep their bytes" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -5221,4 +5425,367 @@ test "RFC 8914: the refusals that already carried a code keep it" {
 
     const plain = try buildRefusedResponse(request);
     try std.testing.expect(dns_rdata.findOption(ednsOptions(&plain).?, ede_option_code) == null);
+}
+
+/// Two answers to the same question are the same answer, byte for byte,
+/// when the only difference is the DO bit of the EDNS option the client
+/// asked for.
+fn expectSameAnswerApartFromDoBit(do_response: *const dns_message.Message, plain_response: *const dns_message.Message) !void {
+    var do_buffer: [4096]u8 = undefined;
+    var plain_buffer: [4096]u8 = undefined;
+    var do_writer = dns_writer.Writer.init(&do_buffer);
+    var plain_writer = dns_writer.Writer.init(&plain_buffer);
+    try do_response.encode(&do_writer);
+    try plain_response.encode(&plain_writer);
+    const with_do = do_writer.written();
+    const without_do = plain_writer.written();
+    try std.testing.expectEqual(without_do.len, with_do.len);
+    var differences: usize = 0;
+    for (with_do, without_do) |do_byte, plain_byte| {
+        if (do_byte == plain_byte) continue;
+        differences += 1;
+        // The DO bit is the high bit of the EDNS option's TTL.
+        try std.testing.expectEqual(@as(u8, 0x80), do_byte ^ plain_byte);
+    }
+    try std.testing.expectEqual(@as(usize, 1), differences);
+}
+
+test "a referral to a delegation the chain covers carries the matching NSEC3 (RFC 5155 7.2.7)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(nsec3_delegation_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    // The chain holds the delegation, so the referral proves the delegation
+    // unsigned with the NSEC3 that matches the delegation name.
+    const query = try testDoQuery(arena.allocator(), 0x4486, "unsigned-sub.example.", .A, true);
+    const response = try buildResponse(query, &zone);
+    try std.testing.expectEqual(header.Rcode.no_error, response.header.rcode);
+    try std.testing.expect(!response.header.authoritative);
+
+    const match = servedNsec3Match(&response, nsec3_unsigned_sub_hash) orelse return error.TestExpectedEqual;
+    try std.testing.expect(match.rrtype.eql(.NSEC3));
+
+    // RFC 5155 section 8.9: the record that proves an unsigned delegation
+    // has the NS bit set and the DS bit clear.
+    const bitmap = servedNsec3Bitmap(match) orelse return error.TestExpectedEqual;
+    try std.testing.expect(dns_dnssec.nsecBitmapHasType(bitmap, dns_types.RecordType.NS.code()));
+    try std.testing.expect(!dns_dnssec.nsecBitmapHasType(bitmap, dns_types.RecordType.DS.code()));
+
+    // Every proof record rides with the RRSIG that covers it.
+    try expectNsec3ProofsSigned(&response);
+}
+
+test "the referral to a delegation the chain covers keeps the delegation it points at" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(nsec3_delegation_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    const response = try buildResponse(try testDoQuery(arena.allocator(), 0x4487, "unsigned-sub.example.", .A, true), &zone);
+
+    // The delegation the referral points at is still in the authority
+    // section: the proof joins the referral, it does not replace it.
+    var saw_ns = false;
+    for (response.authorities.slice()) |record| {
+        if (!record.rrtype.eql(.NS)) continue;
+        saw_ns = true;
+        var owner: [256]u8 = undefined;
+        try std.testing.expectEqualStrings("unsigned-sub.example.", try record.owner.toText(&owner));
+    }
+    try std.testing.expect(saw_ns);
+
+    // RFC 5155 section 7.3: the chain parameters ride with the proof, so a
+    // validator can check the hash the record was built with.
+    var saw_param = false;
+    for (response.authorities.slice()) |record| {
+        if (record.rrtype.eql(.NSEC3PARAM)) saw_param = true;
+    }
+    try std.testing.expect(saw_param);
+
+    // The matching NSEC3 is the only proof record the referral carries.
+    var nsec3_count: usize = 0;
+    for (response.authorities.slice()) |record| {
+        if (record.rrtype.eql(.NSEC3)) nsec3_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), nsec3_count);
+}
+
+test "a referral the NSEC3 rule does not reach is unchanged" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // A zone with an NSEC chain: the zone publishes no NSEC3, so the referral
+    // is the answer the zone always gave.
+    {
+        var zone_file = try zone_parser.ZoneFile.parse(nsec_delegation_test_zone);
+        var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+        defer zone.deinit();
+
+        const do_response = try buildResponse(try testDoQuery(arena.allocator(), 0x4488, "www.child.example.", .A, true), &zone);
+        const plain_response = try buildResponse(try testDoQuery(arena.allocator(), 0x4488, "www.child.example.", .A, false), &zone);
+        try expectSameAnswerApartFromDoBit(&do_response, &plain_response);
+        for (do_response.authorities.slice()) |record| {
+            try std.testing.expect(!record.rrtype.eql(.NSEC3));
+        }
+    }
+
+    // An unsigned zone: the same answer.
+    {
+        var zone_file = try zone_parser.ZoneFile.parse(
+            \\$ORIGIN example.
+            \\$TTL 3600
+            \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+            \\@ IN NS ns.example.
+            \\ns IN A 192.0.2.1
+            \\child IN NS ns.child.example.
+            \\ns.child.example. IN A 192.0.2.10
+            \\
+        );
+        var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+        defer zone.deinit();
+
+        const do_response = try buildResponse(try testDoQuery(arena.allocator(), 0x4489, "www.child.example.", .A, true), &zone);
+        const plain_response = try buildResponse(try testDoQuery(arena.allocator(), 0x4489, "www.child.example.", .A, false), &zone);
+        try expectSameAnswerApartFromDoBit(&do_response, &plain_response);
+    }
+
+    // A delegation the chain does not cover: the Opt-Out proof of section
+    // 7.2.7 is still the answer, and the chain still claims no NSEC3 of the
+    // delegation.
+    {
+        var zone_file = try zone_parser.ZoneFile.parse(nsec3_optout_test_zone);
+        var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+        defer zone.deinit();
+
+        const response = try buildResponse(try testDoQuery(arena.allocator(), 0x4490, "unsigned-sub.example.", .A, true), &zone);
+        try std.testing.expect(servedNsec3Match(&response, nsec3_unsigned_sub_hash) == null);
+        const cover = servedNsec3Cover(&response, nsec3_unsigned_sub_hash) orelse return error.TestExpectedEqual;
+        try std.testing.expect(servedNsec3OptOut(cover));
+        try expectNsec3ProofsSigned(&response);
+    }
+}
+
+test "the project's own validator accepts the referral that carries the matching NSEC3" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(nsec3_delegation_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    const query = try testDoQuery(arena.allocator(), 0x4491, "unsigned-sub.example.", .A, true);
+    const response = try buildResponse(query, &zone);
+
+    // The referral proves the delegation unsigned (RFC 5155 section 8.9), so
+    // the answer is insecure, not bogus.
+    var anchors = dns_validate.Anchors{};
+    const result = try dns_validate.validate(arena.allocator(), &anchors, query, response, &.{}, 1_500_000_000);
+    try std.testing.expectEqual(dns_validate.Status.insecure, result.status);
+}
+
+/// A zone whose NSEC3 chain holds the NSEC3 of its own delegation with the
+/// DS bit set: the delegation is secure, so the parent proves nothing about
+/// it and the referral keeps the answer the zone always gave (RFC 5155
+/// section 7.2.7).
+const nsec3_delegation_secure_test_zone =
+    \\$ORIGIN example.
+    \\$TTL 3600
+    \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+    \\@ IN NS ns.example.
+    \\@ IN DNSKEY 257 3 8 QUJDRA==
+    \\@ IN NSEC3PARAM 1 0 2 73616c74
+    \\@ IN RRSIG NSEC3PARAM 8 1 3600 2000000000 1000000000 1234 example. QUJD
+    \\www IN A 192.0.2.1
+    \\unsigned-sub IN NS ns.unsigned-sub.example.
+    \\65fkkv52vjbvs8mj22eis3lq4enpnpcf IN NSEC3 1 0 2 73616c74 c6sv16md8ke961vneuorgpsqo5c87o64 A RRSIG
+    \\c6sv16md8ke961vneuorgpsqo5c87o64 IN NSEC3 1 0 2 73616c74 ermpp7q2mj4h4amfotejjmbehlb6k56g NS DS RRSIG
+    \\ermpp7q2mj4h4amfotejjmbehlb6k56g IN NSEC3 1 0 2 73616c74 65fkkv52vjbvs8mj22eis3lq4enpnpcf SOA NS DNSKEY RRSIG
+    \\65fkkv52vjbvs8mj22eis3lq4enpnpcf IN RRSIG NSEC3 8 2 3600 2000000000 1000000000 1234 example. QUJD
+    \\c6sv16md8ke961vneuorgpsqo5c87o64 IN RRSIG NSEC3 8 2 3600 2000000000 1000000000 1234 example. QUJD
+    \\ermpp7q2mj4h4amfotejjmbehlb6k56g IN RRSIG NSEC3 8 1 3600 2000000000 1000000000 1234 example. QUJD
+    \\
+;
+
+/// A zone whose NSEC3 chain holds the NSEC3 of its own delegation
+/// "deep.sub.example." with the NS bit clear: the record says the delegation
+/// holds no NS RRset, so it proves nothing about the delegation and the
+/// referral falls through to the Opt-Out proof of section 7.2.7. The
+/// delegation is two labels below the apex, so the closest provable encloser
+/// is the apex and the next closer name is "sub.example.", whose hash the
+/// Opt-Out NSEC3 of the apex covers. Every hash is the one the python
+/// hashlib oracle produced.
+const nsec3_delegation_ns_clear_test_zone =
+    \\$ORIGIN example.
+    \\$TTL 3600
+    \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+    \\@ IN NS ns.example.
+    \\@ IN DNSKEY 257 3 8 QUJDRA==
+    \\@ IN NSEC3PARAM 1 0 2 73616c74
+    \\@ IN RRSIG NSEC3PARAM 8 1 3600 2000000000 1000000000 1234 example. QUJD
+    \\www IN A 192.0.2.1
+    \\deep.sub IN NS ns.deep.sub.example.
+    \\ermpp7q2mj4h4amfotejjmbehlb6k56g IN NSEC3 1 1 2 73616c74 qfn6o7upk632fvdpgis6a4688c90ho8q SOA NS DNSKEY RRSIG
+    \\qfn6o7upk632fvdpgis6a4688c90ho8q IN NSEC3 1 0 2 73616c74 ermpp7q2mj4h4amfotejjmbehlb6k56g A RRSIG
+    \\ermpp7q2mj4h4amfotejjmbehlb6k56g IN RRSIG NSEC3 8 2 3600 2000000000 1000000000 1234 example. QUJD
+    \\qfn6o7upk632fvdpgis6a4688c90ho8q IN RRSIG NSEC3 8 2 3600 2000000000 1000000000 1234 example. QUJD
+    \\
+;
+
+/// A zone with a delegation that the signer signs with an NSEC3 chain: the
+/// signed zone publishes the apex NSEC3PARAM and the signature that covers
+/// it, so a validator with an anchor for the zone can judge the referral.
+const nsec3_signed_delegation_zone =
+    \\$ORIGIN example.
+    \\$TTL 3600
+    \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+    \\@ IN NS ns.example.
+    \\www IN A 192.0.2.1
+    \\unsigned-sub IN NS ns.unsigned-sub.example.
+    \\
+;
+
+test "the referral that carries the matching NSEC3 carries the RRSIG over the NSEC3PARAM (RFC 4035 5.4)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(nsec3_signed_delegation_zone);
+    defer zone_file.deinit();
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    var key = try zone_signer.parseKey("ed25519 DSSF3o0s0f+ElWzj9E/Osxw8hLpk55chkmx0LYN5WiY=\n");
+    defer key.deinit();
+    const dnskey_rdata = try key.dnskeyRdata(arena.allocator());
+    try zone_signer.signZone(arena.allocator(), &zone, &key, .{
+        .inception = 1_000_000_000,
+        .expiration = 2_000_000_000,
+        .chain = .{ .chain = .nsec3, .iterations = 0, .salt = "" },
+    });
+
+    const query = try testDoQuery(arena.allocator(), 0x4492, "unsigned-sub.example.", .A, true);
+    const response = try buildResponse(query, &zone);
+    try std.testing.expectEqual(header.Rcode.no_error, response.header.rcode);
+    try std.testing.expect(!response.header.authoritative);
+
+    // The proof is the NSEC3 that matches the delegation name, with the NS
+    // bit set and the DS bit clear (RFC 5155 section 8.9).
+    var digest: [20]u8 = undefined;
+    dns_dnssec.nsec3Hash(try dns_name.Name.fromText("unsigned-sub.example."), "", 0, &digest);
+    const match = servedNsec3Match(&response, digest) orelse return error.TestExpectedEqual;
+    const bitmap = servedNsec3Bitmap(match) orelse return error.TestExpectedEqual;
+    try std.testing.expect(dns_dnssec.nsecBitmapHasType(bitmap, dns_types.RecordType.NS.code()));
+    try std.testing.expect(!dns_dnssec.nsecBitmapHasType(bitmap, dns_types.RecordType.DS.code()));
+
+    // Every proof record rides with the RRSIG that covers it, the apex
+    // NSEC3PARAM among them: an RRset of a zone the operator anchored that
+    // carries no signature is bogus, not merely unsigned (RFC 4035 section
+    // 5.5).
+    try expectNsec3ProofsSigned(&response);
+
+    // A validator with an anchor that covers the zone judges the answer: the
+    // delegation is unsigned, so the referral is insecure, not bogus.
+    var anchors = dns_validate.Anchors{};
+    anchors.items[0] = .{ .owner = try dns_name.Name.fromText("example."), .rrtype = .DNSKEY, .rdata = dnskey_rdata };
+    anchors.len = 1;
+    const result = try dns_validate.validate(arena.allocator(), &anchors, query, response, &.{}, 1_500_000_000);
+    try std.testing.expectEqual(dns_validate.Status.insecure, result.status);
+}
+
+test "a referral whose NSEC3 leaves the NS bit clear falls through to the Opt-Out proof" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(nsec3_delegation_ns_clear_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    const query = try testDoQuery(arena.allocator(), 0x4493, "deep.sub.example.", .A, true);
+    const response = try buildResponse(query, &zone);
+    try std.testing.expectEqual(header.Rcode.no_error, response.header.rcode);
+    try std.testing.expect(!response.header.authoritative);
+
+    // The record the chain holds for the delegation leaves the NS bit clear,
+    // so it says the delegation holds no NS RRset and proves nothing about it
+    // (RFC 5155 section 8.9): it is not served.
+    var delegation_digest: [20]u8 = undefined;
+    dns_dnssec.nsec3Hash(try dns_name.Name.fromText("deep.sub.example."), &[_]u8{ 0x73, 0x61, 0x6c, 0x74 }, 2, &delegation_digest);
+    try std.testing.expect(servedNsec3Match(&response, delegation_digest) == null);
+
+    // The Opt-Out proof of section 7.2.7 is the answer instead: the closest
+    // provable encloser is the apex and the NSEC3 that covers the next closer
+    // name carries the Opt-Out flag.
+    var next_closer: [20]u8 = undefined;
+    dns_dnssec.nsec3Hash(try dns_name.Name.fromText("sub.example."), &[_]u8{ 0x73, 0x61, 0x6c, 0x74 }, 2, &next_closer);
+    const cover = servedNsec3Cover(&response, next_closer) orelse return error.TestExpectedEqual;
+    try std.testing.expect(servedNsec3OptOut(cover));
+
+    // Every proof record rides with the RRSIG that covers it.
+    try expectNsec3ProofsSigned(&response);
+}
+
+test "a referral to a secure delegation keeps the answer the zone always gave" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(nsec3_delegation_secure_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    const response = try buildResponse(try testDoQuery(arena.allocator(), 0x4494, "unsigned-sub.example.", .A, true), &zone);
+    try std.testing.expectEqual(header.Rcode.no_error, response.header.rcode);
+    try std.testing.expect(!response.header.authoritative);
+
+    // The chain holds the delegation's NSEC3 with the DS bit set, so the
+    // delegation is secure and the parent proves nothing about it (RFC 5155
+    // section 7.2.7): the referral carries the delegation and no proof.
+    var saw_ns = false;
+    for (response.authorities.slice()) |record| {
+        if (record.rrtype.eql(.NS)) saw_ns = true;
+        try std.testing.expect(!record.rrtype.eql(.NSEC3));
+        try std.testing.expect(!record.rrtype.eql(.NSEC3PARAM));
+    }
+    try std.testing.expect(saw_ns);
+}
+
+test "the NSEC3 denial answers still validate as they did (RFC 4035 5.4)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // The no-data proof, the name error proof, and the Opt-Out closest
+    // provable encloser proof: the three answers the denial path serves.
+    const cases = [_]struct {
+        zone_text: []const u8,
+        name: []const u8,
+        qtype: dns_types.RecordType,
+        id: u16,
+        rcode: header.Rcode,
+    }{
+        .{ .zone_text = nsec3_test_zone, .name = "www.example.", .qtype = .MX, .id = 0x4495, .rcode = .no_error },
+        .{ .zone_text = nsec3_test_zone, .name = "nothere.example.", .qtype = .A, .id = 0x4496, .rcode = .nxdomain },
+        .{ .zone_text = nsec3_optout_test_zone, .name = "unsigned-sub.example.", .qtype = .DS, .id = 0x4497, .rcode = .no_error },
+    };
+    for (cases) |case| {
+        var zone_file = try zone_parser.ZoneFile.parse(case.zone_text);
+        var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+        defer zone.deinit();
+
+        const query = try testDoQuery(arena.allocator(), case.id, case.name, case.qtype, true);
+        const response = try buildResponse(query, &zone);
+        try std.testing.expectEqual(case.rcode, response.header.rcode);
+
+        // Every proof record rides with the RRSIG that covers it, the apex
+        // NSEC3PARAM among them.
+        try expectNsec3ProofsSigned(&response);
+
+        // The answer validates as it did before: the zone is outside the
+        // trust domain, so the answer is insecure, not bogus.
+        var anchors = dns_validate.Anchors{};
+        const result = try dns_validate.validate(arena.allocator(), &anchors, query, response, &.{}, 1_500_000_000);
+        try std.testing.expectEqual(dns_validate.Status.insecure, result.status);
+    }
 }

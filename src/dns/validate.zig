@@ -290,6 +290,15 @@ fn labelCount(wire: []const u8) u8 {
     return count;
 }
 
+/// RFC 4034 section 3.1.3: the Labels field of an RRSIG does not count the
+/// wildcard label, so "*.example.com." has a Labels field of 2. The label
+/// counts an RRSIG is compared by are that one.
+fn labelsCount(wire: []const u8) u8 {
+    var count = labelCount(wire);
+    if (count != 0 and wire[0] == 1 and wire[1] == '*') count -= 1;
+    return count;
+}
+
 /// Parent name with the leftmost label stripped; null at the root.
 fn parentName(name: Name) ?Name {
     const wire = name.asWire();
@@ -587,8 +596,13 @@ fn deniesSubdomain(bitmap: []const u8, owner: Name, target: Name) bool {
 /// owner's own label count, the NSEC proves wildcard expansion could not have
 /// matched the request. A lower count means the NSEC sat at a wildcard, so it
 /// cannot deny a name the wildcard could have produced.
+///
+/// RFC 4034 section 3.1.3: the Labels field does not count the wildcard label,
+/// so the zone's own record at "*.example.com." is signed with a Labels field
+/// of 2. A record that came from a deeper wildcard claims fewer labels still,
+/// so it is not the zone's own record at the wildcard's name.
 fn deniesWildcard(labels: u8, owner: Name) bool {
-    return labels == labelCount(owner.asWire());
+    return labels == labelsCount(owner.asWire());
 }
 
 /// NSEC3 span test (RFC 5155 section 7.1): the target hash falls strictly
@@ -1199,8 +1213,58 @@ const Validator = struct {
             proof.used = true;
             return self.nsecNoData(proof, qtype);
         }
-        if (!nxdomain) return self.fail(dnssec.EDE_DNSSEC_BOGUS);
+        if (!nxdomain) return self.nsecWildcardNoData(name, qtype);
         return self.nsecNxDomain(name);
+    }
+
+    /// RFC 4035 section 3.1.3.4: a NODATA answer may rest on the NSEC at
+    /// the wildcard owner name that matched the name. The wildcard is the one
+    /// at the closest encloser, so it covers the name only when the name is
+    /// one label below that encloser, and the encloser must exist.
+    fn nsecWildcardNoData(self: *Validator, name: Name, qtype: u16) Error!Outcome {
+        const encloser = parentName(name) orelse return self.fail(dnssec.EDE_DNSSEC_BOGUS);
+        for (self.nsecs.items) |*proof| {
+            if (!proof.owner.eql(&encloser)) continue;
+            proof.used = true;
+            return self.nsecWildcardEncloser(proof, name, qtype);
+        }
+        return self.fail(dnssec.EDE_DNSSEC_BOGUS);
+    }
+
+    /// The proof a wildcard NODATA rests on: the closest encloser exists, the
+    /// name itself does not, and the wildcard at the encloser holds neither
+    /// the QTYPE nor CNAME.
+    fn nsecWildcardEncloser(self: *Validator, proof: *const Nsec, name: Name, qtype: u16) Error!Outcome {
+        if (isAncestorDelegation(proof.bitmap, labelsCount(proof.owner.asWire()), labelsCount(proof.signer.asWire()))) {
+            return self.fail(dnssec.EDE_DNSSEC_BOGUS);
+        }
+        if (!deniesWildcard(proof.labels, proof.owner)) return self.fail(dnssec.EDE_DNSSEC_BOGUS);
+        // A name that exists holds its own types, so the name itself must be
+        // covered by an NSEC that proves it does not exist.
+        var covered = false;
+        for (self.nsecs.items) |*candidate| {
+            if (!dnssec.nsecCovers(candidate.owner, candidate.next, name)) continue;
+            // The NSEC that covers the name is part of the proof.
+            candidate.used = true;
+            covered = true;
+            if (isAncestorDelegation(candidate.bitmap, labelsCount(candidate.owner.asWire()), labelsCount(candidate.signer.asWire()))) return self.fail(dnssec.EDE_DNSSEC_BOGUS);
+            if (deniesSubdomain(candidate.bitmap, candidate.owner, name)) return self.fail(dnssec.EDE_DNSSEC_BOGUS);
+        }
+        if (!covered) return self.fail(dnssec.EDE_DNSSEC_BOGUS);
+        // The record at the wildcard's own name shows the types the wildcard
+        // holds, so a type it does not hold is proved absent (RFC 4035
+        // section 3.1.3.4, and RFC 6840 section 4.3 for the CNAME bit).
+        const wildcard = wildcardName(proof.owner) catch return self.fail(dnssec.EDE_DNSSEC_BOGUS);
+        for (self.nsecs.items) |*candidate| {
+            if (!candidate.owner.eql(&wildcard)) continue;
+            candidate.used = true;
+            if (isAncestorDelegation(candidate.bitmap, labelsCount(candidate.owner.asWire()), labelsCount(candidate.signer.asWire()))) return self.fail(dnssec.EDE_DNSSEC_BOGUS);
+            if (!deniesWildcard(candidate.labels, candidate.owner)) return self.fail(dnssec.EDE_DNSSEC_BOGUS);
+            const denies = dnssec.bitmapDeniesTypeAndCname(candidate.bitmap, qtype) catch return self.fail(dnssec.EDE_DNSSEC_BOGUS);
+            if (!denies) return self.fail(dnssec.EDE_DNSSEC_BOGUS);
+            return if (try self.anchored(proof.signer)) .secure else .insecure;
+        }
+        return self.fail(dnssec.EDE_DNSSEC_BOGUS);
     }
 
     /// RFC 6840 section 4.4: an insecure delegation needs the NS bit to show
@@ -1226,7 +1290,7 @@ const Validator = struct {
     /// count, or the denial only proves that a wildcard could not have
     /// answered.
     fn nsecNoData(self: *Validator, proof: *const Nsec, qtype: u16) Error!Outcome {
-        if (isAncestorDelegation(proof.bitmap, labelCount(proof.owner.asWire()), labelCount(proof.signer.asWire()))) {
+        if (isAncestorDelegation(proof.bitmap, labelsCount(proof.owner.asWire()), labelsCount(proof.signer.asWire()))) {
             return self.fail(dnssec.EDE_DNSSEC_BOGUS);
         }
         if (!deniesWildcard(proof.labels, proof.owner)) return self.fail(dnssec.EDE_DNSSEC_BOGUS);
@@ -1257,7 +1321,7 @@ const Validator = struct {
     }
 
     fn nsecEncloser(self: *Validator, proof: *const Nsec, next_closer: Name) Error!Outcome {
-        if (isAncestorDelegation(proof.bitmap, labelCount(proof.owner.asWire()), labelCount(proof.signer.asWire()))) {
+        if (isAncestorDelegation(proof.bitmap, labelsCount(proof.owner.asWire()), labelsCount(proof.signer.asWire()))) {
             return self.fail(dnssec.EDE_DNSSEC_BOGUS);
         }
         if (!deniesWildcard(proof.labels, proof.owner)) return self.fail(dnssec.EDE_DNSSEC_BOGUS);
@@ -1269,7 +1333,7 @@ const Validator = struct {
                 candidate.used = true;
                 // An ancestor delegation proves nothing below the cut, and a
                 // DNAME redirects the subtree it would have denied.
-                if (isAncestorDelegation(candidate.bitmap, labelCount(candidate.owner.asWire()), labelCount(candidate.signer.asWire()))) return self.fail(dnssec.EDE_DNSSEC_BOGUS);
+                if (isAncestorDelegation(candidate.bitmap, labelsCount(candidate.owner.asWire()), labelsCount(candidate.signer.asWire()))) return self.fail(dnssec.EDE_DNSSEC_BOGUS);
                 if (deniesSubdomain(candidate.bitmap, candidate.owner, target)) return self.fail(dnssec.EDE_DNSSEC_BOGUS);
             }
         }
@@ -1494,9 +1558,14 @@ fn isReferral(records: []const dns_record.ResourceRecord) bool {
 fn answerHoldsQname(response: dns_message.Message, name: Name, class: Class) bool {
     for (response.answers.slice()) |record| {
         if (record.rrtype.eql(.RRSIG) or record.rrtype.eql(.NSEC) or record.rrtype.eql(.NSEC3)) continue;
-        if (!record.owner.eql(&name)) continue;
         if (!record.class.eql(class)) continue;
-        return true;
+        if (record.owner.eql(&name)) return true;
+        // RFC 6672 section 3.1: a DNAME above the QNAME redirects the query,
+        // so the answer is that DNAME and not a denial of the QNAME. The
+        // answer holds no RRset at the QNAME, and the NSEC that could prove
+        // its absence carries the DNAME bit, which RFC 6840 section 4.1 bars
+        // from proving anything below that owner.
+        if (record.rrtype.eql(.DNAME) and isSuffix(record.owner, name)) return true;
     }
     return false;
 }
@@ -1919,6 +1988,18 @@ const any_zone_text =
     \\both IN MX 10 mail.example.com.
     \\mail IN A 192.0.2.3
     \\alias IN CNAME both.example.com.
+;
+
+/// A zone with a DNAME above a name, so a query for a name below it is
+/// answered with the DNAME and not with a denial of the name (RFC 6672
+/// section 3.1).
+const dname_zone_text =
+    \\$ORIGIN example.com.
+    \\$TTL 3600
+    \\@ IN SOA ns1.example.com. hostmaster.example.com. 1 3600 900 1209600 3600
+    \\@ IN NS ns1.example.com.
+    \\ns1 IN A 192.0.2.1
+    \\redirect IN DNAME target.example.net.
 ;
 
 const SignedZone = struct {
@@ -2830,6 +2911,26 @@ test "RFC 6840 section 4.2: an ANY answer with no RRset at the QNAME is judged b
     try expectStatus(.insecure, try validate(std.testing.allocator, &outside, unsigned.query, unsigned.response, &.{}, now_seconds));
 }
 
+test "RFC 6672 section 3.1: a DNAME above the QNAME answers the query, it does not deny it" {
+    var signed = try signZoneText(std.testing.allocator, dname_zone_text, ed25519_secret);
+    defer signed.deinit(std.testing.allocator);
+    var anchors = try dnskeyAnchor(std.testing.allocator, "example.com.", signed.dnskey);
+    defer anchors.deinit(std.testing.allocator);
+
+    // The answer holds the DNAME and the signature over it, and no RRset at
+    // the QNAME: the DNAME redirects the query, so the absence of the QNAME
+    // needs no proof. The only NSEC that could cover the name is the one the
+    // DNAME's own owner published, and RFC 6840 section 4.1 bars it from
+    // proving anything below that owner.
+    var pair = try exchange(std.testing.allocator, &signed.zone, "host.redirect.example.com.", .A, .no_error, "redirect.example.com.", null);
+    defer pair.query.deinit();
+    defer pair.response.deinit();
+
+    const result = try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds);
+    try expectStatus(.secure, result);
+    try std.testing.expectEqual(@as(u16, 0), result.ede);
+}
+
 // ----------------------------------------- RFC 4035 section 5.4 proofs
 
 test "RFC 4035 section 5.4: an NSEC proof that verifies leaves the answer secure" {
@@ -3282,6 +3383,157 @@ test "RFC 6840 section 5.1: an NSEC proof published in upper case but signed ove
     const result = try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds);
     try expectStatus(.bogus, result);
     try std.testing.expectEqual(dnssec.EDE_DNSSEC_BOGUS, result.ede);
+}
+
+// ------------------------------------------- RFC 4035 section 3.1.3.4
+
+/// One NSEC RRset signed by the zone key: the record and the RRSIG over it
+/// (RFC 4034 section 3.2).
+fn signedNsec(
+    allocator: std.mem.Allocator,
+    key: *const zone_signer.Key,
+    owner_text: []const u8,
+    next_text: []const u8,
+    bitmap: []const u8,
+    ttl: u32,
+) ![2]dns_record.ResourceRecord {
+    const owner = try Name.fromText(owner_text);
+    const next = (try Name.fromText(next_text)).asWire();
+    var raw = dns_rdata.Unknown{};
+    @memcpy(raw.data[0..next.len], next);
+    @memcpy(raw.data[next.len..][0..bitmap.len], bitmap);
+    raw.len = @intCast(next.len + bitmap.len);
+    const signer = try Name.fromText("example.com.");
+    const rrsig = try zone_signer.signRrset(allocator, owner, signer, RecordType.NSEC.code(), &.{raw.data[0..raw.len]}, ttl, key, window);
+    defer allocator.free(rrsig);
+    var signature = dns_rdata.Unknown{};
+    @memcpy(signature.data[0..rrsig.len], rrsig);
+    signature.len = @intCast(rrsig.len);
+    return .{
+        .{
+            .owner = owner,
+            .rrtype = .NSEC,
+            .class = .IN,
+            .ttl = ttl,
+            .rdata = .{ .Unknown = raw },
+        },
+        .{
+            .owner = owner,
+            .rrtype = .RRSIG,
+            .class = .IN,
+            .ttl = ttl,
+            .rdata = .{ .Unknown = signature },
+        },
+    };
+}
+
+/// A negative response whose Authority section holds exactly the NSEC
+/// RRsets a test names, in order, each with the signature that covers it.
+fn nsecExchange(
+    allocator: std.mem.Allocator,
+    key: *const zone_signer.Key,
+    qname: []const u8,
+    qtype: RecordType,
+    rcode: dns_header.Rcode,
+    owners: []const []const u8,
+    nexts: []const []const u8,
+    bitmaps: []const []const u8,
+) !Exchange {
+    const question = dns_question.Question{ .name = try Name.fromText(qname), .qtype = qtype, .qclass = .IN };
+    var query = try emptyMessage(allocator, .{ .id = 0x1234, .recursion_desired = true, .question_count = 1 }, question);
+    defer query.deinit();
+    var response = try emptyMessage(allocator, .{
+        .id = 0x1234,
+        .qr = true,
+        .recursion_desired = true,
+        .recursion_available = true,
+        .question_count = 1,
+        .rcode = rcode,
+    }, question);
+    defer response.deinit();
+
+    for (owners, 0..) |owner, index| {
+        const pair = try signedNsec(allocator, key, owner, nexts[index], bitmaps[index], 3600);
+        try response.authorities.append(pair[0]);
+        try response.authorities.append(pair[1]);
+    }
+    response.header.authority_count = @intCast(response.authorities.len);
+
+    var parsed_query = try roundTrip(allocator, query);
+    errdefer parsed_query.deinit();
+    const parsed_response = try roundTrip(allocator, response);
+    return .{ .query = parsed_query, .response = parsed_response };
+}
+
+test "RFC 4035 section 3.1.3.4: the NSEC at the wildcard owner name proves the NODATA" {
+    var key = try zone_signer.parseKey(ed25519_secret);
+    defer key.deinit();
+    const dnskey_rdata = try key.dnskeyRdata(std.testing.allocator);
+    defer std.testing.allocator.free(dnskey_rdata);
+    var anchors = try dnskeyAnchor(std.testing.allocator, "example.com.", dnskey_rdata);
+    defer anchors.deinit(std.testing.allocator);
+
+    // The closest encloser of nx.example.com. is example.com., the NSEC at
+    // mail.example.com. covers the name, and the NSEC at the wildcard's own
+    // name shows that the wildcard holds neither AAAA nor CNAME.
+    const bitmap = typeBitmap(&.{ .SOA, .NS, .RRSIG, .NSEC });
+    const owners = [_][]const u8{ "example.com.", "mail.example.com.", "*.example.com." };
+    const nexts = [_][]const u8{ "mail.example.com.", "www.example.com.", "mail.example.com." };
+    const bitmaps = [_][]const u8{ &bitmap, &bitmap, &bitmap };
+    var pair = try nsecExchange(std.testing.allocator, &key, "nx.example.com.", .AAAA, .no_error, &owners, &nexts, &bitmaps);
+    defer pair.query.deinit();
+    defer pair.response.deinit();
+
+    const result = try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds);
+    try expectStatus(.secure, result);
+    try std.testing.expectEqual(@as(u16, 0), result.ede);
+}
+
+test "RFC 4035 section 3.1.3.4: an NSEC that does not cover the query proves nothing" {
+    var key = try zone_signer.parseKey(ed25519_secret);
+    defer key.deinit();
+    const dnskey_rdata = try key.dnskeyRdata(std.testing.allocator);
+    defer std.testing.allocator.free(dnskey_rdata);
+    var anchors = try dnskeyAnchor(std.testing.allocator, "example.com.", dnskey_rdata);
+    defer anchors.deinit(std.testing.allocator);
+
+    // The wildcard that matches nx.example.com. is *.example.com. The NSEC
+    // that shows the types it holds sits at *.other.example.com., which does
+    // not cover the query, so the absence is not proved.
+    const bitmap = typeBitmap(&.{ .SOA, .NS, .RRSIG, .NSEC });
+    const owners = [_][]const u8{ "example.com.", "mail.example.com.", "*.other.example.com." };
+    const nexts = [_][]const u8{ "mail.example.com.", "www.example.com.", "mail.example.com." };
+    const bitmaps = [_][]const u8{ &bitmap, &bitmap, &bitmap };
+    var pair = try nsecExchange(std.testing.allocator, &key, "nx.example.com.", .AAAA, .no_error, &owners, &nexts, &bitmaps);
+    defer pair.query.deinit();
+    defer pair.response.deinit();
+
+    const result = try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds);
+    try expectStatus(.bogus, result);
+    try std.testing.expectEqual(dnssec.EDE_DNSSEC_BOGUS, result.ede);
+}
+
+test "RFC 4035 section 5.4: the NSEC at the queried name still proves the NODATA" {
+    var key = try zone_signer.parseKey(ed25519_secret);
+    defer key.deinit();
+    const dnskey_rdata = try key.dnskeyRdata(std.testing.allocator);
+    defer std.testing.allocator.free(dnskey_rdata);
+    var anchors = try dnskeyAnchor(std.testing.allocator, "example.com.", dnskey_rdata);
+    defer anchors.deinit(std.testing.allocator);
+
+    // The ordinary NODATA proof: the NSEC at the name the query named, with
+    // the QTYPE and the CNAME bit clear.
+    const bitmap = typeBitmap(&.{ .SOA, .NS, .RRSIG, .NSEC });
+    const owners = [_][]const u8{"nx.example.com."};
+    const nexts = [_][]const u8{"mail.example.com."};
+    const bitmaps = [_][]const u8{&bitmap};
+    var pair = try nsecExchange(std.testing.allocator, &key, "nx.example.com.", .AAAA, .no_error, &owners, &nexts, &bitmaps);
+    defer pair.query.deinit();
+    defer pair.response.deinit();
+
+    const result = try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds);
+    try expectStatus(.secure, result);
+    try std.testing.expectEqual(@as(u16, 0), result.ede);
 }
 
 // ------------------------------------------------------------------- NSEC3

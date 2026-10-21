@@ -473,6 +473,11 @@ pub const Proof = struct {
 pub const SignedProof = struct {
     record: ?record_mod.ResourceRecord = null,
     rrsig: ?record_mod.ResourceRecord = null,
+    /// The RRSIG that covers the zone SOA the proof arrived with. An answer
+    /// that carries the SOA must carry the signature that covers it, or a
+    /// validating client sees an unsigned RRset in a signed zone (RFC 4035
+    /// section 5.5).
+    soa_rrsig: ?record_mod.ResourceRecord = null,
 };
 
 /// The NSEC3 chain a cached proof belongs to (RFC 5155 section 7.1): the
@@ -526,6 +531,26 @@ pub const WildcardAnswer = struct {
     rrsig: ?ProofRecord = null,
     /// The TTL the answer carries: the TTL of the wildcard's records, held
     /// down to the life of the proof (RFC 8198 section 4).
+    ttl: u32,
+};
+
+/// The NODATA a cached wildcard gives for a name it covers and a type it
+/// does not hold (RFC 8198 section 5.3). The proof shows the name does not
+/// exist and that the wildcard does not hold the type.
+pub const WildcardNodata = struct {
+    /// The wildcard the name falls under, e.g. "*.example.".
+    wildcard: Name,
+    /// The zone the wildcard belongs to: the signer name of the signature
+    /// that covers it (RFC 4035 section 5.3.1).
+    zone: Name,
+    /// The zone SOA that arrived with the proof (RFC 2308 section 3).
+    soa: ?record_mod.ResourceRecord = null,
+    /// The RRSIG that covers that SOA (RFC 4035 section 3.1.3).
+    soa_rrsig: ?record_mod.ResourceRecord = null,
+    /// The proof the answer rests on (RFC 8020 section 2).
+    proof: Proof,
+    /// The life the proof has left: the answer lives no longer (RFC 8198
+    /// section 4).
     ttl: u32,
 };
 
@@ -726,6 +751,8 @@ pub const AggressiveCache = struct {
         /// carry it (RFC 2308 section 3), and a denial without one must not
         /// be cached (RFC 2308 section 5).
         soa: ?record_mod.ResourceRecord = null,
+        /// The RRSIG that covers that SOA (RFC 4035 section 3.1.3).
+        soa_rrsig: ?record_mod.ResourceRecord = null,
         /// The proof record as the upstream answer published it and the
         /// RRSIG that covers it. RFC 8020 section 2 returns them with a cut
         /// answer.
@@ -774,6 +801,7 @@ pub const AggressiveCache = struct {
         @memcpy(slot.bitmap[0..len], bitmap[0..len]);
         slot.bitmap_len = @intCast(len);
         slot.soa = soa;
+        slot.soa_rrsig = proof.soa_rrsig;
         slot.expires_at = now +| @min(@as(i64, ttl), max_entry_ttl_seconds);
         // A proof that names another owner is not this entry's proof.
         if (proof.record) |record| {
@@ -808,6 +836,7 @@ pub const AggressiveCache = struct {
         @memcpy(slot.bitmap[0..len], bitmap[0..len]);
         slot.bitmap_len = @intCast(len);
         slot.soa = soa;
+        slot.soa_rrsig = proof.soa_rrsig;
         slot.expires_at = now +| @min(@as(i64, ttl), max_entry_ttl_seconds);
         if (proof.record) |record| {
             if (record.owner.eql(&owner)) {
@@ -890,7 +919,25 @@ pub const AggressiveCache = struct {
     const WildcardProof = struct {
         records: ?Proof = null,
         expires_at: i64 = 0,
+        /// The cached records the proof rests on, so a proof that adds one
+        /// more (the wildcard's own types) can carry them all.
+        entries: [2]*const Entry = undefined,
+        len: u8 = 0,
     };
+
+    /// The proof records a set of cached entries rests on, or null when one
+    /// of them came without the record or the signature that covers it
+    /// (RFC 8020 section 2).
+    fn proofOfEntries(self: *const AggressiveCache, entries: []const *const Entry) ?Proof {
+        _ = self;
+        var proof = Proof{};
+        for (entries) |entry| {
+            if (entry.proof_record.len == 0 or entry.proof_rrsig.len == 0) return null;
+            proof.add(entry.proof_record);
+            proof.add(entry.proof_rrsig);
+        }
+        return if (proof.len == 0) null else proof;
+    }
 
     /// The zone a cached proof belongs to: the apex of the zone that
     /// published it. A proof of another zone proves nothing here.
@@ -910,19 +957,12 @@ pub const AggressiveCache = struct {
     fn nsecWildcardProof(self: *const AggressiveCache, qname: Name, encloser: Name, zone: Name) ?WildcardProof {
         const ce = self.findNsecOwner(encloser, zone) orelse return null;
         const cover = self.findCovering(qname, zone) orelse return null;
-        var proof = Proof{};
-        var complete = true;
-        for ([_]*const Entry{ ce, cover }) |entry| {
-            if (entry.proof_record.len == 0 or entry.proof_rrsig.len == 0) {
-                complete = false;
-                break;
-            }
-            proof.add(entry.proof_record);
-            proof.add(entry.proof_rrsig);
-        }
+        const entries = [_]*const Entry{ ce, cover };
         return .{
-            .records = if (complete and proof.len != 0) proof else null,
+            .records = self.proofOfEntries(entries[0..]),
             .expires_at = @min(ce.expires_at, cover.expires_at),
+            .entries = entries,
+            .len = 2,
         };
     }
 
@@ -945,19 +985,12 @@ pub const AggressiveCache = struct {
             // set does not prove the non-existence of the name.
             if (cover.nsec3_opt_out) continue;
             const ce = self.findNsec3Match(&chain, nsec3HashIn(chain, encloser)) orelse continue;
-            var proof = Proof{};
-            var complete = true;
-            for ([_]*const Entry{ ce, cover }) |entry| {
-                if (entry.proof_record.len == 0 or entry.proof_rrsig.len == 0) {
-                    complete = false;
-                    break;
-                }
-                proof.add(entry.proof_record);
-                proof.add(entry.proof_rrsig);
-            }
+            const entries = [_]*const Entry{ ce, cover };
             return .{
-                .records = if (complete and proof.len != 0) proof else null,
+                .records = self.proofOfEntries(entries[0..]),
                 .expires_at = @min(ce.expires_at, cover.expires_at),
+                .entries = entries,
+                .len = 2,
             };
         }
         return null;
@@ -997,6 +1030,72 @@ pub const AggressiveCache = struct {
             @memcpy(answer.records[0..entry.len], entry.records[0..entry.len]);
             answer.len = entry.len;
             return answer;
+        }
+        return null;
+    }
+
+    /// RFC 4035 section 5.4: the record at the wildcard's own name shows the
+    /// types the wildcard holds, so a type it does not hold is proved absent.
+    /// RFC 5155 section 8.7 asks the same of the NSEC3 that matches the
+    /// wildcard.
+    fn wildcardTypeEntry(self: *const AggressiveCache, wildcard: Name, zone: Name, qtype: RecordType) ?*const Entry {
+        if (self.findNsecOwner(wildcard, zone)) |entry| {
+            const bitmap = entry.bitmap[0..entry.bitmap_len];
+            // The bitmap must be well-formed, must list NSEC (RFC 4035
+            // section 3.1) and must not list the type.
+            const denies = nsecBitmapDeniesType(bitmap, qtype.code()) catch return null;
+            if (!denies) return null;
+            // RFC 6840 section 4.3: a NODATA proof needs the CNAME bit clear
+            // as well.
+            if (nsecBitmapHasType(bitmap, RecordType.CNAME.code())) return null;
+            return entry;
+        }
+        var index: usize = 0;
+        while (index < self.entries.len) : (index += 1) {
+            const head = &self.entries[index];
+            if (!head.valid or !head.is_nsec3) continue;
+            // One chain at a time: a record of another chain cannot prove
+            // this one (RFC 5155 section 8.2).
+            if (self.chainSeen(head, index)) continue;
+            const chain = head.nsec3_chain;
+            if (!chain.zone.eql(&zone)) continue;
+            const entry = self.findNsec3Match(&chain, nsec3HashIn(chain, wildcard)) orelse continue;
+            const denies = bitmapDeniesTypeAndCname(entry.bitmap[0..entry.bitmap_len], qtype.code()) catch return null;
+            if (!denies) return null;
+            return entry;
+        }
+        return null;
+    }
+
+    /// RFC 8198 section 5.3: the NODATA a cached wildcard gives for a name it
+    /// covers and a type it does not hold, or null when the cache holds no
+    /// proof that the wildcard does not hold the type. The proof is the one
+    /// the positive answer rests on (the name does not exist) plus the
+    /// record that shows the wildcard's own types (RFC 4035 section 5.4,
+    /// RFC 5155 section 8.7).
+    pub fn wildcardNodata(self: *AggressiveCache, qname: Name, qtype: RecordType, now: i64) ?WildcardNodata {
+        self.evictExpired(now);
+        const encloser = parentName(qname) orelse return null;
+        for (&self.wildcards) |*entry| {
+            if (!entry.valid) continue;
+            const wildcard_parent = parentName(entry.name) orelse continue;
+            if (!wildcard_parent.eql(&encloser)) continue;
+            const proof = self.wildcardProof(qname, encloser, entry.zone) orelse continue;
+            const type_entry = self.wildcardTypeEntry(entry.name, entry.zone, qtype) orelse continue;
+            var entries = [_]*const Entry{ proof.entries[0], proof.entries[1], type_entry };
+            // The answer rests on the proof, so it must ride with the
+            // signature that covers every record in it (RFC 8020 section 2).
+            const records = self.proofOfEntries(entries[0..]) orelse continue;
+            const remaining = @min(@min(entry.expires_at, proof.expires_at), type_entry.expires_at) - now;
+            if (remaining <= 0) continue;
+            return .{
+                .wildcard = entry.name,
+                .zone = entry.zone,
+                .soa = type_entry.soa orelse proof.entries[0].soa,
+                .soa_rrsig = type_entry.soa_rrsig orelse proof.entries[0].soa_rrsig,
+                .proof = records,
+                .ttl = @intCast(remaining),
+            };
         }
         return null;
     }
@@ -1460,6 +1559,105 @@ fn testWildcardRrsig(covered: RecordType, labels: u8, zone: Name) record_mod.Res
         .ttl = 300,
         .rdata = .{ .Unknown = rdata },
     };
+}
+
+/// The NSEC a cached proof rests on, as an upstream answer publishes it: the
+/// next owner name and the type bitmap in the RDATA (RFC 4034 section 4.1.2).
+fn testProofNsec(owner: Name, next: Name, bitmap: []const u8) record_mod.ResourceRecord {
+    var rdata: rdata_mod.Unknown = .{};
+    const wire = next.asWire();
+    @memcpy(rdata.data[0..wire.len], wire);
+    @memcpy(rdata.data[wire.len..][0..bitmap.len], bitmap);
+    rdata.len = @intCast(wire.len + bitmap.len);
+    return .{
+        .owner = owner,
+        .rrtype = .NSEC,
+        .class = .IN,
+        .ttl = 300,
+        .rdata = .{ .Unknown = rdata },
+    };
+}
+
+/// The signature that covers a cached proof record, under the record's own
+/// name (RFC 4034 section 3.2).
+fn testProofRrsig(owner: Name, labels: u8, zone: Name) record_mod.ResourceRecord {
+    var rrsig = testWildcardRrsig(.NSEC, labels, zone);
+    rrsig.owner = owner;
+    return rrsig;
+}
+
+test "the cached wildcard answers NODATA for a type it does not hold (RFC 8198 5.3)" {
+    const now: i64 = 1_000_000;
+    // A(1) and NSEC(47): the wildcard holds an A record and no AAAA.
+    const bitmap = [_]u8{ 0x00, 0x06, 0x40, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    const zone = try Name.fromText("example.");
+    var cache = AggressiveCache{};
+    // The closest encloser of nx.example. is example., and it exists.
+    cache.insertNsec(zone, try Name.fromText("mail.example."), &bitmap, now, 3600, testProofSoa(zone), .{
+        .record = testProofNsec(zone, try Name.fromText("mail.example."), &bitmap),
+        .rrsig = testProofRrsig(zone, 1, zone),
+    });
+    // The (mail.example., www.example.) span covers nx.example.
+    cache.insertNsec(try Name.fromText("mail.example."), try Name.fromText("www.example."), &bitmap, now, 3600, testProofSoa(zone), .{
+        .record = testProofNsec(try Name.fromText("mail.example."), try Name.fromText("www.example."), &bitmap),
+        .rrsig = testProofRrsig(try Name.fromText("mail.example."), 2, zone),
+    });
+    // The wildcard's own record shows the types it holds.
+    cache.insertNsec(try Name.fromText("*.example."), try Name.fromText("mail.example."), &bitmap, now, 3600, testProofSoa(zone), .{
+        .record = testProofNsec(try Name.fromText("*.example."), try Name.fromText("mail.example."), &bitmap),
+        .rrsig = testProofRrsig(try Name.fromText("*.example."), 1, zone),
+    });
+    const wildcard = try Name.fromText("*.example.");
+    cache.insertWildcard(wildcard, zone, &.{.{
+        .owner = wildcard,
+        .rrtype = .A,
+        .class = .IN,
+        .ttl = 300,
+        .rdata = .{ .A = .{ 192, 0, 2, 1 } },
+    }}, testWildcardRrsig(.A, 1, zone), now, 300);
+
+    // A type the wildcard does not hold is answered NODATA, with the proof
+    // that shows the type is absent (RFC 4035 section 5.4).
+    const nodata = cache.wildcardNodata(try Name.fromText("nx.example."), .AAAA, now).?;
+    try std.testing.expect(nodata.wildcard.eql(&wildcard));
+    try std.testing.expect(nodata.zone.eql(&zone));
+    try std.testing.expect(nodata.soa != null);
+    // The proof rides with the signature that covers every record in it
+    // (RFC 8020 section 2).
+    try std.testing.expectEqual(@as(u8, 6), nodata.proof.len);
+
+    // A type the wildcard holds is answered, not denied.
+    try std.testing.expect(cache.wildcardNodata(try Name.fromText("nx.example."), .A, now) == null);
+    // A name the wildcard does not cover is not answered from the cache.
+    try std.testing.expect(cache.wildcardNodata(try Name.fromText("deep.nx.example."), .AAAA, now) == null);
+}
+
+test "a wildcard whose own types are not proven is not answered NODATA" {
+    const now: i64 = 1_000_000;
+    const bitmap = [_]u8{ 0x00, 0x06, 0x40, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    const zone = try Name.fromText("example.");
+    var cache = AggressiveCache{};
+    cache.insertNsec(zone, try Name.fromText("mail.example."), &bitmap, now, 3600, testProofSoa(zone), .{
+        .record = testProofNsec(zone, try Name.fromText("mail.example."), &bitmap),
+        .rrsig = testProofRrsig(zone, 1, zone),
+    });
+    cache.insertNsec(try Name.fromText("mail.example."), try Name.fromText("www.example."), &bitmap, now, 3600, testProofSoa(zone), .{
+        .record = testProofNsec(try Name.fromText("mail.example."), try Name.fromText("www.example."), &bitmap),
+        .rrsig = testProofRrsig(try Name.fromText("mail.example."), 2, zone),
+    });
+    const wildcard = try Name.fromText("*.example.");
+    cache.insertWildcard(wildcard, zone, &.{.{
+        .owner = wildcard,
+        .rrtype = .A,
+        .class = .IN,
+        .ttl = 300,
+        .rdata = .{ .A = .{ 192, 0, 2, 1 } },
+    }}, testWildcardRrsig(.A, 1, zone), now, 300);
+
+    // The cache holds no record of the wildcard's own types, so it cannot
+    // prove that the wildcard does not hold the AAAA, and the query goes
+    // upstream (RFC 8198 section 5.3).
+    try std.testing.expect(cache.wildcardNodata(try Name.fromText("nx.example."), .AAAA, now) == null);
 }
 
 test "aggressive cache answers the name a cached wildcard proof covers (RFC 8198 5.3)" {

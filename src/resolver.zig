@@ -912,6 +912,60 @@ fn dropOutOfDomainAdditionals(message: *dns_message.Message, query_name: []const
     message.header.additional_count = @intCast(write_index);
 }
 
+/// RFC 5452 section 6: the answer section of an upstream answer may hold only
+/// data in the domain of the query, so a record for any other name is dropped
+/// before the answer is cached and relayed. The records an alias chain leads
+/// to are the answer the query asked for, so they ride with it.
+fn dropOutOfDomainAnswers(message: *dns_message.Message, query_name: dns_name.Name) void {
+    var targets: [zone.MaxAliasHops]dns_name.Name = undefined;
+    const len = aliasChainTargets(message, query_name, &targets);
+    var write_index: usize = 0;
+    var read_index: usize = 0;
+    while (read_index < message.answers.len) : (read_index += 1) {
+        const record = message.answers.items[read_index];
+        if (!inDomainOf(record.owner.asWire(), query_name.asWire()) and
+            !isChainTarget(record.owner, targets[0..len])) continue;
+        message.answers.items[write_index] = record;
+        write_index += 1;
+    }
+    message.answers.len = write_index;
+    message.header.answer_count = @intCast(write_index);
+}
+
+/// The names the answer's alias chain leads to: the target of the CNAME at the
+/// query name, the target of the CNAME at that name, and so on. A name that
+/// repeats ends the chain.
+fn aliasChainTargets(message: *const dns_message.Message, query_name: dns_name.Name, targets: *[zone.MaxAliasHops]dns_name.Name) usize {
+    var len: usize = 0;
+    var current = query_name;
+    while (len < targets.len) {
+        const target = cnameTarget(message, &current) orelse break;
+        if (isChainTarget(target, targets[0..len])) break;
+        targets[len] = target;
+        len += 1;
+        current = target;
+    }
+    return len;
+}
+
+/// The target of the CNAME record at the owner, when the answer holds one.
+fn cnameTarget(message: *const dns_message.Message, owner: *const dns_name.Name) ?dns_name.Name {
+    for (message.answers.slice()) |record| {
+        if (!record.rrtype.eql(.CNAME)) continue;
+        if (!record.owner.eql(owner)) continue;
+        return record.rdata.CNAME;
+    }
+    return null;
+}
+
+/// True when the name is one the answer's alias chain leads to.
+fn isChainTarget(name: dns_name.Name, targets: []const dns_name.Name) bool {
+    for (targets) |target| {
+        if (name.eql(&target)) return true;
+    }
+    return false;
+}
+
 /// RFC 5452 section 6: a referral's additional section is filtered too. The
 /// records a client needs from a referral are the glue of the delegation's
 /// own name servers (RFC 9471 section 3.1), so a record survives only when
@@ -1121,6 +1175,13 @@ pub const Resolver = struct {
                     if (cookie == .valid) return self.addCachedCookie(output, query, cookie.valid);
                     return bytes;
                 }
+                // RFC 8198 section 5.3: the same wildcard answers NODATA for
+                // a type it does not hold.
+                if (self.dnssec_aggressive.wildcardNodata(question.name, question.qtype, now)) |nodata| {
+                    const bytes = try self.wildcardNodataAnswer(query, nodata, key, now, output);
+                    if (cookie == .valid) return self.addCachedCookie(output, query, cookie.valid);
+                    return bytes;
+                }
             }
         }
         // RFC 9520 section 3.2: a cached resolution failure answers the next
@@ -1178,13 +1239,14 @@ pub const Resolver = struct {
         var upstream_scope = upstreamEcsScope(response, exchange.scope orelse EcsScope{});
         stripOptions(&response);
         // RFC 5452 section 6: only data in the domain of the query may be
-        // accepted, so the authority and the additional section keep the
-        // records whose owner name is the query name or one of its ancestors
-        // or descendants. The answer section is not touched. A referral is not
-        // an answer: its additional section holds the glue of the delegated
-        // name servers, which the client needs to follow the delegation, so
-        // it keeps the glue of the delegation the authority section names and
-        // loses everything else.
+        // accepted, so the answer, the authority, and the additional section
+        // keep the records whose owner name is the query name or one of its
+        // ancestors or descendants. The records an alias chain leads to ride
+        // with the answer, because they are the answer the query asked for.
+        // A referral is not an answer: its additional section holds the glue
+        // of the delegated name servers, which the client needs to follow the
+        // delegation, so it keeps the glue of the delegation the authority
+        // section names and loses everything else.
         if (query.question) |question| {
             dropOutOfDomainAuthorities(&response, question.name.asWire());
             if (isReferral(&response)) {
@@ -1192,6 +1254,7 @@ pub const Resolver = struct {
             } else {
                 dropOutOfDomainAdditionals(&response, question.name.asWire());
             }
+            dropOutOfDomainAnswers(&response, question.name);
         }
         // Validation runs before the cache so a bogus answer is never stored
         // (RFC 4035 section 4.7) and so the AD bit a client sees is the one
@@ -1372,6 +1435,20 @@ pub const Resolver = struct {
         harvestWildcard(&self.dnssec_aggressive, response, now);
     }
 
+    /// RFC 4035 section 5.5: the SOA a denial carries must carry the
+    /// signature that covers it, or a validating client sees an unsigned
+    /// RRset and calls the answer bogus. The cached proof holds the SOA and
+    /// the signature that arrived with it, and a zone that does not sign its
+    /// SOA has none to carry.
+    fn cachedSoaRrsig(cache: *const dnssec.AggressiveCache, soa: dns_record.ResourceRecord) ?dns_record.ResourceRecord {
+        for (cache.entries) |entry| {
+            const cached = entry.soa orelse continue;
+            if (!cached.owner.eql(&soa.owner)) continue;
+            if (entry.soa_rrsig) |rrsig| return rrsig;
+        }
+        return null;
+    }
+
     /// RFC 8198 section 5: the denial this server synthesizes from a cached
     /// NSEC proof. It is kept in the negative cache, so the next client for
     /// a name the denial covers is answered without an upstream query.
@@ -1392,6 +1469,15 @@ pub const Resolver = struct {
             soa_record.ttl = ttl;
             try message.authorities.append(soa_record);
             message.header.authority_count = 1;
+            // RFC 4035 section 5.5: the SOA in a signed zone is signed too,
+            // and RFC 4034 section 3.1: the TTL of an RRSIG matches the TTL
+            // of the RRset it covers.
+            if (cachedSoaRrsig(&self.dnssec_aggressive, soa)) |rrsig| {
+                var sig_record = rrsig;
+                sig_record.ttl = ttl;
+                try message.authorities.append(sig_record);
+                message.header.authority_count += 1;
+            }
         }
         // RFC 8020 section 2: the cut answer carries the proof that
         // justifies it. The proof rides only for a client that asked for
@@ -1466,6 +1552,47 @@ pub const Resolver = struct {
                     try message.authorities.append(parsed.record);
                     message.header.authority_count += 1;
                 }
+            }
+        }
+        if (query.edns) |edns| try appendOpt(&message, edns);
+        try appendEcsScope(&message, key.ecs, 0);
+        var writer = dns_writer.Writer.init(output);
+        message.encode(&writer) catch return Error.ResponseTooLarge;
+        return writer.written();
+    }
+
+    /// RFC 8198 section 5.3: the NODATA a cached wildcard gives for a name it
+    /// covers and a type it does not hold. The answer is empty, and the proof
+    /// that shows the type is absent rides in the authority section with the
+    /// signature that covers it (RFC 8020 section 2).
+    fn wildcardNodataAnswer(self: *Resolver, query: dns_message.Message, nodata: dnssec.WildcardNodata, key: CacheKey, now: i64, output: []u8) ![]const u8 {
+        var message = try aggressiveMessage(query, .no_error);
+        errdefer message.deinit();
+        // RFC 2308 section 3: a negative answer carries the zone SOA, so the
+        // client can cache the denial itself. The proof bounds the answer's
+        // life (RFC 8198 section 4).
+        var ttl: u32 = 0;
+        if (nodata.soa) |soa| {
+            ttl = @min(self.denialTtl(now, soa), nodata.ttl);
+            var soa_record = soa;
+            soa_record.ttl = ttl;
+            try message.authorities.append(soa_record);
+            message.header.authority_count = 1;
+            // RFC 4035 section 5.5: the SOA in a signed zone is signed too,
+            // and RFC 4034 section 3.1: the TTL of an RRSIG matches the TTL
+            // of the RRset it covers.
+            if (nodata.soa_rrsig) |rrsig| {
+                var sig_record = rrsig;
+                sig_record.ttl = ttl;
+                try message.authorities.append(sig_record);
+                message.header.authority_count += 1;
+            }
+        }
+        if (wantsDnssecProofs(query)) {
+            for (nodata.proof.records[0..nodata.proof.len]) |record| {
+                const parsed = dns_record.ResourceRecord.parse(record.bytes(), 0) catch continue;
+                try message.authorities.append(parsed.record);
+                message.header.authority_count += 1;
             }
         }
         if (query.edns) |edns| try appendOpt(&message, edns);
@@ -2433,6 +2560,10 @@ fn harvestSectionNsec(cache: *dnssec.AggressiveCache, records: []const dns_recor
     // RFC 2308 section 3: the SOA of the zone rides with the proof that
     // arrived with it, so a denial the proof gives can carry it.
     const soa = sectionSoa(records);
+    // RFC 4035 section 5.5: an answer that carries the SOA must carry the
+    // signature that covers it, or a validating client sees an unsigned
+    // RRset in a signed zone.
+    const soa_rrsig = if (soa) |record| coveringRrsig(records, record.owner, .SOA) else null;
     for (records) |*record| {
         if (record.rrtype.eql(.NSEC)) {
             const raw = switch (record.rdata) {
@@ -2450,6 +2581,7 @@ fn harvestSectionNsec(cache: *dnssec.AggressiveCache, records: []const dns_recor
             cache.insertNsec(record.owner, next.name, raw[next.next_offset..], now, record.ttl, soa, .{
                 .record = record.*,
                 .rrsig = coveringRrsig(records, record.owner, .NSEC),
+                .soa_rrsig = soa_rrsig,
             });
             continue;
         }
@@ -2468,6 +2600,7 @@ fn harvestSectionNsec(cache: *dnssec.AggressiveCache, records: []const dns_recor
         cache.insertNsec3(record.owner, owner_hash, next_hash, rdata.flags & 1 != 0, rdata.iterations, rdata.salt, rdata.bitmap, now, record.ttl, soa, .{
             .record = record.*,
             .rrsig = coveringRrsig(records, record.owner, .NSEC3),
+            .soa_rrsig = soa_rrsig,
         });
     }
 }
@@ -4211,6 +4344,567 @@ test "a name the cached wildcard proof does not cover goes upstream" {
     const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42605);
     try std.testing.expectError(Error.UpstreamFailure, resolver.answer(encoded, query, &client, &output));
 }
+
+/// The signature that covers the zone SOA the proof arrived with (RFC 4035
+/// section 3.1.3): a validating client needs it beside the SOA.
+fn makeTestSoaRrsig(allocator: std.mem.Allocator, soa: dns_record.ResourceRecord, signer_text: []const u8, key: *const zone_signer.Key) !dns_record.ResourceRecord {
+    var buffer: [dns_rdata.max_unknown_len]u8 = undefined;
+    var writer = dns_writer.Writer.init(&buffer);
+    try soa.rdata.encode(&writer);
+    const signer = try dns_name.Name.fromText(signer_text);
+    const rrsig = try zone_signer.signRrset(allocator, soa.owner, signer, dns_types.RecordType.SOA.code(), &.{writer.written()}, soa.ttl, key, .{ .inception = 1_000_000_000, .expiration = 2_000_000_000 });
+    var unknown = dns_rdata.Unknown{ .len = @intCast(rrsig.len) };
+    @memcpy(unknown.data[0..rrsig.len], rrsig);
+    return .{
+        .owner = soa.owner,
+        .rrtype = .RRSIG,
+        .class = .IN,
+        .ttl = soa.ttl,
+        .rdata = .{ .Unknown = unknown },
+    };
+}
+
+/// The upstream answer that expanded a wildcard, with the proof that the
+/// queried name does not exist (RFC 4035 section 5.4), the record that shows
+/// the types the wildcard holds, and the zone SOA. Every proof record rides
+/// with the signature that covers it (RFC 8020 section 2).
+fn makeTestWildcardNodataResponse(allocator: std.mem.Allocator, name_text: []const u8) !dns_message.Message {
+    var response = try makePositiveResponseFor(allocator, name_text, 300);
+    errdefer response.deinit();
+    response.header.authenticated_data = true;
+    try response.answers.append(.{
+        .owner = try dns_name.Name.fromText(name_text),
+        .rrtype = .RRSIG,
+        .class = .IN,
+        .ttl = 300,
+        .rdata = .{ .Unknown = try makeTestWildcardRrsig(.A, 2) },
+    });
+    response.header.answer_count = 2;
+    // The (mail.example.com., www.example.com.) span covers nx.example.com.
+    const bitmap = [_]u8{ 0x00, 0x06, 0x40, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    try response.authorities.append(try makeTestNsecRecord("mail.example.com.", "www.example.com.", &bitmap, 3600));
+    try response.authorities.append(try makeTestRrsigRecord("mail.example.com.", "example.com.", 3600));
+    // The closest encloser of nx.example.com. is example.com., and it exists.
+    try response.authorities.append(try makeTestNsecRecord("example.com.", "mail.example.com.", &bitmap, 3600));
+    try response.authorities.append(try makeTestRrsigRecord("example.com.", "example.com.", 3600));
+    // The wildcard's own record shows the types it holds: an A record and no
+    // AAAA (RFC 4035 section 5.4).
+    try response.authorities.append(try makeTestNsecRecord("*.example.com.", "mail.example.com.", &bitmap, 3600));
+    try response.authorities.append(try makeTestRrsigRecord("*.example.com.", "example.com.", 3600));
+    const soa = try makeTestSoaIn("example.com.", 3600, 60);
+    try response.authorities.append(soa);
+    var key = try zone_signer.parseKey("ed25519 DSSF3o0s0f+ElWzj9E/Osxw8hLpk55chkmx0LYN5WiY=\n");
+    try response.authorities.append(try makeTestSoaRrsig(allocator, soa, "example.com.", &key));
+    response.header.authority_count = 8;
+    return response;
+}
+
+test "a cached wildcard answers NODATA for a type it does not hold" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = try std.Io.net.IpAddress.parse("127.0.0.1", 9) },
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const now: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+
+    var response = try makeTestWildcardNodataResponse(arena.allocator(), "nx.example.com.");
+    defer response.deinit();
+    resolver.harvestNsecProofs(response, now);
+
+    var query = try makeTestQuery(arena.allocator(), 0x2712, "nx.example.com.", true);
+    defer query.deinit();
+    query.question.?.qtype = .AAAA;
+    query.edns.?.dnssec_ok = true;
+    query.additionals.items[0].ttl |= 0x8000;
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42609);
+    // The forwarder points at a closed port: the answer comes from the
+    // cached wildcard, not from an upstream query.
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    const parsed = try dns_message.Message.parse(arena.allocator(), bytes);
+    // NODATA: NOERROR with an empty answer.
+    try std.testing.expectEqual(dns_header.Rcode.no_error, parsed.header.rcode);
+    try std.testing.expectEqual(@as(usize, 0), parsed.answers.len);
+    // The answer fits the client's payload and is not truncated.
+    try std.testing.expect(!parsed.header.truncated);
+    // The zone SOA, the signature that covers it, and the proof ride in the
+    // authority section (RFC 2308 section 3, RFC 4035 section 5.5, RFC 8020
+    // section 2).
+    try std.testing.expectEqual(@as(usize, 8), parsed.authorities.len);
+    try std.testing.expectEqual(dns_types.RecordType.SOA, parsed.authorities.items[0].rrtype);
+    try std.testing.expectEqual(dns_types.RecordType.RRSIG, parsed.authorities.items[1].rrtype);
+    // The record that shows the wildcard does not hold the type is there.
+    var wildcard_proof = false;
+    for (parsed.authorities.items[1..]) |record| {
+        if (!record.rrtype.eql(.NSEC)) continue;
+        if (!(record.owner).eql(&try dns_name.Name.fromText("*.example.com."))) continue;
+        wildcard_proof = true;
+    }
+    try std.testing.expect(wildcard_proof);
+    // Every proof record rides with the signature that covers it.
+    for (parsed.authorities.items[1..]) |record| {
+        if (!record.rrtype.eql(.NSEC)) continue;
+        var covered = false;
+        for (parsed.authorities.items[1..]) |candidate| {
+            if (!candidate.rrtype.eql(.RRSIG)) continue;
+            if (!(candidate.owner).eql(&record.owner)) continue;
+            const raw = switch (candidate.rdata) {
+                .Unknown => |*unknown| unknown.bytes(),
+                else => continue,
+            };
+            if (dnssec.rrsigCovers(raw) catch continue != dns_types.RecordType.NSEC.code()) continue;
+            covered = true;
+        }
+        try std.testing.expect(covered);
+    }
+}
+
+test "a type the cached wildcard holds still gets the positive answer" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = try std.Io.net.IpAddress.parse("127.0.0.1", 9) },
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const now: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+
+    var response = try makeTestWildcardNodataResponse(arena.allocator(), "nx.example.com.");
+    defer response.deinit();
+    resolver.harvestNsecProofs(response, now);
+
+    var query = try makeTestQuery(arena.allocator(), 0x2713, "nx.example.com.", true);
+    defer query.deinit();
+    query.edns.?.dnssec_ok = true;
+    query.additionals.items[0].ttl |= 0x8000;
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42612);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    const parsed = try dns_message.Message.parse(arena.allocator(), bytes);
+    // The wildcard's records and the signature that covers them ride with
+    // the answer, under the queried name (RFC 4035 section 5.3.2).
+    try std.testing.expectEqual(dns_header.Rcode.no_error, parsed.header.rcode);
+    try std.testing.expectEqual(@as(usize, 2), parsed.answers.len);
+    try std.testing.expectEqual(dns_types.RecordType.A, parsed.answers.items[0].rrtype);
+    try std.testing.expect((parsed.answers.items[0].owner).eql(&try dns_name.Name.fromText("nx.example.com.")));
+    try std.testing.expectEqual(dns_types.RecordType.RRSIG, parsed.answers.items[1].rrtype);
+    try std.testing.expect((parsed.answers.items[1].owner).eql(&try dns_name.Name.fromText("nx.example.com.")));
+    const rrsig_rdata = switch (parsed.answers.items[1].rdata) {
+        .Unknown => |*unknown| unknown.bytes(),
+        else => return error.TestUnexpectedResult,
+    };
+    // The Labels field is the label count of the wildcard.
+    try std.testing.expectEqual(@as(u8, 2), rrsig_rdata[3]);
+}
+
+test "a name the cached wildcard does not cover goes upstream" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = try std.Io.net.IpAddress.parse("127.0.0.1", 9) },
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const now: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+
+    var response = try makeTestWildcardNodataResponse(arena.allocator(), "nx.example.com.");
+    defer response.deinit();
+    resolver.harvestNsecProofs(response, now);
+
+    // "deep.nx.example.com." is below the wildcard, so the proof does not
+    // cover it and the question goes to the authoritative servers.
+    var query = try makeTestQuery(arena.allocator(), 0x2714, "deep.nx.example.com.", true);
+    defer query.deinit();
+    query.question.?.qtype = .AAAA;
+    query.edns.?.dnssec_ok = true;
+    query.additionals.items[0].ttl |= 0x8000;
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42613);
+    try std.testing.expectError(Error.UpstreamFailure, resolver.answer(encoded, query, &client, &output));
+}
+
+test "a wildcard whose own types are not proven goes upstream" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = try std.Io.net.IpAddress.parse("127.0.0.1", 9) },
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const now: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+
+    // The upstream answer carries no record of the wildcard's own types, so
+    // the cache cannot prove that the wildcard does not hold the AAAA, and
+    // the question goes to the authoritative servers (RFC 8198 section 5.3).
+    var response = try makeTestWildcardResponse(arena.allocator(), "nx.example.com.");
+    defer response.deinit();
+    resolver.harvestNsecProofs(response, now);
+
+    var query = try makeTestQuery(arena.allocator(), 0x2715, "nx.example.com.", true);
+    defer query.deinit();
+    query.question.?.qtype = .AAAA;
+    query.edns.?.dnssec_ok = true;
+    query.additionals.items[0].ttl |= 0x8000;
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42614);
+    try std.testing.expectError(Error.UpstreamFailure, resolver.answer(encoded, query, &client, &output));
+}
+
+/// The NSEC3 record of a chain, with the signature that covers it (RFC 4035
+/// section 3.1.3).
+fn appendSignedNsec3Record(allocator: std.mem.Allocator, message: *dns_message.Message, owner_hash: [20]u8, next_hash: [20]u8, salt: []const u8, iterations: u16, bitmap: []const u8, key: *const zone_signer.Key) !void {
+    // The owner name of an NSEC3 record is the base32hex of its hash, in the
+    // canonical (lowercase) form (RFC 5155 section 3).
+    var label: [32]u8 = undefined;
+    dnssec.base32Hex(owner_hash, &label);
+    var text: [64]u8 = undefined;
+    const written = try std.fmt.bufPrint(&text, "{s}.example.", .{label});
+    const owner = try dns_name.Name.fromText(written);
+
+    const rdata = try allocator.alloc(u8, 6 + salt.len + 20 + bitmap.len);
+    var index: usize = 0;
+    rdata[index] = 1; // hash algorithm: SHA-1
+    index += 1;
+    rdata[index] = 0; // flags
+    index += 1;
+    std.mem.writeInt(u16, rdata[index..][0..2], iterations, .big);
+    index += 2;
+    rdata[index] = @intCast(salt.len);
+    index += 1;
+    @memcpy(rdata[index..][0..salt.len], salt);
+    index += salt.len;
+    rdata[index] = 20; // hash length
+    index += 1;
+    @memcpy(rdata[index..][0..20], &next_hash);
+    index += 20;
+    @memcpy(rdata[index..][0..bitmap.len], bitmap);
+    index += bitmap.len;
+    try message.authorities.append(.{
+        .owner = owner,
+        .rrtype = .NSEC3,
+        .class = .IN,
+        .ttl = 3600,
+        .rdata = .{ .Unknown = .{ .len = @intCast(index), .borrowed = rdata } },
+    });
+    const signer = try dns_name.Name.fromText("example.");
+    const signature = try zone_signer.signRrset(allocator, owner, signer, dns_types.RecordType.NSEC3.code(), &.{rdata}, 3600, key, .{ .inception = 1_000_000_000, .expiration = 2_000_000_000 });
+    var unknown = dns_rdata.Unknown{ .len = @intCast(signature.len) };
+    @memcpy(unknown.data[0..signature.len], signature);
+    try message.authorities.append(.{
+        .owner = owner,
+        .rrtype = .RRSIG,
+        .class = .IN,
+        .ttl = 3600,
+        .rdata = .{ .Unknown = unknown },
+    });
+}
+
+/// The upstream answer that expanded a wildcard in a zone signed with
+/// NSEC3, with the proof that the queried name does not exist (RFC 5155
+/// section 8.8), the record that shows the types the wildcard holds (section
+/// 8.7), and the zone SOA.
+fn makeTestSignedNsec3WildcardResponse(allocator: std.mem.Allocator, name_text: []const u8) !dns_message.Message {
+    const salt = [_]u8{ 0x73, 0x61, 0x6c, 0x74 };
+    // RFC 9276 section 3.2: a chain with an iteration count above zero can
+    // only be answered insecure, so the chain here uses none.
+    const iterations: u16 = 0;
+    // A(1), RRSIG(46), NSEC3(50): the wildcard holds an A record and no AAAA.
+    const bitmap = [_]u8{ 0x00, 0x07, 0x40, 0x00, 0x00, 0x00, 0x02, 0xa0, 0x00 };
+    var response = try makePositiveResponseFor(allocator, name_text, 300);
+    errdefer response.deinit();
+    response.header.authenticated_data = true;
+    var key = try zone_signer.parseKey("ed25519 DSSF3o0s0f+ElWzj9E/Osxw8hLpk55chkmx0LYN5WiY=\n");
+    // The RRset the wildcard holds is signed under the wildcard's own name
+    // (RFC 4035 section 5.3.2), and the signature rides under the queried
+    // name.
+    const wildcard = try dns_name.Name.fromText("*.example.");
+    const signer = try dns_name.Name.fromText("example.");
+    const answer = response.answers.items[0];
+    var rdata_buffer: [dns_rdata.max_unknown_len]u8 = undefined;
+    var rdata_writer = dns_writer.Writer.init(&rdata_buffer);
+    try answer.rdata.encode(&rdata_writer);
+    const rrsig_rdata = try zone_signer.signRrset(
+        allocator,
+        wildcard,
+        signer,
+        dns_types.RecordType.A.code(),
+        &.{rdata_writer.written()},
+        answer.ttl,
+        &key,
+        .{ .inception = 1_000_000_000, .expiration = 2_000_000_000 },
+    );
+    var unknown = dns_rdata.Unknown{ .len = @intCast(rrsig_rdata.len) };
+    @memcpy(unknown.data[0..rrsig_rdata.len], rrsig_rdata);
+    try response.answers.append(.{
+        .owner = try dns_name.Name.fromText(name_text),
+        .rrtype = .RRSIG,
+        .class = .IN,
+        .ttl = answer.ttl,
+        .rdata = .{ .Unknown = unknown },
+    });
+    response.header.answer_count = 2;
+    // The chain of the zone: the encloser itself, the span that covers the
+    // next closer name, and the wildcard itself (RFC 5155 section 8.7).
+    const encloser_hash = nsec3TestHash(try dns_name.Name.fromText("example."), &salt, iterations);
+    const next_closer_hash = nsec3TestHash(try dns_name.Name.fromText("nx.example."), &salt, iterations);
+    const wildcard_hash = nsec3TestHash(try dns_name.Name.fromText("*.example."), &salt, iterations);
+    try appendSignedNsec3Record(allocator, &response, encloser_hash, nsec3TestNeighbour(encloser_hash, true), &salt, iterations, &bitmap, &key);
+    try appendSignedNsec3Record(allocator, &response, nsec3TestNeighbour(next_closer_hash, false), nsec3TestNeighbour(next_closer_hash, true), &salt, iterations, &bitmap, &key);
+    try appendSignedNsec3Record(allocator, &response, wildcard_hash, nsec3TestNeighbour(wildcard_hash, true), &salt, iterations, &bitmap, &key);
+    const soa = try makeTestSoa(3600, 3600);
+    try response.authorities.append(soa);
+    try response.authorities.append(try makeTestSoaRrsig(allocator, soa, "example.", &key));
+    response.header.authority_count = 8;
+    return response;
+}
+
+test "a DO=1 client gets the wildcard's NODATA and the answer validates" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = try std.Io.net.IpAddress.parse("127.0.0.1", 9) },
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const now: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+
+    var response = try makeTestSignedNsec3WildcardResponse(arena.allocator(), "nx.example.");
+    defer response.deinit();
+    resolver.harvestNsecProofs(response, now);
+
+    var query = try makeTestQuery(arena.allocator(), 0x2716, "nx.example.", true);
+    defer query.deinit();
+    query.question.?.qtype = .AAAA;
+    query.edns.?.dnssec_ok = true;
+    query.additionals.items[0].ttl |= 0x8000;
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [4096]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42615);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    const parsed = try dns_message.Message.parse(arena.allocator(), bytes);
+    // NODATA: NOERROR with an empty answer.
+    try std.testing.expectEqual(dns_header.Rcode.no_error, parsed.header.rcode);
+    try std.testing.expectEqual(@as(usize, 0), parsed.answers.len);
+    // The proof rides with the signature that covers every record in it.
+    try std.testing.expectEqual(@as(usize, 8), parsed.authorities.len);
+    try std.testing.expectEqual(dns_types.RecordType.SOA, parsed.authorities.items[0].rrtype);
+    try std.testing.expectEqual(dns_types.RecordType.NSEC3, parsed.authorities.items[2].rrtype);
+
+    // The project's own validator accepts the answer: the proof shows the
+    // name does not exist and that the wildcard does not hold the type
+    // (RFC 5155 section 8.7).
+    var anchors = try validate.Anchors.parse(arena.allocator(), "example. DNSKEY 257 3 15 zPnZ/QwEe7S8C5SPz2OfS5RR40ATk2/rYnE9xHIEijs=");
+    const result = try validate.validate(arena.allocator(), &anchors, query, parsed, &.{}, 1_500_000_000);
+    try std.testing.expectEqual(validate.Status.secure, result.status);
+}
+
+/// The RRSIG that covers an NSEC RRset, made with the zone key so a
+/// validating client can check the proof (RFC 4034 section 3.2).
+fn makeTestNsecRrsig(allocator: std.mem.Allocator, nsec: dns_record.ResourceRecord, signer_text: []const u8, key: *const zone_signer.Key) !dns_record.ResourceRecord {
+    var buffer: [dns_rdata.max_unknown_len]u8 = undefined;
+    var writer = dns_writer.Writer.init(&buffer);
+    try nsec.rdata.encode(&writer);
+    const signer = try dns_name.Name.fromText(signer_text);
+    const rrsig = try zone_signer.signRrset(allocator, nsec.owner, signer, dns_types.RecordType.NSEC.code(), &.{writer.written()}, nsec.ttl, key, .{ .inception = 1_000_000_000, .expiration = 2_000_000_000 });
+    var unknown = dns_rdata.Unknown{ .len = @intCast(rrsig.len) };
+    @memcpy(unknown.data[0..rrsig.len], rrsig);
+    return .{
+        .owner = nsec.owner,
+        .rrtype = .RRSIG,
+        .class = .IN,
+        .ttl = nsec.ttl,
+        .rdata = .{ .Unknown = unknown },
+    };
+}
+
+/// The upstream answer that carried the proof of a denial: the closest
+/// encloser, the name below it, the zone SOA, and the signature over that
+/// SOA when the zone signs it.
+fn makeTestSignedDenialResponse(allocator: std.mem.Allocator, name_text: []const u8, sign_soa: bool) !dns_message.Message {
+    const bitmap = [_]u8{ 0x00, 0x06, 0x40, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    var response = try makeTestQuery(allocator, 0x2910, name_text, false);
+    errdefer response.deinit();
+    response.header.qr = true;
+    response.header.authenticated_data = true;
+    var key = try zone_signer.parseKey("ed25519 DSSF3o0s0f+ElWzj9E/Osxw8hLpk55chkmx0LYN5WiY=\n");
+    // The closest encloser of nx.example.com. is example.com., and the NSEC
+    // at mail.example.com. covers the name itself.
+    const encloser = try makeTestNsecRecord("example.com.", "mail.example.com.", &bitmap, 3600);
+    try response.authorities.append(encloser);
+    try response.authorities.append(try makeTestNsecRrsig(allocator, encloser, "example.com.", &key));
+    const cover = try makeTestNsecRecord("mail.example.com.", "www.example.com.", &bitmap, 3600);
+    try response.authorities.append(cover);
+    try response.authorities.append(try makeTestNsecRrsig(allocator, cover, "example.com.", &key));
+    const soa = try makeTestSoaIn("example.com.", 3600, 3600);
+    try response.authorities.append(soa);
+    if (sign_soa) try response.authorities.append(try makeTestSoaRrsig(allocator, soa, "example.com.", &key));
+    response.header.authority_count = @intCast(response.authorities.len);
+    return response;
+}
+
+/// The upstream answer that expanded a wildcard into a NODATA: the closest
+/// encloser, the name below it, the record that shows the types the wildcard
+/// holds, the zone SOA, and the signature over that SOA.
+fn makeTestSignedWildcardNodataResponse(allocator: std.mem.Allocator, name_text: []const u8) !dns_message.Message {
+    const bitmap = [_]u8{ 0x00, 0x06, 0x40, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    var response = try makePositiveResponseFor(allocator, name_text, 300);
+    errdefer response.deinit();
+    response.header.authenticated_data = true;
+    try response.answers.append(.{
+        .owner = try dns_name.Name.fromText(name_text),
+        .rrtype = .RRSIG,
+        .class = .IN,
+        .ttl = 300,
+        .rdata = .{ .Unknown = try makeTestWildcardRrsig(.A, 2) },
+    });
+    response.header.answer_count = 2;
+    var key = try zone_signer.parseKey("ed25519 DSSF3o0s0f+ElWzj9E/Osxw8hLpk55chkmx0LYN5WiY=\n");
+    const encloser = try makeTestNsecRecord("example.com.", "mail.example.com.", &bitmap, 3600);
+    try response.authorities.append(encloser);
+    try response.authorities.append(try makeTestNsecRrsig(allocator, encloser, "example.com.", &key));
+    const cover = try makeTestNsecRecord("mail.example.com.", "www.example.com.", &bitmap, 3600);
+    try response.authorities.append(cover);
+    try response.authorities.append(try makeTestNsecRrsig(allocator, cover, "example.com.", &key));
+    const wildcard = try makeTestNsecRecord("*.example.com.", "mail.example.com.", &bitmap, 3600);
+    try response.authorities.append(wildcard);
+    try response.authorities.append(try makeTestNsecRrsig(allocator, wildcard, "example.com.", &key));
+    const soa = try makeTestSoaIn("example.com.", 3600, 60);
+    try response.authorities.append(soa);
+    try response.authorities.append(try makeTestSoaRrsig(allocator, soa, "example.com.", &key));
+    response.header.authority_count = @intCast(response.authorities.len);
+    return response;
+}
+
+test "RFC 4035 section 3.1.3.4: the wildcard NODATA the client gets validates" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = try std.Io.net.IpAddress.parse("127.0.0.1", 9) },
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const now: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+
+    var response = try makeTestSignedWildcardNodataResponse(arena.allocator(), "nx.example.com.");
+    defer response.deinit();
+    resolver.harvestNsecProofs(response, now);
+
+    var query = try makeTestQuery(arena.allocator(), 0x2916, "nx.example.com.", true);
+    defer query.deinit();
+    query.question.?.qtype = .AAAA;
+    query.edns.?.dnssec_ok = true;
+    query.additionals.items[0].ttl |= 0x8000;
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [4096]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42616);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    const parsed = try dns_message.Message.parse(arena.allocator(), bytes);
+    // NODATA: NOERROR with an empty answer.
+    try std.testing.expectEqual(dns_header.Rcode.no_error, parsed.header.rcode);
+    try std.testing.expectEqual(@as(usize, 0), parsed.answers.len);
+    // The project's own validator accepts the answer: the NSEC at the
+    // wildcard's own name shows that the wildcard does not hold the type
+    // (RFC 4035 section 3.1.3.4).
+    var anchors = try validate.Anchors.parse(arena.allocator(), "example.com. DNSKEY 257 3 15 zPnZ/QwEe7S8C5SPz2OfS5RR40ATk2/rYnE9xHIEijs=");
+    const result = try validate.validate(arena.allocator(), &anchors, query, parsed, &.{}, 1_500_000_000);
+    try std.testing.expectEqual(validate.Status.secure, result.status);
+}
+
+test "RFC 4035 section 5.5: the aggressive denial carries the signature over its SOA" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = try std.Io.net.IpAddress.parse("127.0.0.1", 9) },
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const now: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+
+    var response = try makeTestSignedDenialResponse(arena.allocator(), "nx.example.com.", true);
+    defer response.deinit();
+    resolver.harvestNsecProofs(response, now);
+
+    var query = try makeTestQuery(arena.allocator(), 0x2917, "nx.example.com.", true);
+    defer query.deinit();
+    query.edns.?.dnssec_ok = true;
+    query.additionals.items[0].ttl |= 0x8000;
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [4096]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42617);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    const parsed = try dns_message.Message.parse(arena.allocator(), bytes);
+    try std.testing.expectEqual(dns_header.Rcode.nxdomain, parsed.header.rcode);
+    // The zone SOA rides with the signature that covers it (RFC 4035 section
+    // 5.5), so a validating client does not call the answer bogus.
+    try std.testing.expectEqual(dns_types.RecordType.SOA, parsed.authorities.items[0].rrtype);
+    try std.testing.expectEqual(dns_types.RecordType.RRSIG, parsed.authorities.items[1].rrtype);
+    var anchors = try validate.Anchors.parse(arena.allocator(), "example.com. DNSKEY 257 3 15 zPnZ/QwEe7S8C5SPz2OfS5RR40ATk2/rYnE9xHIEijs=");
+    const result = try validate.validate(arena.allocator(), &anchors, query, parsed, &.{}, 1_500_000_000);
+    try std.testing.expectEqual(validate.Status.secure, result.status);
+    try std.testing.expectEqual(@as(u16, 0), result.ede);
+}
+
+test "a denial from a zone that does not sign its SOA carries no RRSIG" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = try std.Io.net.IpAddress.parse("127.0.0.1", 9) },
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const now: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+
+    // The zone publishes the SOA without signing it, so there is no
+    // signature to carry and the denial is what it always was.
+    var response = try makeTestSignedDenialResponse(arena.allocator(), "nx.example.com.", false);
+    defer response.deinit();
+    resolver.harvestNsecProofs(response, now);
+
+    var query = try makeTestQuery(arena.allocator(), 0x2918, "nx.example.com.", true);
+    defer query.deinit();
+    query.edns.?.dnssec_ok = true;
+    query.additionals.items[0].ttl |= 0x8000;
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [4096]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42618);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    const parsed = try dns_message.Message.parse(arena.allocator(), bytes);
+    try std.testing.expectEqual(dns_header.Rcode.nxdomain, parsed.header.rcode);
+    // The SOA and the proof, and nothing else.
+    try std.testing.expectEqual(@as(usize, 5), parsed.authorities.len);
+    try std.testing.expectEqual(dns_types.RecordType.SOA, parsed.authorities.items[0].rrtype);
+    for (parsed.authorities.items) |record| {
+        if (!record.rrtype.eql(.RRSIG)) continue;
+        const raw = switch (record.rdata) {
+            .Unknown => |*unknown| unknown.bytes(),
+            else => continue,
+        };
+        try std.testing.expect(dnssec.rrsigCovers(raw) catch continue != dns_types.RecordType.SOA.code());
+    }
+}
+
 test "a proof whose RDATA kept a compression pointer is refused as malformed" {
     const now: i64 = 1_000_000;
     var cache = dnssec.AggressiveCache{};
@@ -7320,6 +8014,12 @@ const UpstreamShape = enum {
     /// An answer whose authority section holds a record inside and outside
     /// the domain of the query.
     answer_with_authority,
+    /// An answer whose answer section holds a record for a name outside the
+    /// domain of the query.
+    answer_with_foreign_record,
+    /// An answer whose answer section holds a CNAME chain that leaves the
+    /// domain of the query, beside a record that has nothing to do with it.
+    answer_with_cname_chain,
     /// A negative answer whose authority section holds the zone SOA beside a
     /// record for an unrelated name.
     negative_answer,
@@ -7364,7 +8064,10 @@ fn serveAdditionalUpstream(args: *AdditionalUpstream) void {
 /// additional section that holds a record for an unrelated name beside
 /// records for the query name and for a name below it. The shape with an
 /// authority section adds to it a record for the query name and one for an
-/// unrelated name. A negative answer instead carries the zone SOA in the
+/// unrelated name. The shape with a foreign record adds to the answer
+/// section a record for a name outside the domain of the query, and the
+/// shape with a CNAME chain answers with a chain that leaves the domain of
+/// the query. A negative answer instead carries the zone SOA in the
 /// authority section beside a record for an unrelated name. A referral
 /// carries the NS record of the delegated zone in the authority section and
 /// the glue of its name server in the additional section, beside a record for
@@ -7468,14 +8171,54 @@ fn buildAdditionalUpstreamAnswer(buffer: []u8, query: dns_message.Message, shape
         try message.encode(&writer);
         return writer.written();
     }
-    try message.answers.append(.{
-        .owner = question.name,
-        .rrtype = .A,
-        .class = .IN,
-        .ttl = 60,
-        .rdata = .{ .A = .{ 192, 0, 2, 1 } },
-    });
-    message.header.answer_count = 1;
+    if (shape == .answer_with_cname_chain) {
+        // The answer holds a CNAME chain that leaves the domain of the query,
+        // with the address of the name it leads to, beside a record that has
+        // nothing to do with the chain.
+        try message.answers.append(.{
+            .owner = question.name,
+            .rrtype = .CNAME,
+            .class = .IN,
+            .ttl = 60,
+            .rdata = .{ .CNAME = try dns_name.Name.fromText("cdn.other.net.") },
+        });
+        try message.answers.append(.{
+            .owner = try dns_name.Name.fromText("cdn.other.net."),
+            .rrtype = .A,
+            .class = .IN,
+            .ttl = 60,
+            .rdata = .{ .A = .{ 192, 0, 2, 7 } },
+        });
+        try message.answers.append(.{
+            .owner = try dns_name.Name.fromText("mail.elsewhere.example."),
+            .rrtype = .A,
+            .class = .IN,
+            .ttl = 60,
+            .rdata = .{ .A = .{ 192, 0, 2, 8 } },
+        });
+        message.header.answer_count = 3;
+    } else {
+        try message.answers.append(.{
+            .owner = question.name,
+            .rrtype = .A,
+            .class = .IN,
+            .ttl = 60,
+            .rdata = .{ .A = .{ 192, 0, 2, 1 } },
+        });
+        message.header.answer_count = 1;
+    }
+    if (shape == .answer_with_foreign_record) {
+        // The answer holds a record for a name that is not in the domain of
+        // the query and that no alias chain leads to.
+        try message.answers.append(.{
+            .owner = try dns_name.Name.fromText("mail.elsewhere.example."),
+            .rrtype = .A,
+            .class = .IN,
+            .ttl = 60,
+            .rdata = .{ .A = .{ 192, 0, 2, 6 } },
+        });
+        message.header.answer_count = 2;
+    }
     if (shape == .answer_with_authority) {
         // The authority section holds a record for the query name, which is
         // in the domain of the query, and one for an unrelated name, which is
@@ -7614,6 +8357,42 @@ test "RFC 5452 section 6: the cached answer holds the filtered additional sectio
     try std.testing.expectEqualStrings("www.example.com.", try message.additionals.items[0].owner.toText(&text));
     try std.testing.expectEqualStrings("mail.www.example.com.", try message.additionals.items[1].owner.toText(&text));
     try std.testing.expectEqual(@as(usize, 1), fixture.upstream.requests);
+}
+
+test "RFC 5452 section 6: an answer record outside the domain of the query is not relayed" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const fixture = try AdditionalFixture.create(io, .answer_with_foreign_record);
+    defer fixture.destroy();
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42762);
+
+    const bytes = try fixture.resolver.answer(fixture.encoded, fixture.query, &client, &output);
+    const message = try dns_message.Message.parse(fixture.arena.allocator(), bytes);
+
+    // The answer section keeps the record for the query name and drops the
+    // one for a name that is not in the domain of the query.
+    try std.testing.expectEqual(@as(u16, 1), message.header.answer_count);
+    var text: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("www.example.com.", try message.answers.items[0].owner.toText(&text));
+}
+
+test "RFC 5452 section 6: the records a CNAME chain leads to are relayed" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const fixture = try AdditionalFixture.create(io, .answer_with_cname_chain);
+    defer fixture.destroy();
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42763);
+
+    const bytes = try fixture.resolver.answer(fixture.encoded, fixture.query, &client, &output);
+    const message = try dns_message.Message.parse(fixture.arena.allocator(), bytes);
+
+    // The chain leaves the domain of the query, and the records it leads to
+    // are the answer the query asked for, so they ride with it. The record
+    // beside them belongs to no chain of the query, so it is dropped.
+    try std.testing.expectEqual(@as(u16, 2), message.header.answer_count);
+    var text: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("www.example.com.", try message.answers.items[0].owner.toText(&text));
+    try std.testing.expectEqualStrings("cdn.other.net.", try message.answers.items[1].owner.toText(&text));
 }
 
 test "RFC 5452 section 6: a referral keeps only the glue of the delegation it names" {
