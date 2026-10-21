@@ -20,6 +20,7 @@ const Name = @import("name.zig").Name;
 const dns_message = @import("message.zig");
 const dns_writer = @import("writer.zig");
 const record_mod = @import("record.zig");
+const rdata_mod = @import("rdata.zig");
 
 pub const EDE_DNSSEC_BOGUS: u16 = 6;
 pub const EDE_SIGNATURE_EXPIRED: u16 = 7;
@@ -338,6 +339,16 @@ pub const Denial = enum {
     nodata,
 };
 
+/// The number of records a cached wildcard RRset holds. The RRSIG covers the
+/// whole RRset (RFC 4035 section 5.3.2), so a wildcard the cache cannot hold
+/// whole is not cached at all and the resolver falls back upstream
+/// (RFC 8198 section 5.3).
+pub const max_wildcard_records = 4;
+
+/// The wire length of the longest record the cache holds: an owner name, the
+/// record's own fields, and an RDATA of the largest inline type.
+const max_cached_record_wire_len = 255 + 10 + rdata_mod.max_unknown_len;
+
 /// The bound on the RDATA of a proof record a cut answer carries. It holds
 /// an RRSIG with an RSA-2048 signature and a full-length signer name.
 pub const max_proof_rdata_len: usize = 640;
@@ -422,13 +433,16 @@ pub const ProvenDenial = struct {
 pub const WildcardAnswer = struct {
     /// The wildcard the records come from, e.g. "*.example.".
     wildcard: Name,
+    /// The zone the wildcard belongs to: the signer name of the signature
+    /// that covers it (RFC 4035 section 5.3.1).
+    zone: Name,
     /// The wildcard's records, of the queried type.
-    records: [4]record_mod.ResourceRecord = undefined,
+    records: [max_wildcard_records]record_mod.ResourceRecord = undefined,
     len: u8 = 0,
-    /// The zone SOA that arrived with the proof (RFC 2308 section 3).
-    soa: ?record_mod.ResourceRecord,
     /// The proof the answer rests on (RFC 8020 section 2).
     proof: ?Proof = null,
+    /// The RRSIG that covers the wildcard RRset (RFC 4035 section 5.3.2).
+    rrsig: ?ProofRecord = null,
     /// The TTL the answer carries: the TTL of the wildcard's records, held
     /// down to the life of the proof (RFC 8198 section 4).
     ttl: u32,
@@ -483,6 +497,10 @@ fn proofNamesUncompressed(rrtype: RecordType, rdata: []const u8) bool {
 /// RDATA of a type that is not well known, so such a record cannot be used
 /// as a proof.
 pub fn proofMalformed(record: record_mod.ResourceRecord) bool {
+    switch (record.rrtype.code()) {
+        RecordType.NSEC.code(), RecordType.RRSIG.code(), RecordType.NSEC3.code() => {},
+        else => return false,
+    }
     const rdata = switch (record.rdata) {
         .Unknown => |*unknown| unknown.bytes(),
         else => return false,
@@ -504,6 +522,16 @@ fn parentName(name: Name) ?Name {
     @memcpy(out.wire[0..rest.len], rest);
     out.wire_len = @intCast(rest.len);
     return out;
+}
+
+/// The signer's name of an RRSIG RDATA (RFC 4034 section 3.2): the zone
+/// the signature was made in, which is the zone the covered RRset
+/// belongs to (RFC 4035 section 5.3.1). Null when the name is compressed,
+/// which RFC 4034 section 3.2 forbids.
+pub fn rrsigSigner(rrsig_rdata: []const u8) ?Name {
+    if (!proofNamesUncompressed(.RRSIG, rrsig_rdata)) return null;
+    const parsed = Name.parse(rrsig_rdata, 18) catch return null;
+    return parsed.name;
 }
 
 /// The Labels field of an RRSIG RDATA (RFC 4034 section 3.2.5): the label
@@ -633,8 +661,12 @@ pub const AggressiveCache = struct {
     const WildcardEntry = struct {
         valid: bool = false,
         name: Name = Name.root(),
-        records: [4]record_mod.ResourceRecord = undefined,
+        /// The zone the wildcard belongs to (RFC 4035 section 5.3.1).
+        zone: Name = Name.root(),
+        records: [max_wildcard_records]record_mod.ResourceRecord = undefined,
         len: u8 = 0,
+        /// The RRSIG that covers the wildcard RRset (RFC 4035 section 5.3.2).
+        rrsig: ProofRecord = .{},
         expires_at: i64 = 0,
     };
 
@@ -720,41 +752,103 @@ pub const AggressiveCache = struct {
     /// carried, so a later query the wildcard covers is answered from it.
     /// The records are the wildcard's own, and the answer sends them under
     /// the queried name (RFC 4035 section 5.3.2).
-    pub fn insertWildcard(self: *AggressiveCache, name: Name, records: []const record_mod.ResourceRecord, now: i64, ttl: u32) void {
+    pub fn insertWildcard(self: *AggressiveCache, name: Name, zone: Name, records: []const record_mod.ResourceRecord, rrsig: ?record_mod.ResourceRecord, now: i64, ttl: u32) void {
         if (records.len == 0) return;
-        const slot = &self.wildcards[self.next_wildcard];
-        self.next_wildcard = (self.next_wildcard + 1) % self.wildcards.len;
-        slot.valid = true;
-        slot.name = name;
-        const len = @min(records.len, slot.records.len);
-        for (records[0..len], 0..) |record, index| {
+        // Every record is tested before the slot is written, so a slot that
+        // is reused never keeps the records of the wildcard it held.
+        for (records) |record| {
             // A record whose RDATA borrows the message it came from cannot
             // outlive that message in the cache.
             switch (record.rdata) {
                 .Unknown => return,
                 else => {},
             }
+        }
+        // The answer is only served to a client that asked for the proofs,
+        // and such a client needs the signature that covers the wildcard
+        // RRset (RFC 4035 section 5.3.2).
+        const sig = rrsig orelse return;
+        var sig_wire = ProofRecord{};
+        keepProof(&sig_wire, sig);
+        if (sig_wire.len == 0) return;
+        // The signature covers the whole RRset, so a wildcard the cache
+        // cannot hold whole is not cached at all: a partial RRset under that
+        // signature cannot verify (RFC 4035 section 5.3.2), and the resolver
+        // falls back upstream instead (RFC 8198 section 5.3).
+        if (records.len > max_wildcard_records) return;
+        // The answer carries the records and the signature that covers them
+        // in one message, so their wire size must fit what a message can
+        // carry (RFC 1035 section 4.2.2).
+        var wire_len: usize = sig_wire.len;
+        var scratch: [max_cached_record_wire_len]u8 = undefined;
+        for (records) |record| {
+            var writer = dns_writer.Writer.init(&scratch);
+            record.encode(&writer) catch return;
+            wire_len += writer.written().len;
+        }
+        if (wire_len > rdata_mod.max_message_rdata_len) return;
+        const slot = &self.wildcards[self.next_wildcard];
+        self.next_wildcard = (self.next_wildcard + 1) % self.wildcards.len;
+        slot.* = .{};
+        slot.valid = true;
+        slot.name = name;
+        slot.zone = zone;
+        for (records, 0..) |record, index| {
             var copy = record;
             copy.owner = name;
             slot.records[index] = copy;
         }
-        slot.len = @intCast(len);
+        slot.len = @intCast(records.len);
+        slot.rrsig = sig_wire;
         slot.expires_at = now +| @min(@as(i64, ttl), max_entry_ttl_seconds);
     }
 
-    /// The proof a wildcard answer rests on: an NSEC that covers the
-    /// queried name (RFC 4035 section 5.4), or an NSEC3 that covers the
-    /// hash of the name (RFC 5155 section 8.8).
+    /// The proof a wildcard answer rests on: the closest encloser (the
+    /// wildcard's own parent) must exist and the queried name must not
+    /// (RFC 4035 section 5.4, RFC 5155 section 8.8).
     const WildcardProof = struct {
         records: ?Proof = null,
-        soa: ?record_mod.ResourceRecord = null,
         expires_at: i64 = 0,
     };
 
-    fn wildcardProof(self: *const AggressiveCache, qname: Name) ?WildcardProof {
-        if (self.findCovering(qname)) |entry| {
-            return .{ .records = self.proofOf(entry), .soa = entry.soa, .expires_at = entry.expires_at };
+    /// The zone a cached proof belongs to: the apex of the zone that
+    /// published it. A proof of another zone proves nothing here.
+    fn entryZone(entry: *const Entry) ?Name {
+        if (entry.is_nsec3) return entry.nsec3_chain.zone;
+        const soa = entry.soa orelse return null;
+        return soa.owner;
+    }
+
+    fn wildcardProof(self: *const AggressiveCache, qname: Name, encloser: Name, zone: Name) ?WildcardProof {
+        if (self.nsecWildcardProof(qname, encloser, zone)) |proof| return proof;
+        return self.nsec3WildcardProof(qname, encloser, zone);
+    }
+
+    /// RFC 4035 section 5.4: the closest encloser must exist and the
+    /// queried name must not, both in the zone the wildcard belongs to.
+    fn nsecWildcardProof(self: *const AggressiveCache, qname: Name, encloser: Name, zone: Name) ?WildcardProof {
+        const ce = self.findNsecOwner(encloser, zone) orelse return null;
+        const cover = self.findCovering(qname, zone) orelse return null;
+        var proof = Proof{};
+        var complete = true;
+        for ([_]*const Entry{ ce, cover }) |entry| {
+            if (entry.proof_record.len == 0 or entry.proof_rrsig.len == 0) {
+                complete = false;
+                break;
+            }
+            proof.add(entry.proof_record);
+            proof.add(entry.proof_rrsig);
         }
+        return .{
+            .records = if (complete and proof.len != 0) proof else null,
+            .expires_at = @min(ce.expires_at, cover.expires_at),
+        };
+    }
+
+    /// RFC 5155 section 8.8: an NSEC3 that matches the closest encloser
+    /// and one that covers the next closer name, in the zone the wildcard
+    /// belongs to.
+    fn nsec3WildcardProof(self: *const AggressiveCache, qname: Name, encloser: Name, zone: Name) ?WildcardProof {
         var index: usize = 0;
         while (index < self.entries.len) : (index += 1) {
             const head = &self.entries[index];
@@ -763,12 +857,27 @@ pub const AggressiveCache = struct {
             // this one (RFC 5155 section 8.2).
             if (self.chainSeen(head, index)) continue;
             const chain = head.nsec3_chain;
+            if (!chain.zone.eql(&zone)) continue;
             if (!isWithin(qname, chain.zone)) continue;
             const cover = self.findNsec3Cover(&chain, nsec3HashIn(chain, qname)) orelse continue;
             // RFC 8198 section 5.2: a covering NSEC3 with the Opt-Out flag
             // set does not prove the non-existence of the name.
             if (cover.nsec3_opt_out) continue;
-            return .{ .records = self.proofOf(cover), .soa = cover.soa, .expires_at = cover.expires_at };
+            const ce = self.findNsec3Match(&chain, nsec3HashIn(chain, encloser)) orelse continue;
+            var proof = Proof{};
+            var complete = true;
+            for ([_]*const Entry{ ce, cover }) |entry| {
+                if (entry.proof_record.len == 0 or entry.proof_rrsig.len == 0) {
+                    complete = false;
+                    break;
+                }
+                proof.add(entry.proof_record);
+                proof.add(entry.proof_rrsig);
+            }
+            return .{
+                .records = if (complete and proof.len != 0) proof else null,
+                .expires_at = @min(ce.expires_at, cover.expires_at),
+            };
         }
         return null;
     }
@@ -793,14 +902,15 @@ pub const AggressiveCache = struct {
                 if (record.rrtype.eql(qtype)) found = true;
             }
             if (!found) continue;
-            const proof = self.wildcardProof(qname) orelse continue;
+            const proof = self.wildcardProof(qname, encloser, entry.zone) orelse continue;
             const remaining = @min(entry.expires_at, proof.expires_at) - now;
             if (remaining <= 0) continue;
             var answer = WildcardAnswer{
                 .wildcard = entry.name,
+                .zone = entry.zone,
                 .records = undefined,
-                .soa = proof.soa,
                 .proof = proof.records,
+                .rrsig = if (entry.rrsig.len == 0) null else entry.rrsig,
                 .ttl = @min(@as(u32, @intCast(remaining)), entry.records[0].ttl),
             };
             @memcpy(answer.records[0..entry.len], entry.records[0..entry.len]);
@@ -810,19 +920,33 @@ pub const AggressiveCache = struct {
         return null;
     }
 
-    fn findNsecOwner(self: *const AggressiveCache, owner: Name) ?*const Entry {
+    /// The cached NSEC whose owner is the name. The zone is the one the
+    /// proof must be of: a proof of another zone proves nothing here, and
+    /// the search looks on for one that does. Null asks for any zone.
+    fn findNsecOwner(self: *const AggressiveCache, owner: Name, zone: ?Name) ?*const Entry {
         for (&self.entries) |*entry| {
             if (!entry.valid or entry.is_nsec3) continue;
-            if (entry.owner.eql(&owner)) return entry;
+            if (!entry.owner.eql(&owner)) continue;
+            if (zone) |wanted| {
+                const entry_zone = entryZone(entry) orelse continue;
+                if (!entry_zone.eql(&wanted)) continue;
+            }
+            return entry;
         }
         return null;
     }
 
     /// The cached NSEC whose span covers the name, which is the proof that
-    /// the name does not exist.
-    fn findCovering(self: *const AggressiveCache, name: Name) ?*const Entry {
+    /// the name does not exist. The zone is the one the proof must be of: a
+    /// proof of another zone proves nothing here, and the search looks on for
+    /// one that does. Null asks for any zone.
+    fn findCovering(self: *const AggressiveCache, name: Name, zone: ?Name) ?*const Entry {
         for (&self.entries) |*entry| {
             if (!entry.valid or entry.is_nsec3) continue;
+            if (zone) |wanted| {
+                const entry_zone = entryZone(entry) orelse continue;
+                if (!entry_zone.eql(&wanted)) continue;
+            }
             if (nsecCovers(entry.owner, entry.next, name)) return entry;
         }
         return null;
@@ -887,11 +1011,11 @@ pub const AggressiveCache = struct {
         var next_closer = qname;
         var ancestor = parentName(qname);
         while (ancestor) |closest_encloser| {
-            if (self.findNsecOwner(closest_encloser)) |encloser| {
+            if (self.findNsecOwner(closest_encloser, null)) |encloser| {
                 const wildcard = wildcardName(closest_encloser) orelse return null;
-                if (self.findNsecOwner(wildcard) != null) return null;
-                const next_cover = self.findCovering(next_closer) orelse return null;
-                const wildcard_cover = self.findCovering(wildcard) orelse return null;
+                if (self.findNsecOwner(wildcard, null) != null) return null;
+                const next_cover = self.findCovering(next_closer, null) orelse return null;
+                const wildcard_cover = self.findCovering(wildcard, null) orelse return null;
                 var proof = Proof{};
                 var complete = true;
                 for ([_]*const Entry{ encloser, next_cover, wildcard_cover }) |entry| {
@@ -1219,26 +1343,70 @@ test "aggressive NXDOMAIN needs closest-encloser and wildcard proofs (RFC 8198 5
     try std.testing.expect((try wild.deny(qnx, .A, now)) == null);
 }
 
+/// The zone SOA a proof arrives with (RFC 2308 section 3).
+fn testProofSoa(zone: Name) record_mod.ResourceRecord {
+    return .{
+        .owner = zone,
+        .rrtype = .SOA,
+        .class = .IN,
+        .ttl = 3600,
+        .rdata = .{ .SOA = .{
+            .mname = zone,
+            .rname = zone,
+            .serial = 1,
+            .refresh = 3600,
+            .retry = 900,
+            .expire = 1209600,
+            .minimum = 3600,
+        } },
+    };
+}
+
+/// The RRSIG that covers a wildcard RRset (RFC 4034 section 3.2): the type
+/// it covers, the label count of the wildcard, and the zone that signed it.
+fn testWildcardRrsig(covered: RecordType, labels: u8, zone: Name) record_mod.ResourceRecord {
+    var rdata: rdata_mod.Unknown = .{};
+    std.mem.writeInt(u16, rdata.data[0..2], covered.code(), .big);
+    rdata.data[2] = 8; // algorithm
+    rdata.data[3] = labels;
+    const signer = zone.asWire();
+    @memcpy(rdata.data[18..][0..signer.len], signer);
+    rdata.len = @intCast(18 + signer.len);
+    return .{
+        .owner = Name.root(),
+        .rrtype = .RRSIG,
+        .class = .IN,
+        .ttl = 300,
+        .rdata = .{ .Unknown = rdata },
+    };
+}
+
 test "aggressive cache answers the name a cached wildcard proof covers (RFC 8198 5.3)" {
     const now: i64 = 1_000_000;
     const bitmap = [_]u8{ 0x00, 0x06, 0x40, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    const zone = try Name.fromText("example.");
     var cache = AggressiveCache{};
+    // The closest encloser of nx.example. is example., and it exists.
+    cache.insertNsec(zone, try Name.fromText("mail.example."), &bitmap, now, 3600, testProofSoa(zone), .{});
     // The (mail.example., www.example.) span covers nx.example.
-    cache.insertNsec(try Name.fromText("mail.example."), try Name.fromText("www.example."), &bitmap, now, 3600, null, .{});
+    cache.insertNsec(try Name.fromText("mail.example."), try Name.fromText("www.example."), &bitmap, now, 3600, testProofSoa(zone), .{});
     const wildcard = try Name.fromText("*.example.");
-    cache.insertWildcard(wildcard, &.{.{
+    cache.insertWildcard(wildcard, zone, &.{.{
         .owner = wildcard,
         .rrtype = .A,
         .class = .IN,
         .ttl = 300,
         .rdata = .{ .A = .{ 192, 0, 2, 1 } },
-    }}, now, 300);
+    }}, testWildcardRrsig(.A, 1, zone), now, 300);
 
     const answer = cache.wildcardAnswer(try Name.fromText("nx.example."), .A, now).?;
     try std.testing.expectEqual(@as(u8, 1), answer.len);
     try std.testing.expectEqual(@as(u32, 300), answer.ttl);
     try std.testing.expect(answer.wildcard.eql(&wildcard));
+    try std.testing.expect(answer.zone.eql(&zone));
     try std.testing.expectEqual(@as(u8, 192), answer.records[0].rdata.A[0]);
+    // The answer carries the signature that covers the wildcard RRset.
+    try std.testing.expect(answer.rrsig != null);
 
     // A name the wildcard does not cover is not answered from the cache.
     try std.testing.expect(cache.wildcardAnswer(try Name.fromText("deep.nx.example."), .A, now) == null);
@@ -1246,6 +1414,164 @@ test "aggressive cache answers the name a cached wildcard proof covers (RFC 8198
     try std.testing.expect(cache.wildcardAnswer(try Name.fromText("zzz.example."), .A, now) == null);
     // A type the wildcard does not hold is not answered from the cache.
     try std.testing.expect(cache.wildcardAnswer(try Name.fromText("nx.example."), .AAAA, now) == null);
+}
+
+test "a wildcard answers only with a proof of its own zone (RFC 4035 5.3.1)" {
+    const now: i64 = 1_000_000;
+    const bitmap = [_]u8{ 0x00, 0x06, 0x40, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    const zone = try Name.fromText("example.");
+    const other = try Name.fromText("other.");
+    var cache = AggressiveCache{};
+    // The proof is of the zone other.: the closest encloser exists there
+    // and the span covers the name below it.
+    cache.insertNsec(other, try Name.fromText("zz.other."), &bitmap, now, 3600, testProofSoa(other), .{});
+    // The wildcard belongs to the zone example., which the proof is not of.
+    const wildcard = try Name.fromText("*.other.");
+    cache.insertWildcard(wildcard, zone, &.{.{
+        .owner = wildcard,
+        .rrtype = .A,
+        .class = .IN,
+        .ttl = 300,
+        .rdata = .{ .A = .{ 192, 0, 2, 1 } },
+    }}, testWildcardRrsig(.A, 1, zone), now, 300);
+    try std.testing.expect(cache.wildcardAnswer(try Name.fromText("x.other."), .A, now) == null);
+}
+
+test "a wildcard answers only where the closest encloser is proven (RFC 5155 8.8)" {
+    const now: i64 = 1_000_000;
+    const bitmap = [_]u8{ 0x00, 0x06, 0x40, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    const zone = try Name.fromText("example.");
+    var cache = AggressiveCache{};
+    // The name does not exist, but the closest encloser is not proven.
+    cache.insertNsec(try Name.fromText("mail.example."), try Name.fromText("www.example."), &bitmap, now, 3600, testProofSoa(zone), .{});
+    const wildcard = try Name.fromText("*.example.");
+    cache.insertWildcard(wildcard, zone, &.{.{
+        .owner = wildcard,
+        .rrtype = .A,
+        .class = .IN,
+        .ttl = 300,
+        .rdata = .{ .A = .{ 192, 0, 2, 1 } },
+    }}, testWildcardRrsig(.A, 1, zone), now, 300);
+    try std.testing.expect(cache.wildcardAnswer(try Name.fromText("nx.example."), .A, now) == null);
+}
+
+test "a reused wildcard slot does not serve the wildcard it held" {
+    const now: i64 = 1_000_000;
+    const bitmap = [_]u8{ 0x00, 0x06, 0x40, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    const zone = try Name.fromText("example.");
+    var cache = AggressiveCache{};
+    // The closest encloser c.example. exists and its span covers the name
+    // below it, and the same for e.example.
+    cache.insertNsec(try Name.fromText("c.example."), try Name.fromText("d.example."), &bitmap, now, 3600, testProofSoa(zone), .{});
+    cache.insertNsec(try Name.fromText("e.example."), try Name.fromText("f.example."), &bitmap, now, 3600, testProofSoa(zone), .{});
+    // Every slot of the cache holds a wildcard of its own.
+    for ([_][]const u8{ "*.a.example.", "*.b.example.", "*.c.example.", "*.d.example." }) |text| {
+        const wildcard = try Name.fromText(text);
+        cache.insertWildcard(wildcard, zone, &.{.{
+            .owner = wildcard,
+            .rrtype = .A,
+            .class = .IN,
+            .ttl = 300,
+            .rdata = .{ .A = .{ 192, 0, 2, 1 } },
+        }}, testWildcardRrsig(.A, 1, zone), now, 300);
+    }
+    // The next wildcard holds a record that borrows the message it came
+    // from, so it cannot be cached and the slot it would take keeps the
+    // wildcard it held.
+    const fifth = try Name.fromText("*.e.example.");
+    const raw = [_]u8{ 192, 0, 2, 9 };
+    cache.insertWildcard(fifth, zone, &.{.{
+        .owner = fifth,
+        .rrtype = .A,
+        .class = .IN,
+        .ttl = 300,
+        .rdata = .{ .Unknown = .{ .len = 4, .borrowed = raw[0..] } },
+    }}, testWildcardRrsig(.A, 1, zone), now, 300);
+    // The name the refused wildcard covers is not answered from the cache.
+    try std.testing.expect(cache.wildcardAnswer(try Name.fromText("x.e.example."), .A, now) == null);
+    // The slot still holds the wildcard it had, with its own records.
+    const held = try Name.fromText("*.a.example.");
+    try std.testing.expect(cache.wildcards[0].name.eql(&held));
+    try std.testing.expect(cache.wildcardAnswer(try Name.fromText("x.c.example."), .A, now) != null);
+}
+
+test "a wildcard RRset the cache cannot hold whole is not cached (RFC 4035 5.3.2)" {
+    const now: i64 = 1_000_000;
+    const bitmap = [_]u8{ 0x00, 0x06, 0x40, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    const zone = try Name.fromText("example.");
+    var cache = AggressiveCache{};
+    // The closest encloser of nx.example. is example., and it exists.
+    cache.insertNsec(zone, try Name.fromText("mail.example."), &bitmap, now, 3600, testProofSoa(zone), .{});
+    // The (mail.example., www.example.) span covers nx.example.
+    cache.insertNsec(try Name.fromText("mail.example."), try Name.fromText("www.example."), &bitmap, now, 3600, testProofSoa(zone), .{});
+    const wildcard = try Name.fromText("*.example.");
+    // Five records of the queried type: the signature covers the whole
+    // RRset, so a cache that kept four of them would publish an RRset the
+    // signature cannot verify (RFC 4035 section 5.3.2).
+    var records: [5]record_mod.ResourceRecord = undefined;
+    for (&records, 0..) |*record, index| {
+        record.* = .{
+            .owner = wildcard,
+            .rrtype = .A,
+            .class = .IN,
+            .ttl = 300,
+            .rdata = .{ .A = .{ 192, 0, 2, @intCast(index + 1) } },
+        };
+    }
+    cache.insertWildcard(wildcard, zone, &records, testWildcardRrsig(.A, 1, zone), now, 300);
+    // The name the wildcard covers is not answered from the cache.
+    try std.testing.expect(cache.wildcardAnswer(try Name.fromText("nx.example."), .A, now) == null);
+}
+
+test "a wildcard is answered from a cache that holds another zone's proofs too" {
+    const now: i64 = 1_000_000;
+    const bitmap = [_]u8{ 0x00, 0x06, 0x40, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    const zone = try Name.fromText("example.com.");
+    const parent = try Name.fromText("com.");
+    var cache = AggressiveCache{};
+    // The parent zone's proof comes first: it names the same owner and
+    // covers the same name, and it proves nothing about the child zone.
+    cache.insertNsec(try Name.fromText("example.com."), try Name.fromText("zzz.com."), &bitmap, now, 3600, testProofSoa(parent), .{});
+    // The child zone's own proofs: the closest encloser exists and the span
+    // covers the name below it.
+    cache.insertNsec(try Name.fromText("example.com."), try Name.fromText("*.example.com."), &bitmap, now, 3600, testProofSoa(zone), .{});
+    cache.insertNsec(try Name.fromText("mail.example.com."), try Name.fromText("www.example.com."), &bitmap, now, 3600, testProofSoa(zone), .{});
+    const wildcard = try Name.fromText("*.example.com.");
+    cache.insertWildcard(wildcard, zone, &.{.{
+        .owner = wildcard,
+        .rrtype = .A,
+        .class = .IN,
+        .ttl = 300,
+        .rdata = .{ .A = .{ 192, 0, 2, 1 } },
+    }}, testWildcardRrsig(.A, 2, zone), now, 300);
+    // The proof of the zone the wildcard belongs to is found, so the name
+    // it covers is answered.
+    const answer = cache.wildcardAnswer(try Name.fromText("nx.example.com."), .A, now).?;
+    try std.testing.expectEqual(@as(u8, 1), answer.len);
+}
+
+test "a record type the RFCs do not forbid is not malformed" {
+    const raw = [_]u8{ 192, 0, 2, 1 };
+    const record = record_mod.ResourceRecord{
+        .owner = try Name.fromText("example."),
+        .rrtype = .A,
+        .class = .IN,
+        .ttl = 300,
+        .rdata = .{ .Unknown = .{ .len = 4, .borrowed = raw[0..] } },
+    };
+    // An A record carries no name in its RDATA, so no name rule applies.
+    try std.testing.expect(!proofMalformed(record));
+
+    // An NSEC whose next domain name is compressed cannot be a proof.
+    const compressed = [_]u8{ 0xc0, 0x0c };
+    const nsec = record_mod.ResourceRecord{
+        .owner = try Name.fromText("example."),
+        .rrtype = .NSEC,
+        .class = .IN,
+        .ttl = 300,
+        .rdata = .{ .Unknown = .{ .len = 2, .borrowed = compressed[0..] } },
+    };
+    try std.testing.expect(proofMalformed(nsec));
 }
 
 test "aggressive cache answers a wildcard an NSEC3 proof covers (RFC 8198 5.3)" {
@@ -1265,7 +1591,9 @@ test "aggressive cache answers a wildcard an NSEC3 proof covers (RFC 8198 5.3)" 
     var cache = AggressiveCache{};
     // The NSEC3 that covers the hash of the queried name (RFC 5155 section 8.8).
     cache.insertNsec3(try testChainOwner(2, zone), testHashNeighbour(qname_hash, false), testHashNeighbour(qname_hash, true), false, test_chain_iterations, &test_chain_salt, &bitmap, now, 3600, null, .{});
-    cache.insertWildcard(wildcard, &.{wildcard_record}, now, 300);
+    // The NSEC3 that matches the closest encloser, the zone apex.
+    cache.insertNsec3(try testChainOwner(3, zone), testChainHash(zone), testHashNeighbour(testChainHash(zone), true), false, test_chain_iterations, &test_chain_salt, &bitmap, now, 3600, null, .{});
+    cache.insertWildcard(wildcard, zone, &.{wildcard_record}, testWildcardRrsig(.A, 1, zone), now, 300);
 
     const answer = cache.wildcardAnswer(qname, .A, now).?;
     try std.testing.expectEqual(@as(u8, 1), answer.len);
@@ -1276,7 +1604,8 @@ test "aggressive cache answers a wildcard an NSEC3 proof covers (RFC 8198 5.3)" 
     // (RFC 8198 section 5.2), so the wildcard answers nothing.
     var opt_out = AggressiveCache{};
     opt_out.insertNsec3(try testChainOwner(2, zone), testHashNeighbour(qname_hash, false), testHashNeighbour(qname_hash, true), true, test_chain_iterations, &test_chain_salt, &bitmap, now, 3600, null, .{});
-    opt_out.insertWildcard(wildcard, &.{wildcard_record}, now, 300);
+    opt_out.insertNsec3(try testChainOwner(3, zone), testChainHash(zone), testHashNeighbour(testChainHash(zone), true), false, test_chain_iterations, &test_chain_salt, &bitmap, now, 3600, null, .{});
+    opt_out.insertWildcard(wildcard, zone, &.{wildcard_record}, testWildcardRrsig(.A, 1, zone), now, 300);
     try std.testing.expect(opt_out.wildcardAnswer(qname, .A, now) == null);
 }
 

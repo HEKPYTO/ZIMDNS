@@ -42,8 +42,10 @@ pub const max_opaque_rdata_len: usize = 65535;
 /// record also carries the 12-octet header, the echoed question (a 255-octet
 /// name, QTYPE, and QCLASS), the record's own fields (a 255-octet owner
 /// name, TYPE, CLASS, TTL, and the two-octet RDLENGTH), and the 11-octet
-/// EDNS OPT record, so this is the longest RDATA one message can carry. A
-/// zone that holds more holds a record no message can carry.
+/// EDNS OPT record, so this is the longest RDATA an answer can carry when
+/// the message carries nothing else: an answer that also carries the zone
+/// SOA in its authority section, or the RRSIGs of a signed zone, carries
+/// less. A zone that holds more holds a record no answer can carry.
 pub const max_message_rdata_len: usize = 65535 - 12 - (255 + 2 + 2) - (255 + 2 + 2 + 4 + 2) - 11;
 
 const max_opt_data_len = 512;

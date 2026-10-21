@@ -107,6 +107,22 @@ pub const ServerContext = struct {
             defer allocator.free(key_text);
             dnssec_key = parseDnssecKeyTextAndClear(key_text) catch return Error.BadDnssecKey;
         }
+        // RFC 6781 section 3.1: a zone that separates the roles publishes a
+        // key-signing key the parent points its DS at. It signs the DNSKEY
+        // RRset and nothing else, so the key the `dnssec-key-file` names
+        // signs every other RRset.
+        if (context.config.dnssecKskFileText()) |key_path| {
+            const key_text = try readReferencedFile(dir, io, key_path, allocator);
+            defer allocator.free(key_text);
+            var ksk = parseDnssecKeyTextAndClear(key_text) catch return Error.BadDnssecKey;
+            defer ksk.deinit();
+            if (dnssec_key) |*key| {
+                key.ksk = .{ .material = ksk.material };
+            } else {
+                // A key-signing key without a zone-signing key signs nothing.
+                return Error.BadDnssecKey;
+            }
+        }
 
         // Read before any zone is loaded, so a bad anchor file fails startup
         // rather than leaving a forwarder running with no trust domain.
@@ -544,6 +560,10 @@ test "server context clears the temporary TSIG key text after parsing" {
 /// one the RFC's own DS digest pins.
 const dnssec_test_key = "ed25519 DSSF3o0s0f+ElWzj9E/Osxw8hLpk55chkmx0LYN5WiY=\n";
 
+/// The RFC 6605 section 6.1 ECDSA P-256 example key, published in the RFC. It
+/// is the key-signing key of the zone that separates the roles.
+const dnssec_test_ksk_key = "ecdsap256sha256 GU6SnQ/Ou+xC5RumuIUIuJZteXT2z0O/ok1s38Et6mQ=\n";
+
 const dnssec_test_zone =
     \\$ORIGIN signed.example.
     \\$TTL 3600
@@ -654,6 +674,20 @@ test "a signed zone served by the runtime answers a DO=1 ANY query with a valid 
     try std.testing.expect(std.mem.indexOf(u8, response_bytes, &secret) == null);
 }
 
+/// The key tag the zone's DS states, which is the key tag of the key the
+/// parent points at.
+fn dsKeyTag(zone: zone_index.Zone) !u16 {
+    for (zone.records.items[0..zone.records.len]) |record| {
+        if (!record.rrtype.eql(.DS)) continue;
+        const rdata = try zone_parser.parseRData(.DS, record.rdataText());
+        switch (rdata) {
+            .Unknown => |unknown| return std.mem.readInt(u16, unknown.bytes()[0..2], .big),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
 test "server context signs every zone named by the configured DNSSEC key file" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var dir = std.testing.tmpDir(.{});
@@ -682,6 +716,48 @@ test "server context signs every zone named by the configured DNSSEC key file" {
     // RFC 4034 section 3.1.3: the wildcard owner is signed with one label
     // fewer, because the signature covers the expanded names below it.
     try std.testing.expect(hasRrsigCovering(zone, "*.signed.example.", RecordType.A.code()));
+}
+
+test "server context signs a zone with a key-signing key beside the zone-signing key" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{ .sub_path = "signed.example.zone", .data = dnssec_test_zone });
+    try dir.dir.writeFile(io, .{ .sub_path = "zsk.key", .data = dnssec_test_key });
+    try dir.dir.writeFile(io, .{ .sub_path = "ksk.key", .data = dnssec_test_ksk_key });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone signed.example primary signed.example.zone\ndnssec-key-file zsk.key\ndnssec-ksk-file ksk.key\n" });
+
+    var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+    defer context.deinit();
+
+    // RFC 6781 section 3.1: the zone publishes both keys, and the one DS it
+    // publishes states the key-signing key.
+    const zone = context.zones.items[0];
+    try std.testing.expectEqual(@as(usize, 2), countType(zone, .DNSKEY));
+    try std.testing.expectEqual(@as(usize, 1), countType(zone, .DS));
+    try std.testing.expectEqual(@as(u16, 55648), try dsKeyTag(zone));
+    // The DNSKEY RRset is signed by the key-signing key, and the rest of the
+    // zone by the zone-signing key.
+    try std.testing.expect(hasRrsigCovering(zone, "signed.example.", RecordType.DNSKEY.code()));
+    try std.testing.expect(hasRrsigCovering(zone, "signed.example.", RecordType.SOA.code()));
+}
+
+test "server context refuses a configuration whose key-signing key file does not exist" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{ .sub_path = "signed.example.zone", .data = dnssec_test_zone });
+    try dir.dir.writeFile(io, .{ .sub_path = "zsk.key", .data = dnssec_test_key });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone signed.example primary signed.example.zone\ndnssec-key-file zsk.key\ndnssec-ksk-file missing.key\n" });
+
+    // The key file the configuration names does not exist, so the server
+    // refuses to start rather than sign with half the keys it was given.
+    try std.testing.expectError(
+        error.MissingReferencedFile,
+        ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator),
+    );
 }
 
 test "server context publishes the chain the configuration names" {

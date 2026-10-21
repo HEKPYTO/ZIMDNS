@@ -715,6 +715,7 @@ const Nsec = struct {
 /// signing zone, and RFC 6840 section 4.1 compares the signer against that
 /// original name rather than against the hashed owner.
 const Nsec3 = struct {
+    owner: Name,
     owner_hash: [20]u8,
     next_hash: [20]u8,
     flags: u8,
@@ -789,8 +790,12 @@ const Validator = struct {
         // own and never take part in the Answer-section decision.
         if (record.rrtype.eql(.RRSIG)) return;
         if (raw) |bytes| {
-            if (record.rrtype.eql(.NSEC)) return self.addNsec(record, bytes);
-            if (record.rrtype.eql(.NSEC3)) return self.addNsec3(record, bytes);
+            // RFC 4035 section 5.4: the RRsets that make up a denial proof
+            // must themselves be authenticated, so a proof is collected as an
+            // RRset as well, and the denial path checks the signature over
+            // it with the signer's trusted key set.
+            if (record.rrtype.eql(.NSEC)) try self.addNsec(record, bytes);
+            if (record.rrtype.eql(.NSEC3)) try self.addNsec3(record, bytes);
         }
         for (self.rrsets.items) |*rrset| {
             if (rrset.rrtype != record.rrtype.code() or !rrset.owner.eql(&record.owner)) continue;
@@ -846,6 +851,7 @@ const Validator = struct {
         if (owner_wire[0] != 32 or !isSuffix(rrsig.signer, record.owner)) return Error.MalformedRdata;
         const owner_hash = nsec3OwnerHash(record.owner) orelse return Error.MalformedRdata;
         try self.nsec3s.append(self.allocator, .{
+            .owner = record.owner,
             .owner_hash = owner_hash,
             .next_hash = rdata.next_hash[0..20].*,
             .flags = rdata.flags,
@@ -869,8 +875,10 @@ const Validator = struct {
     /// DNSKEY RDATA trusted for `signer` (RFC 4035 section 5.2). A configured
     /// DNSKEY is its own trust anchor. Otherwise a DS authenticates the child
     /// apex DNSKEY RRset, which must then be self-signed by a key the DS
-    /// matched and which carries the Zone flag. An empty result means no
-    /// configured anchor reaches this zone: the RRset is insecure, not bogus.
+    /// matched and which carries the Zone flag. An authenticated RRset lends
+    /// its other zone keys to the set (RFC 6781 section 3.1). An empty result
+    /// means no configured anchor reaches this zone: the RRset is insecure,
+    /// not bogus.
     fn keySet(self: *Validator, signer: Name) Error![]const []const u8 {
         for (self.chains.items) |cached| {
             if (cached.signer.eql(&signer)) return cached.keys;
@@ -1010,15 +1018,41 @@ const Validator = struct {
             }
         }
         const apex = rrset orelse return keys.clearRetainingCapacity();
+        var authenticated = false;
         for (self.rrsigs.items) |rrsig| {
             if (rrsig.covered != RecordType.DNSKEY.code() or !rrsig.owner.eql(&signer)) continue;
             const data = try signedData(self.allocator, apex.records.items, rrsig);
             for (keys.items) |key| {
                 verifyWithKey(key, rrsig, data) catch continue;
-                return;
+                authenticated = true;
+                break;
             }
+            if (authenticated) break;
         }
-        keys.clearRetainingCapacity();
+        if (!authenticated) return keys.clearRetainingCapacity();
+        try self.addZoneKeys(keys, apex);
+    }
+
+    /// The rest of the keys of an authenticated apex DNSKEY RRset. RFC 6781
+    /// section 3.1: once the key-signing key has signed the RRset, every key
+    /// in it can sign the zone's other RRsets, so the zone-signing key's
+    /// signatures count. RFC 4034 section 2.1.1 keeps a key without the Zone
+    /// Key flag out, and a key this build cannot verify with is no key at all.
+    fn addZoneKeys(self: *Validator, keys: *std.ArrayList([]const u8), apex: *const Rrset) Error!void {
+        for (apex.records.items) |record| {
+            const raw = try encodeRdata(self.allocator, record.rdata);
+            if (!dnskeyZoneKeyBit(raw)) continue;
+            if (!algorithmSupported(raw[3])) continue;
+            var known = false;
+            for (keys.items) |key| {
+                if (std.mem.eql(u8, key, raw)) {
+                    known = true;
+                    break;
+                }
+            }
+            if (known) continue;
+            try keys.append(self.allocator, raw);
+        }
     }
 
     // ------------------------------------------------------------ RRsets
@@ -1079,10 +1113,55 @@ const Validator = struct {
         return self.fail(dnssec.EDE_DNSSEC_BOGUS);
     }
 
+    /// The verdict on one denial proof: its signature verifies with the
+    /// signer's trusted key set, this build cannot authenticate it, or the
+    /// signature does not verify.
+    fn checkProof(self: *Validator, owner: Name, rrtype: u16) Error!Outcome {
+        const rrset = findRrset(self, owner, rrtype) orelse return .insecure;
+        return self.checkRrset(rrset);
+    }
+
+    /// RFC 4035 section 5.4: the RRsets that make up a denial proof must
+    /// themselves be authenticated (section 5.3), so the signature over every
+    /// proof the response carries is checked with the signer's trusted key
+    /// set before the proof may support an answer. A proof whose signature
+    /// does not verify makes the response bad (section 5.5); a proof this
+    /// build cannot authenticate leaves the answer insecure (section 5.2).
+    fn checkProofs(self: *Validator) Error!Outcome {
+        var authenticated = true;
+        for (self.nsecs.items) |proof| {
+            switch (try self.checkProof(proof.owner, RecordType.NSEC.code())) {
+                .bogus => return .bogus,
+                .insecure => authenticated = false,
+                .secure => {},
+            }
+        }
+        for (self.nsec3s.items) |proof| {
+            switch (try self.checkProof(proof.owner, RecordType.NSEC3.code())) {
+                .bogus => return .bogus,
+                .insecure => authenticated = false,
+                .secure => {},
+            }
+        }
+        return if (authenticated) .secure else .insecure;
+    }
+
     // ------------------------------------------------------------ NSEC
 
     /// RFC 4035 section 5.4 with RFC 6840 sections 4.1, 4.3 and 4.4.
     fn checkNsecDenial(self: *Validator, name: Name, qtype: u16, delegation: bool, nxdomain: bool) Error!Outcome {
+        // RFC 4035 section 5.4: the proof must be authenticated before it may
+        // support an answer.
+        const proofs = try self.checkProofs();
+        if (proofs == .bogus) return .bogus;
+        const outcome = try self.nsecDenial(name, qtype, delegation, nxdomain);
+        // A proof this build cannot authenticate cannot make the answer
+        // secure, so the answer stays insecure.
+        if (outcome == .secure and proofs == .insecure) return .insecure;
+        return outcome;
+    }
+
+    fn nsecDenial(self: *Validator, name: Name, qtype: u16, delegation: bool, nxdomain: bool) Error!Outcome {
         // RFC 6840 section 4.1 exempts DS from the ancestor-delegation ban:
         // "all RRs at that (original) owner name other than DS RRs". The NSEC a
         // parent publishes at a delegation is therefore the legitimate proof
@@ -1226,6 +1305,11 @@ const Validator = struct {
     /// RFC 5155 sections 8.4 to 8.7, dispatched on what the response claims.
     fn checkNsec3Denial(self: *Validator, name: Name, qtype: u16, delegation: bool, nxdomain: bool) Error!Outcome {
         if (!self.nsec3ParamsConsistent()) return self.fail(dnssec.EDE_DNSSEC_BOGUS);
+        // RFC 4035 section 5.4: the proof must be authenticated before it may
+        // support an answer, and RFC 9276 section 3.2 asks the same of a
+        // validator that answers insecure over a chain with iterations.
+        const proofs = try self.checkProofs();
+        if (proofs == .bogus) return .bogus;
         const outcome = try self.nsec3Denial(name, qtype, delegation, nxdomain);
         // RFC 9276 section 3.2: a validator that processes NSEC3 records with
         // an iteration count above 0 answers insecure, not secure, and says
@@ -1234,6 +1318,9 @@ const Validator = struct {
             self.noteInsecure(dnssec.EDE_UNSUPPORTED_NSEC3_ITERATIONS);
             if (outcome == .secure) return .insecure;
         }
+        // A proof this build cannot authenticate cannot make the answer
+        // secure, so the answer stays insecure.
+        if (outcome == .secure and proofs == .insecure) return .insecure;
         return outcome;
     }
 
@@ -1351,6 +1438,21 @@ fn isReferral(records: []const dns_record.ResourceRecord) bool {
     return saw_ns;
 }
 
+/// True when the Answer section holds an RRset whose owner is the QNAME and
+/// whose class is the query class. RFC 6840 section 4.2: the RRsets a
+/// response to QTYPE=* carries at the QNAME are the ones that must be
+/// validated, and a response that carries none of them must prove the
+/// absence instead. The DNSSEC bookkeeping records are not data of the name.
+fn answerHoldsQname(response: dns_message.Message, name: Name, class: Class) bool {
+    for (response.answers.slice()) |record| {
+        if (record.rrtype.eql(.RRSIG) or record.rrtype.eql(.NSEC) or record.rrtype.eql(.NSEC3)) continue;
+        if (!record.owner.eql(&name)) continue;
+        if (!record.class.eql(class)) continue;
+        return true;
+    }
+    return false;
+}
+
 /// Validate one response against the configured anchors and return its
 /// security status. `extra` carries DNSKEY records the caller fetched out of
 /// band (a supplementary DNSKEY query), which is how a DS-only anchor reaches
@@ -1390,21 +1492,38 @@ pub fn validate(
         return .{ .status = .insecure };
     }
 
-    for (self.rrsets.items) |*rrset| self.count(try self.checkRrset(rrset));
+    for (self.rrsets.items) |*rrset| {
+        // The NSEC and NSEC3 proof records are checked with the denial proof
+        // they belong to (RFC 4035 section 5.4), not on their own.
+        if (rrset.rrtype == RecordType.NSEC.code()) continue;
+        if (rrset.rrtype == RecordType.NSEC3.code()) continue;
+        self.count(try self.checkRrset(rrset));
+    }
 
     // RFC 4035 section 3.2.3: the AD bit covers the Answer section and the
     // negative response RRs in Authority, so the denial proof is part of the
     // same decision, not a later one.
-    if (response.answers.len == 0) {
-        const question = query.question orelse return .{ .status = .insecure };
+    //
+    // RFC 6840 section 4.2: a response to QTYPE=* carries a subset of the
+    // RRsets at the QNAME, so the validator must not expect all of them.
+    // When the answer holds no RRset at the QNAME in the query class, that
+    // absence must be proved with the rules of RFC 4035 section 5.4, so the
+    // denial path runs on the content of the answer and not on its length.
+    const question = query.question orelse return .{ .status = .insecure };
+    if (!answerHoldsQname(response, question.name, question.qclass)) {
         const nxdomain = response.header.rcode == .nxdomain;
         const delegation = isReferral(response.authorities.slice());
         const outcome = if (self.nsec3s.items.len != 0)
             try self.checkNsec3Denial(question.name, question.qtype.code(), delegation, nxdomain)
         else if (self.nsecs.items.len != 0)
             try self.checkNsecDenial(question.name, question.qtype.code(), delegation, nxdomain)
+        else if (anchors.covers(question.name))
+            // RFC 4035 section 5.4: a signed zone must prove the absence.
+            self.fail(dnssec.EDE_DNSSEC_BOGUS)
         else
-            self.fail(dnssec.EDE_DNSSEC_BOGUS);
+            // Nothing was expected to be signed, so the absence needs no
+            // proof and the answer is insecure, not bogus.
+            .insecure;
         self.count(outcome);
     }
 
@@ -1625,6 +1744,11 @@ pub fn zoneZonemdAbsence(
     for (signatures.items) |*record| try validator.addSignature(record);
     for (proofs.items) |*proof| try validator.addRecord(&proof.record);
 
+    // RFC 4035 section 5.4: the proof is worthless without a signature over
+    // it that verifies, so the absence is proven only by an authenticated
+    // NSEC or NSEC3.
+    if (try validator.checkProofs() != .secure) return .unknown;
+
     // RFC 4035 section 3.1.3 and RFC 5155 section 8.6: the record at the name
     // must deny the type, and the denial must reach the trust anchor.
     for (validator.nsecs.items) |*proof| {
@@ -1733,6 +1857,21 @@ const parent_zone_text =
     \\example.com. IN NS ns1.example.com.
 ;
 
+/// A zone whose owner holds two RRsets, so an answer to QTYPE=* at that owner
+/// carries two RRsets at the QNAME (RFC 6840 section 4.2), and a name that
+/// holds a CNAME, so such an answer can be stripped of it.
+const any_zone_text =
+    \\$ORIGIN example.com.
+    \\$TTL 3600
+    \\@ IN SOA ns1.example.com. hostmaster.example.com. 1 3600 900 1209600 3600
+    \\@ IN NS ns1.example.com.
+    \\ns1 IN A 192.0.2.1
+    \\both IN A 192.0.2.2
+    \\both IN MX 10 mail.example.com.
+    \\mail IN A 192.0.2.3
+    \\alias IN CNAME both.example.com.
+;
+
 const SignedZone = struct {
     zone: zone_index.Zone,
     key: zone_signer.Key,
@@ -1759,6 +1898,139 @@ fn signZoneText(allocator: std.mem.Allocator, text: []const u8, key_text: []cons
         .key = key,
         .dnskey = try key.dnskeyRdata(allocator),
     };
+}
+
+/// A zone whose roles are separated (RFC 6781 section 3.1): the key-signing
+/// key signs the apex DNSKEY RRset and the DS states it, the zone-signing key
+/// signs every other RRset.
+const SplitZone = struct {
+    zone: zone_index.Zone,
+    /// The zone-signing key, with the key-signing key attached to it.
+    key: zone_signer.Key,
+    /// The key-signing key on its own: the DS at the parent states it.
+    ksk: zone_signer.Key,
+    /// The DNSKEY the DS states.
+    ksk_dnskey: []const u8,
+
+    fn deinit(self: *SplitZone, allocator: std.mem.Allocator) void {
+        self.zone.deinit();
+        self.key.deinit();
+        self.ksk.deinit();
+        allocator.free(self.ksk_dnskey);
+    }
+};
+
+fn signSplitZoneText(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    zsk_text: []const u8,
+    ksk_text: []const u8,
+) !SplitZone {
+    var zone_file = try zone_parser.ZoneFile.parse(text);
+    defer zone_file.deinit();
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    errdefer zone.deinit();
+    var key = try zone_signer.parseKey(zsk_text);
+    errdefer key.deinit();
+    var ksk = try zone_signer.parseKey(ksk_text);
+    errdefer ksk.deinit();
+    key.ksk = .{ .material = ksk.material };
+    try zone_signer.signZone(allocator, &zone, &key, window);
+    var ksk_dnskey: []const u8 = undefined;
+    ksk_dnskey = try ksk.dnskeyRdata(allocator);
+    return .{ .zone = zone, .key = key, .ksk = ksk, .ksk_dnskey = ksk_dnskey };
+}
+
+/// The DNSKEY RDATA of an Ed25519 key with the flags a test gives it. The
+/// project signer always publishes a key with the Zone Key flag, so a DNSKEY
+/// without it can only be built here.
+fn ed25519DnskeyRdata(allocator: std.mem.Allocator, flags: u16, pair: Ed25519.KeyPair) ![]const u8 {
+    var rdata: [4 + Ed25519.PublicKey.encoded_length]u8 = undefined;
+    std.mem.writeInt(u16, rdata[0..2], flags, .big);
+    rdata[2] = 3;
+    rdata[3] = 15;
+    const public = pair.public_key.toBytes();
+    @memcpy(rdata[4..], &public);
+    return allocator.dupe(u8, &rdata);
+}
+
+/// An RRSIG over `records` made by `pair`, for the test that needs a signature
+/// from a key the validator must not trust. The RRSIG RDATA is built here
+/// (RFC 4034 section 3.1) because the project signer signs with a key's own
+/// published DNSKEY, and a key without the Zone Key flag has none.
+fn forgeRrsig(
+    allocator: std.mem.Allocator,
+    owner: Name,
+    signer: Name,
+    covered: u16,
+    records: []const *const dns_record.ResourceRecord,
+    key_rdata: []const u8,
+    pair: Ed25519.KeyPair,
+) ![]const u8 {
+    var header: [18 + 255]u8 = undefined;
+    std.mem.writeInt(u16, header[0..2], covered, .big);
+    header[2] = key_rdata[3];
+    header[3] = labelCount(owner.asWire());
+    std.mem.writeInt(u32, header[4..8], records[0].ttl, .big);
+    std.mem.writeInt(u32, header[8..12], window.expiration, .big);
+    std.mem.writeInt(u32, header[12..16], window.inception, .big);
+    std.mem.writeInt(u16, header[16..18], dnssec.keyTag(key_rdata), .big);
+    const signer_wire = signer.asWire();
+    @memcpy(header[18..][0..signer_wire.len], signer_wire);
+    const header_len = 18 + signer_wire.len;
+
+    const raw = try allocator.alloc(u8, header_len + Ed25519.Signature.encoded_length);
+    @memcpy(raw[0..header_len], header[0..header_len]);
+    @memset(raw[header_len..], 0);
+    // The signed data is the RRSIG RDATA without the signature, then the
+    // covered RRset in canonical order (RFC 4035 section 5.3.1).
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    const data = try signedData(scratch.allocator(), records, try Rrsig.at(raw, owner));
+    const signature = try pair.sign(data, null);
+    const bytes = signature.toBytes();
+    @memcpy(raw[header_len..][0..bytes.len], &bytes);
+    return raw;
+}
+
+/// The RRSIG in `section` that covers `covered`, replaced by `rdata`. The
+/// record keeps its place in the section, so the rest of the response is
+/// untouched.
+fn replaceRrsig(
+    section: *dns_message.RecordSection,
+    covered: RecordType,
+    rdata: []const u8,
+) !void {
+    for (section.items[0..section.len]) |*record| {
+        if (!record.rrtype.eql(.RRSIG)) continue;
+        if (!rrsigCoversType(record.*, covered)) continue;
+        record.rdata = .{ .Unknown = .{ .len = @intCast(rdata.len), .borrowed = rdata } };
+        return;
+    }
+    return Error.MalformedRdata;
+}
+
+/// The RRSIG in `section` that covers `covered`, with its signature broken:
+/// the answer then rests on a signature that cannot verify. The copy is
+/// returned so the caller can free it.
+fn breakRrsig(
+    allocator: std.mem.Allocator,
+    section: *dns_message.RecordSection,
+    covered: RecordType,
+) ![]const u8 {
+    for (section.items[0..section.len]) |*record| {
+        if (!record.rrtype.eql(.RRSIG)) continue;
+        if (!rrsigCoversType(record.*, covered)) continue;
+        const raw = switch (record.rdata) {
+            .Unknown => |*unknown| unknown.bytes(),
+            else => return Error.MalformedRdata,
+        };
+        const copy = try allocator.dupe(u8, raw);
+        copy[copy.len - 1] ^= 0xff;
+        record.rdata = .{ .Unknown = .{ .len = @intCast(copy.len), .borrowed = copy } };
+        return copy;
+    }
+    return Error.MalformedRdata;
 }
 
 const Exchange = struct {
@@ -1961,6 +2233,24 @@ fn keepNsecProofs(section: *dns_message.RecordSection) void {
     section.len = kept;
 }
 
+/// Drop the RRSIG over the NSEC, so the proof the answer rests on is
+/// unsigned: RFC 4035 section 5.4 says an NSEC with no signature over it
+/// proves nothing.
+fn dropNsecSignature(section: *dns_message.RecordSection) void {
+    var kept: usize = 0;
+    for (section.items) |record| {
+        const is_signature = record.rrtype.eql(.RRSIG) and rrsigCoversType(record, RecordType.NSEC);
+        if (is_signature) continue;
+        // Copied by value first: `section.items` is one allocation, so writing
+        // the kept record back in place would overwrite an entry the loop has
+        // not reached yet.
+        const copy = record;
+        section.items[kept] = copy;
+        kept += 1;
+    }
+    section.len = kept;
+}
+
 /// True when an RRSIG's Type Covered field is `expected`. A malformed RRSIG
 /// covers nothing, so it is never a proof for anything.
 fn rrsigCoversType(record: dns_record.ResourceRecord, expected: RecordType) bool {
@@ -1970,6 +2260,25 @@ fn rrsigCoversType(record: dns_record.ResourceRecord, expected: RecordType) bool
     };
     const covered = dnssec.rrsigCovers(raw) catch return false;
     return covered == expected.code();
+}
+
+/// Drop the denial proofs and the RRSIGs that cover them, so the response
+/// carries no proof of an absence at all.
+fn dropNsecProofs(section: *dns_message.RecordSection) void {
+    var kept: usize = 0;
+    for (section.items) |record| {
+        const is_proof = record.rrtype.eql(.NSEC) or record.rrtype.eql(.NSEC3);
+        const is_proof_signature = record.rrtype.eql(.RRSIG) and
+            (rrsigCoversType(record, RecordType.NSEC) or rrsigCoversType(record, RecordType.NSEC3));
+        if (is_proof or is_proof_signature) continue;
+        // Copied by value first: `section.items` is one allocation, so writing
+        // the kept record back in place would overwrite an entry the loop has
+        // not reached yet.
+        const copy = record;
+        section.items[kept] = copy;
+        kept += 1;
+    }
+    section.len = kept;
 }
 
 fn expectStatus(expected: Status, actual: Result) !void {
@@ -2005,6 +2314,134 @@ test "a DS anchor authenticates the child DNSKEY RRset and then the answer" {
 
     const result = try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds);
     try expectStatus(.secure, result);
+}
+
+test "RFC 6781 section 3.1: a separated zone validates secure through the DS of its key-signing key" {
+    var signed = try signSplitZoneText(std.testing.allocator, child_zone_text, p256_secret, ed25519_secret);
+    defer signed.deinit(std.testing.allocator);
+    var anchors = try dsAnchor(std.testing.allocator, "example.com.", signed.ksk_dnskey, false);
+    defer anchors.deinit(std.testing.allocator);
+
+    var pair = try exchange(std.testing.allocator, &signed.zone, "www.example.com.", .A, .no_error, "www.example.com.", null);
+    defer pair.query.deinit();
+    defer pair.response.deinit();
+
+    // The DS names the key-signing key, which signed the DNSKEY RRset, so
+    // the zone-signing key's signature over the answer carries the zone: the
+    // answer is secure and the AD bit may be set.
+    const result = try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds);
+    try expectStatus(.secure, result);
+    try std.testing.expectEqual(@as(u16, 0), result.ede);
+}
+
+test "a separated zone whose DNSKEY RRset signature is broken stays insecure" {
+    var signed = try signSplitZoneText(std.testing.allocator, child_zone_text, p256_secret, ed25519_secret);
+    defer signed.deinit(std.testing.allocator);
+    var anchors = try dsAnchor(std.testing.allocator, "example.com.", signed.ksk_dnskey, false);
+    defer anchors.deinit(std.testing.allocator);
+
+    var pair = try exchange(std.testing.allocator, &signed.zone, "www.example.com.", .A, .no_error, "www.example.com.", null);
+    defer pair.query.deinit();
+    defer pair.response.deinit();
+
+    // The key-signing key's signature over the DNSKEY RRset is what
+    // authenticates the set, so breaking it leaves the zone with no
+    // authentication path (RFC 4035 section 5.2): insecure, not bogus, and
+    // the zone-signing key's signature buys the answer nothing.
+    const broken = try breakRrsig(std.testing.allocator, &pair.response.authorities, RecordType.DNSKEY);
+    defer std.testing.allocator.free(broken);
+
+    const result = try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds);
+    try expectStatus(.insecure, result);
+}
+
+test "a DNSKEY without the Zone Key flag is not trusted" {
+    const allocator = std.testing.allocator;
+    var signed = try signSplitZoneText(allocator, child_zone_text, p256_secret, ed25519_secret);
+    defer signed.deinit(allocator);
+    var anchors = try dsAnchor(allocator, "example.com.", signed.ksk_dnskey, false);
+    defer anchors.deinit(allocator);
+
+    var pair = try exchange(allocator, &signed.zone, "www.example.com.", .A, .no_error, "www.example.com.", null);
+    defer pair.query.deinit();
+    defer pair.response.deinit();
+
+    // A third key, published without the Zone Key flag: RFC 4034 section
+    // 2.1.1 says such a key must not verify an RRset, so the answer it
+    // signed is bogus.
+    const bare_pair = try Ed25519.KeyPair.generateDeterministic(@splat(0x33));
+    const bare_dnskey = try ed25519DnskeyRdata(allocator, 0x0001, bare_pair);
+    defer allocator.free(bare_dnskey);
+    try pair.response.authorities.append(.{
+        .owner = try Name.fromText("example.com."),
+        .rrtype = .DNSKEY,
+        .class = .IN,
+        .ttl = 3600,
+        .rdata = .{ .Unknown = .{ .len = @intCast(bare_dnskey.len), .borrowed = bare_dnskey } },
+    });
+    pair.response.header.authority_count = @intCast(pair.response.authorities.len);
+
+    // The DNSKEY RRset now holds three keys, so the key-signing key signs it
+    // again over the three.
+    const zsk_dnskey = try signed.key.dnskeyRdataWithFlags(allocator, 0x0100);
+    defer allocator.free(zsk_dnskey);
+    const rdatas = [_][]const u8{ zsk_dnskey, signed.ksk_dnskey, bare_dnskey };
+    const apex = try Name.fromText("example.com.");
+    const dnskey_rrsig = try zone_signer.signRrset(allocator, apex, apex, RecordType.DNSKEY.code(), &rdatas, 3600, &signed.ksk, window);
+    defer allocator.free(dnskey_rrsig);
+    try replaceRrsig(&pair.response.authorities, RecordType.DNSKEY, dnskey_rrsig);
+
+    // The answer carries the signature of the key without the Zone Key flag.
+    const answer = &pair.response.answers.items[0];
+    const records = [_]*const dns_record.ResourceRecord{answer};
+    const owner = try Name.fromText("www.example.com.");
+    const bare_rrsig = try forgeRrsig(allocator, owner, apex, RecordType.A.code(), &records, bare_dnskey, bare_pair);
+    defer allocator.free(bare_rrsig);
+    try replaceRrsig(&pair.response.answers, RecordType.A, bare_rrsig);
+
+    const result = try validate(allocator, &anchors, pair.query, pair.response, &.{}, now_seconds);
+    try expectStatus(.bogus, result);
+}
+
+test "a zone with one key still validates secure" {
+    var signed = try signZoneText(std.testing.allocator, child_zone_text, ed25519_secret);
+    defer signed.deinit(std.testing.allocator);
+    var anchors = try dsAnchor(std.testing.allocator, "example.com.", signed.dnskey, false);
+    defer anchors.deinit(std.testing.allocator);
+
+    var pair = try exchange(std.testing.allocator, &signed.zone, "www.example.com.", .A, .no_error, "www.example.com.", null);
+    defer pair.query.deinit();
+    defer pair.response.deinit();
+
+    // One key, one signed RRset: the outcome is the one it always was.
+    const result = try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds);
+    try expectStatus(.secure, result);
+    try std.testing.expectEqual(@as(u16, 0), result.ede);
+}
+
+test "the apex DNSKEY RRset is authenticated by the DS and not by the zone-signing key" {
+    var signed = try signSplitZoneText(std.testing.allocator, child_zone_text, p256_secret, ed25519_secret);
+    defer signed.deinit(std.testing.allocator);
+    var anchors = try dsAnchor(std.testing.allocator, "example.com.", signed.ksk_dnskey, false);
+    defer anchors.deinit(std.testing.allocator);
+
+    var pair = try exchange(std.testing.allocator, &signed.zone, "www.example.com.", .A, .no_error, "www.example.com.", null);
+    defer pair.query.deinit();
+    defer pair.response.deinit();
+
+    // The DNSKEY RRset signed by the zone-signing key alone. The DS names the
+    // key-signing key, and only that key authenticates the RRset (RFC 4035
+    // sections 5.2 and 5.3.1), so the zone keeps no authentication path.
+    const zsk_dnskey = try signed.key.dnskeyRdataWithFlags(std.testing.allocator, 0x0100);
+    defer std.testing.allocator.free(zsk_dnskey);
+    const rdatas = [_][]const u8{ zsk_dnskey, signed.ksk_dnskey };
+    const apex = try Name.fromText("example.com.");
+    const dnskey_rrsig = try zone_signer.signRrset(std.testing.allocator, apex, apex, RecordType.DNSKEY.code(), &rdatas, 3600, &signed.key, window);
+    defer std.testing.allocator.free(dnskey_rrsig);
+    try replaceRrsig(&pair.response.authorities, RecordType.DNSKEY, dnskey_rrsig);
+
+    const result = try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds);
+    try expectStatus(.insecure, result);
 }
 
 test "a DS whose digest does not match the DNSKEY leaves the answer insecure" {
@@ -2261,6 +2698,150 @@ test "RFC 6840 section 4.1: a parent delegation NSEC cannot prove a name below t
     try std.testing.expectEqual(dnssec.EDE_DNSSEC_BOGUS, result.ede);
 }
 
+// ------------------------------------------------- RFC 6840 ANY responses
+
+test "RFC 6840 section 4.2: an ANY answer with two RRsets at the QNAME is bogus when one of them does not verify" {
+    var signed = try signZoneText(std.testing.allocator, any_zone_text, ed25519_secret);
+    defer signed.deinit(std.testing.allocator);
+    var anchors = try dnskeyAnchor(std.testing.allocator, "example.com.", signed.dnskey);
+    defer anchors.deinit(std.testing.allocator);
+
+    var pair = try exchange(std.testing.allocator, &signed.zone, "both.example.com.", .ANY, .no_error, "both.example.com.", null);
+    defer pair.query.deinit();
+    defer pair.response.deinit();
+
+    // The answer carries two RRsets at the QNAME and the MX one rests on a
+    // signature that does not verify, so the answer is bogus even though the
+    // A RRset beside it verifies.
+    const broken = try breakRrsig(std.testing.allocator, &pair.response.answers, RecordType.MX);
+    defer std.testing.allocator.free(broken);
+
+    const result = try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds);
+    try expectStatus(.bogus, result);
+    try std.testing.expectEqual(dnssec.EDE_DNSSEC_BOGUS, result.ede);
+}
+
+test "RFC 6840 section 4.2: an ANY answer with two RRsets at the QNAME is secure when both of them verify" {
+    var signed = try signZoneText(std.testing.allocator, any_zone_text, ed25519_secret);
+    defer signed.deinit(std.testing.allocator);
+    var anchors = try dnskeyAnchor(std.testing.allocator, "example.com.", signed.dnskey);
+    defer anchors.deinit(std.testing.allocator);
+
+    var pair = try exchange(std.testing.allocator, &signed.zone, "both.example.com.", .ANY, .no_error, "both.example.com.", null);
+    defer pair.query.deinit();
+    defer pair.response.deinit();
+
+    // The same two RRsets, both of them signed by the zone's own key: the
+    // answer is secure and the AD bit may be set.
+    const result = try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds);
+    try expectStatus(.secure, result);
+    try std.testing.expectEqual(@as(u16, 0), result.ede);
+}
+
+test "RFC 6840 section 4.2: an ANY answer with no RRset at the QNAME is judged by the NODATA proof" {
+    var signed = try signZoneText(std.testing.allocator, any_zone_text, ed25519_secret);
+    defer signed.deinit(std.testing.allocator);
+    var anchors = try dnskeyAnchor(std.testing.allocator, "example.com.", signed.dnskey);
+    defer anchors.deinit(std.testing.allocator);
+    var outside = try dnskeyAnchor(std.testing.allocator, "other.test.", signed.dnskey);
+    defer outside.deinit(std.testing.allocator);
+
+    // The answer holds the RRsets of the CNAME's target and not the CNAME at
+    // the QNAME, so it carries no RRset at the QNAME at all. The NSEC at the
+    // QNAME still names the CNAME type (RFC 6840 section 4.3), so the absence
+    // is not proved and the answer is bogus.
+    var stripped = try exchange(std.testing.allocator, &signed.zone, "alias.example.com.", .ANY, .no_error, "both.example.com.", null);
+    defer stripped.query.deinit();
+    defer stripped.response.deinit();
+
+    const result = try validate(std.testing.allocator, &anchors, stripped.query, stripped.response, &.{}, now_seconds);
+    try expectStatus(.bogus, result);
+    try std.testing.expectEqual(dnssec.EDE_DNSSEC_BOGUS, result.ede);
+
+    // The same answer without any denial proof: inside the trust domain the
+    // absence must be proved (RFC 4035 section 5.4), so the answer is bogus.
+    var unproved = try exchange(std.testing.allocator, &signed.zone, "alias.example.com.", .ANY, .no_error, "both.example.com.", null);
+    defer unproved.query.deinit();
+    defer unproved.response.deinit();
+    dropNsecProofs(&unproved.response.answers);
+    dropNsecProofs(&unproved.response.authorities);
+
+    const unproved_result = try validate(std.testing.allocator, &anchors, unproved.query, unproved.response, &.{}, now_seconds);
+    try expectStatus(.bogus, unproved_result);
+    try std.testing.expectEqual(dnssec.EDE_DNSSEC_BOGUS, unproved_result.ede);
+
+    // The same answer outside the trust domain: nothing was expected to be
+    // signed, so the absence needs no proof and the answer is insecure.
+    var unsigned = try exchange(std.testing.allocator, &signed.zone, "alias.example.com.", .ANY, .no_error, "both.example.com.", null);
+    defer unsigned.query.deinit();
+    defer unsigned.response.deinit();
+    dropNsecProofs(&unsigned.response.answers);
+    dropNsecProofs(&unsigned.response.authorities);
+
+    try expectStatus(.insecure, try validate(std.testing.allocator, &outside, unsigned.query, unsigned.response, &.{}, now_seconds));
+}
+
+// ----------------------------------------- RFC 4035 section 5.4 proofs
+
+test "RFC 4035 section 5.4: an NSEC proof that verifies leaves the answer secure" {
+    var signed = try signZoneText(std.testing.allocator, child_zone_text, ed25519_secret);
+    defer signed.deinit(std.testing.allocator);
+    var anchors = try dnskeyAnchor(std.testing.allocator, "example.com.", signed.dnskey);
+    defer anchors.deinit(std.testing.allocator);
+
+    // The answer holds no RRset at the QNAME, so the absence of an MX record
+    // at www.example.com. must be proved with the NSEC the zone published
+    // there. The zone signed that proof with its own key, so the answer is
+    // secure and the AD bit may be set.
+    var pair = try exchange(std.testing.allocator, &signed.zone, "www.example.com.", .MX, .no_error, "nothing.example.com.", &.{"www.example.com."});
+    defer pair.query.deinit();
+    defer pair.response.deinit();
+
+    const result = try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds);
+    try expectStatus(.secure, result);
+    try std.testing.expectEqual(@as(u16, 0), result.ede);
+}
+
+test "RFC 4035 section 5.4: an NSEC proof whose signature does not verify is bogus" {
+    var signed = try signZoneText(std.testing.allocator, child_zone_text, ed25519_secret);
+    defer signed.deinit(std.testing.allocator);
+    var anchors = try dnskeyAnchor(std.testing.allocator, "example.com.", signed.dnskey);
+    defer anchors.deinit(std.testing.allocator);
+
+    var pair = try exchange(std.testing.allocator, &signed.zone, "www.example.com.", .MX, .no_error, "nothing.example.com.", &.{"www.example.com."});
+    defer pair.query.deinit();
+    defer pair.response.deinit();
+
+    // The signature over the NSEC is broken, so the proof cannot be
+    // authenticated: the absence it supports is not proved and the answer is
+    // bogus, not secure.
+    const broken = try breakRrsig(std.testing.allocator, &pair.response.authorities, RecordType.NSEC);
+    defer std.testing.allocator.free(broken);
+
+    const result = try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds);
+    try expectStatus(.bogus, result);
+    try std.testing.expectEqual(dnssec.EDE_DNSSEC_BOGUS, result.ede);
+}
+
+test "RFC 4035 section 5.4: an NSEC proof with no signature over it is refused" {
+    var signed = try signZoneText(std.testing.allocator, child_zone_text, ed25519_secret);
+    defer signed.deinit(std.testing.allocator);
+    var anchors = try dnskeyAnchor(std.testing.allocator, "example.com.", signed.dnskey);
+    defer anchors.deinit(std.testing.allocator);
+
+    var pair = try exchange(std.testing.allocator, &signed.zone, "www.example.com.", .MX, .no_error, "nothing.example.com.", &.{"www.example.com."});
+    defer pair.query.deinit();
+    defer pair.response.deinit();
+
+    // The NSEC without the RRSIG over it proves nothing (RFC 4035 section
+    // 5.4), so the absence is not proved and the answer is bogus.
+    dropNsecSignature(&pair.response.authorities);
+
+    const result = try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds);
+    try expectStatus(.bogus, result);
+    try std.testing.expectEqual(dnssec.EDE_DNSSEC_BOGUS, result.ede);
+}
+
 // ------------------------------------------------------------------- NSEC3
 
 /// RFC 5155 Appendix A's NSEC3 parameters: SHA-1, salt `aabbccdd`, 12
@@ -2291,16 +2872,36 @@ fn typeBitmap(codes: []const RecordType) [2 + 32]u8 {
     return bitmap;
 }
 
+/// base32hex (RFC 4648 section 7) of a hash, the form an NSEC3 owner name
+/// takes (RFC 5155 section 3). The canonical form is lowercase, so the
+/// label is written that way.
+fn base32Hex(hash: [20]u8, out: *[32]u8) void {
+    const alphabet = "0123456789abcdefghijklmnopqrstuv";
+    var written: usize = 0;
+    var index: usize = 0;
+    while (index < hash.len) : (index += 5) {
+        var chunk: u64 = 0;
+        for (hash[index..][0..5]) |byte| chunk = (chunk << 8) | byte;
+        var shift: u6 = 35;
+        while (true) {
+            out[written] = alphabet[@intCast((chunk >> shift) & 0x1f)];
+            written += 1;
+            if (shift == 0) break;
+            shift -= 5;
+        }
+    }
+}
+
 /// NSEC3 RDATA (RFC 5155 section 3): hash algorithm, flags, iterations, salt,
 /// next hashed owner name, and the type bitmap. `next_label` is the RFC 4648
 /// section 7 base32hex form the published vectors use.
-fn nsec3Rdata(next_label: []const u8, flags: u8, bitmap: []const u8) dns_rdata.Unknown {
+fn nsec3Rdata(next_label: []const u8, flags: u8, bitmap: []const u8, iterations: u16) dns_rdata.Unknown {
     var next: [20]u8 = undefined;
     std.debug.assert(base32hexLabel(next_label, &next));
     var raw = dns_rdata.Unknown{};
     raw.data[0] = 1; // SHA-1 (RFC 5155 section 3)
     raw.data[1] = flags;
-    std.mem.writeInt(u16, raw.data[2..4], nsec3_iterations, .big);
+    std.mem.writeInt(u16, raw.data[2..4], iterations, .big);
     raw.data[4] = @intCast(nsec3_salt.len);
     @memcpy(raw.data[5..][0..nsec3_salt.len], nsec3_salt);
     raw.data[5 + nsec3_salt.len] = 20;
@@ -2363,6 +2964,7 @@ fn nsec3Exchange(
     flags: []const u8,
     next_labels: []const []const u8,
     bitmaps: []const []const u8,
+    iterations: u16,
 ) !Exchange {
     const question = dns_question.Question{ .name = try Name.fromText(qname), .qtype = qtype, .qclass = .IN };
     var query = try emptyMessage(allocator, .{ .id = 0x1234, .recursion_desired = true, .question_count = 1 }, question);
@@ -2378,7 +2980,7 @@ fn nsec3Exchange(
     defer response.deinit();
 
     for (labels, 0..) |label, index| {
-        const pair = try signedNsec3(allocator, key, label, nsec3Rdata(next_labels[index], flags[index], bitmaps[index]), 3600);
+        const pair = try signedNsec3(allocator, key, label, nsec3Rdata(next_labels[index], flags[index], bitmaps[index], iterations), 3600);
         try response.authorities.append(pair[0]);
         try response.authorities.append(pair[1]);
     }
@@ -2416,7 +3018,7 @@ test "RFC 5155 section 8.4: a closest-encloser proof is required, not just a cov
     const two_flags = [_]u8{ 0, 0 };
     const two_next = [_][]const u8{ h_ns1, max_hash };
     const two_bitmaps = [_][]const u8{ &apex_bitmap, &covering_bitmap };
-    var pair = try nsec3Exchange(std.testing.allocator, &key, "w.example.", .A, .nxdomain, &complete, &two_flags, &two_next, &two_bitmaps);
+    var pair = try nsec3Exchange(std.testing.allocator, &key, "w.example.", .A, .nxdomain, &complete, &two_flags, &two_next, &two_bitmaps, nsec3_iterations);
     defer pair.query.deinit();
     defer pair.response.deinit();
     try expectStatus(.insecure, try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds));
@@ -2429,7 +3031,7 @@ test "RFC 5155 section 8.4: a closest-encloser proof is required, not just a cov
     const one_flag = [_]u8{0};
     const one_next = [_][]const u8{max_hash};
     const one_bitmap = [_][]const u8{&covering_bitmap};
-    var incomplete = try nsec3Exchange(std.testing.allocator, &key, "w.example.", .A, .nxdomain, &one, &one_flag, &one_next, &one_bitmap);
+    var incomplete = try nsec3Exchange(std.testing.allocator, &key, "w.example.", .A, .nxdomain, &one, &one_flag, &one_next, &one_bitmap, nsec3_iterations);
     defer incomplete.query.deinit();
     defer incomplete.response.deinit();
 
@@ -2458,13 +3060,117 @@ test "RFC 9276 section 3.2: an answer proven by an NSEC3 chain with an iteration
     const flags = [_]u8{ 0, 0 };
     const next_labels = [_][]const u8{ h_ns1, "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv" };
     const bitmaps = [_][]const u8{ &apex_bitmap, &covering_bitmap };
-    var pair = try nsec3Exchange(std.testing.allocator, &key, "w.example.", .A, .nxdomain, &labels, &flags, &next_labels, &bitmaps);
+    var pair = try nsec3Exchange(std.testing.allocator, &key, "w.example.", .A, .nxdomain, &labels, &flags, &next_labels, &bitmaps, nsec3_iterations);
     defer pair.query.deinit();
     defer pair.response.deinit();
 
     const result = try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds);
     try expectStatus(.insecure, result);
     try std.testing.expectEqual(dnssec.EDE_UNSUPPORTED_NSEC3_ITERATIONS, result.ede);
+}
+
+test "RFC 9276 section 3.2: an insecure answer over an NSEC3 chain still verifies the signature over the NSEC3" {
+    var key = try zone_signer.parseKey(ed25519_secret);
+    defer key.deinit();
+    const dnskey_rdata = try key.dnskeyRdata(std.testing.allocator);
+    defer std.testing.allocator.free(dnskey_rdata);
+    var anchors = try dnskeyAnchor(std.testing.allocator, "example.", dnskey_rdata);
+    defer anchors.deinit(std.testing.allocator);
+
+    // The chain of RFC 5155 Appendix A: 12 iterations, above the count of 0
+    // RFC 9276 section 3.1 asks a publisher to use. The proof is complete, so
+    // the answer is insecure and carries the EDE the RFC assigns to it.
+    const apex_bitmap = typeBitmap(&.{ .SOA, .NS, .RRSIG, .NSEC3, .DNSKEY });
+    const covering_bitmap = typeBitmap(&.{ .RRSIG, .NSEC3 });
+    const labels = [_][]const u8{ h_example, "00000000000000000000000000000000" };
+    const flags = [_]u8{ 0, 0 };
+    const next_labels = [_][]const u8{ h_ns1, "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv" };
+    const bitmaps = [_][]const u8{ &apex_bitmap, &covering_bitmap };
+
+    var pair = try nsec3Exchange(std.testing.allocator, &key, "w.example.", .A, .nxdomain, &labels, &flags, &next_labels, &bitmaps, nsec3_iterations);
+    defer pair.query.deinit();
+    defer pair.response.deinit();
+
+    const result = try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds);
+    try expectStatus(.insecure, result);
+    try std.testing.expectEqual(dnssec.EDE_UNSUPPORTED_NSEC3_ITERATIONS, result.ede);
+
+    // The same proof with a broken signature over the NSEC3 record. The
+    // iteration count a validator answers insecure on must be the one the
+    // zone published, so the signature over the record decides: an answer
+    // that rests on a signature which does not verify is bogus.
+    var broken_pair = try nsec3Exchange(std.testing.allocator, &key, "w.example.", .A, .nxdomain, &labels, &flags, &next_labels, &bitmaps, nsec3_iterations);
+    defer broken_pair.query.deinit();
+    defer broken_pair.response.deinit();
+    const broken = try breakRrsig(std.testing.allocator, &broken_pair.response.authorities, RecordType.NSEC3);
+    defer std.testing.allocator.free(broken);
+
+    const broken_result = try validate(std.testing.allocator, &anchors, broken_pair.query, broken_pair.response, &.{}, now_seconds);
+    try expectStatus(.bogus, broken_result);
+    try std.testing.expectEqual(dnssec.EDE_DNSSEC_BOGUS, broken_result.ede);
+}
+
+test "RFC 4035 section 5.4: an NSEC3 proof that verifies leaves the answer secure" {
+    var key = try zone_signer.parseKey(ed25519_secret);
+    defer key.deinit();
+    const dnskey_rdata = try key.dnskeyRdata(std.testing.allocator);
+    defer std.testing.allocator.free(dnskey_rdata);
+    var anchors = try dnskeyAnchor(std.testing.allocator, "example.", dnskey_rdata);
+    defer anchors.deinit(std.testing.allocator);
+
+    // The NSEC3 that matches the QNAME, over a chain that counts no
+    // iterations: RFC 9276 section 3.2 does not hold the answer insecure, so
+    // the answer is secure once the proof verifies.
+    var digest: [20]u8 = undefined;
+    dnssec.nsec3Hash(try Name.fromText("w.example."), nsec3_salt, 0, &digest);
+    var label: [32]u8 = undefined;
+    base32Hex(digest, &label);
+    const labels = [_][]const u8{&label};
+    const flags = [_]u8{0};
+    const next_labels = [_][]const u8{"vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv"};
+    const covering_bitmap = typeBitmap(&.{ .RRSIG, .NSEC3 });
+    const bitmaps = [_][]const u8{&covering_bitmap};
+
+    var pair = try nsec3Exchange(std.testing.allocator, &key, "w.example.", .A, .no_error, &labels, &flags, &next_labels, &bitmaps, 0);
+    defer pair.query.deinit();
+    defer pair.response.deinit();
+
+    const result = try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds);
+    try expectStatus(.secure, result);
+    try std.testing.expectEqual(@as(u16, 0), result.ede);
+}
+
+test "RFC 4035 section 5.4: an NSEC3 proof whose signature does not verify is bogus" {
+    var key = try zone_signer.parseKey(ed25519_secret);
+    defer key.deinit();
+    const dnskey_rdata = try key.dnskeyRdata(std.testing.allocator);
+    defer std.testing.allocator.free(dnskey_rdata);
+    var anchors = try dnskeyAnchor(std.testing.allocator, "example.", dnskey_rdata);
+    defer anchors.deinit(std.testing.allocator);
+
+    var digest: [20]u8 = undefined;
+    dnssec.nsec3Hash(try Name.fromText("w.example."), nsec3_salt, 0, &digest);
+    var label: [32]u8 = undefined;
+    base32Hex(digest, &label);
+    const labels = [_][]const u8{&label};
+    const flags = [_]u8{0};
+    const next_labels = [_][]const u8{"vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv"};
+    const covering_bitmap = typeBitmap(&.{ .RRSIG, .NSEC3 });
+    const bitmaps = [_][]const u8{&covering_bitmap};
+
+    var pair = try nsec3Exchange(std.testing.allocator, &key, "w.example.", .A, .no_error, &labels, &flags, &next_labels, &bitmaps, 0);
+    defer pair.query.deinit();
+    defer pair.response.deinit();
+
+    // The signature over the NSEC3 is broken, so the proof cannot be
+    // authenticated: the absence it supports is not proved and the answer is
+    // bogus, not secure.
+    const broken = try breakRrsig(std.testing.allocator, &pair.response.authorities, RecordType.NSEC3);
+    defer std.testing.allocator.free(broken);
+
+    const result = try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds);
+    try expectStatus(.bogus, result);
+    try std.testing.expectEqual(dnssec.EDE_DNSSEC_BOGUS, result.ede);
 }
 
 test "RFC 5155 section 8.6: a DS NODATA needs the Opt-Out bit or it is bogus" {
@@ -2488,7 +3194,7 @@ test "RFC 5155 section 8.6: a DS NODATA needs the Opt-Out bit or it is bogus" {
     // That proves the unsigned delegation and nothing below the cut, which is
     // `insecure` and must not set AD (RFC 5155 section 9.2).
     const opt_out_flags = [_]u8{ 0, 1 };
-    var opted_out = try nsec3Exchange(std.testing.allocator, &key, "ns2.example.", .DS, .no_error, &labels, &opt_out_flags, &next_labels, &bitmaps);
+    var opted_out = try nsec3Exchange(std.testing.allocator, &key, "ns2.example.", .DS, .no_error, &labels, &opt_out_flags, &next_labels, &bitmaps, nsec3_iterations);
     defer opted_out.query.deinit();
     defer opted_out.response.deinit();
     try expectStatus(.insecure, try validate(std.testing.allocator, &anchors, opted_out.query, opted_out.response, &.{}, now_seconds));
@@ -2497,7 +3203,7 @@ test "RFC 5155 section 8.6: a DS NODATA needs the Opt-Out bit or it is bogus" {
     // Opt-Out the zone is saying the span is closed, so a delegation inside it
     // that carries no DS is a lie rather than a declared gap.
     const closed_flags = [_]u8{ 0, 0 };
-    var closed = try nsec3Exchange(std.testing.allocator, &key, "ns2.example.", .DS, .no_error, &labels, &closed_flags, &next_labels, &bitmaps);
+    var closed = try nsec3Exchange(std.testing.allocator, &key, "ns2.example.", .DS, .no_error, &labels, &closed_flags, &next_labels, &bitmaps, nsec3_iterations);
     defer closed.query.deinit();
     defer closed.response.deinit();
 

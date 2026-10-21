@@ -307,6 +307,11 @@ pub const Config = struct {
     /// zone at startup; see `dnssec-key-file` in the loader.
     dnssec_key_file: Text = .{},
     has_dnssec_key_file: bool = false,
+    /// Path to the DNSSEC key-signing key file. RFC 6781 section 3.1: this
+    /// key signs the DNSKEY RRset and the DS states it; see `dnssec-ksk-file`
+    /// in the loader.
+    dnssec_ksk_file: Text = .{},
+    has_dnssec_ksk_file: bool = false,
     /// Path to the DNSSEC trust-anchor file the forwarding path validates
     /// against; see `trust-anchor-file` in the loader.
     trust_anchor_file: Text = .{},
@@ -406,6 +411,11 @@ pub const Config = struct {
         return self.dnssec_key_file.text();
     }
 
+    pub fn dnssecKskFileText(self: *const Config) ?[]const u8 {
+        if (!self.has_dnssec_ksk_file) return null;
+        return self.dnssec_ksk_file.text();
+    }
+
     pub fn trustAnchorFileText(self: *const Config) ?[]const u8 {
         if (!self.has_trust_anchor_file) return null;
         return self.trust_anchor_file.text();
@@ -444,6 +454,7 @@ pub const Config = struct {
         if (std.mem.eql(u8, first, "blocklist")) return self.parseBlocklist(&tokens);
         if (std.mem.eql(u8, first, "tsig-key-file")) return self.parseTsigKeyFile(&tokens);
         if (std.mem.eql(u8, first, "dnssec-key-file")) return self.parseDnssecKeyFile(&tokens);
+        if (std.mem.eql(u8, first, "dnssec-ksk-file")) return self.parseDnssecKskFile(&tokens);
         if (std.mem.eql(u8, first, "trust-anchor-file")) return self.parseTrustAnchorFile(&tokens);
         if (std.mem.eql(u8, first, "ixfr-journal-file")) return self.parseIxfrJournalFile(&tokens);
         if (std.mem.eql(u8, first, "tls-cert-file")) return self.parseTlsCertFile(&tokens);
@@ -545,6 +556,15 @@ pub const Config = struct {
         if (path.len == 0) return Error.BadDirective;
         try self.dnssec_key_file.set(path);
         self.has_dnssec_key_file = true;
+    }
+
+    fn parseDnssecKskFile(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        if (self.has_dnssec_ksk_file) return Error.BadDirective;
+        const path = tokens.next() orelse return Error.BadDirective;
+        try requireNoTrailingTokens(tokens);
+        if (path.len == 0) return Error.BadDirective;
+        try self.dnssec_ksk_file.set(path);
+        self.has_dnssec_ksk_file = true;
     }
 
     fn parseTrustAnchorFile(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
@@ -922,6 +942,18 @@ test "config parser accepts one DNSSEC signing key-file path and no inline secre
     try std.testing.expectError(error.BadDirective, Config.parse("dnssec-key-file\n"));
     try std.testing.expectError(error.BadDirective, Config.parse("dnssec-key-file a.key b.key\n"));
     try std.testing.expectError(error.UnknownDirective, Config.parse("dnssec-key ed25519-secret\n"));
+}
+
+test "config parser accepts one DNSSEC key-signing key-file path and no inline secret" {
+    const config = try Config.parse("dnssec-ksk-file ksk.key\n");
+    try std.testing.expectEqualStrings("ksk.key", config.dnssecKskFileText().?);
+    try std.testing.expect((try Config.parse("zone one.example primary one.zone\n")).dnssecKskFileText() == null);
+    try std.testing.expectError(error.BadDirective, Config.parse(
+        "dnssec-ksk-file a.key\ndnssec-ksk-file b.key\n",
+    ));
+    try std.testing.expectError(error.BadDirective, Config.parse("dnssec-ksk-file\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("dnssec-ksk-file a.key b.key\n"));
+    try std.testing.expectError(error.UnknownDirective, Config.parse("dnssec-ksk ed25519-secret\n"));
 }
 
 test "config parser accepts one DNSSEC trust-anchor path and rejects every other shape" {
