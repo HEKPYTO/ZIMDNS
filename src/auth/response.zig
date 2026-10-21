@@ -54,6 +54,10 @@ pub fn truncateClassicUdpResponse(response_bytes: []const u8, output: []u8) Erro
     }
     if (response_bytes.len < 12 or output.len < 12) return Error.BadResponse;
 
+    // RFC 2181 section 9: data that is not required in the reply is omitted
+    // when it does not fit, and the reply then carries no TC bit.
+    if (replyWithoutAdditionalSection(response_bytes, output, payload_limit, null)) |reply| return reply;
+
     var reader = @import("../dns/reader.zig").Reader.init(response_bytes);
     const parsed_header = header.Header.parse(&reader) catch return Error.BadResponse;
     if (parsed_header.question_count > 1) return Error.BadResponse;
@@ -94,6 +98,12 @@ pub fn truncateSignedClassicUdpResponse(response_bytes: []const u8, output: []u8
     if (response_bytes.len < 12 or output.len < 12) return Error.BadResponse;
 
     const final = (@import("../dns/tsig.zig").parseFinalAdditional(response_bytes) catch return Error.BadResponse) orelse return Error.BadResponse;
+
+    // RFC 2181 section 9: data that is not required in the reply is omitted
+    // when it does not fit, and the reply then carries no TC bit. The TSIG
+    // stays: a signed message ends with it.
+    if (replyWithoutAdditionalSection(response_bytes, output, payload_limit, response_bytes[final.record_start..final.record_end])) |reply| return reply;
+
     var reader = @import("../dns/reader.zig").Reader.init(response_bytes);
     const parsed_header = header.Header.parse(&reader) catch return Error.BadResponse;
     if (parsed_header.question_count > 1) return Error.BadResponse;
@@ -118,6 +128,66 @@ pub fn truncateSignedClassicUdpResponse(response_bytes: []const u8, output: []u8
     writer.writeBytes(response_bytes[final.record_start..final.record_end]) catch return Error.ResponseTooLarge;
     if (writer.len() > payload_limit) return Error.ResponseTooLarge;
     return writer.written();
+}
+
+/// RFC 2181 section 9: the TC bit marks an RRSet that could not be included
+/// in a reply in its entirety, so a reply whose answer and authority
+/// sections fit is sent with the extra data of the additional section
+/// omitted and no TC bit. A referral keeps TC: RFC 9471 section 3.1 asks
+/// for it when the glue of an in-domain name server does not fit.
+/// `final_tsig` is the TSIG record a signed message ends with, which the
+/// signed path keeps.
+fn replyWithoutAdditionalSection(
+    response_bytes: []const u8,
+    output: []u8,
+    payload_limit: usize,
+    final_tsig: ?[]const u8,
+) ?[]const u8 {
+    if (response_bytes.len < 12) return null;
+    const flags = std.mem.readInt(u16, response_bytes[2..4], .big);
+    if ((flags & header.Flags.aa) == 0) return null;
+    const core_len = coreLength(response_bytes) orelse return null;
+    const kept = if (final_tsig) |record| record.len else 0;
+    if (core_len + kept > payload_limit) return null;
+    if (core_len + kept > output.len) return null;
+
+    @memcpy(output[0..core_len], response_bytes[0..core_len]);
+    if (final_tsig) |record| @memcpy(output[core_len..][0..record.len], record);
+    const reply_flags = std.mem.readInt(u16, output[2..4], .big) & ~header.Flags.tc;
+    std.mem.writeInt(u16, output[2..4], reply_flags, .big);
+    std.mem.writeInt(u16, output[10..12], if (final_tsig == null) 0 else 1, .big);
+    return output[0 .. core_len + kept];
+}
+
+/// The wire length of the header, the question, and the answer and authority
+/// sections: the records a reply is required to carry.
+fn coreLength(response_bytes: []const u8) ?usize {
+    var reader = @import("../dns/reader.zig").Reader.init(response_bytes);
+    const parsed_header = header.Header.parse(&reader) catch return null;
+    if (parsed_header.question_count > 1) return null;
+    var offset: usize = 12;
+    if (parsed_header.question_count == 1) {
+        const parsed_question = question.Question.parse(response_bytes, offset) catch return null;
+        offset = parsed_question.next_offset;
+    }
+    offset = sectionEnd(response_bytes, offset, parsed_header.answer_count) orelse return null;
+    offset = sectionEnd(response_bytes, offset, parsed_header.authority_count) orelse return null;
+    return offset;
+}
+
+/// The wire offset after `count` resource records.
+fn sectionEnd(response_bytes: []const u8, start: usize, count: u16) ?usize {
+    var offset = start;
+    var index: u16 = 0;
+    while (index < count) : (index += 1) {
+        const owner = dns_name.Name.parse(response_bytes, offset) catch return null;
+        offset = owner.next_offset;
+        if (response_bytes.len -| offset < 10) return null;
+        const rdlength = std.mem.readInt(u16, response_bytes[offset + 8 ..][0..2], .big);
+        offset += 10 + @as(usize, rdlength);
+        if (offset > response_bytes.len) return null;
+    }
+    return offset;
 }
 
 fn responsePayloadLimit(response_bytes: []const u8) usize {
@@ -702,9 +772,9 @@ fn appendNsec3Proofs(
         proof[proof_len] = encloser.cover;
         proof_len += 1;
         if (nsec3Match(chain, wildcard_digest)) |wildcard_match| {
-            // RFC 5155 section 7.2.6: the wildcard at the closest encloser
-            // exists, so no NSEC3 covers it. The proof carries the NSEC3 that
-            // matches the wildcard, which states that it is there.
+            // RFC 5155 section 7.2.2 asks for the NSEC3 that covers the
+            // (nonexistent) wildcard; the chain holds the wildcard, so the
+            // proof carries the NSEC3 that matches it instead.
             proof[proof_len] = wildcard_match;
             proof_len += 1;
         } else {
@@ -1668,7 +1738,7 @@ test "a query for an NSEC3 owner name is a name error (RFC 5155 7.2.8)" {
     try expectNsec3ProofsSigned(&response);
 }
 
-test "an NXDOMAIN under a wildcard carries the wildcard proof (RFC 5155 7.2.6)" {
+test "an NXDOMAIN under a wildcard carries the wildcard proof (RFC 5155 7.2.2)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1682,7 +1752,7 @@ test "an NXDOMAIN under a wildcard carries the wildcard proof (RFC 5155 7.2.6)" 
     try std.testing.expectEqual(header.Rcode.nxdomain, response.header.rcode);
 
     // The proof carries the NSEC3 that matches the wildcard at the closest
-    // encloser, which no other record can state (RFC 5155 section 7.2.6).
+    // encloser, which no other record can state (RFC 5155 section 7.2.2).
     const wildcard = servedNsec3Match(&response, nsec3_wildcard_hash) orelse return error.TestExpectedEqual;
     try std.testing.expect(wildcard.rrtype.eql(.NSEC3));
     // And the NSEC3 that covers the next closer below the closest encloser.
@@ -1989,6 +2059,207 @@ test "EDNS truncation uses negotiated payload and retains OPT" {
     try std.testing.expectEqual(@as(u16, 0), parsed.header.answer_count);
     try std.testing.expectEqual(@as(usize, 1), parsed.additionals.len);
     try std.testing.expectEqual(@as(u16, 600), parsed.edns.?.udp_payload_size);
+}
+
+/// A reply for the truncation tests: `answers` A records in the answer
+/// section, `authorities` A records in the authority section, and
+/// `additionals` A records of extra data in the additional section.
+fn truncationTestMessage(
+    allocator: std.mem.Allocator,
+    authoritative: bool,
+    answers: usize,
+    authorities: usize,
+    additionals: usize,
+) !dns_message.Message {
+    var message = dns_message.Message{
+        .allocator = allocator,
+        .header = .{ .id = 0x1234, .qr = true, .authoritative = authoritative },
+        .question = .{
+            .name = try dns_name.Name.fromText("www.example."),
+            .qtype = .A,
+            .qclass = .IN,
+        },
+        .answers = try dns_message.RecordSection.init(allocator, 0),
+        .authorities = try dns_message.RecordSection.init(allocator, 0),
+        .additionals = try dns_message.RecordSection.init(allocator, 0),
+    };
+    errdefer message.deinit();
+    const owner = try dns_name.Name.fromText("www.example.");
+    var index: usize = 0;
+    while (index < answers) : (index += 1) {
+        try message.answers.append(.{
+            .owner = owner,
+            .rrtype = .A,
+            .class = .IN,
+            .ttl = 60,
+            .rdata = .{ .A = .{ 192, 0, 2, 1 } },
+        });
+    }
+    index = 0;
+    while (index < authorities) : (index += 1) {
+        try message.authorities.append(.{
+            .owner = owner,
+            .rrtype = .A,
+            .class = .IN,
+            .ttl = 60,
+            .rdata = .{ .A = .{ 192, 0, 2, 2 } },
+        });
+    }
+    index = 0;
+    while (index < additionals) : (index += 1) {
+        try message.additionals.append(.{
+            .owner = owner,
+            .rrtype = .A,
+            .class = .IN,
+            .ttl = 60,
+            .rdata = .{ .A = .{ 192, 0, 2, 3 } },
+        });
+    }
+    try setHeaderCounts(&message);
+    return message;
+}
+
+test "RFC 2181 section 9: an answer whose additional section does not fit is sent without it and without TC" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var message = try truncationTestMessage(arena.allocator(), true, 1, 1, 40);
+    defer message.deinit();
+
+    var encoded: [2048]u8 = undefined;
+    var writer = @import("../dns/writer.zig").Writer.init(&encoded);
+    try message.encode(&writer);
+    try std.testing.expect(writer.len() > CLASSIC_UDP_MESSAGE_SIZE);
+
+    var output: [2048]u8 = undefined;
+    const reply = try truncateClassicUdpResponse(writer.written(), &output);
+    const parsed = try dns_message.Message.parse(arena.allocator(), reply);
+
+    // "The TC bit should not be set merely because some extra information
+    // could have been included, but there was insufficient room."
+    try std.testing.expect(!parsed.header.truncated);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.answer_count);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.authority_count);
+    try std.testing.expectEqual(@as(u16, 0), parsed.header.additional_count);
+    try std.testing.expectEqual(@as(usize, 0), parsed.additionals.len);
+    try std.testing.expectEqualSlices(u8, &.{ 192, 0, 2, 1 }, &parsed.answers.items[0].rdata.A);
+    try std.testing.expectEqualSlices(u8, &.{ 192, 0, 2, 2 }, &parsed.authorities.items[0].rdata.A);
+    try std.testing.expect(reply.len <= CLASSIC_UDP_MESSAGE_SIZE);
+}
+
+test "RFC 2181 section 9: an answer whose answer section does not fit still sets TC" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var message = try truncationTestMessage(arena.allocator(), true, 40, 0, 0);
+    defer message.deinit();
+
+    var encoded: [2048]u8 = undefined;
+    var writer = @import("../dns/writer.zig").Writer.init(&encoded);
+    try message.encode(&writer);
+    try std.testing.expect(writer.len() > CLASSIC_UDP_MESSAGE_SIZE);
+
+    var output: [2048]u8 = undefined;
+    const reply = try truncateClassicUdpResponse(writer.written(), &output);
+    const parsed = try dns_message.Message.parse(arena.allocator(), reply);
+
+    // The whole RRSet is required in the reply, so the client must retry
+    // over TCP.
+    try std.testing.expect(parsed.header.truncated);
+    try std.testing.expectEqual(@as(u16, 0), parsed.header.answer_count);
+    try std.testing.expect(reply.len <= CLASSIC_UDP_MESSAGE_SIZE);
+}
+
+test "RFC 2181 section 9: a referral whose glue does not fit keeps TC" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var message = try truncationTestMessage(arena.allocator(), false, 0, 1, 40);
+    defer message.deinit();
+
+    var encoded: [2048]u8 = undefined;
+    var writer = @import("../dns/writer.zig").Writer.init(&encoded);
+    try message.encode(&writer);
+    try std.testing.expect(writer.len() > CLASSIC_UDP_MESSAGE_SIZE);
+
+    var output: [2048]u8 = undefined;
+    const reply = try truncateClassicUdpResponse(writer.written(), &output);
+    const parsed = try dns_message.Message.parse(arena.allocator(), reply);
+
+    // RFC 9471 section 3.1: a referral that cannot hold the glue of its
+    // in-domain name servers sets TC.
+    try std.testing.expect(parsed.header.truncated);
+    try std.testing.expectEqual(@as(u16, 0), parsed.header.answer_count);
+    try std.testing.expect(reply.len <= CLASSIC_UDP_MESSAGE_SIZE);
+}
+
+test "RFC 2181 section 9: a reply that fits is sent byte for byte" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var message = try truncationTestMessage(arena.allocator(), true, 1, 1, 1);
+    defer message.deinit();
+
+    var encoded: [2048]u8 = undefined;
+    var writer = @import("../dns/writer.zig").Writer.init(&encoded);
+    try message.encode(&writer);
+
+    var output: [2048]u8 = undefined;
+    const reply = try truncateClassicUdpResponse(writer.written(), &output);
+    try std.testing.expectEqualSlices(u8, writer.written(), reply);
+}
+
+test "RFC 2181 section 9: the signed path omits the additional section the same way" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const tsig = @import("../dns/tsig.zig");
+
+    var message = try truncationTestMessage(arena.allocator(), true, 1, 1, 40);
+    defer message.deinit();
+    var mac_bytes: [32]u8 = undefined;
+    @memset(&mac_bytes, 0);
+    try message.additionals.append(.{
+        .owner = try dns_name.Name.fromText("key."),
+        .rrtype = .TSIG,
+        .class = .ANY,
+        .ttl = 0,
+        .rdata = .{ .TSIG = try dns_rdata.Tsig.init(
+            try dns_name.Name.fromText("hmac-sha256."),
+            1_700_000_000,
+            300,
+            &mac_bytes,
+            0x1234,
+            0,
+            &.{},
+        ) },
+    });
+    try setHeaderCounts(&message);
+
+    var encoded: [2048]u8 = undefined;
+    var writer = @import("../dns/writer.zig").Writer.init(&encoded);
+    try message.encode(&writer);
+    const final = (try tsig.parseFinalAdditional(writer.written())).?;
+    const secret = "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=";
+    const signed = try tsig.sign(writer.written(), secret, final.owner, final.tsig, null);
+    try tsig.patchMac(encoded[0..writer.len()], final, signed.slice());
+
+    var output: [2048]u8 = undefined;
+    const reply = try truncateSignedClassicUdpResponse(writer.written(), &output);
+    const parsed = try dns_message.Message.parse(arena.allocator(), reply);
+
+    try std.testing.expect(!parsed.header.truncated);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.answer_count);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.authority_count);
+    // The extra data is gone; the TSIG a signed message ends with stays.
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.additional_count);
+    try std.testing.expect(parsed.additionals.items[0].rrtype.eql(.TSIG));
+
+    // The MAC is computed over the reply as it goes on the wire, so the
+    // caller recomputes it and the message still authenticates.
+    const reply_final = (try tsig.parseFinalAdditional(reply)).?;
+    const resigned = try tsig.sign(reply, secret, reply_final.owner, reply_final.tsig, null);
+    try tsig.patchMac(@constCast(reply), reply_final, resigned.slice());
+    _ = try tsig.verify(reply, secret, null, tsig.minimumMacLength(.hmac_sha256));
 }
 
 test "authoritative response ignores unknown EDNS options" {

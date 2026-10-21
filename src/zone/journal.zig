@@ -115,7 +115,9 @@ pub const Journal = struct {
 
     /// Reads the transitions the journal holds. A line that does not parse is
     /// skipped, so a truncated or corrupt record costs the server that
-    /// record and nothing else. The caller owns the returned slice.
+    /// record and nothing else. A file that does not end in a newline was cut
+    /// short, so its last line is a torn record and is not restored either.
+    /// The caller owns the returned slice.
     pub fn read(self: *const Journal, allocator: std.mem.Allocator) ![]Transition {
         const file = self.file orelse return &.{};
         const stat = try file.stat(self.io);
@@ -132,6 +134,13 @@ pub const Journal = struct {
         if (start > 0) {
             const newline = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
             text = text[newline + 1 ..];
+        }
+        // A crash in the middle of an append leaves a record without its
+        // closing newline; such a tail was never written whole, so it is not
+        // restored even when it reads as a complete transition.
+        if (text.len > 0 and text[text.len - 1] != '\n') {
+            const newline = std.mem.lastIndexOfScalar(u8, text, '\n') orelse 0;
+            text = text[0..newline];
         }
         var transitions: std.ArrayList(Transition) = .empty;
         errdefer transitions.deinit(allocator);
@@ -348,4 +357,34 @@ test "the journal skips a corrupt or truncated record" {
     try std.testing.expectEqualStrings("one.example.", transitions[0].originText());
     try std.testing.expectEqual(@as(u32, 10), transitions[0].from_serial);
     try std.testing.expectEqual(@as(u32, 11), transitions[0].to_serial);
+}
+
+test "the journal skips a torn record that has no closing newline" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A crash in the middle of an append left the last record without its
+    // newline, and it reads as a complete transition.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "journal.log",
+        .data = "one.example. 10 11\ntwo.example. 20 21",
+    });
+
+    var journal = try Journal.open(io, tmp.dir, "journal.log");
+    defer journal.close();
+    const transitions = try journal.read(std.testing.allocator);
+    defer std.testing.allocator.free(transitions);
+
+    // The whole record is kept, the torn one is not.
+    try std.testing.expectEqual(@as(usize, 1), transitions.len);
+    try std.testing.expectEqualStrings("one.example.", transitions[0].originText());
+    try std.testing.expectEqual(@as(u32, 10), transitions[0].from_serial);
+    try std.testing.expectEqual(@as(u32, 11), transitions[0].to_serial);
+
+    // The torn transition is not known, so a client at its serial is not
+    // answered incrementally.
+    var restored = DeltaLog{};
+    try restored.restore(transitions[0].from_serial, transitions[0].to_serial);
+    try std.testing.expect(!restored.canServeIncremental(20, 21));
 }

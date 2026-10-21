@@ -86,6 +86,8 @@ pub const Error = error{
     BadUpstreamResponse,
     ResponseTooLarge,
     UnsupportedOpcode,
+    /// The runtime maps this to a REFUSED response. The resolver forwards the
+    /// client's client subnet option, so it produces no refusal today.
     EcsRefused,
     BadCookie,
 };
@@ -276,6 +278,22 @@ pub const CookieReplayDb = struct {
     }
 };
 
+/// RFC 7871 section 6: the Client Subnet option as the network an answer was
+/// fetched for. A family of 0 means the query carried no option at all.
+const EcsScope = struct {
+    family: u16 = 0,
+    /// The SOURCE PREFIX-LENGTH the option carried.
+    prefix: u8 = 0,
+    /// The address bits of that prefix, zero padded to the last octet.
+    address: [16]u8 = @splat(0),
+
+    fn eql(self: EcsScope, other: EcsScope) bool {
+        if (self.family != other.family or self.prefix != other.prefix) return false;
+        const len = (@as(usize, self.prefix) + 7) / 8;
+        return std.mem.eql(u8, self.address[0..len], other.address[0..len]);
+    }
+};
+
 const CacheKey = struct {
     /// The question name in wire form: the RFC 8020 cut compares a name
     /// with its ancestors, and only the label structure says where one ends.
@@ -285,6 +303,9 @@ const CacheKey = struct {
     qclass: u16 = 0,
     checking_disabled: bool = false,
     dnssec_ok: bool = false,
+    /// RFC 7871 section 7.3.1: an answer is tied to the network it was
+    /// fetched for, so the scope is part of the key.
+    ecs: EcsScope = .{},
 
     fn fromQuestion(question: dns_message.Message) !CacheKey {
         const q = question.question orelse return error.BadQuery;
@@ -294,6 +315,7 @@ const CacheKey = struct {
             .checking_disabled = question.header.checking_disabled,
             .dnssec_ok = if (question.edns) |edns| edns.dnssec_ok else false,
         };
+        if (ecsScope(question)) |scope| key.ecs = scope;
         @memcpy(key.name[0..q.name.wire_len], q.name.asWire());
         key.name_len = q.name.wire_len;
         return key;
@@ -302,16 +324,52 @@ const CacheKey = struct {
     fn eql(self: *const CacheKey, other: *const CacheKey) bool {
         return self.qtype == other.qtype and self.qclass == other.qclass and
             self.checking_disabled == other.checking_disabled and self.dnssec_ok == other.dnssec_ok and
+            self.ecs.eql(other.ecs) and
             std.ascii.eqlIgnoreCase(self.name[0..self.name_len], other.name[0..other.name_len]);
     }
 
     /// True when two keys ask the same question. The CD and DO flags are
-    /// left out: a resolution failure does not depend on them.
+    /// left out: a resolution failure does not depend on them. The client
+    /// subnet scope is not left out: a failure for one scope says nothing
+    /// about another.
     fn sameQuestion(self: *const CacheKey, other: *const CacheKey) bool {
         return self.qtype == other.qtype and self.qclass == other.qclass and
+            self.ecs.eql(other.ecs) and
             std.ascii.eqlIgnoreCase(self.name[0..self.name_len], other.name[0..other.name_len]);
     }
 };
+
+/// The Client Subnet option of a message, if it carries one. RFC 7871
+/// section 6 gives the layout: FAMILY, SOURCE PREFIX-LENGTH, SCOPE
+/// PREFIX-LENGTH, and the address truncated to the source prefix.
+fn ecsScope(message: dns_message.Message) ?EcsScope {
+    const payload = findOption(message, dns_rdata.EDNS_ECS_OPTION_CODE) orelse return null;
+    if (payload.len < 4) return null;
+    const family = std.mem.readInt(u16, payload[0..2], .big);
+    const max_prefix: u8 = switch (family) {
+        1 => 32,
+        2 => 128,
+        else => return null,
+    };
+    const prefix = payload[2];
+    if (prefix > max_prefix) return null;
+    const address_len = (@as(usize, prefix) + 7) / 8;
+    if (payload.len != 4 + address_len) return null;
+    var scope = EcsScope{ .family = family, .prefix = prefix };
+    @memcpy(scope.address[0..address_len], payload[4..]);
+    return scope;
+}
+
+/// The option payload of a scope. RFC 7871 section 6 gives the layout, and
+/// section 7.1.1 keeps the scope of a query at 0.
+fn ecsPayload(scope: EcsScope, buffer: *[4 + 16]u8) []const u8 {
+    std.mem.writeInt(u16, buffer[0..2], scope.family, .big);
+    buffer[2] = scope.prefix;
+    buffer[3] = 0;
+    const address_len = (@as(usize, scope.prefix) + 7) / 8;
+    @memcpy(buffer[4..][0..address_len], scope.address[0..address_len]);
+    return buffer[0 .. 4 + address_len];
+}
 
 const CacheEntry = struct {
     response: ?[]u8 = null,
@@ -432,8 +490,9 @@ const Cache = struct {
         try self.store(key, message, now, ttl_info);
     }
 
-    /// Stores a denial this server synthesized (RFC 8198). It carries no SOA,
-    /// so its TTL comes from the proof it rests on, not from the message.
+    /// Stores a denial this server synthesized (RFC 8198). Its TTL is the
+    /// negative TTL of RFC 2308 section 5, which the SOA the denial carries
+    /// already states.
     fn putDenial(self: *Cache, key: CacheKey, message: *dns_message.Message, ttl: u32, now: i64) !void {
         if (ttl == 0) return;
         try self.store(key, message, now, .{
@@ -536,6 +595,9 @@ const Cache = struct {
             if (entry.key.qclass != key.qclass) continue;
             if (entry.key.checking_disabled != key.checking_disabled) continue;
             if (entry.key.dnssec_ok != key.dnssec_ok) continue;
+            // RFC 7871 section 7.3.1: a denial is tied to the network it was
+            // fetched for, so a cut never crosses into another scope.
+            if (!entry.key.ecs.eql(key.ecs)) continue;
             const elapsed = @max(@as(i64, 0), now - entry.stored_at);
             if (elapsed >= @as(i64, entry.ttl)) continue;
             if (!isDescendant(key.name[0..key.name_len], entry.key.name[0..entry.key.name_len])) continue;
@@ -709,9 +771,6 @@ pub const Resolver = struct {
 
     pub fn answer(self: *Resolver, query_bytes: []const u8, query: dns_message.Message, client: *const std.Io.net.IpAddress, output: []u8) ![]const u8 {
         if (query.header.opcode != .query) return Error.UnsupportedOpcode;
-        if (findOption(query, dns_rdata.EDNS_ECS_OPTION_CODE)) |ecs| {
-            if (ecs.len >= 4 and ecs[2] != 0) return Error.EcsRefused;
-        }
         const cookie = self.clientCookie(query, client);
         if (cookie == .invalid) return self.cookieFailure(query, client, output);
         const key = try CacheKey.fromQuestion(query);
@@ -913,7 +972,7 @@ pub const Resolver = struct {
     /// RFC 8198 section 5: the denial this server synthesizes from a cached
     /// NSEC proof. It is kept in the negative cache, so the next client for
     /// a name the denial covers is answered without an upstream query.
-    fn aggressiveAnswer(self: *Resolver, query: dns_message.Message, denial: dnssec.Denial, key: CacheKey, now: i64, output: []u8) ![]const u8 {
+    fn aggressiveAnswer(self: *Resolver, query: dns_message.Message, proof: dnssec.ProvenDenial, key: CacheKey, now: i64, output: []u8) ![]const u8 {
         const q = query.question orelse return Error.BadUpstreamResponse;
         var message = dns_message.Message{
             .allocator = query.allocator,
@@ -922,7 +981,7 @@ pub const Resolver = struct {
                 .qr = true,
                 .recursion_desired = query.header.recursion_desired,
                 .recursion_available = true,
-                .rcode = switch (denial) {
+                .rcode = switch (proof.denial) {
                     .nxdomain => .nxdomain,
                     .nodata => .no_error,
                 },
@@ -940,6 +999,18 @@ pub const Resolver = struct {
             } else null,
         };
         errdefer message.deinit();
+        // RFC 2308 section 3: a negative answer carries the zone SOA, so the
+        // client can cache the denial itself. A denial with no SOA stays
+        // uncached (RFC 2308 section 5), and its TTL stays zero: there is no
+        // way to stop such a denial from looping between two servers.
+        var ttl: u32 = 0;
+        if (proof.soa) |soa| {
+            ttl = self.denialTtl(now, soa);
+            var soa_record = soa;
+            soa_record.ttl = ttl;
+            try message.authorities.append(soa_record);
+            message.header.authority_count = 1;
+        }
         if (query.edns) |edns| try appendOpt(&message, edns);
         var writer = dns_writer.Writer.init(output);
         message.encode(&writer) catch return Error.ResponseTooLarge;
@@ -947,15 +1018,16 @@ pub const Resolver = struct {
         // for the clients that did not ask for the proofs.
         var denial_key = key;
         denial_key.dnssec_ok = false;
-        self.cache.putDenial(denial_key, &message, self.denialTtl(now), now) catch {};
+        if (ttl != 0) self.cache.putDenial(denial_key, &message, ttl, now) catch {};
         return writer.written();
     }
 
     /// RFC 8198 section 4: a denial lives no longer than the proof it rests
     /// on, so the shortest live proof bounds it. RFC 8198 section 5.4 caps
     /// the effective TTL of a negative answer at the three hours RFC 2308
-    /// section 5 sets.
-    fn denialTtl(self: *const Resolver, now: i64) u32 {
+    /// section 5 sets, and RFC 2308 section 5 takes the smaller of the SOA's
+    /// TTL and its MINIMUM field.
+    fn denialTtl(self: *const Resolver, now: i64, soa: dns_record.ResourceRecord) u32 {
         var ttl: u32 = MAX_NEGATIVE_TTL;
         for (self.dnssec_aggressive.entries) |entry| {
             if (!entry.valid) continue;
@@ -963,7 +1035,11 @@ pub const Resolver = struct {
             if (remaining <= 0) continue;
             ttl = @min(ttl, @as(u32, @intCast(remaining)));
         }
-        return ttl;
+        const minimum = switch (soa.rdata) {
+            .SOA => |soa_rdata| soa_rdata.minimum,
+            else => 0,
+        };
+        return @min(ttl, @min(soa.ttl, minimum));
     }
 
     const CookieDecision = union(enum) { disabled, absent, valid: [24]u8, invalid };
@@ -1083,15 +1159,23 @@ pub const Resolver = struct {
     }
 };
 
-/// RFC 6147 sections 5.1.1, 5.1.2 and 5.1.6: a DNS64 answers an IN AAAA
-/// query whose answer came back empty with an AAAA synthesized from the A
-/// records of the same name. The A records come from one more upstream
+/// RFC 6147 sections 5.1.1, 5.1.2, 5.1.4 and 5.1.6: a DNS64 answers an IN
+/// AAAA query whose answer came back empty with an AAAA synthesized from the
+/// A records of the same name. The A records come from one more upstream
 /// query. An RCODE other than 0 counts as an empty answer, so the query for
 /// the A records runs for an error answer too. Returns false when nothing is
 /// synthesized, which leaves the answer as the upstream sent it.
 fn synthesizeDns64Answer(self: *Resolver, query: dns_message.Message, response: *dns_message.Message) !bool {
     const prefix = self.policy.nat64_prefix orelse return false;
     if (!dns64Applies(query, response.*)) return false;
+    // RFC 6147 section 5.1.4: an AAAA record inside the excluded ranges is
+    // not real AAAA data. The offending records are dropped, and an answer
+    // that held only such records is then empty, so the synthesis proceeds.
+    dropExcludedAaaa(response, prefix);
+    // RFC 6147 section 5.1.1: a name with a real AAAA is never synthesized
+    // over. Section 5.1.2: any other RCODE "is treated as though the RCODE
+    // were 0 and the answer section were empty".
+    if (response.header.rcode == .no_error and response.answers.len != 0) return false;
     const question = query.question.?;
     var a_query = try buildAQuery(self, query);
     defer a_query.deinit();
@@ -1103,12 +1187,10 @@ fn synthesizeDns64Answer(self: *Resolver, query: dns_message.Message, response: 
     return synthesizeDns64(prefix, question.name, response, a_response);
 }
 
-/// RFC 6147 sections 5.1.1, 5.1.2 and 5.1.6: the trigger for synthesis is
-/// an IN AAAA query whose answer section is empty. A name with a real AAAA
-/// is never synthesized over (RFC 6147 section 5.1.1), a client that set CD
-/// does the validation and the synthesis itself (RFC 6147 section 5.5),
-/// and an RCODE other than 0 counts as an empty answer (RFC 6147 section
-/// 5.1.2) with NXDOMAIN the one RCODE that is handled as the error it is.
+/// RFC 6147 section 5.1.2: the query and the response decide whether this
+/// server acts as a DNS64 for them. A client that set CD does the validation
+/// and the synthesis itself (RFC 6147 section 5.5), and NXDOMAIN is the one
+/// RCODE that is handled as the error it is.
 fn dns64Applies(query: dns_message.Message, response: dns_message.Message) bool {
     if (query.header.checking_disabled) return false;
     const question = query.question orelse return false;
@@ -1117,10 +1199,57 @@ fn dns64Applies(query: dns_message.Message, response: dns_message.Message) bool 
     // handled according to normal DNS operation", so the name error is
     // relayed and nothing is synthesized from it.
     if (response.header.rcode == .nxdomain) return false;
-    // RFC 6147 section 5.1.2: any other RCODE "is treated as though the
-    // RCODE were 0 and the answer section were empty".
-    if (response.header.rcode == .no_error and response.answers.len != 0) return false;
     return true;
+}
+
+/// RFC 6147 section 5.1.4: the special exclusion set for AAAA records. An
+/// AAAA record with an address inside one of these ranges is not real AAAA
+/// data: the RFC says an answer that holds only such records "MUST be
+/// treated as though it were an empty answer", and the offending records
+/// "MUST NOT" be returned to the client.
+const dns64_excluded_ranges = [_]struct { bytes: [16]u8, octets: usize }{
+    // The IPv4-mapped network ::ffff:0:0/96, the range the RFC says to
+    // include by default.
+    .{ .bytes = .{
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
+    }, .octets = 12 },
+    // The Well-Known Prefix 64:ff9b::/96 of RFC 6052 section 2.1.
+    .{ .bytes = .{
+        0x00, 0x64, 0xff, 0x9b, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    }, .octets = 12 },
+};
+
+/// RFC 6147 section 5.1.4: the address is inside the exclusion set, so the
+/// AAAA record that holds it is not real AAAA data.
+fn dns64Excluded(address: [16]u8, prefix: config.Nat64Prefix) bool {
+    for (dns64_excluded_ranges) |range| {
+        if (addressInRange(address, range.bytes, range.octets)) return true;
+    }
+    // The site's own Pref64::/n, the prefix this server synthesizes into.
+    return addressInRange(address, prefix.bytes, @as(usize, prefix.length) / 8);
+}
+
+/// The leading octets of the address are the ones the range covers. Every
+/// length in play is a whole number of octets: RFC 6052 section 2.2's six
+/// prefix lengths and the two ranges above.
+fn addressInRange(address: [16]u8, network: [16]u8, octets: usize) bool {
+    return std.mem.eql(u8, address[0..octets], network[0..octets]);
+}
+
+/// RFC 6147 section 5.1.4: the offending AAAA records "MUST NOT" be returned
+/// as part of a response, so they are taken out of the answer section.
+fn dropExcludedAaaa(response: *dns_message.Message, prefix: config.Nat64Prefix) void {
+    var kept: usize = 0;
+    for (response.answers.slice()) |record| {
+        if (record.rdata == .AAAA and dns64Excluded(record.rdata.AAAA, prefix)) continue;
+        response.answers.items[kept] = record;
+        kept += 1;
+    }
+    if (kept == response.answers.len) return;
+    response.answers.len = kept;
+    response.header.answer_count = @intCast(kept);
 }
 
 /// RFC 6147 section 5.1.6: the A query for the same name. It carries the
@@ -1293,6 +1422,13 @@ fn buildUpstreamQuery(
     var upstream_edns = query.edns.?;
     upstream_edns.dnssec_ok = true;
     try appendOpt(&sanitized, upstream_edns);
+    // RFC 7871 section 7.1.1: the SOURCE PREFIX-LENGTH of the client's own
+    // option caps what this server may ask upstream, so the option travels
+    // with the prefix the client asked for and a scope of 0.
+    if (ecsScope(query)) |scope| {
+        var ecs_buffer: [4 + 16]u8 = undefined;
+        try appendOption(&sanitized, dns_rdata.EDNS_ECS_OPTION_CODE, ecsPayload(scope, &ecs_buffer));
+    }
     appendKeyTags(&sanitized, query, anchors);
     var writer = dns_writer.Writer.init(output);
     sanitized.encode(&writer) catch return Error.UpstreamFailure;
@@ -1404,10 +1540,26 @@ fn cloneMessage(allocator: std.mem.Allocator, source: dns_message.Message) !dns_
 
 fn validUpstreamResponse(response: dns_message.Message, query: dns_message.Message, expected_id: u16) bool {
     if (!response.header.qr or response.header.id != expected_id or response.header.opcode != query.header.opcode or response.header.question_count != 1) return false;
-    if (findOption(response, dns_rdata.EDNS_ECS_OPTION_CODE) != null) return false;
     const expected = query.question orelse return false;
     const actual = response.question orelse return false;
-    return actual.name.eql(&expected.name) and actual.qtype.eql(expected.qtype) and actual.qclass.eql(expected.qclass);
+    if (!actual.name.eql(&expected.name) or !actual.qtype.eql(expected.qtype) or !actual.qclass.eql(expected.qclass)) return false;
+    return validEcsResponse(response, query);
+}
+
+/// RFC 7871 section 7.3: an answer that carries a Client Subnet option must
+/// match the family, the prefix, and the address bits the query asked for,
+/// and an answer that carries one for a query that asked for none is
+/// unsolicited and is dropped.
+fn validEcsResponse(response: dns_message.Message, query: dns_message.Message) bool {
+    if (findOption(response, dns_rdata.EDNS_ECS_OPTION_CODE) == null) return true;
+    const asked = ecsScope(query) orelse return false;
+    const answered = ecsScope(response) orelse return false;
+    if (answered.family != asked.family) return false;
+    // A query that named no address leaves the address to the responder.
+    if (asked.prefix == 0) return true;
+    if (answered.prefix != asked.prefix) return false;
+    const len = (@as(usize, asked.prefix) + 7) / 8;
+    return std.mem.eql(u8, asked.address[0..len], answered.address[0..len]);
 }
 
 test "upstream TCP connect timeout is explicit and bounded" {
@@ -1443,6 +1595,9 @@ fn wantsDnssecProofs(query: dns_message.Message) bool {
 }
 
 fn harvestSectionNsec(cache: *dnssec.AggressiveCache, records: []const dns_record.ResourceRecord, now: i64) void {
+    // RFC 2308 section 3: the SOA of the zone rides with the proof that
+    // arrived with it, so a denial the proof gives can carry it.
+    const soa = sectionSoa(records);
     for (records) |*record| {
         if (!record.rrtype.eql(.NSEC)) continue;
         const raw = switch (record.rdata) {
@@ -1450,8 +1605,17 @@ fn harvestSectionNsec(cache: *dnssec.AggressiveCache, records: []const dns_recor
             else => continue,
         };
         const next = dns_name.Name.parse(raw, 0) catch continue;
-        cache.insertNsec(record.owner, next.name, raw[next.next_offset..], now, record.ttl);
+        cache.insertNsec(record.owner, next.name, raw[next.next_offset..], now, record.ttl, soa);
     }
+}
+
+/// The zone SOA of a section, which a negative answer carries (RFC 2308
+/// section 3).
+fn sectionSoa(records: []const dns_record.ResourceRecord) ?dns_record.ResourceRecord {
+    for (records) |record| {
+        if (record.rrtype.eql(.SOA)) return record;
+    }
+    return null;
 }
 
 /// Presence-only DNSSEC classifier over a response already received. Reports
@@ -2041,20 +2205,115 @@ test "resolver rejects non-query opcodes before cache or upstream" {
     try std.testing.expectError(Error.UnsupportedOpcode, resolver.answer(encoded, query, &client, &output));
 }
 
-test "resolver refuses nonzero ECS before cache or upstream" {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var resolver = try Resolver.init(std.testing.allocator, io, .{});
-    defer resolver.deinit();
-
-    var query = try makeTestQuery(std.testing.allocator, 0x2601, "example.com.", true);
+test "resolver forwards the client subnet option upstream" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2601, "example.com.", true);
     defer query.deinit();
     const ecs = [_]u8{ 0, 1, 24, 0, 192, 0, 2 };
     try appendOption(&query, dns_rdata.EDNS_ECS_OPTION_CODE, &ecs);
+
+    var output: [512]u8 = undefined;
+    const encoded = try buildUpstreamQuery(&.{ 0xde, 0xad }, query, &output, &.{});
+
+    var parsed_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer parsed_arena.deinit();
+    const upstream = try dns_message.Message.parse(parsed_arena.allocator(), encoded);
+    const option = findOption(upstream, dns_rdata.EDNS_ECS_OPTION_CODE).?;
+    try std.testing.expectEqual(@as(usize, 7), option.len);
+    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, option[0..2], .big));
+    try std.testing.expectEqual(@as(u8, 24), option[2]);
+    // RFC 7871 section 6: the scope of a query is 0.
+    try std.testing.expectEqual(@as(u8, 0), option[3]);
+    try std.testing.expectEqualSlices(u8, &.{ 192, 0, 2 }, option[4..]);
+
+    // RFC 7871 section 7.3: an answer that echoes the option is taken, and
+    // one that names another network is dropped.
+    var response = try makePositiveResponse(arena.allocator(), 60);
+    defer response.deinit();
+    response.header.id = query.header.id;
+    response.question = query.question;
+    try appendOpt(&response, query.edns.?);
+    try appendOption(&response, dns_rdata.EDNS_ECS_OPTION_CODE, &ecs);
+    try std.testing.expect(validUpstreamResponse(response, query, query.header.id));
+
+    var other = try makePositiveResponse(arena.allocator(), 60);
+    defer other.deinit();
+    other.header.id = query.header.id;
+    other.question = query.question;
+    try appendOpt(&other, query.edns.?);
+    try appendOption(&other, dns_rdata.EDNS_ECS_OPTION_CODE, &.{ 0, 1, 24, 0, 198, 51, 100 });
+    try std.testing.expect(!validUpstreamResponse(other, query, query.header.id));
+}
+
+test "the answer cache keeps the client subnet scopes apart" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var scoped = try makeTestQuery(arena.allocator(), 0x2604, "example.com.", true);
+    defer scoped.deinit();
+    try appendOption(&scoped, dns_rdata.EDNS_ECS_OPTION_CODE, &.{ 0, 1, 24, 0, 192, 0, 2 });
+    var other = try makeTestQuery(arena.allocator(), 0x2604, "example.com.", true);
+    defer other.deinit();
+    try appendOption(&other, dns_rdata.EDNS_ECS_OPTION_CODE, &.{ 0, 1, 16, 0, 192, 0 });
+    var plain = try makeTestQuery(arena.allocator(), 0x2604, "example.com.", true);
+    defer plain.deinit();
+
+    var response = try makePositiveResponse(arena.allocator(), 60);
+    defer response.deinit();
+    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    defer cache.deinit();
+    try cache.put(try CacheKey.fromQuestion(scoped), &response, 4000);
+
+    var output: [2048]u8 = undefined;
+    const scoped_key = try CacheKey.fromQuestion(scoped);
+    try std.testing.expect((try cache.lookup(&scoped_key, scoped, 4001, &output, false)) != null);
+    // Another scope and a client that sent no option at all are answered by
+    // the upstream, never by the answer fetched for this scope.
+    const other_key = try CacheKey.fromQuestion(other);
+    try std.testing.expect((try cache.lookup(&other_key, other, 4001, &output, false)) == null);
+    const plain_key = try CacheKey.fromQuestion(plain);
+    try std.testing.expect((try cache.lookup(&plain_key, plain, 4001, &output, false)) == null);
+}
+
+test "a client without the client subnet option keeps today's behavior" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var plain = try makeTestQuery(arena.allocator(), 0x2605, "example.com.", true);
+    defer plain.deinit();
+
+    var output: [512]u8 = undefined;
+    const encoded = try buildUpstreamQuery(&.{ 0xde, 0xad }, plain, &output, &.{});
+    var parsed_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer parsed_arena.deinit();
+    const upstream = try dns_message.Message.parse(parsed_arena.allocator(), encoded);
+    try std.testing.expect(findOption(upstream, dns_rdata.EDNS_ECS_OPTION_CODE) == null);
+
+    var response = try makePositiveResponse(arena.allocator(), 60);
+    defer response.deinit();
+    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    defer cache.deinit();
+    try cache.put(try CacheKey.fromQuestion(plain), &response, 4000);
+
+    var cache_output: [2048]u8 = undefined;
+    const plain_key = try CacheKey.fromQuestion(plain);
+    try std.testing.expect((try cache.lookup(&plain_key, plain, 4001, &cache_output, false)) != null);
+}
+
+test "a malformed client subnet is refused before the resolver sees it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2606, "example.com.", true);
+    defer query.deinit();
+    // RFC 7871 section 6: the address is truncated to the source prefix, so
+    // a /24 needs three octets and this option carries two.
+    try appendOption(&query, dns_rdata.EDNS_ECS_OPTION_CODE, &.{ 0, 1, 24, 0, 192, 0 });
+
     var query_bytes: [1024]u8 = undefined;
     const encoded = try encodeTestMessage(query, &query_bytes);
-    var output: [2048]u8 = undefined;
-    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42601);
-    try std.testing.expectError(Error.EcsRefused, resolver.answer(encoded, query, &client, &output));
+    try std.testing.expectError(
+        dns_message.Error.MalformedEcsOption,
+        dns_message.Message.parse(arena.allocator(), encoded),
+    );
 }
 
 test "resolver rejects ECS-bearing upstream responses before cache" {
@@ -2072,7 +2331,7 @@ test "resolver rejects ECS-bearing upstream responses before cache" {
     try std.testing.expect(!validUpstreamResponse(response, query, query.header.id));
 }
 
-test "buildUpstreamQuery strips client EDNS options but preserves payload size and DO" {
+test "buildUpstreamQuery strips the other client EDNS options but preserves payload size and DO" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -2099,9 +2358,13 @@ test "buildUpstreamQuery strips client EDNS options but preserves payload size a
     const upstream = try dns_message.Message.parse(parsed_arena.allocator(), encoded);
     try std.testing.expectEqual(@as(u16, 1200), upstream.edns.?.udp_payload_size);
     try std.testing.expect(upstream.edns.?.dnssec_ok);
-    try std.testing.expectEqual(@as(usize, 0), upstream.additionals.items[0].rdata.OPT.bytes().len);
+    try std.testing.expectEqual(@as(usize, 8), upstream.additionals.items[0].rdata.OPT.bytes().len);
     try std.testing.expect(findOption(upstream, dns_rdata.EDNS_PADDING_OPTION_CODE) == null);
-    try std.testing.expect(findOption(upstream, dns_rdata.EDNS_ECS_OPTION_CODE) == null);
+    // The client subnet option is the one option that travels upstream.
+    const ecs = findOption(upstream, dns_rdata.EDNS_ECS_OPTION_CODE).?;
+    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, ecs[0..2], .big));
+    try std.testing.expectEqual(@as(u8, 0), ecs[2]);
+    try std.testing.expectEqual(@as(u8, 0), ecs[3]);
     try std.testing.expect(findOption(upstream, COOKIE_OPTION_CODE) == null);
     try std.testing.expect(findOption(upstream, 65000) == null);
     try std.testing.expect(findOption(upstream, dns_rdata.EDNS_EXPIRE_OPTION_CODE) == null);
@@ -2491,6 +2754,7 @@ test "aggressive NSEC answers denials without upstream and honors CD" {
         &bitmap,
         now,
         3600,
+        try makeTestSoa(3600, 3600),
     );
     resolver.dnssec_aggressive.insertNsec(
         try dns_name.Name.fromText("mail.example."),
@@ -2498,6 +2762,7 @@ test "aggressive NSEC answers denials without upstream and honors CD" {
         &bitmap,
         now,
         3600,
+        try makeTestSoa(3600, 3600),
     );
 
     var query = try makeTestQuery(arena.allocator(), 0x2704, "nx.example.", true);
@@ -2512,7 +2777,7 @@ test "aggressive NSEC answers denials without upstream and honors CD" {
         (query.question orelse return error.TestUnexpectedResult).qtype,
         now,
     );
-    try std.testing.expectEqual(dnssec.Denial.nxdomain, denial.?);
+    try std.testing.expectEqual(dnssec.Denial.nxdomain, denial.?.denial);
     const bytes = try resolver.aggressiveAnswer(query, denial.?, try CacheKey.fromQuestion(query), now, &output);
     const parsed = try dns_message.Message.parse(arena.allocator(), bytes);
     try std.testing.expectEqual(dns_header.Rcode.nxdomain, parsed.header.rcode);
@@ -2544,6 +2809,7 @@ test "RFC 8198 section 4: a synthesized denial is reused from the negative cache
         &bitmap,
         now,
         3600,
+        try makeTestSoa(3600, 3600),
     );
     resolver.dnssec_aggressive.insertNsec(
         try dns_name.Name.fromText("mail.example."),
@@ -2551,6 +2817,7 @@ test "RFC 8198 section 4: a synthesized denial is reused from the negative cache
         &bitmap,
         now,
         3600,
+        try makeTestSoa(3600, 3600),
     );
 
     var client = try std.Io.net.IpAddress.parse("127.0.0.1", 42620);
@@ -2609,6 +2876,7 @@ test "RFC 8198 section 5.4: a synthesized denial lives as long as its proof" {
         &bitmap,
         now,
         3600,
+        try makeTestSoa(3600, 3600),
     );
     resolver.dnssec_aggressive.insertNsec(
         try dns_name.Name.fromText("mail.example."),
@@ -2616,6 +2884,7 @@ test "RFC 8198 section 5.4: a synthesized denial lives as long as its proof" {
         &bitmap,
         now,
         3600,
+        try makeTestSoa(3600, 3600),
     );
     var query = try makeTestQuery(arena.allocator(), 0x2864, "nx.example.", true);
     defer query.deinit();
@@ -2640,6 +2909,7 @@ test "RFC 8198 section 5.4: a synthesized denial lives as long as its proof" {
         &bitmap,
         now,
         200000,
+        try makeTestSoa(200000, 200000),
     );
     capped.dnssec_aggressive.insertNsec(
         try dns_name.Name.fromText("mail.example."),
@@ -2647,6 +2917,7 @@ test "RFC 8198 section 5.4: a synthesized denial lives as long as its proof" {
         &bitmap,
         now,
         200000,
+        try makeTestSoa(200000, 200000),
     );
     var capped_query = try makeTestQuery(arena.allocator(), 0x2865, "nx.example.", true);
     defer capped_query.deinit();
@@ -2677,6 +2948,7 @@ test "RFC 2308 section 5: a synthesized NODATA covers its own name only" {
         &bitmap,
         now,
         3600,
+        try makeTestSoa(3600, 3600),
     );
 
     var client = try std.Io.net.IpAddress.parse("127.0.0.1", 42622);
@@ -2712,6 +2984,187 @@ test "RFC 2308 section 5: a synthesized NODATA covers its own name only" {
     try std.testing.expectError(Error.UpstreamFailure, resolver.answer(encoded_below, below, &client, &output));
 }
 
+test "RFC 2308 section 6: a cached denial carries the zone SOA" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = try std.Io.net.IpAddress.parse("127.0.0.1", 9) },
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // Closest-encloser and wildcard-cover proofs, as harvestSectionNsec
+    // would take them from an upstream answer (RFC 8198 section 5), with the
+    // SOA that answer carried.
+    const bitmap = [_]u8{ 0x00, 0x06, 0x40, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    const now: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+    const soa = try makeTestSoa(3600, 3600);
+    resolver.dnssec_aggressive.insertNsec(
+        try dns_name.Name.fromText("example."),
+        try dns_name.Name.fromText("mail.example."),
+        &bitmap,
+        now,
+        3600,
+        soa,
+    );
+    resolver.dnssec_aggressive.insertNsec(
+        try dns_name.Name.fromText("mail.example."),
+        try dns_name.Name.fromText("www.example."),
+        &bitmap,
+        now,
+        3600,
+        soa,
+    );
+
+    var client = try std.Io.net.IpAddress.parse("127.0.0.1", 42623);
+    var output: [2048]u8 = undefined;
+
+    // The first client gets the synthesized denial with the zone SOA in the
+    // authority section, so the client can cache the denial itself.
+    var first = try makeTestQuery(arena.allocator(), 0x2870, "nx.example.", true);
+    defer first.deinit();
+    first.edns.?.dnssec_ok = true;
+    first.additionals.items[0].ttl |= 0x8000;
+    var first_bytes: [1024]u8 = undefined;
+    const encoded_first = try encodeTestMessage(first, &first_bytes);
+    const denial_bytes = try resolver.answer(encoded_first, first, &client, &output);
+    const denial = try dns_message.Message.parse(arena.allocator(), denial_bytes);
+    try std.testing.expectEqual(dns_header.Rcode.nxdomain, denial.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), denial.header.authority_count);
+    try std.testing.expect(denial.authorities.items[0].rrtype.eql(.SOA));
+    var owner_buffer: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("example.", try denial.authorities.items[0].owner.toText(&owner_buffer));
+
+    // The second client is answered from the cache, and the answer carries
+    // the SOA too. The forwarder points at a closed port, so an upstream
+    // attempt would fail instead of answering.
+    var second = try makeTestQuery(arena.allocator(), 0x2871, "deep.nx.example.", false);
+    defer second.deinit();
+    var second_bytes: [1024]u8 = undefined;
+    const encoded_second = try encodeTestMessage(second, &second_bytes);
+    const cut_bytes = try resolver.answer(encoded_second, second, &client, &output);
+    const cut = try dns_message.Message.parse(arena.allocator(), cut_bytes);
+    try std.testing.expectEqual(dns_header.Rcode.nxdomain, cut.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), cut.header.authority_count);
+    try std.testing.expect(cut.authorities.items[0].rrtype.eql(.SOA));
+    // RFC 2308 section 6: the SOA rides with the TTL it has left.
+    try std.testing.expect(cut.authorities.items[0].ttl > 0);
+    try std.testing.expect(cut.authorities.items[0].ttl <= 3600);
+}
+
+test "RFC 2308 section 5: the negative TTL of a synthesized denial is the SOA's" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = try std.Io.net.IpAddress.parse("127.0.0.1", 9) },
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // The proof lives an hour, but the SOA's MINIMUM is a minute, so the
+    // negative TTL is the minute (RFC 2308 section 5).
+    const bitmap = [_]u8{ 0x00, 0x06, 0x40, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    const now: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+    const soa = try makeTestSoa(3600, 60);
+    resolver.dnssec_aggressive.insertNsec(
+        try dns_name.Name.fromText("example."),
+        try dns_name.Name.fromText("mail.example."),
+        &bitmap,
+        now,
+        3600,
+        soa,
+    );
+    resolver.dnssec_aggressive.insertNsec(
+        try dns_name.Name.fromText("mail.example."),
+        try dns_name.Name.fromText("www.example."),
+        &bitmap,
+        now,
+        3600,
+        soa,
+    );
+
+    var client = try std.Io.net.IpAddress.parse("127.0.0.1", 42624);
+    var output: [2048]u8 = undefined;
+
+    var first = try makeTestQuery(arena.allocator(), 0x2872, "nx.example.", true);
+    defer first.deinit();
+    first.edns.?.dnssec_ok = true;
+    first.additionals.items[0].ttl |= 0x8000;
+    var first_bytes: [1024]u8 = undefined;
+    const encoded_first = try encodeTestMessage(first, &first_bytes);
+    _ = try resolver.answer(encoded_first, first, &client, &output);
+
+    // The cached entry lives the negative TTL, not the TTL of the proof.
+    try std.testing.expectEqual(@as(u32, 60), resolver.cache.entries[0].ttl);
+
+    // The SOA the client is served carries that TTL.
+    var second = try makeTestQuery(arena.allocator(), 0x2873, "deep.nx.example.", false);
+    defer second.deinit();
+    var second_bytes: [1024]u8 = undefined;
+    const encoded_second = try encodeTestMessage(second, &second_bytes);
+    const cut_bytes = try resolver.answer(encoded_second, second, &client, &output);
+    const cut = try dns_message.Message.parse(arena.allocator(), cut_bytes);
+    try std.testing.expect(cut.authorities.items[0].ttl > 0);
+    try std.testing.expect(cut.authorities.items[0].ttl <= 60);
+}
+
+test "RFC 2308 section 5: a denial without an SOA is not cached" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = try std.Io.net.IpAddress.parse("127.0.0.1", 9) },
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // The same proofs without the SOA of the zone they came from.
+    const bitmap = [_]u8{ 0x00, 0x06, 0x40, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    const now: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+    resolver.dnssec_aggressive.insertNsec(
+        try dns_name.Name.fromText("example."),
+        try dns_name.Name.fromText("mail.example."),
+        &bitmap,
+        now,
+        3600,
+        null,
+    );
+    resolver.dnssec_aggressive.insertNsec(
+        try dns_name.Name.fromText("mail.example."),
+        try dns_name.Name.fromText("www.example."),
+        &bitmap,
+        now,
+        3600,
+        null,
+    );
+
+    var client = try std.Io.net.IpAddress.parse("127.0.0.1", 42625);
+    var output: [2048]u8 = undefined;
+
+    // The first client is still answered with the denial.
+    var first = try makeTestQuery(arena.allocator(), 0x2874, "nx.example.", true);
+    defer first.deinit();
+    first.edns.?.dnssec_ok = true;
+    first.additionals.items[0].ttl |= 0x8000;
+    var first_bytes: [1024]u8 = undefined;
+    const encoded_first = try encodeTestMessage(first, &first_bytes);
+    const denial_bytes = try resolver.answer(encoded_first, first, &client, &output);
+    const denial = try dns_message.Message.parse(arena.allocator(), denial_bytes);
+    try std.testing.expectEqual(dns_header.Rcode.nxdomain, denial.header.rcode);
+    try std.testing.expectEqual(@as(u16, 0), denial.header.authority_count);
+
+    // The denial is not cached: without an SOA there is no way to stop it
+    // from looping between two servers (RFC 2308 section 5).
+    try std.testing.expectEqual(@as(usize, 0), resolver.cache.len);
+
+    // The second client for the same name is not answered from the cache:
+    // the upstream is asked, and the forwarder points at a closed port.
+    var second = try makeTestQuery(arena.allocator(), 0x2875, "nx.example.", false);
+    defer second.deinit();
+    var second_bytes: [1024]u8 = undefined;
+    const encoded_second = try encodeTestMessage(second, &second_bytes);
+    try std.testing.expectError(Error.UpstreamFailure, resolver.answer(encoded_second, second, &client, &output));
+}
+
 test "aggressive NSEC answers SERVFAIL with bogus EDE on malformed bitmap" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var resolver = try Resolver.init(std.testing.allocator, io, .{
@@ -2730,6 +3183,7 @@ test "aggressive NSEC answers SERVFAIL with bogus EDE on malformed bitmap" {
         &[_]u8{ 0x00, 0x01, 0x40 },
         now,
         3600,
+        null,
     );
     try std.testing.expectError(
         dnssec.Error.MalformedNsec,
@@ -3009,7 +3463,10 @@ test "RFC 6147 section 5.1.1: a name with a real AAAA is never synthesized over"
     var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
     defer upstream_socket.close(io);
 
-    const aaaa_records = [_]dns_record.ResourceRecord{dns64TestAaaaRecord("dual.example.")};
+    const aaaa_records = [_]dns_record.ResourceRecord{dns64TestAaaaRecord("dual.example.", .{
+        0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x20, 0x01, 0x0d, 0xb8,
+    })};
     const a_records = [_]dns_record.ResourceRecord{dns64TestARecord("dual.example.")};
     var upstream = Dns64Upstream{
         .io = io,
@@ -3046,6 +3503,172 @@ test "RFC 6147 section 5.1.1: a name with a real AAAA is never synthesized over"
         0x00, 0x00, 0x00, 0x00, 0x20, 0x01, 0x0d, 0xb8,
     }, &response.answers.items[0].rdata.AAAA);
     // No A query followed, so nothing was synthesized.
+    try std.testing.expectEqual(@as(usize, 1), upstream.requests);
+}
+
+test "RFC 6147 section 5.1.4: an AAAA in an excluded range is not a real AAAA and the synthesis answers the client" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    // The IPv4-mapped network ::ffff:0:0/96, the range the RFC says to
+    // include in the exclusion set by default.
+    const aaaa_records = [_]dns_record.ResourceRecord{dns64TestAaaaRecord("mapped.example.", .{
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0xff, 0xff, 0xc0, 0x00, 0x02, 0x21,
+    })};
+    const a_records = [_]dns_record.ResourceRecord{dns64TestARecord("mapped.example.")};
+    var upstream = Dns64Upstream{
+        .io = io,
+        .udp = &upstream_socket,
+        .aaaa = &aaaa_records,
+        .a = &a_records,
+    };
+    const thread = try std.Thread.spawn(.{}, serveDns64Upstream, .{&upstream});
+
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = upstream_socket.address },
+        .nat64_prefix = try config.Nat64Prefix.parse("64:ff9b::/96"),
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2905, "mapped.example.", false);
+    defer query.deinit();
+    query.question.?.qtype = .AAAA;
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42705);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    thread.join();
+
+    // RFC 6147 section 5.1.4: an answer that holds only an excluded AAAA
+    // counts as an empty answer, so the synthesis answers the client.
+    const response = try dns_message.Message.parse(arena.allocator(), bytes);
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+    try std.testing.expect(response.answers.items[0].rrtype.eql(.AAAA));
+    // The address the client gets is the synthesized one, not the excluded
+    // AAAA the upstream sent.
+    try std.testing.expectEqualSlices(u8, &.{
+        0x00, 0x64, 0xff, 0x9b, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x02, 0x21,
+    }, &response.answers.items[0].rdata.AAAA);
+    // The upstream saw the AAAA query and the A query that followed it.
+    try std.testing.expectEqual(@as(usize, 2), upstream.requests);
+}
+
+test "RFC 6147 section 5.1.4: the site's own prefix and the well-known prefix are excluded too" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    const aaaa_records = [_]dns_record.ResourceRecord{
+        // The site's own Pref64::/n, the prefix this server synthesizes into.
+        dns64TestAaaaRecord("site.example.", .{
+            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x64, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x02, 0x21,
+        }),
+        // The Well-Known Prefix 64:ff9b::/96 of RFC 6052 section 2.1.
+        dns64TestAaaaRecord("site.example.", .{
+            0x00, 0x64, 0xff, 0x9b, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x02, 0x21,
+        }),
+    };
+    const a_records = [_]dns_record.ResourceRecord{dns64TestARecord("site.example.")};
+    var upstream = Dns64Upstream{
+        .io = io,
+        .udp = &upstream_socket,
+        .aaaa = &aaaa_records,
+        .a = &a_records,
+    };
+    const thread = try std.Thread.spawn(.{}, serveDns64Upstream, .{&upstream});
+
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = upstream_socket.address },
+        .nat64_prefix = try config.Nat64Prefix.parse("2001:db8:64::/96"),
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2906, "site.example.", false);
+    defer query.deinit();
+    query.question.?.qtype = .AAAA;
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42706);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    thread.join();
+
+    // Both excluded AAAA records are gone and the synthesis answers the
+    // client with the address in the site's own prefix.
+    const response = try dns_message.Message.parse(arena.allocator(), bytes);
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+    try std.testing.expect(response.answers.items[0].rrtype.eql(.AAAA));
+    try std.testing.expectEqualSlices(u8, &.{
+        0x20, 0x01, 0x0d, 0xb8, 0x00, 0x64, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x02, 0x21,
+    }, &response.answers.items[0].rdata.AAAA);
+    try std.testing.expectEqual(@as(usize, 2), upstream.requests);
+}
+
+test "RFC 6147 section 5.1.4: a real AAAA beside an excluded one is the answer and the excluded one is dropped" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    const aaaa_records = [_]dns_record.ResourceRecord{
+        dns64TestAaaaRecord("mixed.example.", .{
+            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x20, 0x01, 0x0d, 0xb8,
+        }),
+        dns64TestAaaaRecord("mixed.example.", .{
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0xff, 0xff, 0xc0, 0x00, 0x02, 0x21,
+        }),
+    };
+    const a_records = [_]dns_record.ResourceRecord{dns64TestARecord("mixed.example.")};
+    var upstream = Dns64Upstream{
+        .io = io,
+        .udp = &upstream_socket,
+        .aaaa = &aaaa_records,
+        .a = &a_records,
+    };
+    const thread = try std.Thread.spawn(.{}, serveDns64Upstream, .{&upstream});
+
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = upstream_socket.address },
+        .nat64_prefix = try config.Nat64Prefix.parse("64:ff9b::/96"),
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2907, "mixed.example.", false);
+    defer query.deinit();
+    query.question.?.qtype = .AAAA;
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42707);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    thread.join();
+
+    // The real AAAA is the answer and the excluded one is not returned.
+    const response = try dns_message.Message.parse(arena.allocator(), bytes);
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+    try std.testing.expect(response.answers.items[0].rrtype.eql(.AAAA));
+    try std.testing.expectEqualSlices(u8, &.{
+        0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x20, 0x01, 0x0d, 0xb8,
+    }, &response.answers.items[0].rdata.AAAA);
+    // A real AAAA means no synthesis, so no A query followed.
     try std.testing.expectEqual(@as(usize, 1), upstream.requests);
 }
 
@@ -3265,16 +3888,13 @@ fn dns64TestARecord(name_text: []const u8) dns_record.ResourceRecord {
     };
 }
 
-fn dns64TestAaaaRecord(name_text: []const u8) dns_record.ResourceRecord {
+fn dns64TestAaaaRecord(name_text: []const u8, address: [16]u8) dns_record.ResourceRecord {
     return .{
         .owner = dns_name.Name.fromText(name_text) catch unreachable,
         .rrtype = .AAAA,
         .class = .IN,
         .ttl = 300,
-        .rdata = .{ .AAAA = .{
-            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x20, 0x01, 0x0d, 0xb8,
-        } },
+        .rdata = .{ .AAAA = address },
     };
 }
 
@@ -3600,4 +4220,25 @@ fn makeNxdomainResponse(allocator: std.mem.Allocator, name_text: []const u8, ttl
     });
     message.header.authority_count = 1;
     return message;
+}
+
+/// The zone SOA a negative answer carries (RFC 2308 section 3), with the
+/// record TTL and the MINIMUM field given apart so the negative TTL rule
+/// can be exercised.
+fn makeTestSoa(ttl: u32, minimum: u32) !dns_record.ResourceRecord {
+    return .{
+        .owner = try dns_name.Name.fromText("example."),
+        .rrtype = .SOA,
+        .class = .IN,
+        .ttl = ttl,
+        .rdata = .{ .SOA = .{
+            .mname = try dns_name.Name.fromText("ns.example."),
+            .rname = try dns_name.Name.fromText("hostmaster.example."),
+            .serial = 1,
+            .refresh = 3600,
+            .retry = 900,
+            .expire = 1209600,
+            .minimum = minimum,
+        } },
+    };
 }

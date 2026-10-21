@@ -28,3 +28,7 @@ zone home.arpa primary examples/zones/home.arpa.zone
 # RFC 6303 section 3 mechanism to disable them; examples/local-zones.gdns is a
 # worked configuration for them.
 # local-zones on
+
+# The IXFR delta log file: an old client is still answered incrementally. The
+# file sits beside this configuration, so the name is a bare one.
+# ixfr-journal-file ixfr.log
