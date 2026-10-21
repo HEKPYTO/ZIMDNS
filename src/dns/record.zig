@@ -67,12 +67,13 @@ pub const ResourceRecord = struct {
         try writer.writeU16(self.class.code());
         try writer.writeU32(self.ttl);
 
-        // Sized for the largest opaque RDATA (DNSKEY/RRSIG/NSEC, 2048 bytes).
-        var rdata_buffer: [2048]u8 = undefined;
-        var rdata_writer = Writer.init(&rdata_buffer);
-        try self.rdata.encode(&rdata_writer);
-        try writer.writeU16(@intCast(rdata_writer.len()));
-        try writer.writeBytes(rdata_writer.written());
+        // The RDATA length is patched in place, so an RDATA is not copied
+        // through a fixed buffer that would bound it.
+        const length_offset = writer.len();
+        try writer.writeU16(0);
+        const rdata_start = writer.len();
+        try self.rdata.encode(writer);
+        try writer.patchU16(length_offset, @intCast(writer.len() - rdata_start));
     }
 
     pub fn encodeCompressed(self: ResourceRecord, writer: *Writer, table: *CompressionTable) !void {
@@ -148,6 +149,37 @@ test "received TTL with the sign bit set counts as zero" {
     };
     const parsed_maximum = try ResourceRecord.parse(&maximum, 0);
     try std.testing.expectEqual(@as(u32, 0x7fff_ffff), parsed_maximum.record.ttl);
+}
+
+test "resource record carries an unknown type's whole RDLENGTH" {
+    // RFC 3597 section 3 keeps the RDATA of a type this server does not
+    // implement unchanged, so a record longer than the bounded opaque
+    // profile still parses and encodes byte for byte.
+    const rdata_len = 4096;
+    const rdata = try std.testing.allocator.alloc(u8, rdata_len);
+    defer std.testing.allocator.free(rdata);
+    for (rdata, 0..) |*byte, index| byte.* = @truncate(index);
+
+    const bytes = try std.testing.allocator.alloc(u8, 19 + rdata_len);
+    defer std.testing.allocator.free(bytes);
+    bytes[0] = 7;
+    @memcpy(bytes[1..8], "example");
+    bytes[8] = 0;
+    std.mem.writeInt(u16, bytes[9..11], 65280, .big);
+    std.mem.writeInt(u16, bytes[11..13], 1, .big);
+    std.mem.writeInt(u32, bytes[13..17], 3600, .big);
+    std.mem.writeInt(u16, bytes[17..19], @intCast(rdata_len), .big);
+    @memcpy(bytes[19..], rdata);
+
+    const parsed = try ResourceRecord.parse(bytes, 0);
+    try std.testing.expectEqual(@as(usize, bytes.len), parsed.next_offset);
+    try std.testing.expectEqualSlices(u8, rdata, parsed.record.rdata.Unknown.bytes());
+
+    const output = try std.testing.allocator.alloc(u8, bytes.len);
+    defer std.testing.allocator.free(output);
+    var writer = Writer.init(output);
+    try parsed.record.encode(&writer);
+    try std.testing.expectEqualSlices(u8, bytes, writer.written());
 }
 
 test "OPT record keeps its EDNS TTL field" {

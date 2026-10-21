@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const SerialOrder = enum {
     equal,
@@ -48,7 +49,8 @@ pub const max_origin_len = 256;
 /// The longest journal path the server accepts.
 pub const max_path_len = 256;
 
-/// The journal file is read in one piece, and a bigger file is not read.
+/// The journal file is read in one piece, and it is not written past this
+/// size: a bigger file is not read, and the file cannot grow without bound.
 pub const max_journal_bytes = 1024 * 1024;
 
 pub const DeltaError = error{
@@ -80,6 +82,10 @@ pub const Journal = struct {
     /// The offset the next transition is written at: the end of the file, so
     /// an existing journal keeps its records.
     offset: u64 = 0,
+    /// The transitions the journal could not record because the file was at
+    /// its bound. A dropped transition is counted, so it never looks like a
+    /// recorded one.
+    dropped: u64 = 0,
 
     /// Opens the journal for appending, creating the file when it is not
     /// there yet.
@@ -103,12 +109,22 @@ pub const Journal = struct {
 
     /// Appends one transition. The record is one line written at the end of
     /// the file, so a write that is cut short leaves a truncated tail the
-    /// reader skips. A failed write leaves the journal as it was.
+    /// reader skips. A failed write leaves the journal as it was. A file at
+    /// its bound takes no more transitions: the transition is dropped and
+    /// counted, and the server keeps working without it.
     pub fn append(self: *Journal, origin: []const u8, from_serial: u32, to_serial: u32) void {
         const file = self.file orelse return;
         if (origin.len == 0 or origin.len > max_origin_len) return;
         var line: [max_origin_len + 32]u8 = undefined;
         const text = std.fmt.bufPrint(&line, "{s} {d} {d}\n", .{ origin, from_serial, to_serial }) catch return;
+        // The file stops growing at its bound, so a long-lived server cannot
+        // fill the disk. The transition is lost, and the zone falls back to
+        // the full transfer once the in-memory log no longer holds it.
+        if (self.offset + @as(u64, text.len) > max_journal_bytes) {
+            self.dropped += 1;
+            reportDropped(self.io, origin, from_serial, to_serial);
+            return;
+        }
         file.writePositionalAll(self.io, text, self.offset) catch return;
         self.offset += text.len;
     }
@@ -152,6 +168,25 @@ pub const Journal = struct {
         return transitions.toOwnedSlice(allocator);
     }
 };
+
+/// One operator-facing line about a transition the journal could not
+/// record. A test build has no operator and the test runner fails on any
+/// stderr write, so the line is printed by the server build only.
+fn reportDropped(io: std.Io, origin: []const u8, from_serial: u32, to_serial: u32) void {
+    if (builtin.is_test) return;
+    var line_buffer: [512]u8 = undefined;
+    const line = std.fmt.bufPrint(
+        &line_buffer,
+        "error: the IXFR journal file is at its {d}-byte bound; the transition for {s} from serial {d} to {d} was not recorded",
+        .{ max_journal_bytes, origin, from_serial, to_serial },
+    ) catch return;
+    var stderr_buffer: [256]u8 = undefined;
+    // The streaming writer appends at the shared file position; the
+    // positional one would rewrite every line from the start of the file.
+    var stderr_writer = std.Io.File.stderr().writerStreaming(io, &stderr_buffer);
+    stderr_writer.interface.print("{s}\n", .{line}) catch {};
+    stderr_writer.interface.flush() catch {};
+}
 
 /// Parses one journal line: the zone apex and the two serials of the
 /// transition. A line that does not parse is not a transition.
@@ -212,7 +247,10 @@ pub const DeltaLog = struct {
     /// Only RFC 1982 newer transitions are accepted. The transition is
     /// appended to the journal when one is active, so the log survives a
     /// restart; a journal that cannot be written does not fail the record,
-    /// because the in-memory log still carries the transition.
+    /// because the in-memory log still carries the transition. A journal at
+    /// its bound drops the transition: the server keeps running, the drop is
+    /// reported, and the transition is gone after a restart, so the zone
+    /// falls back to the full transfer.
     pub fn record(self: *DeltaLog, from_serial: u32, to_serial: u32) DeltaError!void {
         try self.push(from_serial, to_serial);
         if (active) |journal| journal.append(self.originText(), from_serial, to_serial);
@@ -387,4 +425,71 @@ test "the journal skips a torn record that has no closing newline" {
     var restored = DeltaLog{};
     try restored.restore(transitions[0].from_serial, transitions[0].to_serial);
     try std.testing.expect(!restored.canServeIncremental(20, 21));
+}
+
+test "the journal stops growing at its bound and drops the transitions past it" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var journal = try Journal.open(io, tmp.dir, "journal.log");
+    defer journal.close();
+
+    // A long apex makes the records big, so the file reaches its bound in
+    // a few thousand transitions.
+    var origin_buffer: [max_origin_len]u8 = undefined;
+    @memset(&origin_buffer, 'a');
+    const origin = origin_buffer[0..];
+    var serial: u32 = 1;
+    var dropped: u32 = 0;
+    while (journal.dropped == 0 and serial < 100_000) : (serial += 1) {
+        journal.append(origin, serial, serial + 1);
+        if (journal.dropped > 0) dropped = serial;
+    }
+
+    // The file stopped at its bound, and the drop was counted, not silent.
+    try std.testing.expect(dropped > 0);
+    try std.testing.expectEqual(@as(u64, 1), journal.dropped);
+    const stat = try tmp.dir.statFile(io, "journal.log", .{});
+    try std.testing.expect(stat.size <= max_journal_bytes);
+
+    // The transition that did not fit is not in the file.
+    const transitions = try journal.read(std.testing.allocator);
+    defer std.testing.allocator.free(transitions);
+    try std.testing.expect(transitions.len > 0);
+    try std.testing.expectEqual(dropped, transitions[transitions.len - 1].to_serial);
+}
+
+test "a journal at its bound leaves the dropped transition to the full transfer fallback" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var journal = try Journal.open(io, tmp.dir, "journal.log");
+    var origin_buffer: [max_origin_len]u8 = undefined;
+    @memset(&origin_buffer, 'a');
+    const origin = origin_buffer[0..];
+    var serial: u32 = 1;
+    var dropped: u32 = 0;
+    while (journal.dropped == 0 and serial < 100_000) : (serial += 1) {
+        journal.append(origin, serial, serial + 1);
+        if (journal.dropped > 0) dropped = serial;
+    }
+    journal.close();
+
+    // A server that comes back reads the file and finds every transition
+    // but the dropped one.
+    var reopened = try Journal.open(io, tmp.dir, "journal.log");
+    defer reopened.close();
+    const transitions = try reopened.read(std.testing.allocator);
+    defer std.testing.allocator.free(transitions);
+    var restored = DeltaLog{};
+    for (transitions) |transition| restored.restore(transition.from_serial, transition.to_serial) catch continue;
+
+    // The client at the dropped transition's serial is answered with the
+    // full transfer, exactly as a client at a serial the journal never held
+    // is.
+    const transfer = @import("transfer.zig");
+    try std.testing.expectEqual(transfer.IxfrDecision.fallback_axfr, transfer.decideIxfr(dropped + 1, dropped, &restored));
+    try std.testing.expectEqual(transfer.IxfrDecision.fallback_axfr, transfer.decideIxfr(dropped + 1, 0, &restored));
 }

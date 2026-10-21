@@ -952,7 +952,7 @@ pub const Runtime = struct {
             return self.encodeMessage(try self.buildMessage(query), output);
         }
         if (try self.localZoneAnswer(query)) |local| return self.encodeMessage(local, output);
-        if (self.blocklist.blocks(qname_text)) return self.encodeMessage(try response.buildRefusedResponse(query), output);
+        if (self.blocklist.blocks(qname_text)) return self.encodeMessage(try response.buildBlockedResponse(query), output);
         if (!q.qclass.eql(@import("../dns/types.zig").Class.IN) or !query.header.recursion_desired) {
             return self.encodeMessage(try response.buildRefusedResponse(query), output);
         }
@@ -1071,16 +1071,19 @@ pub const Runtime = struct {
         const q = query.question orelse return response.Error.MissingQuestion;
         if (query.header.opcode == .notify) {
             if (!transfer.isNotifyMessage(&query)) return response.buildFormerrResponse(query);
+            // RFC 1996 section 3.7: the master hints at its new SOA in the
+            // answer section, and that serial is what the zone's own is
+            // compared against; without it there is no serial to compare.
+            const notify_serial = transfer.notifySerialFromMessage(&query) orelse return response.buildFormerrResponse(query);
             var notify_name_buffer: [256]u8 = undefined;
             const notify_name = q.name.toText(&notify_name_buffer) catch return response.Error.BadQName;
-            if (self.blocklist.blocks(notify_name)) return response.buildRefusedResponse(query);
+            if (self.blocklist.blocks(notify_name)) return response.buildBlockedResponse(query);
             const zone = self.selectZone(notify_name) orelse return response.buildRefusedResponse(query);
-            _ = zone;
-            return transfer.buildNotifyResponse(query.allocator, &query) catch return Error.EncodeFailed;
+            return transfer.buildNotifyResponse(query.allocator, &query, zone, notify_serial) catch return Error.EncodeFailed;
         }
         var qname_text_buffer: [256]u8 = undefined;
         const qname_text = q.name.toText(&qname_text_buffer) catch return response.Error.BadQName;
-        if (self.blocklist.blocks(qname_text)) return response.buildRefusedResponse(query);
+        if (self.blocklist.blocks(qname_text)) return response.buildBlockedResponse(query);
         // Zone transfers are served only as multi-frame TCP sequences through
         // encodeTransferFrames. The single-message path refuses them so a
         // partial zone can never leak through one datagram or frame.
@@ -1946,6 +1949,104 @@ test "authoritative runtime refuses exact blocklisted names" {
     try std.testing.expectEqual(@as(u16, 0), parsed.header.answer_count);
 }
 
+test "a blocklisted name is answered REFUSED with the RFC 8914 Blocked EDE code" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const blocklist = try @import("../blocklist.zig").Blocklist.parse("ads.home.arpa.\n");
+    var runtime = try Runtime.fromZoneTextWithBlocklist(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\ads IN A 192.168.1.99
+        \\
+    , blocklist);
+    defer runtime.deinit();
+
+    // The query carries an OPT pseudo-RR and no DO bit: RFC 8914 section 2
+    // allows the EDE option in any response to such a query.
+    var output: [512]u8 = undefined;
+    const response_bytes = try runtime.answer(&.{
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        3,    'a',  'd',  's',  4,    'h',  'o',  'm',  'e',  4,    'a',  'r',
+        'p',  'a',  0,    0x00, 0x01, 0x00, 0x01, 0,    0x00, 0x29, 0x04, 0xd0,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    }, &output);
+
+    const parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@import("../dns/header.zig").Rcode.refused, parsed.header.rcode);
+    try std.testing.expectEqual(@as(u16, 0), parsed.header.answer_count);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.additional_count);
+    const opt = parsed.additionals.items[0];
+    try std.testing.expect(opt.rrtype.eql(.OPT));
+    // RFC 8914 section 4.16: INFO-CODE 15 is "Blocked", and the EXTRA-TEXT
+    // is empty, so the option carries the two octets of the code alone.
+    const ede = @import("../dns/rdata.zig").findOption(opt.rdata.OPT.bytes(), 15);
+    try std.testing.expect(ede != null);
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x0f }, ede.?);
+}
+
+test "a blocklisted name without EDNS is refused without an EDE option" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const blocklist = try @import("../blocklist.zig").Blocklist.parse("ads.home.arpa.\n");
+    var runtime = try Runtime.fromZoneTextWithBlocklist(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\ads IN A 192.168.1.99
+        \\
+    , blocklist);
+    defer runtime.deinit();
+
+    // RFC 8914 section 2 allows the EDE option only in a response to a query
+    // that includes an OPT pseudo-RR, and this query carries none.
+    var output: [512]u8 = undefined;
+    const response_bytes = try runtime.answer(&.{
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        3,    'a',  'd',  's',  4,    'h',  'o',  'm',  'e',  4,    'a',  'r',
+        'p',  'a',  0,    0x00, 0x01, 0x00, 0x01,
+    }, &output);
+
+    const parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@import("../dns/header.zig").Rcode.refused, parsed.header.rcode);
+    try std.testing.expectEqual(@as(u16, 0), parsed.header.additional_count);
+    try std.testing.expect(parsed.edns == null);
+}
+
+test "a refusal that is not a blocklist refusal carries no EDE option" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
+        \\
+    );
+    defer runtime.deinit();
+
+    var output: [512]u8 = undefined;
+    const response_bytes = try runtime.answer(&.{
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        7,    'o',  'u',  't',  's',  'i',  'd',  'e',  7,    'e',  'x',  'a',
+        'm',  'p',  'l',  'e',  0,    0x00, 0x01, 0x00, 0x01, 0,    0x00, 0x29,
+        0x04, 0xd0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    }, &output);
+
+    const parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@import("../dns/header.zig").Rcode.refused, parsed.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.additional_count);
+    const opt = parsed.additionals.items[0];
+    try std.testing.expect(opt.rrtype.eql(.OPT));
+    try std.testing.expectEqual(@as(usize, 0), opt.rdata.OPT.bytes().len);
+}
+
 test "authoritative runtime returns NOTIMP for non-IN queries outside a zone" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2240,7 +2341,49 @@ const transfer_test_axfr_query = [_]u8{
     0x01,
 };
 
-test "runtime answers NOTIFY with a mirrored response and refuses transfers singly" {
+/// A NOTIFY request for `qname` whose answer section hints at an SOA with
+/// the given serial, the shape a master sends (RFC 1996 section 4.5). A null
+/// serial leaves the answer section empty.
+fn encodeNotifyRequest(
+    allocator: std.mem.Allocator,
+    buffer: []u8,
+    qname: []const u8,
+    serial: ?u32,
+) ![]const u8 {
+    const dns_name = @import("../dns/name.zig");
+    const owner = try dns_name.Name.fromText(qname);
+    var request = dns_message.Message{
+        .allocator = allocator,
+        .header = .{ .id = 0x4321, .opcode = .notify, .question_count = 1 },
+        .question = .{ .name = owner, .qtype = .SOA, .qclass = .IN },
+        .answers = try dns_message.RecordSection.init(allocator, 0),
+        .authorities = try dns_message.RecordSection.init(allocator, 0),
+        .additionals = try dns_message.RecordSection.init(allocator, 0),
+    };
+    if (serial) |value| {
+        request.header.answer_count = 1;
+        try request.answers.append(.{
+            .owner = owner,
+            .rrtype = .SOA,
+            .class = .IN,
+            .ttl = 3600,
+            .rdata = .{ .SOA = .{
+                .mname = try dns_name.Name.fromText("ns.example."),
+                .rname = try dns_name.Name.fromText("hostmaster.example."),
+                .serial = value,
+                .refresh = 3600,
+                .retry = 900,
+                .expire = 1209600,
+                .minimum = 3600,
+            } },
+        });
+    }
+    var writer = dns_writer.Writer.init(buffer);
+    try request.encode(&writer);
+    return writer.written();
+}
+
+test "runtime answers NOTIFY by comparing the serial and refuses transfers singly" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var runtime = try Runtime.fromZoneText(
@@ -2254,16 +2397,37 @@ test "runtime answers NOTIFY with a mirrored response and refuses transfers sing
     defer runtime.deinit();
 
     var output: [512]u8 = undefined;
-    const notify_query = [_]u8{
-        0x43, 0x21, 0x20, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x07, 'e',  'x',  'a',  'm',  'p',  'l',  'e',  0x00, 0x00, 0x06, 0x00,
-        0x01,
-    };
-    const notify_bytes = try runtime.answer(&notify_query, &output);
-    const notify_response = try dns_message.Message.parse(arena.allocator(), notify_bytes);
-    try std.testing.expect(notify_response.header.qr);
-    try std.testing.expect(notify_response.header.opcode == .notify);
-    try std.testing.expectEqual(@as(u16, 0x4321), notify_response.header.id);
+    var request_buffer: [512]u8 = undefined;
+
+    const newer = try encodeNotifyRequest(arena.allocator(), &request_buffer, "example.", 11);
+    const newer_bytes = try runtime.answer(newer, &output);
+    const newer_response = try dns_message.Message.parse(arena.allocator(), newer_bytes);
+    try std.testing.expect(newer_response.header.qr);
+    try std.testing.expect(newer_response.header.opcode == .notify);
+    try std.testing.expectEqual(@as(u16, 0x4321), newer_response.header.id);
+    try std.testing.expectEqual(@as(@TypeOf(newer_response.header.rcode), .no_error), newer_response.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), newer_response.header.answer_count);
+    try std.testing.expectEqual(@as(u32, 10), newer_response.answers.items[0].rdata.SOA.serial);
+
+    const equal = try encodeNotifyRequest(arena.allocator(), &request_buffer, "example.", 10);
+    const equal_bytes = try runtime.answer(equal, &output);
+    const equal_response = try dns_message.Message.parse(arena.allocator(), equal_bytes);
+    try std.testing.expectEqual(@as(@TypeOf(equal_response.header.rcode), .notauth), equal_response.header.rcode);
+
+    const older = try encodeNotifyRequest(arena.allocator(), &request_buffer, "example.", 9);
+    const older_bytes = try runtime.answer(older, &output);
+    const older_response = try dns_message.Message.parse(arena.allocator(), older_bytes);
+    try std.testing.expectEqual(@as(@TypeOf(older_response.header.rcode), .notauth), older_response.header.rcode);
+
+    const without_soa = try encodeNotifyRequest(arena.allocator(), &request_buffer, "example.", null);
+    const without_soa_bytes = try runtime.answer(without_soa, &output);
+    const without_soa_response = try dns_message.Message.parse(arena.allocator(), without_soa_bytes);
+    try std.testing.expectEqual(@as(@TypeOf(without_soa_response.header.rcode), .formerr), without_soa_response.header.rcode);
+
+    const unserved = try encodeNotifyRequest(arena.allocator(), &request_buffer, "other.", 11);
+    const unserved_bytes = try runtime.answer(unserved, &output);
+    const unserved_response = try dns_message.Message.parse(arena.allocator(), unserved_bytes);
+    try std.testing.expectEqual(@as(@TypeOf(unserved_response.header.rcode), .refused), unserved_response.header.rcode);
 
     const axfr_bytes = try runtime.answer(&transfer_test_axfr_query, &output);
     const axfr_response = try dns_message.Message.parse(arena.allocator(), axfr_bytes);

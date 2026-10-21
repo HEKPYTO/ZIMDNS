@@ -62,8 +62,8 @@ pub fn classifyMessage(message: *const dns_message.Message) TransferKind {
 }
 
 /// Reports whether a parsed message is an RFC 1996 NOTIFY query: opcode
-/// notify with QR clear and exactly one question. The optional answer-section
-/// SOA is accepted and ignored for the response decision.
+/// notify with QR clear and exactly one question. The answer-section SOA the
+/// master hints at is read separately by notifySerialFromMessage.
 pub fn isNotifyMessage(message: *const dns_message.Message) bool {
     if (message.header.qr) return false;
     if (message.header.opcode != .notify) return false;
@@ -369,14 +369,35 @@ pub fn buildIxfrIncrementalMessages(
     return message;
 }
 
+/// Extracts the sender's serial from a NOTIFY request: the SOA the master
+/// hints at in its answer section (RFC 1996 section 3.7). Returns null when
+/// the request carries no SOA.
+pub fn notifySerialFromMessage(message: *const dns_message.Message) ?u32 {
+    for (message.answers.slice()) |record| {
+        if (!record.rrtype.eql(dns_types.RecordType.SOA)) continue;
+        if (record.rdata != .SOA) continue;
+        return record.rdata.SOA.serial;
+    }
+    return null;
+}
+
 /// Builds the RFC 1996 NOTIFY response: QR set with the notify opcode, the
-/// echoed question, and NOERROR. The optional query SOA needs no reply data.
+/// echoed question, and the zone's own SOA in the answer section. The RCODE
+/// follows the RFC 1982 serial comparison of the NOTIFY's serial against the
+/// zone's own: a newer serial is answered NOERROR, any other serial NOTAUTH.
 pub fn buildNotifyResponse(
     allocator: std.mem.Allocator,
     request: *const dns_message.Message,
+    zone: *const zone_index.Zone,
+    notify_serial: u32,
 ) Error!dns_message.Message {
     if (!isNotifyMessage(request)) return Error.BadTransferQuery;
     const question = request.question orelse return Error.BadTransferQuery;
+    const apex_soa = zone.soa orelse return Error.MissingSoa;
+    const zone_serial = zone.soaSerial() orelse return Error.MissingSoa;
+    // RFC 1982 ordering: only a serial newer than the zone's own counts as
+    // an update, and the undefined half-range does not.
+    const newer = journal_mod.compareSerial(notify_serial, zone_serial) == .newer;
     var message = dns_message.Message{
         .allocator = allocator,
         .header = .{
@@ -387,7 +408,7 @@ pub fn buildNotifyResponse(
             .recursion_desired = request.header.recursion_desired,
             .checking_disabled = request.header.checking_disabled,
             .recursion_available = false,
-            .rcode = .no_error,
+            .rcode = if (newer) .no_error else .notauth,
             .question_count = 1,
         },
         .question = question,
@@ -397,6 +418,8 @@ pub fn buildNotifyResponse(
         .edns = mirrorEdns(request),
     };
     errdefer message.deinit();
+    const converted = toResourceRecord(apex_soa) catch return Error.BadZoneRecord;
+    message.answers.append(converted) catch return Error.BadTransferQuery;
     appendOpt(&message) catch return Error.BadTransferQuery;
     try setHeaderCounts(&message);
     return message;
@@ -711,25 +734,96 @@ test "transfer answers IXFR from the authority SOA serial" {
     try std.testing.expectEqual(@as(u32, 10), incremental.answers.items[incremental.answers.len - 1].rdata.SOA.serial);
 }
 
-test "transfer builds NOTIFY responses that mirror the query" {
+/// A NOTIFY request for example. whose answer section hints at an SOA with
+/// the given serial, the shape a master sends (RFC 1996 section 4.5).
+fn buildNotifyRequest(allocator: std.mem.Allocator, serial: u32) !dns_message.Message {
+    const owner = try dns_name.Name.fromText("example.");
+    var request = dns_message.Message{
+        .allocator = allocator,
+        .header = .{ .id = 0x4321, .opcode = .notify, .checking_disabled = true, .question_count = 1, .answer_count = 1 },
+        .question = .{ .name = owner, .qtype = .SOA, .qclass = .IN },
+        .answers = try dns_message.RecordSection.init(allocator, 0),
+        .authorities = try dns_message.RecordSection.init(allocator, 0),
+        .additionals = try dns_message.RecordSection.init(allocator, 0),
+    };
+    try request.answers.append(.{
+        .owner = owner,
+        .rrtype = .SOA,
+        .class = .IN,
+        .ttl = 3600,
+        .rdata = .{ .SOA = .{
+            .mname = try dns_name.Name.fromText("ns.example."),
+            .rname = try dns_name.Name.fromText("hostmaster.example."),
+            .serial = serial,
+            .refresh = 3600,
+            .retry = 900,
+            .expire = 1209600,
+            .minimum = 3600,
+        } },
+    });
+    return request;
+}
+
+test "transfer answers a NOTIFY with a newer serial NOERROR and the zone SOA" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const notify_query = [_]u8{
-        0x43, 0x21, 0x21, 0x11, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x07, 'e',  'x',  'a',  'm',  'p',  'l',  'e',  0x00, 0x00, 0x06, 0x00,
-        0x01,
-    };
-    const parsed = try dns_message.Message.parse(arena.allocator(), &notify_query);
-    try std.testing.expect(isNotifyMessage(&parsed));
-    try std.testing.expectEqual(TransferKind.none, classifyMessage(&parsed));
-    var response = try buildNotifyResponse(arena.allocator(), &parsed);
+    var zone = try loadTransferTestZone();
+    defer zone.deinit();
+    var request = try buildNotifyRequest(arena.allocator(), 11);
+    try std.testing.expect(isNotifyMessage(&request));
+    try std.testing.expectEqual(TransferKind.none, classifyMessage(&request));
+    try std.testing.expectEqual(@as(?u32, 11), notifySerialFromMessage(&request));
+
+    var response = try buildNotifyResponse(arena.allocator(), &request, &zone, 11);
     defer response.deinit();
     try std.testing.expect(response.header.qr);
     try std.testing.expectEqual(header_mod.Opcode.notify, response.header.opcode);
     try std.testing.expectEqual(@as(u16, 0x4321), response.header.id);
     try std.testing.expect(response.header.authoritative);
-    try std.testing.expectEqual(@as(u16, 1), response.header.question_count);
     try std.testing.expect(response.header.checking_disabled);
+    try std.testing.expectEqual(@as(u16, 1), response.header.question_count);
+    try std.testing.expectEqual(header_mod.Rcode.no_error, response.header.rcode);
+    try std.testing.expectEqual(@as(usize, 1), response.answers.len);
+    try std.testing.expect(response.answers.items[0].rrtype.eql(.SOA));
+    try std.testing.expectEqual(@as(u32, 10), response.answers.items[0].rdata.SOA.serial);
+}
+
+test "transfer answers a NOTIFY with an equal or older serial NOTAUTH" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var zone = try loadTransferTestZone();
+    defer zone.deinit();
+
+    var equal_request = try buildNotifyRequest(arena.allocator(), 10);
+    var equal_response = try buildNotifyResponse(arena.allocator(), &equal_request, &zone, 10);
+    defer equal_response.deinit();
+    try std.testing.expectEqual(header_mod.Rcode.notauth, equal_response.header.rcode);
+    try std.testing.expectEqual(@as(u32, 10), equal_response.answers.items[0].rdata.SOA.serial);
+
+    var older_request = try buildNotifyRequest(arena.allocator(), 9);
+    var older_response = try buildNotifyResponse(arena.allocator(), &older_request, &zone, 9);
+    defer older_response.deinit();
+    try std.testing.expectEqual(header_mod.Rcode.notauth, older_response.header.rcode);
+}
+
+test "transfer answers a NOTIFY whose serial wrapped past 2^32 NOERROR" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var zone_file = try zone_parser.ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 4294967295 3600 900 1209600 3600
+        \\@ IN NS ns.example.
+        \\
+    );
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+    var request = try buildNotifyRequest(arena.allocator(), 0);
+
+    var response = try buildNotifyResponse(arena.allocator(), &request, &zone, 0);
+    defer response.deinit();
+    try std.testing.expectEqual(header_mod.Rcode.no_error, response.header.rcode);
+    try std.testing.expectEqual(@as(u32, 0xffff_ffff), response.answers.items[0].rdata.SOA.serial);
 }
 
 test "transfer chains one TSIG per message through the chainedMac primitive" {

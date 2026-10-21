@@ -377,6 +377,14 @@ fn parseRecordType(text: []const u8) ?RecordType {
 
 fn validateName(text: []const u8) Error!void {
     _ = dns_name.Name.fromText(text) catch return Error.BadName;
+    // RFC 1123 section 2.1 keeps the RFC 952 host name syntax, so a label may
+    // neither begin nor end with a hyphen; the rest of the character set stays
+    // open because underscore labels are legal DNS names.
+    var labels = std.mem.splitScalar(u8, text, '.');
+    while (labels.next()) |label| {
+        if (label.len == 0) continue;
+        if (label[0] == '-' or label[label.len - 1] == '-') return Error.BadName;
+    }
 }
 
 /// Parses one supported zone-text RDATA value. Zone loading calls this before

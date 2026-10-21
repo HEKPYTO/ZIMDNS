@@ -862,7 +862,13 @@ pub const Resolver = struct {
                 // RFC 8914 INFO-CODE that says why. `wantsDnssecProofs` is
                 // false when CD is set, and that is exactly the case section
                 // 5.5 says must be returned in full instead.
-                .bogus => return self.relayBogus(query, cookie, result.ede, output),
+                // RFC 9520 section 3.4: the validation failure is cached, so
+                // the next client for the same question is answered with the
+                // same SERVFAIL and the same code and no new upstream query.
+                .bogus => {
+                    self.cache.failures.put(key, .{ .rcode = .servfail, .ede = result.ede }, now);
+                    return self.relayBogus(query, cookie, result.ede, output);
+                },
                 .insecure => {},
             }
         }
@@ -871,7 +877,8 @@ pub const Resolver = struct {
         // resolution failure. The next client for the same question is
         // answered from the failure cache instead of a new upstream query. A
         // DNSSEC validation failure never reaches this point: it returned
-        // above with its own RFC 8914 code.
+        // above with its own RFC 8914 code, and RFC 9520 section 3.4 put it
+        // in the failure cache there.
         //
         // RFC 6147 section 5.1.2 runs before this: an error RCODE other than
         // NXDOMAIN is treated as an empty answer, so a synthesis that
@@ -930,6 +937,8 @@ pub const Resolver = struct {
 
     /// SERVFAIL plus the RFC 8914 DNSSEC-bogus INFO-CODE the validator
     /// produced, with the cookie the same answer path would have carried.
+    /// RFC 9520 section 3.4: the failure is in the failure cache, so the next
+    /// client for the same question is answered with the same RCODE and code.
     fn relayBogus(self: *Resolver, query: dns_message.Message, cookie: CookieDecision, ede_code: u16, output: []u8) ![]const u8 {
         _ = self;
         var message = try Resolver.buildDnssecBogusResponse(query, ede_code);
@@ -3947,6 +3956,63 @@ fn serveFailingUpstream(args: *FailingUpstream) void {
     }
 }
 
+/// The fake upstream a validation-failure test forwards to. It answers every
+/// query with an unsigned A record, which inside the trust domain is a
+/// validation failure (RFC 4035 section 5.5), and counts the queries it
+/// received.
+const UnsignedUpstream = struct {
+    io: std.Io,
+    udp: *const std.Io.net.Socket,
+    requests: usize = 0,
+};
+
+fn serveUnsignedUpstream(args: *UnsignedUpstream) void {
+    var request_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
+    var index: usize = 0;
+    while (index < 2) : (index += 1) {
+        const incoming = args.udp.receiveTimeout(args.io, &request_buffer, FailingUpstreamTimeout) catch return;
+        args.requests += 1;
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const query = dns_message.Message.parseQuery(arena.allocator(), incoming.data) catch return;
+        var response_buffer: [512]u8 = undefined;
+        const bytes = buildUnsignedUpstreamAnswer(&response_buffer, query) catch return;
+        args.udp.send(args.io, &incoming.from, bytes) catch return;
+    }
+}
+
+/// The answer the upstream sends: the A record the client asked for, with no
+/// signature over it.
+fn buildUnsignedUpstreamAnswer(buffer: []u8, query: dns_message.Message) ![]const u8 {
+    const question = query.question orelse return Error.BadUpstreamResponse;
+    var message = dns_message.Message{
+        .allocator = query.allocator,
+        .header = .{
+            .id = query.header.id,
+            .qr = true,
+            .recursion_desired = true,
+            .recursion_available = true,
+            .question_count = 1,
+        },
+        .question = query.question,
+        .answers = try dns_message.RecordSection.init(query.allocator, 0),
+        .authorities = try dns_message.RecordSection.init(query.allocator, 0),
+        .additionals = try dns_message.RecordSection.init(query.allocator, 0),
+    };
+    defer message.deinit();
+    try message.answers.append(.{
+        .owner = question.name,
+        .rrtype = .A,
+        .class = .IN,
+        .ttl = 60,
+        .rdata = .{ .A = .{ 192, 0, 2, 1 } },
+    });
+    message.header.answer_count = 1;
+    var writer = dns_writer.Writer.init(buffer);
+    try message.encode(&writer);
+    return writer.written();
+}
+
 /// A response that fails the question the upstream was asked.
 fn buildFailingUpstreamAnswer(buffer: []u8, query: dns_message.Message, rcode: dns_header.Rcode) ![]const u8 {
     var message = dns_message.Message{
@@ -4082,6 +4148,146 @@ test "RFC 9520 section 3.2: the failure cache keeps the answer cache's own bound
     try std.testing.expectEqual(@as(usize, 1), cache.len);
     const hit = (try cache.lookup(&key, query, 1001, &output, false)).?;
     try std.testing.expect(!hit.stale);
+}
+
+/// A validating resolver in front of a fake upstream that answers with an
+/// unsigned record, which inside the trust domain is a validation failure.
+const ValidationFixture = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    upstream_socket: std.Io.net.Socket,
+    upstream: UnsignedUpstream,
+    thread: std.Thread,
+    resolver: Resolver,
+    arena: std.heap.ArenaAllocator,
+    query: dns_message.Message,
+    query_bytes: [1024]u8 = undefined,
+    encoded: []const u8 = &.{},
+
+    fn create(io: std.Io) !*ValidationFixture {
+        const allocator = std.testing.allocator;
+        const self = try allocator.create(ValidationFixture);
+        errdefer allocator.destroy(self);
+        var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        self.* = .{
+            .allocator = allocator,
+            .io = io,
+            .upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp }),
+            .upstream = .{ .io = io, .udp = undefined },
+            .thread = undefined,
+            .resolver = undefined,
+            .arena = std.heap.ArenaAllocator.init(allocator),
+            .query = undefined,
+        };
+        errdefer self.upstream_socket.close(io);
+        errdefer self.arena.deinit();
+        self.upstream.udp = &self.upstream_socket;
+        self.thread = try std.Thread.spawn(.{}, serveUnsignedUpstream, .{&self.upstream});
+        errdefer self.thread.join();
+
+        // A DS anchor for the zone the question is in: an unsigned answer
+        // there is a validation failure, not an insecure answer.
+        var anchors = try validate.Anchors.parse(allocator,
+            \\example.com. DS 60485 8 2 aabbccdd
+            \\
+        );
+        var anchors_owned = false;
+        errdefer if (!anchors_owned) anchors.deinit(allocator);
+        self.resolver = try Resolver.init(allocator, io, .{
+            .forwarder = .{ .address = self.upstream_socket.address },
+            .anchors = anchors,
+        });
+        // The resolver owns the anchors now.
+        anchors_owned = true;
+        errdefer self.resolver.deinit();
+
+        self.query = try makeTestQuery(self.arena.allocator(), 0x2930, "example.com.", true);
+        errdefer self.query.deinit();
+        // The client asks for the proofs, so this server validates the answer.
+        self.query.edns.?.dnssec_ok = true;
+        self.encoded = try encodeTestMessage(self.query, &self.query_bytes);
+        return self;
+    }
+
+    fn destroy(self: *ValidationFixture) void {
+        self.thread.join();
+        self.upstream_socket.close(self.io);
+        self.resolver.deinit();
+        self.query.deinit();
+        self.arena.deinit();
+        self.allocator.destroy(self);
+    }
+
+    /// The unix second the clock reads now.
+    fn now(self: *const ValidationFixture) i64 {
+        return @intCast(@divTrunc(std.Io.Clock.real.now(self.io).nanoseconds, std.time.ns_per_s));
+    }
+};
+
+test "RFC 9520 section 3.4: a validation failure is cached and answered without a second upstream query" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const fixture = try ValidationFixture.create(io);
+    defer fixture.destroy();
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42711);
+
+    const first = try fixture.resolver.answer(fixture.encoded, fixture.query, &client, &output);
+    const first_message = try dns_message.Message.parse(fixture.arena.allocator(), first);
+    try std.testing.expectEqual(dns_header.Rcode.servfail, first_message.header.rcode);
+    // The RFC 8914 code the validator produced rides along with it.
+    try expectEde(first_message, EDE_RRSIGS_MISSING, "rrsigs missing");
+
+    // The same question again: the validation failure is in the cache, so no
+    // second query goes upstream and the client sees the same failure.
+    const second = try fixture.resolver.answer(fixture.encoded, fixture.query, &client, &output);
+    const second_message = try dns_message.Message.parse(fixture.arena.allocator(), second);
+    try std.testing.expectEqual(dns_header.Rcode.servfail, second_message.header.rcode);
+    try expectEde(second_message, EDE_RRSIGS_MISSING, "rrsigs missing");
+
+    try std.testing.expectEqual(@as(usize, 1), fixture.upstream.requests);
+}
+
+test "RFC 9520 section 3.4: a cached validation failure is answered as the failure it is" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const fixture = try ValidationFixture.create(io);
+    defer fixture.destroy();
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42712);
+
+    _ = try fixture.resolver.answer(fixture.encoded, fixture.query, &client, &output);
+    const cached = try fixture.resolver.answer(fixture.encoded, fixture.query, &client, &output);
+    const message = try dns_message.Message.parse(fixture.arena.allocator(), cached);
+
+    // A cached validation failure is a failure: never an NXDOMAIN, never a
+    // NODATA, and never an authenticated answer.
+    try std.testing.expectEqual(dns_header.Rcode.servfail, message.header.rcode);
+    try std.testing.expectEqual(@as(u16, 0), message.header.answer_count);
+    try std.testing.expectEqual(@as(u16, 0), message.header.authority_count);
+    try std.testing.expect(!message.header.authenticated_data);
+
+    // The failure is in the failure cache, and it never enters the answer
+    // cache.
+    const key = try CacheKey.fromQuestion(fixture.query);
+    try std.testing.expect(fixture.resolver.cache.failures.lookup(&key, fixture.now()) != null);
+    try std.testing.expect((try fixture.resolver.cache.lookup(&key, fixture.query, fixture.now(), &output, false)) == null);
+}
+
+test "RFC 9520 section 3.4: a cached validation failure expires like every other failure" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const fixture = try ValidationFixture.create(io);
+    defer fixture.destroy();
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42713);
+
+    const before = fixture.now();
+    _ = try fixture.resolver.answer(fixture.encoded, fixture.query, &client, &output);
+    const after = fixture.now();
+    const key = try CacheKey.fromQuestion(fixture.query);
+
+    // The failure lives exactly as long as any other cached failure: the
+    // operator's `minimum-failure-cache-time` seconds.
+    try std.testing.expect(fixture.resolver.cache.failures.lookup(&key, before + @as(i64, DEFAULT_FAILURE_CACHE_SECONDS) - 1) != null);
+    try std.testing.expect(fixture.resolver.cache.failures.lookup(&key, after + @as(i64, DEFAULT_FAILURE_CACHE_SECONDS)) == null);
 }
 
 test "RFC 1035 section 4.1.1: the upstream query never carries the reserved Z bit" {

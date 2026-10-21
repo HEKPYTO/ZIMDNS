@@ -5,6 +5,8 @@ const zimdns = @import("zimdns");
 // allow either a letter or a digit.  Host software MUST support this more
 // liberal syntax." and "Host software MUST handle host names of up to 63
 // characters and SHOULD handle host names of up to 255 characters."
+// RFC 1123 section 2.1 keeps the RFC 952 label syntax, so a label may
+// neither begin nor end with a hyphen.
 
 /// A query for example.com A, the source of the A record type value.
 const a_query = [_]u8{
@@ -74,6 +76,29 @@ test "RFC 1123 2.1: a zone-file owner label accepts a leading digit" {
     );
     defer zone.deinit();
     try std.testing.expectEqualStrings("4www.example.", zone.records.items[2].ownerText());
+}
+
+test "RFC 1123 2.1: a zone-file owner label refuses a leading or trailing hyphen" {
+    var leading: [512]u8 = undefined;
+    var trailing: [512]u8 = undefined;
+
+    try std.testing.expectError(zimdns.zone_parser.Error.BadName, zimdns.zone_parser.ZoneFile.parse(try zoneWithOwner(&leading, "-bad")));
+    try std.testing.expectError(zimdns.zone_parser.Error.BadName, zimdns.zone_parser.ZoneFile.parse(try zoneWithOwner(&trailing, "bad-")));
+}
+
+test "RFC 1123 2.1: a zone-file owner label accepts an underscore label and an interior hyphen" {
+    var zone = try zimdns.zone_parser.ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns hostmaster 1 3600 900 1209600 300
+        \\@ IN NS ns
+        \\_443._tcp IN SRV 0 0 443 target.example.
+        \\sri-nic IN A 192.0.2.1
+        \\
+    );
+    defer zone.deinit();
+    try std.testing.expectEqualStrings("_443._tcp.example.", zone.records.items[2].ownerText());
+    try std.testing.expectEqualStrings("sri-nic.example.", zone.records.items[3].ownerText());
 }
 
 test "RFC 1123 2.1: a zone-file owner label reaches the 255-octet name bound" {

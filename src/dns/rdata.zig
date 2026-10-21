@@ -1,5 +1,5 @@
 /// Contract: Parses and encodes supported DNS RDATA and EDNS option payloads.
-/// Ownership: RDATA values own inline bounded bytes; input message and Writer storage are borrowed.
+/// Ownership: RDATA values own inline bounded bytes or borrow the message they were parsed from; input message and Writer storage are borrowed.
 /// Errors: RDATA and option violations are typed; transport/file I/O is not handled here.
 const std = @import("std");
 const Writer = @import("writer.zig").Writer;
@@ -16,17 +16,26 @@ const max_txt_len = 255;
 /// so TXT wire stays far below the 2048-octet record buffer; the 255-octet
 /// single-string bound above still applies per chunk and to X25/ISDN/NAPTR.
 const max_txt_data_len = 512;
-// Bounded opaque-RDATA profile: untyped types (DNSKEY/RRSIG and future
-// types), APL, CAA, and the NAPTR size check share this bound. 2048 covers a
-// 4096-bit RSA DNSKEY (~520 bytes) and a 4096-bit RSA RRSIG (~570 bytes with
-// signer name), while still rejecting oversize typed RDATA instead of growing
-// to the 64 KB wire maximum. Keep this far below message limits; do not
-// reintroduce per-type fallbacks. SVCB/HTTPS stay typed under their own
-// 512-byte cap below and never use this bound.
+// Bounded opaque-RDATA profile: the bytes a zone-built record keeps inline
+// (the DNSSEC types and APL), and the ceiling for the typed RDATA that
+// shares this bound (CAA, NAPTR, TXT). 2048 covers a 4096-bit RSA DNSKEY
+// (~520 bytes) and a 4096-bit RSA RRSIG (~570 bytes with signer name),
+// while still rejecting oversize typed RDATA instead of growing to the 64 KB
+// wire maximum. Keep this far below message limits; do not reintroduce
+// per-type fallbacks. SVCB/HTTPS stay typed under their own 512-byte cap
+// below and never use this bound.
 // Public because the DNSSEC signer builds its own opaque RDATA and reuses
 // this ceiling instead of inventing a second bound it would have to keep in
 // step with the parser.
 pub const max_unknown_len = 2048;
+
+/// RFC 1035 section 4.2.2: RDLENGTH is a 16-bit field, so an RDATA is at
+/// most 65535 octets. RFC 3597 section 3 makes a server treat the RDATA of
+/// a type it does not implement as unstructured binary data, stored and
+/// transmitted without change, so such a record carries that many octets; a
+/// record whose RDATA is longer than the inline buffer borrows those bytes
+/// from the message it was parsed from.
+pub const max_opaque_rdata_len: usize = 65535;
 const max_opt_data_len = 512;
 const max_caa_payload_len = max_unknown_len - 2;
 const max_sshfp_fingerprint_len = 32;
@@ -559,11 +568,17 @@ pub const Txt = struct {
     }
 };
 
+/// The RDATA of a type this server does not implement, and of the DNSSEC
+/// types the zone serves opaque. A record parsed from a message borrows its
+/// bytes from that message, so a long RDATA costs no copy and no fixed
+/// buffer; a record the zone builds keeps its bytes inline.
 pub const Unknown = struct {
     data: [max_unknown_len]u8 = undefined,
     len: u16 = 0,
+    borrowed: ?[]const u8 = null,
 
     pub fn bytes(self: *const Unknown) []const u8 {
+        if (self.borrowed) |borrowed| return borrowed;
         return self.data[0..self.len];
     }
 };
@@ -882,10 +897,19 @@ pub const RData = union(enum) {
                 break :blk .{ .ZONEMD = zonemd };
             },
             else => blk: {
-                if (len > max_unknown_len) return Error.UnknownTooLong;
-                var unknown = Unknown{ .len = @intCast(len) };
-                @memcpy(unknown.data[0..len], message[offset..end]);
-                break :blk .{ .Unknown = unknown };
+                // RFC 3597 section 3: the RDATA of a type this server does
+                // not implement is unstructured binary data, stored and
+                // transmitted without change, so it is not bounded by the
+                // inline buffer. Short RDATA is copied, so the record owns
+                // it; a longer one is borrowed from the message, the way a
+                // parsed name borrows the message it came from.
+                if (len > opaqueLimit(rrtype.code())) return Error.UnknownTooLong;
+                if (len <= max_unknown_len) {
+                    var unknown = Unknown{ .len = @intCast(len) };
+                    @memcpy(unknown.data[0..len], message[offset..end]);
+                    break :blk .{ .Unknown = unknown };
+                }
+                break :blk .{ .Unknown = .{ .len = @intCast(len), .borrowed = message[offset..end] } };
             },
         };
     }
@@ -1076,6 +1100,22 @@ pub const RData = union(enum) {
         }
     }
 };
+
+/// The RDATA a type may carry on the wire. The DNSSEC types this server
+/// serves opaque keep the bounded profile; every other type code is unknown
+/// to it, and RFC 3597 section 3 keeps such an RDATA whole.
+fn opaqueLimit(code: u16) usize {
+    return switch (code) {
+        RecordType.DNSKEY.value,
+        RecordType.DS.value,
+        RecordType.RRSIG.value,
+        RecordType.NSEC.value,
+        RecordType.NSEC3.value,
+        RecordType.NSEC3PARAM.value,
+        => max_unknown_len,
+        else => max_opaque_rdata_len,
+    };
+}
 
 /// Parse one RFC 9460 SVCB/HTTPS RDATA. Types 64 and 65 never use the
 /// Unknown fallback: malformed bytes are typed errors.
@@ -1976,14 +2016,29 @@ test "rdata preserves unknown record bytes" {
     try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, unknown.Unknown.bytes());
 }
 
-test "rdata keeps unknown wire data within the declared bounded profile" {
-    var max: [max_unknown_len]u8 = undefined;
-    @memset(&max, 0xa5);
-    const unknown = try RData.parse(RecordType.fromCode(65280), &max, 0, max.len);
-    try std.testing.expectEqual(@as(usize, max_unknown_len), unknown.Unknown.bytes().len);
+test "rdata carries an unknown type's whole RDLENGTH and encodes it back" {
+    // RFC 3597 section 3 keeps the RDATA of a type this server does not
+    // implement unchanged, and RFC 1035 section 4.2.2 caps RDLENGTH at
+    // 65535 octets.
+    const payload = try std.testing.allocator.alloc(u8, max_opaque_rdata_len);
+    defer std.testing.allocator.free(payload);
+    for (payload, 0..) |*byte, index| byte.* = @truncate(index);
 
-    var overlong: [max_unknown_len + 1]u8 = undefined;
-    try std.testing.expectError(Error.UnknownTooLong, RData.parse(RecordType.fromCode(65280), &overlong, 0, overlong.len));
+    const unknown = try RData.parse(RecordType.fromCode(65280), payload, 0, payload.len);
+    try std.testing.expectEqual(@as(usize, max_opaque_rdata_len), unknown.Unknown.bytes().len);
+    try std.testing.expectEqualSlices(u8, payload, unknown.Unknown.bytes());
+
+    const output = try std.testing.allocator.alloc(u8, max_opaque_rdata_len);
+    defer std.testing.allocator.free(output);
+    var writer = Writer.init(output);
+    try unknown.encode(&writer);
+    try std.testing.expectEqualSlices(u8, payload, writer.written());
+}
+
+test "rdata refuses an RDATA longer than the 16-bit RDLENGTH" {
+    const payload = try std.testing.allocator.alloc(u8, max_opaque_rdata_len + 1);
+    defer std.testing.allocator.free(payload);
+    try std.testing.expectError(Error.UnknownTooLong, RData.parse(RecordType.fromCode(65280), payload, 0, payload.len));
 }
 
 test "rdata preserves DNSKEY and RRSIG sizes within the bounded profile" {
