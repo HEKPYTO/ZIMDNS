@@ -15,6 +15,7 @@ const zone_index = @import("../zone/index.zig");
 const zone_signer = @import("../zone/signer.zig");
 const dns_validate = @import("../dns/validate.zig");
 const dns_dnssec = @import("../dns/dnssec.zig");
+const dns_error_report = @import("../dns/error_report.zig");
 
 pub const CLASSIC_UDP_MESSAGE_SIZE: usize = 512;
 pub const DEFAULT_EDNS_UDP_PAYLOAD_SIZE: u16 = 1232;
@@ -44,6 +45,11 @@ pub const AnswerPolicy = struct {
     /// is no default: without a configured identifier the server never answers
     /// with one.
     nsid: ?[]const u8 = null,
+    /// RFC 9567 section 5: the agent domain the Report-Channel option
+    /// advertises. Null when the operator configured none, and the root
+    /// domain is never advertised (section 4). The name is inline, so the
+    /// policy owns nothing.
+    report_agent: ?dns_name.Name = null,
     /// RFC 9660 section 3.2 makes answering optional. On by default because
     /// the value is the answer's own SOA serial, with nothing to leak.
     zoneversion: bool = true,
@@ -366,6 +372,7 @@ pub fn buildResponseWithPolicy(
     if (response.edns != null) {
         try appendOpt(&response);
         appendRequestedEdnsOptions(&response, &request, zone, policy, over_tcp);
+        appendReportChannelOption(&response, zone, policy);
     }
 
     // DNSSEC minimum (RFC 4035 section 3.1, RFC 5155): RRSIGs covering the
@@ -1481,6 +1488,47 @@ fn appendRequestedEdnsOptions(
     data[1] = 0;
     std.mem.writeInt(u32, data[2..6], serial, .big);
     _ = optOf(response).appendOption(dns_rdata.EDNS_ZONEVERSION_OPTION_CODE, &data);
+}
+
+/// RFC 9567 section 5: the Report-Channel option names the agent domain a
+/// client may send error reports to. The option is unsolicited, so it rides
+/// along whether or not the query asked for it, and RFC 9567 section 6.2
+/// allows it only once. Section 4: the option is never present when the
+/// agent domain is the root domain. Section 8.1: the agent domain must not
+/// be a subdomain of the domain the server reports on, so the option is left
+/// out of the answers of a zone that holds the agent domain.
+fn appendReportChannelOption(
+    response: *dns_message.Message,
+    zone: *const zone_index.Zone,
+    policy: AnswerPolicy,
+) void {
+    // Only an authoritative answer reports on a domain the server serves.
+    if (!response.header.authoritative) return;
+    const agent = policy.report_agent orelse return;
+    // RFC 9567 section 4: the root domain is not an agent domain.
+    if (agent.asWire().len <= 1) return;
+    const origin = dns_name.Name.fromText(zone.originText()) catch return;
+    if (nameEndsWith(&agent, &origin)) return;
+    _ = optOf(response).appendOption(dns_error_report.option_code, dns_error_report.agentDomainWire(&agent));
+}
+
+/// Whether the name `name` ends with the name `suffix`, compared label by
+/// label. The wire form carries a length byte before every label, so the two
+/// names match only when a whole label matches: "xfoo.example." does not end
+/// with "foo.example.".
+fn nameEndsWith(name: *const dns_name.Name, suffix: *const dns_name.Name) bool {
+    const name_wire = name.asWire();
+    const suffix_wire = suffix.asWire();
+    if (suffix_wire.len > name_wire.len) return false;
+    const start = name_wire.len - suffix_wire.len;
+    if (start == 0) return std.mem.eql(u8, name_wire, suffix_wire);
+    // The suffix must begin at a label boundary of the name.
+    var offset: usize = 0;
+    while (offset < start) {
+        offset += 1 + name_wire[offset];
+    }
+    if (offset != start) return false;
+    return std.mem.eql(u8, name_wire[start..], suffix_wire);
 }
 
 fn optOf(message: *dns_message.Message) *dns_rdata.Opt {
@@ -5787,5 +5835,164 @@ test "the NSEC3 denial answers still validate as they did (RFC 4035 5.4)" {
         var anchors = dns_validate.Anchors{};
         const result = try dns_validate.validate(arena.allocator(), &anchors, query, response, &.{}, 1_500_000_000);
         try std.testing.expectEqual(dns_validate.Status.insecure, result.status);
+    }
+}
+
+/// A zone whose origin shares a label suffix with an agent domain, so the
+/// section 8.1 test can tell a label boundary from a text suffix.
+const report_agent_test_zone =
+    \\$ORIGIN foo.example.com.
+    \\$TTL 3600
+    \\@ IN SOA ns.foo.example.com. hostmaster.foo.example.com. 1 3600 900 1209600 300
+    \\@ IN NS ns.foo.example.com.
+    \\ns IN A 192.0.2.53
+    \\www IN A 192.0.2.1
+    \\
+;
+
+/// The number of times an option code appears in an EDNS option list.
+fn countOption(options: []const u8, code: u16) usize {
+    var count: usize = 0;
+    var offset: usize = 0;
+    while (offset + 4 <= options.len) {
+        const option_code = std.mem.readInt(u16, options[offset..][0..2], .big);
+        const option_len = std.mem.readInt(u16, options[offset + 2 ..][0..2], .big);
+        if (option_len > options.len - offset - 4) break;
+        if (option_code == code) count += 1;
+        offset += 4 + option_len;
+    }
+    return count;
+}
+
+test "RFC 9567: the Report-Channel option advertises the agent domain" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(zoneversion_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    const agent = try dns_name.Name.fromText("agent.example.net.");
+    // The option is unsolicited, so a query that never asked for it is
+    // answered with one.
+    const request = try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &.{});
+    const response = try buildResponseWithPolicy(request, &zone, .{ .report_agent = agent }, null, false);
+    const options = ednsOptions(&response) orelse return error.TestExpectedEqual;
+    // RFC 9567 section 6.2: the option appears at most once.
+    try std.testing.expectEqual(@as(usize, 1), countOption(options, dns_error_report.option_code));
+    // Section 5: the option carries the agent domain in wire form.
+    try std.testing.expectEqualSlices(
+        u8,
+        dns_error_report.agentDomainWire(&agent),
+        dns_rdata.findOption(options, dns_error_report.option_code).?,
+    );
+}
+
+test "RFC 9567: a query without EDNS(0) is answered with no Report-Channel option" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(zoneversion_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    const agent = try dns_name.Name.fromText("agent.example.net.");
+    const request = try testQuery(arena.allocator(), "www.example.com.", .A);
+    const response = try buildResponseWithPolicy(request, &zone, .{ .report_agent = agent }, null, false);
+    // RFC 6891 sections 6.1.1 and 7: a reply to a query that carried no OPT
+    // record carries none either, so there is no record to hold the option.
+    try std.testing.expect(response.edns == null);
+    try std.testing.expect(ednsOptions(&response) == null);
+    for (response.additionals.slice()) |record| {
+        try std.testing.expect(!record.rrtype.eql(.OPT));
+    }
+}
+
+test "RFC 9567: a server with no agent domain advertises no Report-Channel option" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(zoneversion_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    const request = try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &.{});
+    const response = try buildResponseWithPolicy(request, &zone, .{}, null, false);
+    const options = ednsOptions(&response) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 0), countOption(options, dns_error_report.option_code));
+}
+
+test "RFC 9567 section 4: the root domain is never advertised" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(zoneversion_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    const request = try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &.{});
+    const response = try buildResponseWithPolicy(request, &zone, .{ .report_agent = dns_name.Name.root() }, null, false);
+    const options = ednsOptions(&response) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 0), countOption(options, dns_error_report.option_code));
+}
+
+test "RFC 9567 section 8.1: an agent domain under the answered zone is not advertised" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(zoneversion_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    // The agent domain is a subdomain of the zone the server reports on, so
+    // the option is left out of the answer.
+    const agent = try dns_name.Name.fromText("agent.example.com.");
+    const request = try testOptionsQuery(arena.allocator(), "www.example.com.", .A, &.{});
+    const response = try buildResponseWithPolicy(request, &zone, .{ .report_agent = agent }, null, false);
+    const options = ednsOptions(&response) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 0), countOption(options, dns_error_report.option_code));
+}
+
+test "RFC 9567 section 8.1: the zone and the agent domain are compared on label boundaries" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(report_agent_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    // "xfoo.example.com." ends with the text of "foo.example.com." but not
+    // with its labels, so the agent domain is not a subdomain of the zone and
+    // the option is advertised.
+    const agent = try dns_name.Name.fromText("xfoo.example.com.");
+    const request = try testOptionsQuery(arena.allocator(), "www.foo.example.com.", .A, &.{});
+    const response = try buildResponseWithPolicy(request, &zone, .{ .report_agent = agent }, null, false);
+    const options = ednsOptions(&response) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 1), countOption(options, dns_error_report.option_code));
+    try std.testing.expectEqualSlices(
+        u8,
+        dns_error_report.agentDomainWire(&agent),
+        dns_rdata.findOption(options, dns_error_report.option_code).?,
+    );
+}
+
+test "RFC 9567: an answer that is not authoritative carries no Report-Channel option" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(zoneversion_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    const agent = try dns_name.Name.fromText("agent.example.net.");
+    // A name the zone does not hold is a refusal, and a name below a
+    // delegation is a referral: neither reports on a domain the server
+    // serves, so neither carries the option.
+    for ([_][]const u8{ "www.other.net.", "www.child.example.com." }) |name_text| {
+        const request = try testOptionsQuery(arena.allocator(), name_text, .A, &.{});
+        const response = try buildResponseWithPolicy(request, &zone, .{ .report_agent = agent }, null, false);
+        try std.testing.expect(!response.header.authoritative);
+        const options = ednsOptions(&response) orelse return error.TestExpectedEqual;
+        try std.testing.expectEqual(@as(usize, 0), countOption(options, dns_error_report.option_code));
     }
 }

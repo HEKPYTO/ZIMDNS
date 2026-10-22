@@ -221,7 +221,13 @@ fn readExactWith(fd: std.posix.fd_t, io: std.Io, buffer: []u8, frame_deadline: s
             if (err == error.EndOfStream and offset > 0) return error.Truncated;
             return err;
         };
-        const count = try operation.read(fd, buffer[offset..]);
+        const count = operation.read(fd, buffer[offset..]) catch |err| switch (err) {
+            // The descriptor had nothing to give: the same condition the
+            // DeadlineReader maps to a timeout, so both readers report it
+            // the same way.
+            error.WouldBlock => return error.Timeout,
+            else => return err,
+        };
         if (count == 0) return if (offset == 0) error.EndOfStream else error.Truncated;
         offset += count;
     }
@@ -272,7 +278,7 @@ fn waitForSocket(fd: std.posix.fd_t, io: std.Io, frame_deadline: std.Io.Clock.Ti
     const count = try std.posix.poll(&poll_fds, poll_timeout);
     if (count == 0) return error.Timeout;
     const revents: i16 = poll_fds[0].revents;
-    if ((revents & std.posix.POLL.NVAL) != 0) return error.ReadFailed;
+    if ((revents & std.posix.POLL.NVAL) != 0) return if (events == std.posix.POLL.IN) error.ReadFailed else error.WriteFailed;
     if ((revents & (std.posix.POLL.ERR | std.posix.POLL.HUP)) != 0 and (revents & events) == 0) {
         return if (events == std.posix.POLL.IN) error.EndOfStream else error.WriteFailed;
     }

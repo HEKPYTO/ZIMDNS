@@ -124,3 +124,33 @@ here because the reasons still hold for the transports that remain.
 Option (a) is chosen and implemented; the other two are closed. DoT and DoH
 now run on it. The next dependency question is the same shape: DoQ needs a
 QUIC stack.
+
+## The bounds the encrypted ports hold
+
+The three encrypted listeners — DoT, DoH, and the RFC 9103 strict-TLS
+transfer channel — share one channel helper, `src/transport/channel.zig`,
+so their bounds cannot drift apart. A connection is bounded by the
+operator's `tcp-max-connection-duration` and every frame runs under one
+absolute deadline on the raw descriptor under the TLS connection, never
+under a socket timeout: a blocked read that hits `SO_RCVTIMEO` surfaces
+as `EAGAIN`, which the threaded standard-library backend treats as a
+fatal error and answers with a panic, so a stalled peer would take the
+whole server down. The DoH channel adds one absolute deadline per
+exchange on top of that, and the strict-TLS transfer channel applies the
+same SIGHUP zone reload the cleartext paths apply.
+
+Every encrypted listener also applies the per-client policy the cleartext
+TCP listener applies: the peer address reaches the runtime, so the
+recursion ACL and the DNS cookie check see the same client whichever
+port the query arrived on.
+
+## The request mapping the DoH channel refuses
+
+RFC 9112 section 6.1 says a server must reject a request whose headers
+disagree about the body. The DoH channel answers 400 to a request that
+carries both a transfer coding and a content length, and to a request
+that declares two different content lengths. A head over the 8192-octet
+budget is answered 431, a body over the 65535-octet budget is answered
+413, a POST whose media type is not `application/dns-message` is answered
+415, and the last exchange of a connection carries `connection: close` so
+the client does not reuse a connection the server is about to close.

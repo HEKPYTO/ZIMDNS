@@ -13,7 +13,12 @@
 /// EAGAIN, which the threaded backend treats as a programmer bug and answers
 /// with a panic, so a stalled peer would take the whole server down. A DoT
 /// connection lives no longer than the connection duration the operator
-/// configured, the same bound the cleartext TCP listener enforces. A SIGHUP
+/// configured, the same bound the cleartext TCP listener enforces, and its
+/// handshake runs under one absolute deadline, so a peer that dribbles
+/// handshake bytes holds a worker slot for that window and no longer. The
+/// answer comes from the same entry point the cleartext TCP path uses, so the
+/// peer address reaches the recursion policy, the local-zone table, and the
+/// cookie validation. A SIGHUP
 /// re-reads the zone file on this path too, outside the signal handler, so
 /// the answer that follows a reload comes from the new zone.
 /// Ownership: Runtime is borrowed; streams are consumed/closed by the caller
@@ -25,6 +30,10 @@ const tls = @import("tls");
 const Runtime = @import("../auth/runtime.zig").Runtime;
 const dns_message = @import("../dns/message.zig");
 const dns_padding = @import("../dns/padding.zig");
+const dns_rdata = @import("../dns/rdata.zig");
+const dns_header = @import("../dns/header.zig");
+const config_mod = @import("../config/parser.zig");
+const resolver_mod = @import("../resolver.zig");
 const metrics = @import("../metrics.zig");
 const listener = @import("../platform/listener.zig");
 const tcp_deadline = @import("../platform/tcp_deadline.zig");
@@ -71,13 +80,18 @@ fn serveDotStream(stream: std.Io.net.Stream, io: std.Io, runtime: *Runtime, coun
         .timeout = IO_TIMEOUT,
         .connection_deadline = channel_mod.connectionDeadline(io),
     };
-    try serveDotFrames(&channel, runtime, counters);
+    try serveDotFrames(&channel, runtime, counters, &stream.socket.address);
 }
 
 /// RFC 7858 section 3.3 framing loop: two-octet length-prefixed DNS messages
 /// with the same bounds as DNS over TCP. Operates on an already-terminated
 /// byte stream, so the cleartext helper and the TLS connection share it.
-fn serveDotFrames(channel: *const channel_mod.Channel, runtime: *Runtime, counters: ?*metrics.Counters) !void {
+fn serveDotFrames(
+    channel: *const channel_mod.Channel,
+    runtime: *Runtime,
+    counters: ?*metrics.Counters,
+    client: *const std.Io.net.IpAddress,
+) !void {
     var request_buffer: [listener.TCP_MAX_FRAME_SIZE]u8 = undefined;
     var response_buffer: [listener.TCP_MAX_FRAME_SIZE]u8 = undefined;
     // The request is parsed once per frame to see whether it asked for
@@ -86,6 +100,10 @@ fn serveDotFrames(channel: *const channel_mod.Channel, runtime: *Runtime, counte
     defer arena.deinit();
     var frame_count: usize = 0;
     while (frame_count < MAX_FRAMES_PER_CONNECTION) : (frame_count += 1) {
+        // The parsed query and the padded answer of the frame before are
+        // gone: the arena is reset, so a connection that serves many frames
+        // holds the memory of one frame and not of all of them.
+        _ = arena.reset(.retain_capacity);
         // A SIGHUP asks for the zone to be re-read. The reload happens here,
         // outside the signal handler. The first check answers a connection
         // that waited for the request, the second one answers a request that
@@ -93,8 +111,10 @@ fn serveDotFrames(channel: *const channel_mod.Channel, runtime: *Runtime, counte
         // reload always comes from the new zone.
         _ = runtime.reloadZoneIfRequested(channel.io);
         // One deadline for the whole frame: a peer that stalls in the middle
-        // of a frame loses the frame, not the server.
-        if (!channel.applyFrameDeadline()) return;
+        // of a frame loses the frame, not the server. The write of the answer
+        // shares it, so one frame cannot take two windows.
+        const frame_deadline = channel.frameDeadline() orelse return;
+        channel.deadlines.apply(frame_deadline);
         const request = readFrame(channel.reader, &request_buffer) catch |err| {
             if (err == error.EndOfStream) {
                 if (frame_count == 0) return error.EndOfStream;
@@ -104,14 +124,13 @@ fn serveDotFrames(channel: *const channel_mod.Channel, runtime: *Runtime, counte
             return err;
         };
         _ = runtime.reloadZoneIfRequested(channel.io);
-        // The answer gets its own deadline: the reload took time, and the
-        // cleartext path gives the write of a frame its own deadline too.
-        if (!channel.applyFrameDeadline()) return;
+        // RFC 9210 section 3: the answer comes from the same entry point the
+        // cleartext TCP path uses, so the peer address reaches the recursion
+        // policy, the local-zone table, and the cookie validation.
+        const response_bytes = try runtime.answerFromTcp(request, &response_buffer, client, counters);
+        // The counter moves after the answer, so a refused or failed query
+        // is not counted as served.
         if (counters) |value| value.dot_queries_total += 1;
-        const response_bytes = if (counters) |value|
-            try runtime.answerWithMetrics(request, &response_buffer, value)
-        else
-            try runtime.answer(request, &response_buffer);
         // RFC 7830 section 4: the responder pads the answer when the query
         // carried the Padding option. RFC 7830 section 6 keeps the option for
         // encrypted transports, so this path and no other one calls it.
@@ -132,13 +151,20 @@ fn serveDotFrames(channel: *const channel_mod.Channel, runtime: *Runtime, counte
 }
 
 /// Reads one length-prefixed frame. A clean EOF at the frame boundary ends
-/// the connection; a truncated payload is a bad frame.
+/// the connection; a half-written length prefix and a truncated payload are
+/// both a bad frame.
 fn readFrame(reader: *std.Io.Reader, frame_buffer: []u8) ![]const u8 {
-    const len_bytes = reader.takeArray(2) catch |err| switch (err) {
+    // The two octets are read one at a time, so a prefix that stops after
+    // the first octet is a bad frame and not a clean end of stream.
+    const first = reader.takeByte() catch |err| switch (err) {
         error.EndOfStream => return error.EndOfStream,
         else => return err,
     };
-    const request_len = std.mem.readInt(u16, len_bytes, .big);
+    const second = reader.takeByte() catch |err| switch (err) {
+        error.EndOfStream => return error.Truncated,
+        else => return err,
+    };
+    const request_len = std.mem.readInt(u16, &.{ first, second }, .big);
     try listener.validateTcpFrameLength(request_len);
     if (request_len > frame_buffer.len) return listener.Error.BadTcpFrame;
     reader.readSliceAll(frame_buffer[0..request_len]) catch |err| switch (err) {
@@ -175,16 +201,20 @@ fn serveDotTlsStreamWithTimeout(
     // RFC 9210 section 4.2: the operator may bound the lifetime of one
     // connection, and that deadline covers the whole connection.
     const connection_deadline = channel_mod.connectionDeadline(io);
+    // The handshake runs under one absolute deadline: the connection's, when
+    // the operator set one, and the module's own timeout otherwise. A peer
+    // that dribbles handshake bytes holds a worker slot for that window and
+    // no longer.
+    const handshake_timeout = listener.frameTimeout(io, connection_deadline, timeout) orelse return;
+    const handshake_deadline = tcp_deadline.deadline(io, handshake_timeout);
 
     var input_buffer: [tls_server.input_buffer_len]u8 = undefined;
     var output_buffer: [tls_server.output_buffer_len]u8 = undefined;
     var stream_reader = tcp_deadline.DeadlineReader.init(stream.socket.handle, io, &input_buffer, timeout);
     var stream_writer = tcp_deadline.DeadlineWriter.init(stream.socket.handle, io, &output_buffer, timeout);
     // The handshake is part of the connection, so it shares its deadline.
-    if (connection_deadline) |value| {
-        stream_reader.setFrameDeadline(value);
-        stream_writer.setFrameDeadline(value);
-    }
+    stream_reader.setFrameDeadline(handshake_deadline);
+    stream_writer.setFrameDeadline(handshake_deadline);
     var connection = try server.handshake(&stream_reader.interface, &stream_writer.interface);
 
     var read_buffer: [STREAM_BUFFER_SIZE]u8 = undefined;
@@ -204,7 +234,7 @@ fn serveDotTlsStreamWithTimeout(
         .timeout = timeout,
         .connection_deadline = connection_deadline,
     };
-    try serveDotFrames(&channel, runtime, counters);
+    try serveDotFrames(&channel, runtime, counters, &stream.socket.address);
 }
 
 /// Binds the DoT port and serves DoT connections. Every accepted connection
@@ -218,11 +248,12 @@ pub fn serveDotLoopOnAddress(
     address: *const std.Io.net.IpAddress,
     server: *tls_server.Server,
     max_requests: ?usize,
+    counters: ?*metrics.Counters,
 ) !void {
     var bind_address = address.*;
     var listener_socket = try std.Io.net.IpAddress.listen(&bind_address, io, .{ .reuse_address = true });
     defer listener_socket.deinit(io);
-    return serveDotLoop(&listener_socket, io, runtime, server, max_requests);
+    return serveDotLoop(&listener_socket, io, runtime, server, max_requests, counters);
 }
 
 /// Serves the DoT port on an already-bound listener.
@@ -232,6 +263,7 @@ pub fn serveDotLoop(
     runtime: *Runtime,
     server: *tls_server.Server,
     max_requests: ?usize,
+    counters: ?*metrics.Counters,
 ) !void {
     var group: std.Io.Group = .init;
     defer group.await(io) catch unreachable;
@@ -248,7 +280,7 @@ pub fn serveDotLoop(
             stream.close(io);
             continue;
         }
-        group.concurrent(io, serveDotTlsWorker, .{ stream, io, server, runtime, &sources }) catch |err| switch (err) {
+        group.concurrent(io, serveDotTlsWorker, .{ stream, io, server, runtime, &sources, counters }) catch |err| switch (err) {
             error.ConcurrencyUnavailable => {
                 sources.release(&stream.socket.address);
                 stream.close(io);
@@ -258,10 +290,17 @@ pub fn serveDotLoop(
 }
 
 /// Serves one accepted DoT connection.
-fn serveDotTlsWorker(stream: std.Io.net.Stream, io: std.Io, server: *tls_server.Server, runtime: *Runtime, sources: *listener.SourceCounter) void {
+fn serveDotTlsWorker(
+    stream: std.Io.net.Stream,
+    io: std.Io,
+    server: *tls_server.Server,
+    runtime: *Runtime,
+    sources: *listener.SourceCounter,
+    counters: ?*metrics.Counters,
+) void {
     defer stream.close(io);
     defer sources.release(&stream.socket.address);
-    serveDotTlsStream(stream, io, server, runtime, null) catch {};
+    serveDotTlsStream(stream, io, server, runtime, counters) catch {};
 }
 
 fn streamPair() ![2]std.Io.net.Stream {
@@ -379,7 +418,27 @@ test "RFC 7830: the DoT answer is padded when the query asked for it" {
     const padding = @import("../dns/rdata.zig").findOption(options.?, @import("../dns/rdata.zig").EDNS_PADDING_OPTION_CODE).?;
     try std.testing.expect(padding.len > 0);
     for (padding) |octet| try std.testing.expectEqual(@as(u8, 0), octet);
+    // The answer carries the Padding option exactly once.
+    try std.testing.expectEqual(@as(usize, 1), paddingOptionCount(options.?));
     try std.testing.expectEqual(@as(usize, 0), response_bytes.len % dns_padding.PADDING_BLOCK);
+}
+
+test "RFC 7830: the DoT answer carries no padding when the query did not ask for it" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+
+    const response_bytes = try dotStreamAnswer(arena.allocator(), io, &runtime, no_padding_a_query, null);
+    const response = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+    // The query advertised EDNS(0), so the answer carries an OPT record, but
+    // the query asked for no padding, so the option is absent.
+    const options = messageOptions(&response).?;
+    try std.testing.expectEqual(@as(usize, 0), options.len);
+    try std.testing.expect(dns_rdata.findOption(options, dns_rdata.EDNS_PADDING_OPTION_CODE) == null);
 }
 
 test "DoT channel rejects a zero length prefix" {
@@ -402,11 +461,8 @@ test "DoT channel rejects a zero length prefix" {
     try std.testing.expectError(listener.Error.BadTcpFrame, serveDotStreamOnce(server_stream, io, &runtime));
 }
 
-test "DoT channel records metrics for served queries" {
+test "DoT channel rejects a half-written length prefix" {
     const io = std.Io.Threaded.global_single_threaded.io();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
     var runtime = try Runtime.fromZoneText(test_zone);
     defer runtime.deinit();
 
@@ -416,23 +472,115 @@ test "DoT channel records metrics for served queries" {
     const server_stream = streams[1];
     defer server_stream.close(io);
 
-    var query = simple_a_query.*;
-    std.mem.writeInt(u16, query[0..2], 0x9a9a, .big);
-    var client_write_buffer: [512]u8 = undefined;
+    var client_write_buffer: [8]u8 = undefined;
+    var client_writer = client_stream.writer(io, &client_write_buffer);
+    // One octet of the two-octet length prefix, and then the end of the
+    // stream: a bad frame, not a clean close.
+    try client_writer.interface.writeAll(&.{0x00});
+    try client_writer.interface.flush();
+    try client_stream.shutdown(io, .send);
+
+    try std.testing.expectError(listener.Error.BadTcpFrame, serveDotStreamOnce(server_stream, io, &runtime));
+}
+
+/// Serves one query over a fresh stream and returns the answer the server
+/// wrote, with the counters the caller asks for.
+fn dotStreamAnswer(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    runtime: *Runtime,
+    query: []const u8,
+    counters: ?*metrics.Counters,
+) ![]u8 {
+    const streams = try streamPair();
+    var client_stream = streams[0];
+    defer client_stream.close(io);
+    const server_stream = streams[1];
+    defer server_stream.close(io);
+
+    var client_write_buffer: [1024]u8 = undefined;
     var client_writer = client_stream.writer(io, &client_write_buffer);
     var prefix: [2]u8 = undefined;
     std.mem.writeInt(u16, &prefix, @intCast(query.len), .big);
     try client_writer.interface.writeAll(&prefix);
-    try client_writer.interface.writeAll(&query);
+    try client_writer.interface.writeAll(query);
     try client_writer.interface.flush();
     try client_stream.shutdown(io, .send);
 
+    if (counters) |value| {
+        serveDotStreamOnceWithMetrics(server_stream, io, runtime, value) catch |err| switch (err) {
+            error.EndOfStream => {},
+            else => return err,
+        };
+    } else {
+        serveDotStreamOnce(server_stream, io, runtime) catch |err| switch (err) {
+            error.EndOfStream => {},
+            else => return err,
+        };
+    }
+
+    var client_read_buffer: [4096]u8 = undefined;
+    var client_reader = client_stream.reader(io, &client_read_buffer);
+    const length_bytes = try client_reader.interface.takeArray(2);
+    const length = std.mem.readInt(u16, length_bytes, .big);
+    const bytes = try allocator.alloc(u8, length);
+    try client_reader.interface.readSliceAll(bytes);
+    return bytes;
+}
+
+/// The option framing of a message's OPT record, or null when the message
+/// carries no EDNS(0) at all.
+fn messageOptions(message: *const dns_message.Message) ?[]const u8 {
+    for (message.additionals.slice()) |record| {
+        if (!record.rrtype.eql(.OPT)) continue;
+        return switch (record.rdata) {
+            .OPT => |opt| opt.bytes(),
+            else => unreachable,
+        };
+    }
+    return null;
+}
+
+/// The number of times the option framing carries the RFC 7830 Padding
+/// option.
+fn paddingOptionCount(options: []const u8) usize {
+    var count: usize = 0;
+    var offset: usize = 0;
+    while (offset + 4 <= options.len) {
+        const code = std.mem.readInt(u16, options[offset..][0..2], .big);
+        const length = std.mem.readInt(u16, options[offset + 2 ..][0..2], .big);
+        offset += 4;
+        if (length > options.len - offset) break;
+        if (code == dns_rdata.EDNS_PADDING_OPTION_CODE) count += 1;
+        offset += length;
+    }
+    return count;
+}
+
+test "a DoT query for a locally served name answers the same way with and without the counters" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+
+    var query_buffer: [512]u8 = undefined;
+    // RFC 6761 section 6.3: a localhost name is answered from the local
+    // table of RFC 6303, RFC 6761, RFC 7793, and RFC 8375.
+    const query = try @import("../cli/query.zig").buildQueryPacket(&query_buffer, 0x1111, "localhost.", .A, false);
+
     var counters = metrics.Counters{};
-    // One query then EOF ends the stream; EOF after a served frame is not an error.
-    serveDotStreamOnceWithMetrics(server_stream, io, &runtime, &counters) catch |err| switch (err) {
-        error.EndOfStream => {},
-        else => return err,
-    };
+    const with_counters = try dotStreamAnswer(arena.allocator(), io, &runtime, query, &counters);
+    const without_counters = try dotStreamAnswer(arena.allocator(), io, &runtime, query, null);
+    // The counters change how the query is counted, never what it is
+    // answered.
+    try std.testing.expectEqualSlices(u8, without_counters, with_counters);
+
+    const answer = try dns_message.Message.parse(arena.allocator(), with_counters);
+    try std.testing.expect(answer.header.qr);
+    try std.testing.expectEqual(@as(usize, 1), answer.answers.items.len);
+    try std.testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, &answer.answers.items[0].rdata.A);
     try std.testing.expectEqual(@as(u64, 1), counters.queries_total);
     try std.testing.expectEqual(@as(u64, 1), counters.responses_total);
     try std.testing.expectEqual(@as(u64, 1), counters.dot_queries_total);
@@ -487,6 +635,20 @@ fn serveTwoConnections(
     }
 }
 
+/// The server side of the handshake-window test: one accepted connection,
+/// served with the handshake window the test asks for.
+fn serveOneConnectionWithTimeout(
+    listener_socket: *std.Io.net.Server,
+    io: std.Io,
+    server: *tls_server.Server,
+    runtime: *Runtime,
+    timeout: tcp_deadline.Timeout,
+) void {
+    const stream = listener_socket.accept(io) catch return;
+    defer stream.close(io);
+    serveDotTlsStreamWithTimeout(stream, io, server, runtime, null, timeout) catch {};
+}
+
 /// The server side of the metrics test: one accepted connection, served with
 /// the counters the test watches.
 fn serveOneConnectionWithMetrics(
@@ -517,6 +679,181 @@ fn tlsClient(
         .now = std.Io.Clock.real.now(io),
         .alpn_protocols = &.{DOT_ALPN},
     });
+}
+
+/// Runs one DoT query over a real TLS handshake and returns the answer the
+/// server wrote.
+fn dotTlsAnswer(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    server: *tls_server.Server,
+    runtime: *Runtime,
+    query: []const u8,
+) ![]u8 {
+    var bind_address = std.Io.net.IpAddress{ .ip4 = .loopback(0) };
+    var listener_socket = try std.Io.net.IpAddress.listen(&bind_address, io, .{ .reuse_address = true });
+    defer listener_socket.deinit(io);
+    const port = listener_socket.socket.address.getPort();
+
+    const thread = try std.Thread.spawn(.{}, serveOneConnection, .{ &listener_socket, io, server, runtime });
+    defer thread.join();
+
+    var address = std.Io.net.IpAddress{ .ip4 = .loopback(port) };
+    const stream = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer stream.close(io);
+
+    var client_input: [tls_server.input_buffer_len]u8 = undefined;
+    var client_output: [tls_server.output_buffer_len]u8 = undefined;
+    var client_reader = stream.reader(io, &client_input);
+    var client_writer = stream.writer(io, &client_output);
+    var rng_source: std.Random.IoSource = .{ .io = io };
+    var connection = try tlsClient(&client_reader.interface, &client_writer.interface, &rng_source, io);
+    defer connection.close() catch {};
+
+    var read_buffer: [512]u8 = undefined;
+    var write_buffer: [512]u8 = undefined;
+    var connection_reader = connection.reader(&read_buffer);
+    var connection_writer = connection.writer(&write_buffer);
+    var prefix: [2]u8 = undefined;
+    std.mem.writeInt(u16, &prefix, @intCast(query.len), .big);
+    try connection_writer.interface.writeAll(&prefix);
+    try connection_writer.interface.writeAll(query);
+    try connection_writer.interface.flush();
+
+    const len_bytes = try connection_reader.interface.takeArray(2);
+    const response_len = std.mem.readInt(u16, len_bytes, .big);
+    const bytes = try allocator.alloc(u8, response_len);
+    try connection_reader.interface.readSliceAll(bytes);
+    return bytes;
+}
+
+test "a DoT query the recursion ACL refuses is refused over DoT too" {
+    var io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_backend.deinit();
+    const io = io_backend.io();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+    // The recursion ACL allows one network only, and the peer is on the
+    // loopback, so the ACL refuses it.
+    var policy = resolver_mod.Policy{};
+    policy.recursion_allow[0] = try config_mod.Cidr.parse("10.0.0.0/8");
+    policy.recursion_allow_len = 1;
+    runtime.resolver = try resolver_mod.Resolver.init(std.testing.allocator, io, policy);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestIdentity(tmp.dir, io);
+
+    var server: tls_server.Server = undefined;
+    try server.init(allocator, io, tmp.dir, "cert.pem", "key.pem", DOT_ALPN);
+    defer server.deinit();
+
+    var query_buffer: [512]u8 = undefined;
+    // The query carries EDNS(0), so the refusal can carry the EDE option that
+    // says why it was refused.
+    const query = try @import("../cli/query.zig").buildQueryPacketWithEdns(&query_buffer, 0x2222, "example.com.", .A, .{ .dnssec_ok = true });
+    const answer_bytes = try dotTlsAnswer(allocator, io, &server, &runtime, query);
+    const answer = try dns_message.Message.parse(allocator, answer_bytes);
+
+    // RFC 8914 section 4.21: the refusal carries the EDE code that says the
+    // operator's recursion ACL refused the client. The cleartext TCP path
+    // refuses the same peer the same way.
+    try std.testing.expect(answer.header.qr);
+    try std.testing.expectEqual(dns_header.Rcode.refused, answer.header.rcode);
+    const options = messageOptions(&answer).?;
+    const ede = dns_rdata.findOption(options, ede_option_code).?;
+    try std.testing.expectEqual(@as(u16, 18), std.mem.readInt(u16, ede[0..2], .big));
+}
+
+test "a DoT peer that dribbles handshake bytes is dropped inside the handshake window" {
+    var io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_backend.deinit();
+    const io = io_backend.io();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestIdentity(tmp.dir, io);
+
+    var server: tls_server.Server = undefined;
+    try server.init(allocator, io, tmp.dir, "cert.pem", "key.pem", DOT_ALPN);
+    defer server.deinit();
+
+    var bind_address = std.Io.net.IpAddress{ .ip4 = .loopback(0) };
+    var listener_socket = try std.Io.net.IpAddress.listen(&bind_address, io, .{ .reuse_address = true });
+    defer listener_socket.deinit(io);
+    const port = listener_socket.socket.address.getPort();
+
+    // The handshake window is short, so the dribbling peer is dropped at
+    // once instead of holding the connection for the production timeout.
+    const handshake_window = tcp_deadline.Timeout{ .seconds = 1, .microseconds = 0 };
+    const thread = try std.Thread.spawn(.{}, serveOneConnectionWithTimeout, .{ &listener_socket, io, &server, &runtime, handshake_window });
+
+    var address = std.Io.net.IpAddress{ .ip4 = .loopback(port) };
+    const stalled = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer stalled.close(io);
+    var stalled_output: [tls_server.output_buffer_len]u8 = undefined;
+    var stalled_writer = stalled.writer(io, &stalled_output);
+    // A valid record header, and then a body that never arrives whole: the
+    // handshake never completes.
+    try stalled_writer.interface.writeAll(&.{ 0x16, 0x03, 0x03, 0x00, 0x64 });
+    try stalled_writer.interface.flush();
+
+    var stop = std.atomic.Value(bool).init(false);
+    var sent = std.atomic.Value(usize).init(0);
+    const dribbler = try std.Thread.spawn(.{}, dribbleHandshake, .{ io, stalled.socket.handle, &stop, &sent });
+    defer {
+        stop.store(true, .release);
+        dribbler.join();
+    }
+
+    // The handshake window is over, so the server drops the connection even
+    // though the peer keeps sending handshake bytes.
+    try std.testing.expect(readUntilEof(stalled.socket.handle, 3000));
+    // The peer really dribbled: the server dropped the connection while the
+    // bytes were still coming.
+    try std.testing.expect(sent.load(.monotonic) > 4);
+
+    thread.join();
+}
+
+/// The dribbling peer: one handshake byte every interval, so the peer never
+/// lets the server wait long enough for a read to time out. The counter holds
+/// the bytes the peer sent, so a test can tell a dribbling peer from a
+/// silent one.
+fn dribbleHandshake(io: std.Io, fd: std.posix.fd_t, stop: *std.atomic.Value(bool), sent: *std.atomic.Value(usize)) void {
+    while (!stop.load(.acquire)) {
+        const result = std.posix.system.write(fd, &.{0x00}, 1);
+        if (std.posix.errno(result) != .SUCCESS) return;
+        const count: usize = @intCast(result);
+        if (count == 0) return;
+        _ = sent.fetchAdd(1, .monotonic);
+        std.Io.sleep(io, .fromMilliseconds(50), .awake) catch return;
+    }
+}
+
+/// Reads what the peer still sends until the connection ends. False means the
+/// connection was still open when the budget was over.
+fn readUntilEof(fd: std.posix.fd_t, budget_ms: i32) bool {
+    var buffer: [256]u8 = undefined;
+    while (true) {
+        var poll_fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+        const count = std.posix.poll(&poll_fds, budget_ms) catch return false;
+        if (count == 0) return false;
+        const read_count = std.posix.read(fd, &buffer) catch return true;
+        if (read_count == 0) return true;
+    }
 }
 
 test "DoT answers a query over a real TLS 1.3 handshake with the dot ALPN token" {
@@ -895,7 +1232,7 @@ test "the DoT listener answers a query over the bound port" {
     const port = listener_socket.socket.address.getPort();
 
     // The listener serves one connection and then stops, so the test ends.
-    const thread = try std.Thread.spawn(.{}, serveDotLoop, .{ &listener_socket, io, &runtime, &server, @as(?usize, 1) });
+    const thread = try std.Thread.spawn(.{}, serveDotLoop, .{ &listener_socket, io, &runtime, &server, @as(?usize, 1), @as(?*metrics.Counters, null) });
 
     var address = std.Io.net.IpAddress{ .ip4 = .loopback(port) };
     const stream = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp });
@@ -1068,3 +1405,15 @@ const padding_a_query = &[_]u8{
     0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x0c, 0x00, 0x04, 0x00, 0x00,
     0x00, 0x00,
 };
+
+/// The same query with an OPT record that advertises EDNS(0) and carries no
+/// option at all: the request that asks for an unpadded answer.
+const no_padding_a_query = &[_]u8{
+    0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+    3,    'd',  'n',  's',  4,    'h',  'o',  'm',  'e',  4,    'a',  'r',
+    'p',  'a',  0,    0x00, 0x01, 0x00, 0x01, 0,    0x00, 0x29, 0x04, 0xd0,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+};
+
+/// The RFC 8914 section 3 EDNS option code of the Extended DNS Error.
+const ede_option_code: u16 = 15;

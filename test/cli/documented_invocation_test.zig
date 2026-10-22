@@ -58,7 +58,7 @@ const child_deadline = std.Io.Timeout{ .duration = .{
     .clock = .awake,
 } };
 
-const Transport = enum { udp, tcp, doh, xfr };
+const Transport = enum { udp, tcp, dot, doh, xfr };
 
 const Kind = enum {
     /// `--help`, `--version`: runs and exits 0.
@@ -320,9 +320,12 @@ fn classify(allocator: std.mem.Allocator, io: std.Io, tmp_prefix: []const u8, ar
         // the real listener and drives one transfer over the handshake.
         if (hasFlag(argv, "--serve-xfr")) return classifyXfr(allocator, argv, tls_cert, tls_key);
 
-        // The transports this build cannot serve refuse; `--serve-dot` is
-        // served, so its refusal has to come from the identity.
-        if (hasFlag(argv, "--serve-dot")) return classifyRefusal(allocator, "--serve-dot", tls_cert, tls_key);
+        // The DoT port is served now, so the case runs the real listener and
+        // drives one DoT exchange over the handshake.
+        if (hasFlag(argv, "--serve-dot")) return classifyDot(allocator, argv, tls_cert, tls_key);
+
+        // The transports this build cannot serve refuse; the encrypted ones
+        // are served, so their refusal has to come from the identity.
 
         switch (flagCount(argv)) {
             0 => return plain(argv, .usage_refusal, port),
@@ -396,6 +399,33 @@ fn classifyDoh(allocator: std.mem.Allocator, argv: []const []const u8, tls_cert:
     };
 }
 
+/// `--serve-dot` is served: the case runs the real listener with a loadable
+/// identity and drives one DoT exchange over TLS. The documented invocation
+/// names no listener, so the port is the CLI default.
+fn classifyDot(allocator: std.mem.Allocator, argv: []const []const u8, tls_cert: []const u8, tls_key: []const u8) !Case {
+    var out: std.ArrayList([]const u8) = .empty;
+    try out.appendSlice(allocator, argv);
+    try out.append(allocator, "--enable-encrypted-dns");
+    try out.append(allocator, "--tls-cert-file");
+    try out.append(allocator, tls_cert);
+    try out.append(allocator, "--tls-key-file");
+    try out.append(allocator, tls_key);
+    // One connection is the whole quota, so the server stops on its own.
+    try out.append(allocator, "--max-requests");
+    try out.append(allocator, "1");
+    // The metrics run proves the DoT query counter moves in the server.
+    try out.append(allocator, "--print-metrics");
+    return .{
+        .documented = argv,
+        .executed = try out.toOwnedSlice(allocator),
+        .kind = .serve,
+        .transport = .dot,
+        .quota = 1,
+        .port = documented_port,
+        .metrics = true,
+    };
+}
+
 /// A flag the prose names without a complete invocation of its own. The
 /// transports this build serves run their real listener; a transport that
 /// still cannot be served refuses with its own reason.
@@ -403,6 +433,10 @@ fn classifyProseFlag(allocator: std.mem.Allocator, flag: []const u8, tls_cert: [
     if (std.mem.eql(u8, flag, "--serve-xfr")) {
         const argv = [_][]const u8{ "server", "run", "--zone-file", "examples/zones/home.arpa.zone", "--serve-xfr" };
         return classifyXfr(allocator, &argv, tls_cert, tls_key);
+    }
+    if (std.mem.eql(u8, flag, "--serve-dot")) {
+        const argv = [_][]const u8{ "server", "run", "--zone-file", "examples/zones/home.arpa.zone", "--serve-dot" };
+        return classifyDot(allocator, &argv, tls_cert, tls_key);
     }
     return classifyRefusal(allocator, flag, tls_cert, tls_key);
 }
@@ -669,6 +703,7 @@ fn runServe(allocator: std.mem.Allocator, io: std.Io, case: Case, argv: []const 
     const drive = switch (case.transport) {
         .udp => Drive{ .served = driveUdp(io, address, case.quota) },
         .tcp => driveTcp(allocator, io, address, case.quota),
+        .dot => driveDot(allocator, io, address, case.quota),
         .doh => driveDoh(allocator, io, address, case.quota),
         .xfr => driveXfr(allocator, io, address, case.quota),
     };
@@ -690,7 +725,9 @@ fn runServe(allocator: std.mem.Allocator, io: std.Io, case: Case, argv: []const 
     const stdout = try tmp.dir.readFileAlloc(io, "out", allocator, .limited(1024 * 1024));
     const stderr = try tmp.dir.readFileAlloc(io, "err", allocator, .limited(1024 * 1024));
 
-    const metrics_ok = !case.metrics or std.mem.indexOf(u8, stdout, "zimdns_queries_total") != null;
+    // The DoT port counts its own queries, so its counter has to move too.
+    const metrics_ok = !case.metrics or (std.mem.indexOf(u8, stdout, "zimdns_queries_total") != null and
+        (case.transport != .dot or std.mem.indexOf(u8, stdout, "zimdns_dot_queries_total 1") != null));
     if (served == case.quota and code == 0 and metrics_ok) return true;
 
     const note = if (served != case.quota)
@@ -754,6 +791,60 @@ fn driveTcp(allocator: std.mem.Allocator, io: std.Io, address: std.Io.net.IpAddr
     // count, is what stops this from spinning out before the child binds.
     while (drive.served < quota and !expired(io, deadline)) {
         exchangeTcpOnce(allocator, io, address) catch |err| {
+            drive.last_error = @errorName(err);
+            continue;
+        };
+        drive.served += 1;
+    }
+    return drive;
+}
+
+/// One DoT exchange over TLS: the handshake with the "dot" ALPN token, a
+/// query in the RFC 7858 section 3.3 framing, and the answer that comes back.
+fn exchangeDotOnce(allocator: std.mem.Allocator, io: std.Io, address: std.Io.net.IpAddress) !void {
+    const stream = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer stream.close(io);
+
+    var client_input: [tls.input_buffer_len]u8 = undefined;
+    var client_output: [tls.output_buffer_len]u8 = undefined;
+    var client_reader = stream.reader(io, &client_input);
+    var client_writer = stream.writer(io, &client_output);
+    var rng_source: std.Random.IoSource = .{ .io = io };
+    var connection = try tls.client(&client_reader.interface, &client_writer.interface, .{
+        .rng = rng_source.interface(),
+        .host = "localhost",
+        .root_ca = .empty,
+        .insecure_skip_verify = true,
+        .now = std.Io.Clock.real.now(io),
+        .alpn_protocols = &.{"dot"},
+    });
+    defer connection.close() catch {};
+
+    var read_buffer: [4096]u8 = undefined;
+    var write_buffer: [4096]u8 = undefined;
+    var connection_reader = connection.reader(&read_buffer);
+    var connection_writer = connection.writer(&write_buffer);
+
+    var packet: [512]u8 = undefined;
+    const query = try cli_query.buildQueryPacket(&packet, 0x5eed, "dns.home.arpa.", .A, false);
+    var prefix: [2]u8 = undefined;
+    std.mem.writeInt(u16, &prefix, @intCast(query.len), .big);
+    try connection_writer.interface.writeAll(&prefix);
+    try connection_writer.interface.writeAll(query);
+    try connection_writer.interface.flush();
+
+    const length_bytes = try connection_reader.interface.takeArray(2);
+    const length = std.mem.readInt(u16, length_bytes, .big);
+    const body = try connection_reader.interface.take(length);
+    const message = try zimdns.dns_message.Message.parse(allocator, body);
+    if (message.header.answer_count != 1) return error.DotNoAnswer;
+}
+
+fn driveDot(allocator: std.mem.Allocator, io: std.Io, address: std.Io.net.IpAddress, quota: usize) Drive {
+    var drive: Drive = .{};
+    const deadline = readyDeadline(io);
+    while (drive.served < quota and !expired(io, deadline)) {
+        exchangeDotOnce(allocator, io, address) catch |err| {
             drive.last_error = @errorName(err);
             continue;
         };

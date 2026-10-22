@@ -19,6 +19,7 @@ const signer = @import("../zone/signer.zig");
 const journal_mod = @import("../zone/journal.zig");
 
 const validate_mod = @import("../dns/validate.zig");
+const dns_name = @import("../dns/name.zig");
 const RecordType = @import("../dns/types.zig").RecordType;
 const tsig = @import("../dns/tsig.zig");
 /// RFC 4034 section 3.1.5 signature window for a zone signed at startup. The
@@ -265,6 +266,14 @@ pub const ServerContext = struct {
             decodeNsid(self.allocator, text) catch return error.BadConfiguration
         else
             null;
+        // RFC 9567 section 5: the agent domain is a domain name, and the
+        // option carries it in wire form, so it is parsed into a name here.
+        // A value that is not a domain name stops the server at startup
+        // rather than advertising a channel nobody can report to.
+        const report_agent = if (self.config.errorReportAgentText()) |text|
+            agentDomainName(text) catch return error.BadConfiguration
+        else
+            null;
         // Per-zone override apexes outlive the config text: lowercased with a
         // trailing dot, owned by the runtime. Decoded before the runtime
         // exists, so a failure here leaves the context whole.
@@ -298,6 +307,7 @@ pub const ServerContext = struct {
             except_owned = null;
         }
         runtime.answer_policy.nsid = nsid;
+        runtime.answer_policy.report_agent = report_agent;
         runtime.answer_policy.zoneversion = self.config.zoneversion;
         if (self.config.minimal_any_ttl) |ttl| runtime.answer_policy.minimal_any_ttl = ttl;
         if (self.config.minimal_any_ttl_tcp) |ttl| runtime.answer_policy.minimal_any_ttl_tcp = ttl;
@@ -408,6 +418,23 @@ fn decodeNsid(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     _ = std.fmt.hexToBytes(bytes, text) catch return error.BadConfiguration;
     return bytes;
 }
+/// RFC 9567 section 5: the agent domain an operator configured, as the name
+/// the Report-Channel option carries. A name written without its trailing
+/// dot is completed, and a value that is not a domain name is refused, so a
+/// broken agent domain stops the server instead of advertising a channel
+/// nobody can report to.
+fn agentDomainName(text: []const u8) !dns_name.Name {
+    if (text.len == 0) return error.BadConfiguration;
+    var buffer: [256]u8 = undefined;
+    const absolute = if (text[text.len - 1] == '.') text else blk: {
+        if (text.len + 1 > buffer.len) return error.BadConfiguration;
+        @memcpy(buffer[0..text.len], text);
+        buffer[text.len] = '.';
+        break :blk buffer[0 .. text.len + 1];
+    };
+    return dns_name.Name.fromText(absolute) catch error.BadConfiguration;
+}
+
 /// Lowercase an override apex with its trailing dot, for comparison against
 /// `local_zone.Zone.apex`. The parser stores raw text; the runtime compares
 /// case-insensitively, but canonicalizing here keeps one comparison path.

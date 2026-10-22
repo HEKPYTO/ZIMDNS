@@ -340,6 +340,11 @@ pub const Config = struct {
     /// unconfigured server answers no NSID at all.
     nsid: Text = .{},
     has_nsid: bool = false,
+    /// RFC 9567 section 5: the agent domain the server advertises in the
+    /// Report-Channel option. There is no default, so an unconfigured server
+    /// advertises no agent at all.
+    error_report_agent: Text = .{},
+    has_error_report_agent: bool = false,
     /// RFC 9660 section 3.2 lets a server decline to answer ZONEVERSION.
     /// Default on: the value is the answer's own SOA serial.
     zoneversion: bool = true,
@@ -431,6 +436,11 @@ pub const Config = struct {
         return self.nsid.text();
     }
 
+    pub fn errorReportAgentText(self: *const Config) ?[]const u8 {
+        if (!self.has_error_report_agent) return null;
+        return self.error_report_agent.text();
+    }
+
     pub fn parse(text: []const u8) !Config {
         var config = Config{};
         var lines = std.mem.splitScalar(u8, text, '\n');
@@ -462,6 +472,7 @@ pub const Config = struct {
         if (std.mem.eql(u8, first, "encrypted-dns")) return self.parseEncryptedDns(&tokens);
         if (std.mem.eql(u8, first, "local-zones")) return self.parseLocalZones(&tokens);
         if (std.mem.eql(u8, first, "nsid")) return self.parseNsid(&tokens);
+        if (std.mem.eql(u8, first, "error-report-agent")) return self.parseErrorReportAgent(&tokens);
         if (std.mem.eql(u8, first, "zoneversion")) return self.parseZoneversion(&tokens);
         if (std.mem.eql(u8, first, "minimal-any-ttl")) return self.parseMinimalAnyTtl(&tokens);
         if (std.mem.eql(u8, first, "minimal-any-ttl-tcp")) return self.parseMinimalAnyTtlTcp(&tokens);
@@ -652,6 +663,15 @@ pub const Config = struct {
         }
         try self.nsid.set(value);
         self.has_nsid = true;
+    }
+
+    fn parseErrorReportAgent(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        if (self.has_error_report_agent) return Error.BadDirective;
+        const value = tokens.next() orelse return Error.BadDirective;
+        try requireNoTrailingTokens(tokens);
+        if (value.len == 0) return Error.BadDirective;
+        try self.error_report_agent.set(value);
+        self.has_error_report_agent = true;
     }
 
     fn parseZoneversion(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {

@@ -501,10 +501,22 @@ fn dnskeyZoneKeyBit(raw: []const u8) bool {
     return raw.len >= 4 and (raw[0] & 0x01) != 0;
 }
 
+/// The revoked-key policy of this validator, in one place.
+/// RFC 5011 section 2.1: "Once the resolver sees the REVOKE bit, it MUST NOT
+/// use this key as a trust anchor." Section 3 says when the resolver sees it:
+/// the bit counts only "AND the resolver sees an RRSIG(DNSKEY) signed by the
+/// associated key", so the signature the key made over the DNSKEY RRset is
+/// what proves a revocation and the bit alone proves nothing.
+/// The proof depends on where the key comes from:
+/// - A key the zone published in its own DNSKEY RRset: the proof is the
+///   RRSIG that key made over that RRset, which `selfRevoked` looks for.
+/// - A configured DNSKEY anchor: the anchor file holds no RRset and so has
+///   no signature to see. The operator's file is the proof there, and an
+///   operator who writes a revoked key into the anchor file has revoked it.
 /// RFC 5011 section 3: bit 8 of the DNSKEY Flags field is the REVOKE flag.
 /// The flags are a 16-bit field, so bit 8 is the high bit of the second
 /// octet (0x0080).
-fn dnskeyRevokeBit(raw: []const u8) bool {
+fn revokedKey(raw: []const u8) bool {
     return raw.len >= 4 and (raw[1] & 0x80) != 0;
 }
 
@@ -937,9 +949,11 @@ const Validator = struct {
             if (!dnskeyZoneKeyBit(anchor.rdata)) continue;
             if (!algorithmSupported(anchor.rdata[3])) continue;
             // RFC 5011 section 2.1: "Once the resolver sees the REVOKE bit, it
-            // MUST NOT use this key as a trust anchor". An operator who
-            // writes a revoked key into the anchor file has revoked it.
-            if (dnskeyRevokeBit(anchor.rdata)) continue;
+            // MUST NOT use this key as a trust anchor". The anchor file holds
+            // no RRset and so no self-signature to see, and the operator's
+            // file is the proof there: an operator who writes a revoked key
+            // into the anchor file has revoked it.
+            if (revokedKey(anchor.rdata)) continue;
             try keys.append(self.allocator, anchor.rdata);
         }
         if (keys.items.len == 0) try self.keysFromDs(&keys, signer);
@@ -1073,10 +1087,10 @@ const Validator = struct {
             for (keys.items) |key| {
                 verifyWithKey(key, rrsig, data) catch continue;
                 // The key signed the apex DNSKEY RRset it belongs to, so the
-                // RRset is self-signed by it: RFC 5011 sections 2.1 and 3
-                // make the key revoked, and a revoked key is invalid for
-                // every purpose except validating the revocation.
-                if (dnskeyRevokeBit(key)) continue;
+                // proof RFC 5011 section 3 names is in hand: a key that
+                // carries the REVOKE bit is revoked, and a revoked key is
+                // invalid for every purpose except validating the revocation.
+                if (revokedKey(key)) continue;
                 authenticated = true;
                 break;
             }
@@ -1096,14 +1110,12 @@ const Validator = struct {
         try self.addZoneKeys(keys, apex);
     }
 
-    /// RFC 5011 section 2.1: a key is revoked when the resolver sees it in a
-    /// self-signed RRset and the key has the REVOKE bit set. Section 3 says
-    /// the same: the bit counts only "AND the resolver sees an RRSIG(DNSKEY)
-    /// signed by the associated key". The signature the key made over the
-    /// DNSKEY RRset is what proves the revocation, so the bit alone proves
-    /// nothing.
+    /// Whether the key signed the apex DNSKEY RRset it belongs to, which is
+    /// the proof RFC 5011 section 3 names for a revocation: the signature the
+    /// key made over that RRset, and not the bit alone. `revokedKey` states
+    /// the policy both trust paths follow.
     fn selfRevoked(self: *Validator, apex: *const Rrset, key_rdata: []const u8) Error!bool {
-        if (!dnskeyRevokeBit(key_rdata)) return false;
+        if (!revokedKey(key_rdata)) return false;
         for (self.rrsigs.items) |rrsig| {
             if (rrsig.covered != RecordType.DNSKEY.code() or !rrsig.owner.eql(&apex.owner)) continue;
             const data = try signedData(self.allocator, apex.records.items, rrsig);
@@ -1118,8 +1130,8 @@ const Validator = struct {
     /// in it can sign the zone's other RRsets, so the zone-signing key's
     /// signatures count. RFC 4034 section 2.1.1 keeps a key without the Zone
     /// Key flag out, and a key this build cannot verify with is no key at all.
-    /// RFC 5011 section 2.1 keeps a revoked key out as well: it is invalid
-    /// for every purpose except validating the revocation.
+    /// RFC 5011 section 2.1 keeps a revoked key out as well (`revokedKey`):
+    /// it is invalid for every purpose except validating the revocation.
     fn addZoneKeys(self: *Validator, keys: *std.ArrayList([]const u8), apex: *const Rrset) Error!void {
         for (apex.records.items) |record| {
             const raw = try encodeRdata(self.allocator, record.rrtype.code(), record.rdata);
@@ -2601,31 +2613,6 @@ test "a DNSKEY without the Zone Key flag is not trusted" {
     try expectStatus(.bogus, result);
 }
 
-test "RFC 5011 section 3: the REVOKE flag is bit 8 of the DNSKEY flags field" {
-    const allocator = std.testing.allocator;
-    const pair = try Ed25519.KeyPair.generateDeterministic(@splat(0x51));
-    // Zone Key (bit 7) with REVOKE (bit 8) set.
-    const revoked = try ed25519DnskeyRdata(allocator, 0x0180, pair);
-    defer allocator.free(revoked);
-    // The same key without the REVOKE bit.
-    const zone_key = try ed25519DnskeyRdata(allocator, 0x0100, pair);
-    defer allocator.free(zone_key);
-
-    // The flags are a 16-bit field, so bit 8 is the high bit of the second
-    // octet, and the Zone Key flag (bit 7) sits in the first one.
-    try std.testing.expectEqual(@as(u8, 0x80), revoked[1] & 0x80);
-    try std.testing.expectEqual(@as(u8, 0x01), revoked[0] & 0x01);
-    try std.testing.expect(dnskeyRevokeBit(revoked));
-    try std.testing.expect(!dnskeyRevokeBit(zone_key));
-    // The SEP flag (bit 15) is the low bit of the second octet, and it is not
-    // the REVOKE bit.
-    const sep_key = try ed25519DnskeyRdata(allocator, 0x0101, pair);
-    defer allocator.free(sep_key);
-    try std.testing.expect(!dnskeyRevokeBit(sep_key));
-    // A DNSKEY too short to hold the flags is not revoked.
-    try std.testing.expect(!dnskeyRevokeBit("abc"));
-}
-
 test "RFC 5011 section 2.1: a revoked key in a self-signed DNSKEY RRset is not used to verify the zone" {
     const allocator = std.testing.allocator;
     var signed = try signZoneText(allocator, child_zone_text, ed25519_secret);
@@ -2675,6 +2662,98 @@ test "RFC 5011 section 2.1: a revoked key in a self-signed DNSKEY RRset is not u
     // so the DS matches no usable key and the zone has no chain of trust.
     // RFC 4035 section 5.2 makes that insecure, not bogus.
     try expectStatus(.insecure, try validate(allocator, &anchors, pair.query, pair.response, &.{}, now_seconds));
+}
+
+test "RFC 5011 section 3: a key that carries the REVOKE bit but did not sign the DNSKEY RRset is not revoked" {
+    const allocator = std.testing.allocator;
+    var signed = try signZoneText(allocator, child_zone_text, ed25519_secret);
+    defer signed.deinit(allocator);
+    var pair = try exchange(allocator, &signed.zone, "www.example.com.", .A, .no_error, "www.example.com.", null);
+    defer pair.query.deinit();
+    defer pair.response.deinit();
+
+    // Two keys in the apex DNSKEY RRset: the one the DS names, and one that
+    // carries the REVOKE bit.
+    const ksk_pair = try Ed25519.KeyPair.generateDeterministic(@splat(0x53));
+    const ksk_dnskey = try ed25519DnskeyRdata(allocator, 0x0100, ksk_pair);
+    defer allocator.free(ksk_dnskey);
+    const revoked_pair = try Ed25519.KeyPair.generateDeterministic(@splat(0x54));
+    const revoked_dnskey = try ed25519DnskeyRdata(allocator, 0x0180, revoked_pair);
+    defer allocator.free(revoked_dnskey);
+
+    // The zone publishes both keys, and only the first signs the DNSKEY
+    // RRset. The REVOKE bit of the second is there, but the proof RFC 5011
+    // section 3 names -- that key's own signature over the RRset -- is not.
+    try setApexDnskey(&pair.response, ksk_dnskey);
+    try pair.response.authorities.append(.{
+        .owner = try Name.fromText("example.com."),
+        .rrtype = .DNSKEY,
+        .class = .IN,
+        .ttl = 3600,
+        .rdata = .{ .Unknown = .{ .len = @intCast(revoked_dnskey.len), .borrowed = revoked_dnskey } },
+    });
+    keepApexDnskey(&pair.response.authorities);
+
+    const apex = try Name.fromText("example.com.");
+    var dnskey_records: [2]*const dns_record.ResourceRecord = undefined;
+    var found: usize = 0;
+    for (pair.response.authorities.items[0..pair.response.authorities.len]) |*record| {
+        if (!record.rrtype.eql(.DNSKEY)) continue;
+        dnskey_records[found] = record;
+        found += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), found);
+    const self_signature = try forgeRrsig(allocator, apex, apex, RecordType.DNSKEY.code(), &dnskey_records, ksk_dnskey, ksk_pair);
+    defer allocator.free(self_signature);
+    try replaceRrsig(&pair.response.authorities, RecordType.DNSKEY, self_signature);
+
+    // The answer is signed by the key that carries the REVOKE bit and did
+    // not sign the DNSKEY RRset, so nothing but the policy decides whether
+    // that key is trusted.
+    const answer = &pair.response.answers.items[0];
+    const answer_records = [_]*const dns_record.ResourceRecord{answer};
+    const owner = try Name.fromText("www.example.com.");
+    const answer_signature = try forgeRrsig(allocator, owner, apex, RecordType.A.code(), &answer_records, revoked_dnskey, revoked_pair);
+    defer allocator.free(answer_signature);
+    try replaceRrsig(&pair.response.answers, RecordType.A, answer_signature);
+
+    // The DS at the parent names the key that signed the DNSKEY RRset.
+    var anchors = try dsAnchor(allocator, "example.com.", ksk_dnskey, false);
+    defer anchors.deinit(allocator);
+
+    // RFC 5011 section 3: the bit counts only where the resolver saw the key
+    // sign the DNSKEY RRset, and this key did not, so it is not revoked and
+    // it stays in the trusted set. RFC 4035 section 5.3.1 trusts every key
+    // of an authenticated DNSKEY RRset, so the answer validates secure.
+    const result = try validate(allocator, &anchors, pair.query, pair.response, &.{}, now_seconds);
+    try expectStatus(.secure, result);
+    try std.testing.expectEqual(@as(u16, 0), result.ede);
+}
+
+test "RFC 5011 section 2.1: a configured DNSKEY anchor that carries the REVOKE bit is not a trust anchor" {
+    const allocator = std.testing.allocator;
+    var signed = try signZoneText(allocator, child_zone_text, ed25519_secret);
+    defer signed.deinit(allocator);
+    var pair = try exchange(allocator, &signed.zone, "www.example.com.", .A, .no_error, "www.example.com.", null);
+    defer pair.query.deinit();
+    defer pair.response.deinit();
+
+    // The anchor an operator wrote carries the REVOKE bit. The anchor file
+    // holds no RRset and so has no self-signature to see: the operator's
+    // file is the proof that the key is revoked.
+    const revoked = try allocator.dupe(u8, signed.dnskey);
+    defer allocator.free(revoked);
+    revoked[1] |= 0x80;
+    var anchors = try dnskeyAnchor(allocator, "example.com.", revoked);
+    defer anchors.deinit(allocator);
+
+    // RFC 5011 section 2.1: a revoked key is not a trust anchor, so the zone
+    // has no chain of trust and RFC 4035 section 5.2 leaves the answer
+    // insecure rather than bogus. RFC 8914 has no code that names a revoked
+    // key, so the client is told the status is indeterminate.
+    const result = try validate(allocator, &anchors, pair.query, pair.response, &.{}, now_seconds);
+    try expectStatus(.insecure, result);
+    try std.testing.expectEqual(dnssec.EDE_DNSSEC_INDETERMINATE, result.ede);
 }
 
 test "a zone with one key still validates secure" {

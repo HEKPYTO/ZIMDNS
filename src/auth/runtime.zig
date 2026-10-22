@@ -116,8 +116,9 @@ pub const Runtime = struct {
     /// trailing dot, heap-owned. Empty unless configured.
     local_zones_except: []const []const u8 = &.{},
     /// What an authoritative answer may carry back in its OPT record, from the
-    /// `nsid` and `zoneversion` directives. `nsid` is heap-owned so it outlives
-    /// the config text it was decoded from.
+    /// `nsid`, `zoneversion`, and `error-report-agent` directives. `nsid` is
+    /// heap-owned so it outlives the config text it was decoded from; the
+    /// agent domain is a name, so it is inline and owns nothing.
     answer_policy: response.AnswerPolicy = .{},
     /// The signing material of a signed zone, kept so the answer path can sign
     /// an RRset that is not in the zone file (RFC 8482 section 4.2). Null

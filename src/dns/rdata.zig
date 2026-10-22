@@ -79,6 +79,9 @@ pub const EDNS_TCP_KEEPALIVE_OPTION_CODE: u16 = 11;
 /// RFC 7314 section 2: the EXPIRE option, zero-length in a query and four
 /// octets of SOA EXPIRE seconds in the answer.
 pub const EDNS_EXPIRE_OPTION_CODE: u16 = 9;
+/// RFC 9567 section 5: the Report-Channel option, whose payload carries the
+/// agent domain that error reports are sent to.
+pub const EDNS_REPORT_CHANNEL_OPTION_CODE: u16 = 18;
 
 /// RFC 9460 SVCB/HTTPS SvcParam keys with assigned presentation names.
 pub const SVCB_MANDATORY_KEY: u16 = 0;

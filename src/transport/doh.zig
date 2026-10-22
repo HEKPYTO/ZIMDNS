@@ -1,16 +1,21 @@
 /// Contract: Serves the RFC 8484 DNS-over-HTTPS message mapping (GET
 /// /dns-query?dns=<base64url> and POST /dns-query with application/dns-message
-/// bodies) over a TLS 1.3 channel, sharing runtime.answer with the Do53/DoT
-/// paths. The listener in this module binds the port, terminates the
-/// handshake with the "http/1.1" ALPN token, and only then speaks HTTP/1.1
-/// exchanges, so the port never answers in cleartext: a client that offers no
-/// common token is refused with the RFC 7301 no_application_protocol alert.
+/// bodies) over a TLS 1.3 channel, sharing the runtime's TCP answer path with
+/// the Do53/DoT paths: the peer address of the accepted connection reaches
+/// the recursion policy, the cookie check, and the locally served zones, the
+/// same way it does on the cleartext TCP port. The listener in this module
+/// binds the port, terminates the handshake with the "http/1.1" ALPN token,
+/// and only then speaks HTTP/1.1 exchanges, so the port never answers in
+/// cleartext: a client that offers no common token is refused with the
+/// RFC 7301 no_application_protocol alert.
 /// The channel carries the same bounds the cleartext TCP listener carries: at
 /// most MAX_EXCHANGES_PER_CONNECTION exchanges per connection, the operator's
-/// per-source connection cap, a worker bound, and a per-frame socket
-/// deadline. HTTP/2 framing additionally needs the reviewed HTTP/2
-/// dependency, so this module is the HTTP/1.1 mapping subset, not a full
-/// RFC 8484 transport claim.
+/// per-source connection cap, a worker bound, a per-frame socket deadline, and
+/// the operator's connection-duration limit. A DoH connection lives no longer
+/// than the connection duration the operator configured, the same bound the
+/// cleartext TCP listener enforces. HTTP/2 framing additionally needs the
+/// reviewed HTTP/2 dependency, so this module is the HTTP/1.1 mapping subset,
+/// not a full RFC 8484 transport claim.
 /// Ownership: Request/response scratch lives in caller buffers or a
 /// per-exchange arena; runtime zones stay borrowed.
 /// Errors: HTTP mapping failures map to HTTP status codes and never reach
@@ -19,12 +24,16 @@ const std = @import("std");
 const tls = @import("tls");
 const Runtime = @import("../auth/runtime.zig").Runtime;
 const cli_query = @import("../cli/query.zig");
+const config_parser = @import("../config/parser.zig");
+const dns_header = @import("../dns/header.zig");
 const metrics = @import("../metrics.zig");
 const dns_message = @import("../dns/message.zig");
 const dns_padding = @import("../dns/padding.zig");
 const dns_rdata = @import("../dns/rdata.zig");
 const dns_types = @import("../dns/types.zig");
 const dns_writer = @import("../dns/writer.zig");
+const resolver_mod = @import("../resolver.zig");
+const zone_index = @import("../zone/index.zig");
 const tcp_deadline = @import("../platform/tcp_deadline.zig");
 const listener = @import("../platform/listener.zig");
 const tls_policy = @import("tls.zig");
@@ -41,6 +50,9 @@ pub const MAX_CONNECTION_WORKERS = listener.TCP_MAX_CONNECTION_WORKERS;
 pub const MAX_BODY_LEN: usize = 65535;
 pub const MAX_HEADER_BYTES: usize = 8192;
 pub const MAX_EXCHANGES_PER_CONNECTION: usize = 16;
+/// The octets a request line or a header line ends with: the CRLF the
+/// reader strips before it hands the line over.
+const line_terminator_len: usize = 2;
 /// Five-second socket I/O budget shared with the Do53/DoT TCP paths.
 pub const DOH_IO_TIMEOUT = tcp_deadline.Timeout{ .seconds = 5 };
 /// HTTP/1.1 stream write buffering. The writer flushes incrementally, so a
@@ -61,7 +73,14 @@ pub const Error = error{
     BadContentType,
     BadBase64,
     BadDnsMessage,
-    EncodeFailed,
+    /// The request head ends in the middle of a line.
+    TruncatedRequest,
+    /// The request carries a transfer coding. This channel decodes no
+    /// chunked body, so such a request is refused.
+    TransferEncodingUnsupported,
+    /// The request carries two content lengths that differ, which makes
+    /// the body length ambiguous.
+    ConflictingContentLength,
 };
 
 const Status = enum(u16) {
@@ -69,7 +88,6 @@ const Status = enum(u16) {
     bad_request = 400,
     not_found = 404,
     method_not_allowed = 405,
-    uri_too_long = 414,
     unsupported_media_type = 415,
     request_header_fields_too_large = 431,
     payload_too_large = 413,
@@ -81,7 +99,6 @@ const Status = enum(u16) {
             .bad_request => "Bad Request",
             .not_found => "Not Found",
             .method_not_allowed => "Method Not Allowed",
-            .uri_too_long => "URI Too Long",
             .unsupported_media_type => "Unsupported Media Type",
             .request_header_fields_too_large => "Request Header Fields Too Large",
             .payload_too_large => "Payload Too Large",
@@ -97,6 +114,9 @@ fn statusForError(err: anyerror) Status {
         Error.HeadersTooLarge => .request_header_fields_too_large,
         Error.BodyTooLarge => .payload_too_large,
         Error.BadContentType => .unsupported_media_type,
+        Error.TruncatedRequest => .bad_request,
+        Error.TransferEncodingUnsupported => .bad_request,
+        Error.ConflictingContentLength => .bad_request,
         else => .bad_request,
     };
 }
@@ -124,7 +144,7 @@ fn readLine(reader: *std.Io.Reader, arena: std.mem.Allocator) ![]u8 {
         else => return Error.BadRequestLine,
     };
     const nl = reader.takeByte() catch |err| switch (err) {
-        error.EndOfStream => return Error.TruncatedBody,
+        error.EndOfStream => return Error.TruncatedRequest,
         else => return Error.BadRequestLine,
     };
     if (nl != '\n') return Error.BadRequestLine;
@@ -154,10 +174,12 @@ fn readRequest(reader: *std.Io.Reader, arena: std.mem.Allocator) !struct { head:
         .content_length = null,
         .close = std.mem.eql(u8, version, "HTTP/1.0"),
     };
-    var header_bytes: usize = request_line.len;
+    // The budget counts the octets the head really carries: every line
+    // ends with the CRLF the reader strips before it hands the line over.
+    var header_bytes: usize = request_line.len + line_terminator_len;
     while (true) {
         const line = try readLine(reader, arena);
-        header_bytes += line.len;
+        header_bytes += line.len + line_terminator_len;
         if (header_bytes > MAX_HEADER_BYTES) return Error.HeadersTooLarge;
         if (line.len == 0) break;
         const colon = std.mem.indexOfScalar(u8, line, ':') orelse return Error.BadRequestLine;
@@ -166,49 +188,62 @@ fn readRequest(reader: *std.Io.Reader, arena: std.mem.Allocator) !struct { head:
         if (std.ascii.eqlIgnoreCase(name, "content-type")) {
             head.content_type = arena.dupe(u8, value) catch return Error.BadRequestLine;
         } else if (std.ascii.eqlIgnoreCase(name, "content-length")) {
-            head.content_length = std.fmt.parseInt(usize, value, 10) catch return Error.BadRequestLine;
+            const length = std.fmt.parseInt(usize, value, 10) catch return Error.BadRequestLine;
+            // RFC 9112 section 6.3: two content lengths that differ leave
+            // the body length ambiguous, so the request is refused.
+            if (head.content_length) |first| {
+                if (first != length) return Error.ConflictingContentLength;
+            } else {
+                head.content_length = length;
+            }
+        } else if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
+            // RFC 9112 section 6.1: this channel decodes no chunked body,
+            // and a message that carries a transfer coding is refused
+            // rather than read as if it carried no body at all.
+            return Error.TransferEncodingUnsupported;
         } else if (std.ascii.eqlIgnoreCase(name, "connection")) {
             if (std.ascii.eqlIgnoreCase(value, "close")) head.close = true;
         }
     }
 
     var body: []u8 = &.{};
+    const declared = head.content_length orelse 0;
+    if (declared > MAX_BODY_LEN) return Error.BodyTooLarge;
     if (method_is_post) {
-        const length = head.content_length orelse return Error.BadRequestLine;
-        if (length > MAX_BODY_LEN) return Error.BodyTooLarge;
-        if (length == 0) return Error.BadRequestLine;
-        body = arena.alloc(u8, length) catch return Error.BadRequestLine;
+        // RFC 8484 section 4.2: the body of a POST carries the DNS message.
+        if (head.content_length == null or declared == 0) return Error.BadRequestLine;
+        body = arena.alloc(u8, declared) catch return Error.BadRequestLine;
         reader.readSliceAll(body) catch return Error.TruncatedBody;
+    } else if (declared > 0) {
+        // A body on a GET carries no query, but it has to leave the stream,
+        // so the next request starts at a request line again.
+        const discarded = arena.alloc(u8, declared) catch return Error.BadRequestLine;
+        reader.readSliceAll(discarded) catch return Error.TruncatedBody;
     }
     return .{ .head = head, .body = body };
 }
 
-fn pathOf(target: []const u8) []const u8 {
-    var rest = target;
-    if (std.mem.indexOf(u8, rest, "://")) |scheme_end| {
-        rest = rest[scheme_end + 3 ..];
-        if (std.mem.indexOfScalar(u8, rest, '/')) |slash| {
-            rest = rest[slash..];
-        } else {
-            return rest;
-        }
-    }
-    if (std.mem.indexOfScalar(u8, rest, '?')) |query_start| return rest[0..query_start];
-    return rest;
-}
+/// The path and the query of a request target. RFC 9112 section 3.2: the
+/// target of a request is in origin-form, but a client may send the
+/// absolute form, which carries the same path and query behind the
+/// authority.
+const Target = struct {
+    path: []const u8,
+    query: []const u8,
+};
 
-fn queryOf(target: []const u8) []const u8 {
+fn splitTarget(target: []const u8) Target {
     var rest = target;
     if (std.mem.indexOf(u8, rest, "://")) |scheme_end| {
         rest = rest[scheme_end + 3 ..];
         if (std.mem.indexOfScalar(u8, rest, '/')) |slash| {
             rest = rest[slash..];
         } else {
-            return &.{};
+            return .{ .path = rest, .query = &.{} };
         }
     }
-    const query_start = std.mem.indexOfScalar(u8, rest, '?') orelse return &.{};
-    return rest[query_start + 1 ..];
+    const query_start = std.mem.indexOfScalar(u8, rest, '?') orelse return .{ .path = rest, .query = &.{} };
+    return .{ .path = rest[0..query_start], .query = rest[query_start + 1 ..] };
 }
 
 /// Extracts the single RFC 8484 section 4.1 `dns` query parameter.
@@ -236,10 +271,11 @@ fn decodeQueryParam(arena: std.mem.Allocator, value: []const u8) Error![]u8 {
 
 /// Maps one parsed request to DNS wire bytes per RFC 8484 sections 4.1/4.2.
 pub fn dnsQueryFromRequest(arena: std.mem.Allocator, head: ParsedRequest, body: []u8) Error![]u8 {
-    if (!std.mem.eql(u8, pathOf(head.target), doh_path)) return Error.BadTarget;
+    const target = splitTarget(head.target);
+    if (!std.mem.eql(u8, target.path, doh_path)) return Error.BadTarget;
     if (head.method_is_get) {
         if (head.target.len > MAX_HEADER_BYTES) return Error.BadDnsMessage;
-        return decodeQueryParam(arena, try dnsParam(queryOf(head.target)));
+        return decodeQueryParam(arena, try dnsParam(target.query));
     }
     const content_type = head.content_type orelse return Error.BadContentType;
     if (!std.mem.eql(u8, content_type, dns_message_media_type)) return Error.BadContentType;
@@ -292,8 +328,10 @@ pub fn serveDohExchange(
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,
     arena: std.mem.Allocator,
-    runtime: *const Runtime,
+    runtime: *Runtime,
     counters: ?*metrics.Counters,
+    client: *const std.Io.net.IpAddress,
+    last_exchange: bool,
 ) !bool {
     const parsed = readRequest(reader, arena) catch |err| {
         if (err == error.EndOfStream) return error.EndOfStream;
@@ -306,10 +344,6 @@ pub fn serveDohExchange(
         try writer.flush();
         return true;
     };
-    if (counters) |value| {
-        value.queries_total += 1;
-        value.doh_queries_total += 1;
-    }
 
     // Everything below lives in the per-exchange arena: one heap allocation
     // per exchange, freed together when the exchange ends. No 64KB stack
@@ -325,10 +359,17 @@ pub fn serveDohExchange(
         try writer.flush();
         return true;
     };
-    const response_bytes = if (counters) |value|
-        runtime.answerWithMetrics(query, response_buffer, value) catch |err| return serveRuntimeError(writer, err)
-    else
-        runtime.answer(query, response_buffer) catch |err| return serveRuntimeError(writer, err);
+    // The workers run concurrently, so the counters they share are updated
+    // under one lock: no count is lost and no count is taken twice.
+    const response_bytes = blk: {
+        if (counters != null) lockCounters();
+        defer if (counters != null) unlockCounters();
+        if (counters) |value| value.doh_queries_total += 1;
+        // One runtime entry point serves every DoH query, and it takes the
+        // peer address: the recursion policy, the cookie check, and the
+        // locally served zones apply as they do on the cleartext TCP port.
+        break :blk runtime.answerFromTcp(query, response_buffer, client, counters) catch |err| return serveRuntimeError(writer, err);
+    };
 
     // RFC 7830 section 4: the responder pads the answer when the query
     // carried the Padding option. RFC 7830 section 6 keeps the option for
@@ -341,9 +382,12 @@ pub fn serveDohExchange(
         try writer.flush();
         return true;
     };
-    try writeDnsResponse(writer, body, minTtl(&response_message), parsed.head.close);
+    // The last exchange of a connection says so, so the client does not
+    // reuse a connection the server closes right after it.
+    const close = parsed.head.close or last_exchange;
+    try writeDnsResponse(writer, body, minTtl(&response_message), close);
     try writer.flush();
-    return parsed.head.close;
+    return close;
 }
 
 fn serveRuntimeError(writer: *std.Io.Writer, err: anyerror) !bool {
@@ -361,29 +405,107 @@ fn serveRuntimeError(writer: *std.Io.Writer, err: anyerror) !bool {
     };
 }
 
-pub fn serveDohStreamOnce(stream: std.Io.net.Stream, io: std.Io, runtime: *const Runtime) !void {
+pub fn serveDohStreamOnce(stream: std.Io.net.Stream, io: std.Io, runtime: *Runtime) !void {
     return serveDohStream(stream, io, runtime, null);
 }
 
-fn serveDohStream(stream: std.Io.net.Stream, io: std.Io, runtime: *const Runtime, counters: ?*metrics.Counters) !void {
+/// The end of one DoH connection: the operator may bound the lifetime of a
+/// connection (RFC 9210 section 4.2), and that deadline covers the whole
+/// connection. Null means the connection lives as long as the transport
+/// allows.
+fn connectionDeadline(io: std.Io) ?std.Io.Clock.Timestamp {
+    const seconds = listener.tcpLimits().max_connection_duration orelse return null;
+    return tcp_deadline.deadline(io, .{ .seconds = seconds });
+}
+
+/// The DoH workers run concurrently, so the counters they share are updated
+/// under one lock: no count is lost between two workers.
+var counters_mutex: std.Io.Mutex = .init;
+
+fn lockCounters() void {
+    std.Io.Threaded.mutexLockUncancelable(&counters_mutex);
+}
+
+fn unlockCounters() void {
+    std.Io.Threaded.mutexUnlock(&counters_mutex);
+}
+
+/// One DoH connection: the channel the exchanges travel over and the
+/// deadlines that bound them. The exchanges travel over the TLS connection
+/// or over the socket, and the deadlines are applied to the raw descriptor
+/// under it, so a stalled peer holds neither an exchange nor a connection
+/// past its bound.
+const DohChannel = struct {
+    io: std.Io,
+    reader: *std.Io.Reader,
+    writer: *std.Io.Writer,
+    deadlines: tcp_deadline.FrameDeadlines,
+    timeout: tcp_deadline.Timeout,
+    connection_deadline: ?std.Io.Clock.Timestamp,
+    /// The peer address of the accepted connection: the recursion policy and
+    /// the cookie check need the client the query came from.
+    client: *const std.Io.net.IpAddress,
+
+    /// The deadline of the exchange that starts now: the per-exchange
+    /// timeout, shortened to what is left of the connection's lifetime.
+    /// Null means the connection is over.
+    fn frameDeadline(self: *const DohChannel) ?std.Io.Clock.Timestamp {
+        const frame_timeout = listener.frameTimeout(self.io, self.connection_deadline, self.timeout) orelse return null;
+        return tcp_deadline.deadline(self.io, frame_timeout);
+    }
+
+    /// Bounds the exchange that starts now to the raw descriptor under the
+    /// channel. False means the connection has outlived its duration and
+    /// ends here.
+    fn applyFrameDeadline(self: *const DohChannel) bool {
+        const frame_deadline = self.frameDeadline() orelse return false;
+        self.deadlines.apply(frame_deadline);
+        return true;
+    }
+};
+
+fn serveDohStream(stream: std.Io.net.Stream, io: std.Io, runtime: *Runtime, counters: ?*metrics.Counters) !void {
+    if (comptime !listener.TCP_DEADLINES_SUPPORTED) return listener.Error.UnsupportedPlatform;
+
     var read_buffer: [MAX_HEADER_BYTES]u8 = undefined;
     var write_buffer: [DOH_WRITE_BUFFER_SIZE]u8 = undefined;
     var reader = tcp_deadline.DeadlineReader.init(stream.socket.handle, io, &read_buffer, DOH_IO_TIMEOUT);
     var writer = tcp_deadline.DeadlineWriter.init(stream.socket.handle, io, &write_buffer, DOH_IO_TIMEOUT);
-    try serveDohExchanges(&reader.interface, &writer.interface, runtime, counters);
+    defer writer.interface.flush() catch {};
+    var channel = DohChannel{
+        .io = io,
+        .reader = &reader.interface,
+        .writer = &writer.interface,
+        .deadlines = .{ .reader = &reader, .writer = &writer },
+        .timeout = DOH_IO_TIMEOUT,
+        .connection_deadline = connectionDeadline(io),
+        .client = &stream.socket.address,
+    };
+    try serveDohExchanges(&channel, runtime, counters);
 }
 
 /// The exchange loop both channels share: HTTP/1.1 keep-alive over one
 /// connection, bounded by MAX_EXCHANGES_PER_CONNECTION.
-fn serveDohExchanges(reader: *std.Io.Reader, writer: *std.Io.Writer, runtime: *const Runtime, counters: ?*metrics.Counters) !void {
+fn serveDohExchanges(channel: *const DohChannel, runtime: *Runtime, counters: ?*metrics.Counters) !void {
     var exchanges: usize = 0;
     while (exchanges < MAX_EXCHANGES_PER_CONNECTION) : (exchanges += 1) {
+        // One deadline for the whole exchange: a peer that stalls in the
+        // middle of an exchange loses the exchange, not the server.
+        if (!channel.applyFrameDeadline()) return;
         // Block-scoped so the arena frees at the end of each exchange, not
         // at connection close: memory stays bounded across keep-alive.
         const must_close = blk: {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
-            break :blk serveDohExchange(reader, writer, arena.allocator(), runtime, counters) catch |err| {
+            break :blk serveDohExchange(
+                channel.reader,
+                channel.writer,
+                arena.allocator(),
+                runtime,
+                counters,
+                channel.client,
+                exchanges + 1 == MAX_EXCHANGES_PER_CONNECTION,
+            ) catch |err| {
                 if (err == error.EndOfStream or err == error.ReadFailed) {
                     if (exchanges == 0) return error.EndOfStream;
                     return;
@@ -401,15 +523,26 @@ pub fn serveDohTlsStream(
     stream: std.Io.net.Stream,
     io: std.Io,
     server: *tls_server.Server,
-    runtime: *const Runtime,
+    runtime: *Runtime,
     counters: ?*metrics.Counters,
 ) !void {
     if (comptime !listener.TCP_DEADLINES_SUPPORTED) return listener.Error.UnsupportedPlatform;
+
+    // RFC 9210 section 4.2: the operator may bound the lifetime of one
+    // connection, and that deadline covers the whole connection.
+    const connection_deadline = connectionDeadline(io);
 
     var input_buffer: [tls_server.input_buffer_len]u8 = undefined;
     var output_buffer: [tls_server.output_buffer_len]u8 = undefined;
     var stream_reader = tcp_deadline.DeadlineReader.init(stream.socket.handle, io, &input_buffer, DOH_IO_TIMEOUT);
     var stream_writer = tcp_deadline.DeadlineWriter.init(stream.socket.handle, io, &output_buffer, DOH_IO_TIMEOUT);
+    // The handshake is part of the connection, so it shares its deadline:
+    // a peer that dribbles into the handshake cannot hold the worker.
+    if (listener.frameTimeout(io, connection_deadline, DOH_IO_TIMEOUT)) |handshake_timeout| {
+        const handshake_deadline = tcp_deadline.deadline(io, handshake_timeout);
+        stream_reader.setFrameDeadline(handshake_deadline);
+        stream_writer.setFrameDeadline(handshake_deadline);
+    }
     var connection = try server.handshake(&stream_reader.interface, &stream_writer.interface);
 
     var read_buffer: [MAX_HEADER_BYTES]u8 = undefined;
@@ -421,7 +554,16 @@ pub fn serveDohTlsStream(
         connection.close() catch {};
         stream_writer.interface.flush() catch {};
     }
-    try serveDohExchanges(&connection_reader.interface, &connection_writer.interface, runtime, counters);
+    var channel = DohChannel{
+        .io = io,
+        .reader = &connection_reader.interface,
+        .writer = &connection_writer.interface,
+        .deadlines = .{ .reader = &stream_reader, .writer = &stream_writer },
+        .timeout = DOH_IO_TIMEOUT,
+        .connection_deadline = connection_deadline,
+        .client = &stream.socket.address,
+    };
+    try serveDohExchanges(&channel, runtime, counters);
 }
 
 /// Binds the DoH port and serves DoH connections. Every accepted connection
@@ -431,24 +573,26 @@ pub fn serveDohTlsStream(
 /// hold up the others.
 pub fn serveDohLoopOnAddress(
     io: std.Io,
-    runtime: *const Runtime,
+    runtime: *Runtime,
     address: *const std.Io.net.IpAddress,
     server: *tls_server.Server,
     max_requests: ?usize,
+    counters: ?*metrics.Counters,
 ) !void {
     var bind_address = address.*;
     var listener_socket = try std.Io.net.IpAddress.listen(&bind_address, io, .{ .reuse_address = true });
     defer listener_socket.deinit(io);
-    return serveDohLoop(&listener_socket, io, runtime, server, max_requests);
+    return serveDohLoop(&listener_socket, io, runtime, server, max_requests, counters);
 }
 
 /// Serves the DoH port on an already-bound listener.
 pub fn serveDohLoop(
     listener_socket: *std.Io.net.Server,
     io: std.Io,
-    runtime: *const Runtime,
+    runtime: *Runtime,
     server: *tls_server.Server,
     max_requests: ?usize,
+    counters: ?*metrics.Counters,
 ) !void {
     var group: std.Io.Group = .init;
     defer group.await(io) catch unreachable;
@@ -465,7 +609,7 @@ pub fn serveDohLoop(
             stream.close(io);
             continue;
         }
-        group.concurrent(io, serveDohTlsWorker, .{ stream, io, server, runtime, &sources }) catch |err| switch (err) {
+        group.concurrent(io, serveDohTlsWorker, .{ stream, io, server, runtime, &sources, counters }) catch |err| switch (err) {
             error.ConcurrencyUnavailable => {
                 sources.release(&stream.socket.address);
                 stream.close(io);
@@ -475,10 +619,10 @@ pub fn serveDohLoop(
 }
 
 /// Serves one accepted DoH connection.
-fn serveDohTlsWorker(stream: std.Io.net.Stream, io: std.Io, server: *tls_server.Server, runtime: *const Runtime, sources: *listener.SourceCounter) void {
+fn serveDohTlsWorker(stream: std.Io.net.Stream, io: std.Io, server: *tls_server.Server, runtime: *Runtime, sources: *listener.SourceCounter, counters: ?*metrics.Counters) void {
     defer stream.close(io);
     defer sources.release(&stream.socket.address);
-    serveDohTlsStream(stream, io, server, runtime, null) catch {};
+    serveDohTlsStream(stream, io, server, runtime, counters) catch {};
 }
 
 fn streamPair() ![2]std.Io.net.Stream {
@@ -490,6 +634,15 @@ fn streamPair() ![2]std.Io.net.Stream {
         .{ .socket = .{ .handle = pair[0], .address = address } },
         .{ .socket = .{ .handle = pair[1], .address = address } },
     };
+}
+
+/// Grows the send buffer of a socket. The buffer of a socket pair holds
+/// less than an over-long head, so a test that writes one would block on a
+/// peer that reads nothing.
+fn growSendBuffer(fd: std.posix.fd_t, size: u32) !void {
+    const value = size;
+    const result = std.posix.system.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&value).ptr, @sizeOf(u32));
+    try std.testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(result));
 }
 
 test "DoH GET serves a base64url query with DNS media type" {
@@ -665,8 +818,9 @@ fn buildEdnsQuery(buffer: []u8, id: u16, padding: bool) ![]const u8 {
 }
 
 /// Serves one DoH exchange with `query` and returns the DNS message the
-/// server answered with.
-fn dohAnswer(arena: std.mem.Allocator, runtime: *const Runtime, query: []const u8) ![]u8 {
+/// server answered with. The counters are the ones the channel counts with,
+/// or null for a channel that counts nothing.
+fn dohAnswer(arena: std.mem.Allocator, runtime: *Runtime, query: []const u8, counters: ?*metrics.Counters) ![]u8 {
     const io = std.Io.Threaded.global_single_threaded.io();
     const streams = try streamPair();
     var client_stream = streams[0];
@@ -684,7 +838,7 @@ fn dohAnswer(arena: std.mem.Allocator, runtime: *const Runtime, query: []const u
     try client_writer.interface.writeAll(request_stream.buffered());
     try client_writer.interface.flush();
 
-    try serveDohStreamOnce(server_stream, io, runtime);
+    try serveDohStream(server_stream, io, runtime, counters);
 
     var response_buffer: [4096]u8 = undefined;
     var client_reader = client_stream.reader(io, &response_buffer);
@@ -730,7 +884,7 @@ test "RFC 7830: the DoH answer is padded when the query asked for it" {
     var answer_buffer: [4096]u8 = undefined;
     const answer = try runtime.answer(query, &answer_buffer);
 
-    const body = try dohAnswer(arena.allocator(), &runtime, query);
+    const body = try dohAnswer(arena.allocator(), &runtime, query, null);
     try std.testing.expect(body.len > answer.len);
 
     const parsed = try dns_message.Message.parse(arena.allocator(), body);
@@ -752,7 +906,7 @@ test "RFC 7830: the DoH answer carries no padding when the query did not ask for
     var query_buffer: [128]u8 = undefined;
     const query = try buildEdnsQuery(&query_buffer, 0xdcba, false);
 
-    const body = try dohAnswer(arena.allocator(), &runtime, query);
+    const body = try dohAnswer(arena.allocator(), &runtime, query, null);
     const parsed = try dns_message.Message.parse(arena.allocator(), body);
     try std.testing.expectEqual(@as(u16, 0xdcba), parsed.header.id);
     // The query indicated EDNS(0) support, so the answer carries an OPT
@@ -849,9 +1003,6 @@ test "DoH rejects wrong method, path, media type, and bad wire" {
 }
 
 test "DoH keep-alive serves pipelined exchanges with bounded per-exchange state" {
-    try std.testing.expect(DOH_WRITE_BUFFER_SIZE < MAX_BODY_LEN);
-    try std.testing.expectEqual(@as(u32, 5), DOH_IO_TIMEOUT.seconds);
-
     const io = std.Io.Threaded.global_single_threaded.io();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -911,6 +1062,394 @@ test "DoH status reasons cover the served subset" {
     try std.testing.expectEqualStrings("OK", Status.ok.reason());
     try std.testing.expectEqualStrings("Bad Request", Status.bad_request.reason());
     try std.testing.expectEqualStrings("Not Found", Status.not_found.reason());
+    try std.testing.expectEqualStrings("Method Not Allowed", Status.method_not_allowed.reason());
+    try std.testing.expectEqualStrings("Unsupported Media Type", Status.unsupported_media_type.reason());
+    try std.testing.expectEqualStrings("Request Header Fields Too Large", Status.request_header_fields_too_large.reason());
+    try std.testing.expectEqualStrings("Payload Too Large", Status.payload_too_large.reason());
+}
+
+test "DoH refuses a request that carries a transfer coding and a content length" {
+    // RFC 9112 section 6.1: a message with a transfer coding this channel
+    // cannot decode is refused with 400, and the connection ends there, so
+    // the chunked body is never read as the next request.
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+
+    const streams = try streamPair();
+    var client_stream = streams[0];
+    defer client_stream.close(io);
+    var server_stream = streams[1];
+    var server_stream_closed = false;
+    defer {
+        if (!server_stream_closed) server_stream.close(io);
+    }
+
+    var request_buffer: [2048]u8 = undefined;
+    var request_stream = std.Io.Writer.fixed(&request_buffer);
+    try request_stream.print("POST /dns-query HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/dns-message\r\nTransfer-Encoding: chunked\r\nContent-Length: 4\r\n\r\n", .{});
+    try request_stream.writeAll("0\r\n\r\n");
+
+    var client_write_buffer: [2048]u8 = undefined;
+    var client_writer = client_stream.writer(io, &client_write_buffer);
+    try client_writer.interface.writeAll(request_stream.buffered());
+    try client_writer.interface.flush();
+
+    try serveDohStreamOnce(server_stream, io, &runtime);
+    server_stream.close(io);
+    server_stream_closed = true;
+
+    var response_buffer: [4096]u8 = undefined;
+    var client_reader = client_stream.reader(io, &response_buffer);
+    const status_line = try takeTestLine(&client_reader.interface);
+    try std.testing.expect(std.mem.startsWith(u8, status_line, "HTTP/1.1 400"));
+    var closes = false;
+    while (true) {
+        const line = try takeTestLine(&client_reader.interface);
+        if (line.len == 0) break;
+        if (std.ascii.eqlIgnoreCase(line, "connection: close")) closes = true;
+    }
+    try std.testing.expect(closes);
+    // The connection ends with the refusal: the chunked body that follows
+    // is never answered as a request of its own.
+    try std.testing.expectError(error.EndOfStream, takeTestLine(&client_reader.interface));
+}
+
+test "DoH refuses a request that declares two different content lengths" {
+    // RFC 9112 section 6.3: two content lengths that differ leave the body
+    // length ambiguous, so the request is refused.
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+
+    const streams = try streamPair();
+    var client_stream = streams[0];
+    defer client_stream.close(io);
+    const server_stream = streams[1];
+    defer server_stream.close(io);
+
+    var request_buffer: [2048]u8 = undefined;
+    const request = try std.fmt.bufPrint(&request_buffer, "POST /dns-query HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/dns-message\r\nContent-Length: 4\r\nContent-Length: 8\r\n\r\n", .{});
+    var client_write_buffer: [2048]u8 = undefined;
+    var client_writer = client_stream.writer(io, &client_write_buffer);
+    try client_writer.interface.writeAll(request);
+    try client_writer.interface.flush();
+
+    try serveDohStreamOnce(server_stream, io, &runtime);
+
+    var response_buffer: [4096]u8 = undefined;
+    var client_reader = client_stream.reader(io, &response_buffer);
+    const status_line = try takeTestLine(&client_reader.interface);
+    try std.testing.expect(std.mem.startsWith(u8, status_line, "HTTP/1.1 400"));
+}
+
+test "DoH answers an over-long header block with 431" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+
+    const streams = try streamPair();
+    var client_stream = streams[0];
+    defer client_stream.close(io);
+    const server_stream = streams[1];
+    defer server_stream.close(io);
+
+    // A head that runs past the header budget of the channel. The server
+    // stops reading it once the budget is over, so the send buffer grows
+    // first: the write must not block on a peer that reads nothing.
+    try growSendBuffer(client_stream.socket.handle, 64 * 1024);
+
+    var request_buffer: [16384]u8 = undefined;
+    var request_stream = std.Io.Writer.fixed(&request_buffer);
+    try request_stream.writeAll("GET /dns-query HTTP/1.1\r\n");
+    var filler: [100]u8 = @splat('a');
+    for (0..80) |_| {
+        try request_stream.writeAll("X-Fill: ");
+        try request_stream.writeAll(&filler);
+        try request_stream.writeAll("\r\n");
+    }
+    try request_stream.writeAll("\r\n");
+
+    var client_write_buffer: [16384]u8 = undefined;
+    var client_writer = client_stream.writer(io, &client_write_buffer);
+    try client_writer.interface.writeAll(request_stream.buffered());
+    try client_writer.interface.flush();
+
+    try serveDohStreamOnce(server_stream, io, &runtime);
+
+    var response_buffer: [4096]u8 = undefined;
+    var client_reader = client_stream.reader(io, &response_buffer);
+    const response = try readTestResponse(&client_reader.interface);
+    try std.testing.expect(std.mem.startsWith(u8, response.status, "HTTP/1.1 431"));
+}
+
+test "DoH answers a body above the body budget with 413" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+
+    const streams = try streamPair();
+    var client_stream = streams[0];
+    defer client_stream.close(io);
+    const server_stream = streams[1];
+    defer server_stream.close(io);
+
+    var request_buffer: [2048]u8 = undefined;
+    const request = try std.fmt.bufPrint(&request_buffer, "POST /dns-query HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/dns-message\r\nContent-Length: {d}\r\n\r\n", .{MAX_BODY_LEN + 1});
+    var client_write_buffer: [2048]u8 = undefined;
+    var client_writer = client_stream.writer(io, &client_write_buffer);
+    try client_writer.interface.writeAll(request);
+    try client_writer.interface.flush();
+
+    try serveDohStreamOnce(server_stream, io, &runtime);
+
+    var response_buffer: [4096]u8 = undefined;
+    var client_reader = client_stream.reader(io, &response_buffer);
+    const response = try readTestResponse(&client_reader.interface);
+    try std.testing.expect(std.mem.startsWith(u8, response.status, "HTTP/1.1 413"));
+}
+
+test "DoH answers a POST with the wrong media type with 415" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+
+    const streams = try streamPair();
+    var client_stream = streams[0];
+    defer client_stream.close(io);
+    const server_stream = streams[1];
+    defer server_stream.close(io);
+
+    const request = "POST /dns-query HTTP/1.1\r\nHost: localhost\r\nContent-Type: text/plain\r\nContent-Length: 4\r\n\r\njunk";
+    var client_write_buffer: [2048]u8 = undefined;
+    var client_writer = client_stream.writer(io, &client_write_buffer);
+    try client_writer.interface.writeAll(request);
+    try client_writer.interface.flush();
+
+    try serveDohStreamOnce(server_stream, io, &runtime);
+
+    var response_buffer: [4096]u8 = undefined;
+    var client_reader = client_stream.reader(io, &response_buffer);
+    const response = try readTestResponse(&client_reader.interface);
+    try std.testing.expect(std.mem.startsWith(u8, response.status, "HTTP/1.1 415"));
+}
+
+test "DoH reads a body a GET declares, so the next request starts at a request line" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+
+    const streams = try streamPair();
+    var client_stream = streams[0];
+    defer client_stream.close(io);
+    const server_stream = streams[1];
+    defer server_stream.close(io);
+
+    var query_buffer: [512]u8 = undefined;
+    const query = try @import("../cli/query.zig").buildQueryPacket(&query_buffer, 0x9a9a, "dns.home.arpa.", .A, false);
+    var encoded: [1024]u8 = undefined;
+    const encoded_query = std.base64.url_safe_no_pad.Encoder.encode(&encoded, query);
+
+    var request_buffer: [2048]u8 = undefined;
+    var request_stream = std.Io.Writer.fixed(&request_buffer);
+    try request_stream.print("GET /dns-query?dns={s} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\n", .{encoded_query});
+    try request_stream.writeAll("junk");
+    try request_stream.print("GET /dns-query?dns={s} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", .{encoded_query});
+
+    var client_write_buffer: [2048]u8 = undefined;
+    var client_writer = client_stream.writer(io, &client_write_buffer);
+    try client_writer.interface.writeAll(request_stream.buffered());
+    try client_writer.interface.flush();
+
+    try serveDohStreamOnce(server_stream, io, &runtime);
+
+    var response_buffer: [4096]u8 = undefined;
+    var client_reader = client_stream.reader(io, &response_buffer);
+    // Both requests are answered: the body of the first one left the
+    // stream, so the second one starts at a request line.
+    for (0..2) |_| {
+        const status_line = try takeTestLine(&client_reader.interface);
+        try std.testing.expect(std.mem.startsWith(u8, status_line, "HTTP/1.1 200"));
+        var content_length: usize = 0;
+        while (true) {
+            const trimmed = try takeTestLine(&client_reader.interface);
+            if (trimmed.len == 0) break;
+            if (trimmed.len > 15 and std.ascii.eqlIgnoreCase(trimmed[0..14], "content-length")) {
+                content_length = try std.fmt.parseInt(usize, std.mem.trim(u8, trimmed[15..], " "), 10);
+            }
+        }
+        const body = try client_reader.interface.take(content_length);
+        const response = try dns_message.Message.parse(arena.allocator(), body);
+        try std.testing.expectEqual(@as(u16, 0x9a9a), response.header.id);
+    }
+}
+
+test "the last exchange of a DoH connection says the connection closes" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+
+    const streams = try streamPair();
+    var client_stream = streams[0];
+    defer client_stream.close(io);
+    const server_stream = streams[1];
+    defer server_stream.close(io);
+
+    var client_write_buffer: [4096]u8 = undefined;
+    var client_writer = client_stream.writer(io, &client_write_buffer);
+    for (0..MAX_EXCHANGES_PER_CONNECTION) |_| {
+        var query_buffer: [512]u8 = undefined;
+        const query = try @import("../cli/query.zig").buildQueryPacket(&query_buffer, 0x1111, "dns.home.arpa.", .A, false);
+        var encoded: [1024]u8 = undefined;
+        const encoded_query = std.base64.url_safe_no_pad.Encoder.encode(&encoded, query);
+        try client_writer.interface.print("GET /dns-query?dns={s} HTTP/1.1\r\nHost: localhost\r\n\r\n", .{encoded_query});
+    }
+    try client_writer.interface.flush();
+    try client_stream.shutdown(io, .send);
+
+    try serveDohStreamOnce(server_stream, io, &runtime);
+
+    var response_buffer: [4096]u8 = undefined;
+    var client_reader = client_stream.reader(io, &response_buffer);
+    for (0..MAX_EXCHANGES_PER_CONNECTION) |index| {
+        const status_line = try takeTestLine(&client_reader.interface);
+        try std.testing.expect(std.mem.startsWith(u8, status_line, "HTTP/1.1 200"));
+        var connection_header: []const u8 = "";
+        var content_length: usize = 0;
+        while (true) {
+            const trimmed = try takeTestLine(&client_reader.interface);
+            if (trimmed.len == 0) break;
+            if (trimmed.len > 10 and std.ascii.eqlIgnoreCase(trimmed[0..10], "connection")) {
+                connection_header = trimmed;
+            }
+            if (trimmed.len > 15 and std.ascii.eqlIgnoreCase(trimmed[0..14], "content-length")) {
+                content_length = try std.fmt.parseInt(usize, std.mem.trim(u8, trimmed[15..], " "), 10);
+            }
+        }
+        try std.testing.expect(content_length > 0);
+        _ = try client_reader.interface.take(content_length);
+        // The last permitted exchange says the connection closes, so the
+        // client does not reuse a connection the server closes right after.
+        if (index + 1 == MAX_EXCHANGES_PER_CONNECTION) {
+            try std.testing.expect(std.mem.indexOf(u8, connection_header, "close") != null);
+        } else {
+            try std.testing.expect(std.mem.indexOf(u8, connection_header, "keep-alive") != null);
+        }
+    }
+}
+
+test "a DoH query moves the counters the DoH path counts" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+
+    const streams = try streamPair();
+    var client_stream = streams[0];
+    defer client_stream.close(io);
+    const server_stream = streams[1];
+    defer server_stream.close(io);
+
+    var query_buffer: [512]u8 = undefined;
+    const query = try @import("../cli/query.zig").buildQueryPacket(&query_buffer, 0xabcd, "dns.home.arpa.", .A, false);
+    var encoded: [1024]u8 = undefined;
+    const encoded_query = std.base64.url_safe_no_pad.Encoder.encode(&encoded, query);
+
+    var request_buffer: [2048]u8 = undefined;
+    const request = try std.fmt.bufPrint(&request_buffer, "GET /dns-query?dns={s} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", .{encoded_query});
+    var client_write_buffer: [2048]u8 = undefined;
+    var client_writer = client_stream.writer(io, &client_write_buffer);
+    try client_writer.interface.writeAll(request);
+    try client_writer.interface.flush();
+
+    var counters = metrics.Counters{};
+    try serveDohStream(server_stream, io, &runtime, &counters);
+
+    // The DoH path counts the query, the answer and the transport, the way
+    // the cleartext TCP path counts them.
+    try std.testing.expectEqual(@as(u64, 1), counters.queries_total);
+    try std.testing.expectEqual(@as(u64, 1), counters.responses_total);
+    try std.testing.expectEqual(@as(u64, 0), counters.bad_queries_total);
+    try std.testing.expectEqual(@as(u64, 1), counters.doh_queries_total);
+}
+
+test "a DoH query for a locally served name is answered from the local zone table" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+
+    var query_buffer: [512]u8 = undefined;
+    const query = try @import("../cli/query.zig").buildQueryPacket(&query_buffer, 0xabcd, "localhost.", .A, false);
+
+    // The counters are wired, the way the running server wires them.
+    var counters = metrics.Counters{};
+    const body = try dohAnswer(arena.allocator(), &runtime, query, &counters);
+    const parsed = try dns_message.Message.parse(arena.allocator(), body);
+    // RFC 6761 section 6.3: the localhost name resolves to the loopback
+    // address, and the answer comes from the locally served zones, so the
+    // DoH port serves it the way the cleartext TCP port does.
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.answer_count);
+    try std.testing.expect(parsed.answers.items[0].rrtype.eql(.A));
+    try std.testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, &parsed.answers.items[0].rdata.A);
+}
+
+test "a DoH query from a client the recursion ACL refuses is refused" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // The operator's recursion ACL serves one network; the DoH client below
+    // is outside it, so the refusal is the policy's and not the server's.
+    var policy = resolver_mod.Policy{};
+    policy.recursion_allow[0] = try config_parser.Cidr.parse("192.0.2.0/24");
+    policy.recursion_allow_len = 1;
+    var zones = std.ArrayList(zone_index.Zone).empty;
+    var runtime = try Runtime.fromZonesWithPolicy(std.testing.allocator, &zones, .{}, io, policy);
+    defer runtime.deinit();
+
+    var query_buffer: [512]u8 = undefined;
+    // The query carries an OPT pseudo-RR, so RFC 8914 section 2 allows the
+    // EDE option in the answer.
+    const query = try @import("../cli/query.zig").buildQueryPacketWithEdns(&query_buffer, 0xabcd, "outside.example.", .A, .{ .dnssec_ok = true });
+
+    var counters = metrics.Counters{};
+    const body = try dohAnswer(arena.allocator(), &runtime, query, &counters);
+    const parsed = try dns_message.Message.parse(arena.allocator(), body);
+    // The client address reaches the runtime, so the same source the policy
+    // refuses over the cleartext TCP port is refused over DoH too. RFC 8914
+    // section 4.19: INFO-CODE 18 is "Prohibited", and the EXTRA-TEXT says
+    // the operator's recursion policy refused the client.
+    try std.testing.expectEqual(dns_header.Rcode.refused, parsed.header.rcode);
+    try std.testing.expectEqual(@as(u16, 0), parsed.header.answer_count);
+    const opt = parsed.additionals.items[0];
+    try std.testing.expect(opt.rrtype.eql(.OPT));
+    const ede = dns_rdata.findOption(opt.rdata.OPT.bytes(), 15);
+    try std.testing.expect(ede != null);
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x12 }, ede.?[0..2]);
+    try std.testing.expectEqualStrings("prohibited by policy", ede.?[2..]);
+}
+
+test "the DoH answer is the same with and without the counters wired" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+
+    var query_buffer: [512]u8 = undefined;
+    const query = try @import("../cli/query.zig").buildQueryPacket(&query_buffer, 0xabcd, "localhost.", .A, false);
+
+    var counters = metrics.Counters{};
+    const counted = try dohAnswer(arena.allocator(), &runtime, query, &counters);
+    const uncounted = try dohAnswer(arena.allocator(), &runtime, query, null);
+    // One answer path serves both: the counters change the count, not the
+    // message the client receives.
+    try std.testing.expectEqualSlices(u8, counted, uncounted);
+    try std.testing.expectEqual(@as(u64, 1), counters.doh_queries_total);
 }
 
 /// The identity the DoH tests load: a throwaway self-signed certificate and
@@ -933,7 +1472,7 @@ fn serveOneConnection(
     listener_socket: *std.Io.net.Server,
     io: std.Io,
     server: *tls_server.Server,
-    runtime: *const Runtime,
+    runtime: *Runtime,
 ) void {
     const stream = listener_socket.accept(io) catch return;
     defer stream.close(io);
@@ -1067,7 +1606,7 @@ test "the DoH listener answers a query over the bound port" {
     const port = listener_socket.socket.address.getPort();
 
     // The listener serves one connection and then stops, so the test ends.
-    const thread = try std.Thread.spawn(.{}, serveDohLoop, .{ &listener_socket, io, &runtime, &server, @as(?usize, 1) });
+    const thread = try std.Thread.spawn(.{}, serveDohLoop, .{ &listener_socket, io, &runtime, &server, @as(?usize, 1), null });
 
     var address = std.Io.net.IpAddress{ .ip4 = .loopback(port) };
     const stream = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp });
@@ -1107,6 +1646,66 @@ test "the DoH listener answers a query over the bound port" {
     try std.testing.expectEqual(@as(u16, 1), message.header.answer_count);
 
     connection.close() catch {};
+    thread.join();
+}
+
+test "a DoH connection ends when the configured connection duration is over" {
+    const previous_limits = listener.tcpLimits();
+    defer listener.setTcpLimits(previous_limits);
+    // RFC 9210 section 4.2: one connection lives for a second.
+    listener.setTcpLimits(.{ .max_connection_duration = 1 });
+
+    var io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_backend.deinit();
+    const io = io_backend.io();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestIdentity(tmp.dir, io);
+
+    var server: tls_server.Server = undefined;
+    try server.init(allocator, io, tmp.dir, "cert.pem", "key.pem", DOH_ALPN);
+    defer server.deinit();
+
+    var bind_address = std.Io.net.IpAddress{ .ip4 = .loopback(0) };
+    var listener_socket = try std.Io.net.IpAddress.listen(&bind_address, io, .{ .reuse_address = true });
+    defer listener_socket.deinit(io);
+    const port = listener_socket.socket.address.getPort();
+
+    const thread = try std.Thread.spawn(.{}, serveOneConnection, .{ &listener_socket, io, &server, &runtime });
+
+    var address = std.Io.net.IpAddress{ .ip4 = .loopback(port) };
+    var rng_source: std.Random.IoSource = .{ .io = io };
+
+    // The peer completes the handshake and then says nothing.
+    const stalled = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer stalled.close(io);
+    var stalled_input: [tls_server.input_buffer_len]u8 = undefined;
+    var stalled_output: [tls_server.output_buffer_len]u8 = undefined;
+    var stalled_reader = stalled.reader(io, &stalled_input);
+    var stalled_writer = stalled.writer(io, &stalled_output);
+    var stalled_connection = try tls.client(&stalled_reader.interface, &stalled_writer.interface, .{
+        .rng = rng_source.interface(),
+        .host = "localhost",
+        .root_ca = .empty,
+        .insecure_skip_verify = true,
+        .now = std.Io.Clock.real.now(io),
+        .alpn_protocols = &.{DOH_ALPN},
+    });
+    defer stalled_connection.close() catch {};
+
+    // The connection ends with the duration the operator configured, not
+    // with the five-second deadline of the transport.
+    var poll_fds = [_]std.posix.pollfd{.{ .fd = stalled.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+    try std.testing.expectEqual(@as(usize, 1), try std.posix.poll(&poll_fds, 3000));
+
     thread.join();
 }
 

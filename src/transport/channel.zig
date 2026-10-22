@@ -27,8 +27,10 @@ pub const Channel = struct {
 
     /// The deadline of the frame that starts now: the per-frame timeout,
     /// shortened to what is left of the connection's lifetime. Null means
-    /// the connection is over.
-    fn frameDeadline(self: *const Channel) ?std.Io.Clock.Timestamp {
+    /// the connection is over. A caller that reads and writes one frame
+    /// takes the deadline once and applies it to both, so one frame cannot
+    /// take two windows.
+    pub fn frameDeadline(self: *const Channel) ?std.Io.Clock.Timestamp {
         const frame_timeout = listener.frameTimeout(self.io, self.connection_deadline, self.timeout) orelse return null;
         return tcp_deadline.deadline(self.io, frame_timeout);
     }

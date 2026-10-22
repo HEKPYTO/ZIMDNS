@@ -763,11 +763,14 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
             });
             defer io_backend.deinit();
             const dot_io = io_backend.io();
+            // The counters reach the port, so the DoT query counter moves in
+            // a metrics run.
+            const dot_counters: ?*metrics.Counters = if (print_metrics) &counters else null;
             if (configured_address) |*address| {
-                try transport_dot.serveDotLoopOnAddress(dot_io, &runtime, address, &server, max_requests);
+                try transport_dot.serveDotLoopOnAddress(dot_io, &runtime, address, &server, max_requests, dot_counters);
             } else {
                 var address = defaultListenerAddress(port);
-                try transport_dot.serveDotLoopOnAddress(dot_io, &runtime, &address, &server, max_requests);
+                try transport_dot.serveDotLoopOnAddress(dot_io, &runtime, &address, &server, max_requests, dot_counters);
             }
         },
         .doh_loop => {
@@ -779,11 +782,13 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
             });
             defer io_backend.deinit();
             const doh_io = io_backend.io();
+            // The DoH workers share the counters of the run, so the DoH
+            // queries are counted the way the other transports count them.
             if (configured_address) |*address| {
-                try transport_doh.serveDohLoopOnAddress(doh_io, &runtime, address, &server, max_requests);
+                try transport_doh.serveDohLoopOnAddress(doh_io, &runtime, address, &server, max_requests, &counters);
             } else {
                 var address = defaultListenerAddress(port);
-                try transport_doh.serveDohLoopOnAddress(doh_io, &runtime, &address, &server, max_requests);
+                try transport_doh.serveDohLoopOnAddress(doh_io, &runtime, &address, &server, max_requests, &counters);
             }
         },
         // The strict-TLS transfer channel: the same handshake and the same
