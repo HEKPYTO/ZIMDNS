@@ -14,6 +14,11 @@ listeners this build starts.
 python3 test/interop/tls_channel_test.py   # 13/13: 5 tls.zig + 4 doh.zig + 4 dot.zig
 ```
 
+The mirror decodes the DoH `dns=` parameter the way the server does: unpadded
+base64url, every character from the alphabet, and a length that can be a
+base64url string. A lenient decode would accept a query the server refuses, so
+the mirror rejects the same values.
+
 Transcripts: `docs/reports/interop-final/doh-get-post-transcript.log`
 (DoH GET + POST mapping vectors) and
 `docs/reports/interop-final/axfr-transcript.log` (SOA-framed AXFR

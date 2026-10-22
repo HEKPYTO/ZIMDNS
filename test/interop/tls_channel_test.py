@@ -213,8 +213,15 @@ def dns_param(query):
 
 
 def decode_query_param(value):
+    # Mirror the no-pad base64url decoder in doh.zig: padding is not part of
+    # the wire form, a length of 1 mod 4 cannot be a base64url string, and
+    # every character must come from the alphabet. The strict decode keeps
+    # the mirror independent of the interpreter's leniency.
+    if "=" in value or len(value) % 4 == 1:
+        raise BadBase64("value is not unpadded base64url")
     try:
-        out = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+        out = base64.b64decode(
+            value + "=" * (-len(value) % 4), altchars=b"-_", validate=True)
     except Exception as exc:
         raise BadBase64(str(exc))
     if len(out) == 0 or len(out) > MAX_BODY_LEN:

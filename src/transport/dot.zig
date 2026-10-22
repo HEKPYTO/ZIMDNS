@@ -45,7 +45,6 @@ pub const DOT_ALPN = tls_policy.dot_alpn;
 pub const DOT_PORT = tls_policy.dot_port;
 pub const MAX_FRAMES_PER_CONNECTION = listener.TCP_MAX_FRAMES_PER_CONNECTION;
 pub const MAX_CONNECTION_WORKERS = listener.TCP_MAX_CONNECTION_WORKERS;
-const IO_TIMEOUT = listener.TCP_IO_TIMEOUT;
 /// The cleartext stream buffer. The frame buffers live in the framing.
 const STREAM_BUFFER_SIZE: usize = 8192;
 
@@ -69,15 +68,15 @@ fn serveDotStream(stream: std.Io.net.Stream, io: std.Io, runtime: *Runtime, coun
 
     var read_buffer: [STREAM_BUFFER_SIZE]u8 = undefined;
     var write_buffer: [STREAM_BUFFER_SIZE]u8 = undefined;
-    var reader = tcp_deadline.DeadlineReader.init(stream.socket.handle, io, &read_buffer, IO_TIMEOUT);
-    var writer = tcp_deadline.DeadlineWriter.init(stream.socket.handle, io, &write_buffer, IO_TIMEOUT);
+    var reader = tcp_deadline.DeadlineReader.init(stream.socket.handle, io, &read_buffer, listener.tcpIdleTimeout());
+    var writer = tcp_deadline.DeadlineWriter.init(stream.socket.handle, io, &write_buffer, listener.tcpIdleTimeout());
     defer writer.interface.flush() catch {};
     var channel = channel_mod.Channel{
         .io = io,
         .reader = &reader.interface,
         .writer = &writer.interface,
         .deadlines = .{ .reader = &reader, .writer = &writer },
-        .timeout = IO_TIMEOUT,
+        .timeout = listener.tcpIdleTimeout(),
         .connection_deadline = channel_mod.connectionDeadline(io),
     };
     try serveDotFrames(&channel, runtime, counters, &stream.socket.address);
@@ -183,7 +182,7 @@ pub fn serveDotTlsStream(
     runtime: *Runtime,
     counters: ?*metrics.Counters,
 ) !void {
-    return serveDotTlsStreamWithTimeout(stream, io, server, runtime, counters, IO_TIMEOUT);
+    return serveDotTlsStreamWithTimeout(stream, io, server, runtime, counters, listener.tcpIdleTimeout());
 }
 
 /// Serves one DoT connection with the frame timeout the caller asks for.

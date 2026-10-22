@@ -394,6 +394,16 @@ const CacheKey = struct {
         return key;
     }
 
+    /// RFC 8020 section 2: the key of a denial stored under the name that
+    /// does not exist. The question is the same one, so only the name of the
+    /// node the denial belongs to changes.
+    fn withName(self: CacheKey, name: dns_name.Name) CacheKey {
+        var key = self;
+        @memcpy(key.name[0..name.wire_len], name.asWire());
+        key.name_len = name.wire_len;
+        return key;
+    }
+
     fn eql(self: *const CacheKey, other: *const CacheKey) bool {
         return self.qtype == other.qtype and self.qclass == other.qclass and
             self.checking_disabled == other.checking_disabled and self.dnssec_ok == other.dnssec_ok and
@@ -860,6 +870,35 @@ fn applyNegativeTtl(message: *dns_message.Message, ttl: u32) void {
     for (message.authorities.items[0..message.authorities.len]) |*record| {
         if (record.rrtype.eql(.SOA)) record.ttl = ttl;
     }
+}
+
+/// RFC 8020 section 2: the denial of an upstream answer is stored under the
+/// name that does not exist. That name is the last name of the alias chain
+/// the answer carried, and the QNAME when the answer carried no chain, so a
+/// denial stored under another name never cuts the QNAME. The records of a
+/// chain answer the QNAME and not the denied name, so the stored denial
+/// carries none of them.
+fn storeUpstreamAnswer(
+    cache: *Cache,
+    key: CacheKey,
+    query: dns_message.Message,
+    response: *dns_message.Message,
+    now: i64,
+    ecs_scope: u8,
+    ede: u16,
+) void {
+    if (response.header.rcode == .nxdomain) {
+        if (deniedName(response, query)) |denied| {
+            const answers = response.answers.len;
+            response.answers.len = 0;
+            response.header.answer_count = 0;
+            cache.put(key.withName(denied), response, now, ecs_scope, ede) catch {};
+            response.answers.len = answers;
+            response.header.answer_count = @intCast(answers);
+            return;
+        }
+    }
+    cache.put(key, response, now, ecs_scope, ede) catch {};
 }
 
 /// True when `name` sits strictly below `ancestor` in the DNS tree. Both
@@ -1406,7 +1445,7 @@ pub const Resolver = struct {
         // ADDRESS, so it is served to the /0 queries only.
         var answer_key = key;
         answer_key.ecs = exchange.scope orelse EcsScope{};
-        self.cache.put(answer_key, &response, now, upstream_scope, insecure_ede) catch {};
+        storeUpstreamAnswer(&self.cache, answer_key, query, &response, now, upstream_scope, insecure_ede);
         // RFC 3225 section 3: a query with the DO bit clear must not be answered
         // with DNSSEC security RRs. The cached copy keeps them, so the removal
         // happens on the way out only.
@@ -1960,6 +1999,13 @@ fn synthesizeDns64Answer(self: *Resolver, query: dns_message.Message, response: 
     // caller before this point, and the A answer must validate as well
     // whenever this server validates at all.
     const validating = self.validating(query);
+    // RFC 6147 section 5.5 item 2: the AD bit rides on the synthesized
+    // answer only when the negative AAAA answer and the A answer both
+    // validated. The caller set the bit when the negative answer validated
+    // and the client asked for the proofs, so its value here is the verdict
+    // of the first half of the synthesis.
+    const negative_authenticated = response.header.authenticated_data;
+    var a_authenticated = false;
     var hops: usize = 0;
     while (true) {
         var a_query = try buildAQuery(self, query, target, scope);
@@ -1978,10 +2024,17 @@ fn synthesizeDns64Answer(self: *Resolver, query: dns_message.Message, response: 
             // vDNS64 MUST respond with RCODE=2 (Server failure)".
             const result = try self.checkDnssec(a_query, a_response, @intCast(@max(now, 0)));
             if (result.status == .bogus) return .{ .bogus = result.ede };
+            a_authenticated = result.status == .secure;
         }
         // The A answer may carry a further chain, which is followed too.
         const owner = followAliasChain(a_response, target, zone_name, &chain) orelse return .none;
         if (try synthesizeDns64(&self.policy, owner, response, a_response, &chain)) {
+            // RFC 6147 section 5.5 item 2: the client is told the
+            // synthesized answer is authentic when the negative AAAA answer
+            // and the A answer both validated. Item 1 keeps the bit clear
+            // for a client that did not ask for the proofs, and the
+            // synthesis itself is the caller's business under item 3.
+            response.header.authenticated_data = negative_authenticated and a_authenticated;
             // RFC 7871 section 7.3.1: the records the client gets come from
             // the A answer, so the answer reports the scope of that answer:
             // the /0 scope of a retry that carried no ADDRESS.
@@ -2072,6 +2125,19 @@ fn followAliasChain(message: dns_message.Message, start: dns_name.Name, zone_nam
         hops += 1;
         current = target;
     }
+}
+
+/// RFC 8020 section 2: the name that does not exist. It is the last name of
+/// the alias chain the answer carried, and the QNAME when the answer carried
+/// no chain. Null when the answer carried no chain, so the caller keeps the
+/// QNAME as the name of the denial. An NXDOMAIN carries no address records,
+/// so the chain is what the answer has to say.
+fn deniedName(response: *const dns_message.Message, query: dns_message.Message) ?dns_name.Name {
+    const question = query.question orelse return null;
+    var chain = AliasChain{};
+    const end = followAliasChain(response.*, question.name, null, &chain) orelse return null;
+    if (end.eql(&question.name)) return null;
+    return end;
 }
 
 /// RFC 6672 section 2.2: the substitution replaces the suffix labels of the
@@ -2250,8 +2316,10 @@ fn buildAQuery(self: *Resolver, query: dns_message.Message, name: dns_name.Name,
 /// the chain the synthesis followed and one synthesized AAAA per A record of
 /// the owner that chain ended at, and the authority section keeps the zone's
 /// SOA with the TTL RFC 2308 section 5 gives a negative answer, so the client
-/// can cache the missing AAAA. The answer claims neither authority nor
-/// DNSSEC security: the record comes from no zone.
+/// can cache the missing AAAA. The answer claims no authority: the record
+/// comes from no zone. The AD bit is the verdict on the answers the
+/// synthesis rests on (RFC 6147 section 5.5 item 2), so it is cleared here
+/// and the caller sets it when those answers validated.
 fn synthesizeDns64(policy: *const Policy, owner: dns_name.Name, response: *dns_message.Message, a_response: dns_message.Message, chain: *const AliasChain) !bool {
     var soa: ?dns_record.ResourceRecord = null;
     for (response.authorities.slice()) |record| {
@@ -3263,6 +3331,174 @@ test "RFC 8020 section 2: a descendant of a cached NXDOMAIN is answered without 
     try std.testing.expectEqual(@as(u16, 0), parsed.header.answer_count);
 }
 
+/// The fake upstream the RFC 8020 denied-name tests forward to. It answers
+/// every query with a denial, and with the alias chain that leads to the
+/// name that does not exist when the test asks for one. It counts the
+/// queries it received, so a cached answer is told from a fresh one.
+const DeniedNameUpstream = struct {
+    io: std.Io,
+    udp: *const std.Io.net.Socket,
+    /// The answer carries the alias chain to the name that does not exist.
+    chain: bool = true,
+    /// The number of queries the fake answers before it stops.
+    max_requests: usize = 2,
+    requests: usize = 0,
+};
+
+fn serveDeniedNameUpstream(args: *DeniedNameUpstream) void {
+    var request_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
+    while (args.requests < args.max_requests) {
+        const incoming = args.udp.receiveTimeout(args.io, &request_buffer, FailingUpstreamTimeout) catch return;
+        args.requests += 1;
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const query = dns_message.Message.parseQuery(arena.allocator(), incoming.data) catch return;
+        const question = query.question orelse return;
+        var answers: []const dns_record.ResourceRecord = &.{};
+        var answer_slot: [1]dns_record.ResourceRecord = undefined;
+        if (args.chain) {
+            // The chain leads to the name that does not exist, and the denial
+            // is the one of that name (RFC 8020 section 2).
+            answer_slot[0] = .{
+                .owner = question.name,
+                .rrtype = .CNAME,
+                .class = .IN,
+                .ttl = 300,
+                .rdata = .{ .CNAME = dns_name.Name.fromText("missing.example.") catch return },
+            };
+            answers = answer_slot[0..1];
+        }
+        const soa = makeTestSoa(60, 30) catch return;
+        const authority = [_]dns_record.ResourceRecord{soa};
+        var response_buffer: [2048]u8 = undefined;
+        const bytes = buildUpstreamAnswer(&response_buffer, query, answers, &authority, .nxdomain, null) catch return;
+        args.udp.send(args.io, &incoming.from, bytes) catch return;
+    }
+}
+
+/// A resolver in front of the fake upstream that answers with a denial and
+/// the alias chain that leads to it.
+const DeniedNameFixture = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    upstream_socket: std.Io.net.Socket,
+    upstream: DeniedNameUpstream,
+    thread: std.Thread,
+    joined: bool = false,
+    resolver: Resolver,
+    arena: std.heap.ArenaAllocator,
+
+    fn create(io: std.Io, chain: bool, max_requests: usize) !*DeniedNameFixture {
+        const allocator = std.testing.allocator;
+        const self = try allocator.create(DeniedNameFixture);
+        errdefer allocator.destroy(self);
+        var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        self.* = .{
+            .allocator = allocator,
+            .io = io,
+            .upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp }),
+            .upstream = .{ .io = io, .udp = undefined, .chain = chain, .max_requests = max_requests },
+            .thread = undefined,
+            .resolver = undefined,
+            .arena = std.heap.ArenaAllocator.init(allocator),
+        };
+        errdefer self.upstream_socket.close(io);
+        errdefer self.arena.deinit();
+        self.upstream.udp = &self.upstream_socket;
+        self.thread = try std.Thread.spawn(.{}, serveDeniedNameUpstream, .{&self.upstream});
+        errdefer self.join();
+        self.resolver = try Resolver.init(allocator, io, .{
+            .forwarder = .{ .address = self.upstream_socket.address },
+        });
+        errdefer self.resolver.deinit();
+        return self;
+    }
+
+    /// Waits for the fake upstream to stop, so a later answer can only come
+    /// from the cache.
+    fn join(self: *DeniedNameFixture) void {
+        if (self.joined) return;
+        self.thread.join();
+        self.joined = true;
+    }
+
+    fn destroy(self: *DeniedNameFixture) void {
+        self.join();
+        self.upstream_socket.close(self.io);
+        self.resolver.deinit();
+        self.arena.deinit();
+        self.allocator.destroy(self);
+    }
+
+    /// Asks the resolver a question and returns the answer it gave.
+    fn ask(self: *DeniedNameFixture, id: u16, name_text: []const u8) !dns_message.Message {
+        var query = try makeTestQuery(self.arena.allocator(), id, name_text, false);
+        defer query.deinit();
+        query.question.?.qtype = .AAAA;
+        var query_bytes: [1024]u8 = undefined;
+        const encoded = try encodeTestMessage(query, &query_bytes);
+        var output: [2048]u8 = undefined;
+        const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42680);
+        const bytes = try self.resolver.answer(encoded, query, &client, &output);
+        return dns_message.Message.parse(self.arena.allocator(), bytes);
+    }
+};
+
+test "RFC 8020 section 2: the denial of an alias chain is stored under the name that does not exist" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const fixture = try DeniedNameFixture.create(io, true, 2);
+    defer fixture.destroy();
+
+    // The client asks for the alias name: the upstream answers with the
+    // chain and with the denial of the name the chain leads to.
+    const alias = try fixture.ask(0x2850, "alias.example.");
+    try std.testing.expectEqual(dns_header.Rcode.nxdomain, alias.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), alias.header.answer_count);
+    try std.testing.expectEqual(@as(usize, 1), fixture.upstream.requests);
+
+    // The denial is cached under the name that does not exist, so the client
+    // that asks for that name is answered from the cache.
+    const missing = try fixture.ask(0x2851, "missing.example.");
+    try std.testing.expectEqual(dns_header.Rcode.nxdomain, missing.header.rcode);
+    try std.testing.expectEqual(@as(u16, 0), missing.header.answer_count);
+    try std.testing.expectEqual(@as(u16, 1), missing.header.authority_count);
+    try std.testing.expectEqual(@as(usize, 1), fixture.upstream.requests);
+
+    // The name below the denied name is cut by the same denial.
+    const below = try fixture.ask(0x2852, "below.missing.example.");
+    try std.testing.expectEqual(dns_header.Rcode.nxdomain, below.header.rcode);
+    try std.testing.expectEqual(@as(u16, 0), below.header.answer_count);
+    try std.testing.expectEqual(@as(usize, 1), fixture.upstream.requests);
+
+    // The denial belongs to the name that does not exist and not to the
+    // QNAME, so the alias name is asked upstream again.
+    const again = try fixture.ask(0x2853, "alias.example.");
+    try std.testing.expectEqual(dns_header.Rcode.nxdomain, again.header.rcode);
+    try std.testing.expectEqual(@as(usize, 2), fixture.upstream.requests);
+}
+
+test "RFC 8020 section 2: a denial without a chain is stored under the name that was asked for" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const fixture = try DeniedNameFixture.create(io, false, 1);
+    defer fixture.destroy();
+
+    const denied = try fixture.ask(0x2860, "gone.example.");
+    try std.testing.expectEqual(dns_header.Rcode.nxdomain, denied.header.rcode);
+    try std.testing.expectEqual(@as(u16, 0), denied.header.answer_count);
+    try std.testing.expectEqual(@as(usize, 1), fixture.upstream.requests);
+
+    // The same name is answered from the cache.
+    const same = try fixture.ask(0x2861, "gone.example.");
+    try std.testing.expectEqual(dns_header.Rcode.nxdomain, same.header.rcode);
+    try std.testing.expectEqual(@as(usize, 1), fixture.upstream.requests);
+
+    // The name below it is cut by the same denial.
+    const below = try fixture.ask(0x2862, "below.gone.example.");
+    try std.testing.expectEqual(dns_header.Rcode.nxdomain, below.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), below.header.authority_count);
+    try std.testing.expectEqual(@as(usize, 1), fixture.upstream.requests);
+}
+
 test "resolver treats missing cookie normally and rejects an invalid cookie" {
     const io = std.Io.Threaded.global_single_threaded.io();
     const client = try std.Io.net.IpAddress.parse("127.0.0.1", 12346);
@@ -3453,7 +3689,7 @@ fn serveEcsUpstream(args: *EcsUpstream) void {
                 ecs = echoed[0..len];
             }
         }
-        const bytes = buildDns64UpstreamAnswer(&response_buffer, query, &answer_slot, &.{}, .no_error, ecs) catch return;
+        const bytes = buildUpstreamAnswer(&response_buffer, query, &answer_slot, &.{}, .no_error, ecs) catch return;
         args.udp.send(args.io, &incoming.from, bytes) catch return;
     }
 }
@@ -7405,6 +7641,236 @@ test "RFC 6147 section 5.5: a bogus negative AAAA answer is not synthesized over
     try std.testing.expectEqual(@as(usize, 1), upstream.requests);
 }
 
+/// The RRSIG that covers an RRset, made with the zone key (RFC 4034
+/// section 3.2): the type it covers, the signer's name, and the signature
+/// over the RRset.
+fn makeTestSignedRrsig(
+    allocator: std.mem.Allocator,
+    record: dns_record.ResourceRecord,
+    signer_text: []const u8,
+    key: *const zone_signer.Key,
+) !dns_record.ResourceRecord {
+    var buffer: [dns_rdata.max_unknown_len]u8 = undefined;
+    var writer = dns_writer.Writer.init(&buffer);
+    try record.rdata.encode(&writer);
+    const signer = try dns_name.Name.fromText(signer_text);
+    const rrsig = try zone_signer.signRrset(
+        allocator,
+        record.owner,
+        signer,
+        record.rrtype.code(),
+        &.{writer.written()},
+        record.ttl,
+        key,
+        .{ .inception = 1_000_000_000, .expiration = 2_000_000_000 },
+    );
+    var unknown = dns_rdata.Unknown{ .len = @intCast(rrsig.len) };
+    @memcpy(unknown.data[0..rrsig.len], rrsig);
+    return .{
+        .owner = record.owner,
+        .rrtype = .RRSIG,
+        .class = record.class,
+        .ttl = record.ttl,
+        .rdata = .{ .Unknown = unknown },
+    };
+}
+
+/// The answers a signed zone gives the DNS64 test: the A record of the name
+/// with the signature that covers it, and the authority section of the
+/// negative AAAA answer that proves the name holds no AAAA.
+const Dns64SignedZone = struct {
+    a: [2]dns_record.ResourceRecord,
+    authority: [4]dns_record.ResourceRecord,
+};
+
+fn dns64TestSignedZone(allocator: std.mem.Allocator, key: *const zone_signer.Key) !Dns64SignedZone {
+    // The name holds an A record, an RRSIG, and an NSEC, and no AAAA and no
+    // CNAME: the type bitmap of RFC 4034 section 4.1.2.
+    const bitmap = [_]u8{ 0x00, 0x06, 0x40, 0x00, 0x00, 0x00, 0x00, 0x03 };
+    const a_record = dns64TestARecord("v4only.example.");
+    const nsec = try makeTestNsecRecord("v4only.example.", "w4only.example.", &bitmap, 3600);
+    const soa = try makeTestSoaIn("example.", 3600, 3600);
+    return .{
+        .a = .{ a_record, try makeTestSignedRrsig(allocator, a_record, "example.", key) },
+        .authority = .{
+            nsec,
+            try makeTestSignedRrsig(allocator, nsec, "example.", key),
+            soa,
+            try makeTestSignedRrsig(allocator, soa, "example.", key),
+        },
+    };
+}
+
+test "RFC 6147 section 5.5: a validated synthesis carries the AD bit" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+
+    // The zone "example." is signed: the negative AAAA answer proves the
+    // name holds no AAAA, and the A answer carries the signature that
+    // covers it.
+    const key = try zone_signer.parseKey("ed25519 DSSF3o0s0f+ElWzj9E/Osxw8hLpk55chkmx0LYN5WiY=\n");
+    const signed = try dns64TestSignedZone(scratch, &key);
+    var upstream = Dns64Upstream{
+        .io = io,
+        .udp = &upstream_socket,
+        .a = &signed.a,
+        .authority = &signed.authority,
+    };
+    const thread = try std.Thread.spawn(.{}, serveDns64Upstream, .{&upstream});
+
+    // The trust anchor speaks for the zone, so this server validates the
+    // answers it gets.
+    const anchors = try validate.Anchors.parse(std.testing.allocator,
+        \\example. DNSKEY 257 3 15 zPnZ/QwEe7S8C5SPz2OfS5RR40ATk2/rYnE9xHIEijs=
+        \\
+    );
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = upstream_socket.address },
+        .nat64_prefixes = .init(&.{try config.Nat64Prefix.parse("64:ff9b::/96")}),
+        .anchors = anchors,
+    });
+    defer resolver.deinit();
+
+    var query = try makeTestQuery(scratch, 0x2945, "v4only.example.", true);
+    defer query.deinit();
+    query.question.?.qtype = .AAAA;
+    query.edns.?.dnssec_ok = true;
+    query.additionals.items[0].ttl |= 0x8000;
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42745);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    thread.join();
+
+    const response = try dns_message.Message.parse(scratch, bytes);
+    try std.testing.expectEqual(dns_header.Rcode.no_error, response.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+    try std.testing.expect(response.answers.items[0].rrtype.eql(.AAAA));
+    // RFC 6147 section 5.5 item 2: the client asked for the proofs and both
+    // the negative AAAA answer and the A answer validated, so the AD bit
+    // tells the client that the synthesized answer is authentic.
+    try std.testing.expect(response.header.authenticated_data);
+    // The upstream saw the AAAA query and the A query that followed it.
+    try std.testing.expectEqual(@as(usize, 2), upstream.requests);
+}
+
+test "RFC 6147 section 5.5: a client without the DO bit gets no AD bit" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+
+    const key = try zone_signer.parseKey("ed25519 DSSF3o0s0f+ElWzj9E/Osxw8hLpk55chkmx0LYN5WiY=\n");
+    const signed = try dns64TestSignedZone(scratch, &key);
+    var upstream = Dns64Upstream{
+        .io = io,
+        .udp = &upstream_socket,
+        .a = &signed.a,
+        .authority = &signed.authority,
+    };
+    const thread = try std.Thread.spawn(.{}, serveDns64Upstream, .{&upstream});
+
+    const anchors = try validate.Anchors.parse(std.testing.allocator,
+        \\example. DNSKEY 257 3 15 zPnZ/QwEe7S8C5SPz2OfS5RR40ATk2/rYnE9xHIEijs=
+        \\
+    );
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = upstream_socket.address },
+        .nat64_prefixes = .init(&.{try config.Nat64Prefix.parse("64:ff9b::/96")}),
+        .anchors = anchors,
+    });
+    defer resolver.deinit();
+
+    var query = try makeTestQuery(scratch, 0x2946, "v4only.example.", true);
+    defer query.deinit();
+    query.question.?.qtype = .AAAA;
+    // The client did not ask for the proofs.
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42746);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    thread.join();
+
+    const response = try dns_message.Message.parse(scratch, bytes);
+    // The synthesis still runs: the answers validated, so the client gets
+    // the synthesized AAAA.
+    try std.testing.expectEqual(dns_header.Rcode.no_error, response.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+    try std.testing.expect(response.answers.items[0].rrtype.eql(.AAAA));
+    // RFC 6147 section 5.5 item 1: with CD clear and DO clear the vDNS64
+    // must not set the AD bit in any response.
+    try std.testing.expect(!response.header.authenticated_data);
+    try std.testing.expectEqual(@as(usize, 2), upstream.requests);
+}
+
+test "RFC 6147 section 5.5: a client that set CD gets no synthesis" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+
+    const key = try zone_signer.parseKey("ed25519 DSSF3o0s0f+ElWzj9E/Osxw8hLpk55chkmx0LYN5WiY=\n");
+    const signed = try dns64TestSignedZone(scratch, &key);
+    var upstream = Dns64Upstream{
+        .io = io,
+        .udp = &upstream_socket,
+        .a = &signed.a,
+        .authority = &signed.authority,
+    };
+    const thread = try std.Thread.spawn(.{}, serveDns64Upstream, .{&upstream});
+
+    const anchors = try validate.Anchors.parse(std.testing.allocator,
+        \\example. DNSKEY 257 3 15 zPnZ/QwEe7S8C5SPz2OfS5RR40ATk2/rYnE9xHIEijs=
+        \\
+    );
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = upstream_socket.address },
+        .nat64_prefixes = .init(&.{try config.Nat64Prefix.parse("64:ff9b::/96")}),
+        .anchors = anchors,
+    });
+    defer resolver.deinit();
+
+    var query = try makeTestQuery(scratch, 0x2947, "v4only.example.", true);
+    defer query.deinit();
+    query.question.?.qtype = .AAAA;
+    query.edns.?.dnssec_ok = true;
+    query.additionals.items[0].ttl |= 0x8000;
+    // The client does the validation and the synthesis itself (RFC 6147
+    // section 5.5 item 3).
+    query.header.checking_disabled = true;
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42747);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    thread.join();
+
+    const response = try dns_message.Message.parse(scratch, bytes);
+    // The answer is the empty AAAA answer the upstream sent: nothing was
+    // synthesized, and the AD bit is clear.
+    try std.testing.expectEqual(dns_header.Rcode.no_error, response.header.rcode);
+    try std.testing.expectEqual(@as(u16, 0), response.header.answer_count);
+    try std.testing.expect(!response.header.authenticated_data);
+    // The upstream saw the AAAA query and no A query behind it.
+    try std.testing.expectEqual(@as(usize, 1), upstream.requests);
+}
+
 test "RFC 6147 section 5.5: the negative answer is validated without the client's DO bit" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
@@ -7467,6 +7933,9 @@ const Dns64Upstream = struct {
     a: []const dns_record.ResourceRecord = &.{},
     /// The SOA the AAAA answer carries in its authority section.
     soa: []const dns_record.ResourceRecord = &.{},
+    /// The whole authority section of the AAAA answer, for the test that
+    /// needs more than the SOA alone (a signed denial, for instance).
+    authority: []const dns_record.ResourceRecord = &.{},
     /// The RCODE the AAAA answer carries (RFC 6147 section 5.1.2).
     rcode: dns_header.Rcode = .no_error,
     requests: usize = 0,
@@ -7517,9 +7986,13 @@ fn serveDns64Upstream(args: *Dns64Upstream) void {
         const answers = if (refused) empty else if (question.qtype.eql(.AAAA)) args.aaaa else args.a;
         var soa_slot: [1]dns_record.ResourceRecord = undefined;
         var authority: []const dns_record.ResourceRecord = &.{};
-        if (question.qtype.eql(.AAAA) and args.soa.len != 0) {
-            soa_slot[0] = args.soa[0];
-            authority = soa_slot[0..1];
+        if (question.qtype.eql(.AAAA)) {
+            if (args.authority.len != 0) {
+                authority = args.authority;
+            } else if (args.soa.len != 0) {
+                soa_slot[0] = args.soa[0];
+                authority = soa_slot[0..1];
+            }
         }
         const rcode = if (refused) .refused else if (question.qtype.eql(.AAAA)) args.rcode else .no_error;
         // RFC 7871 section 6: an answer that carries the client subnet
@@ -7536,13 +8009,13 @@ fn serveDns64Upstream(args: *Dns64Upstream) void {
             }
         }
         var response_buffer: [2048]u8 = undefined;
-        const bytes = buildDns64UpstreamAnswer(&response_buffer, query, answers, authority, rcode, ecs) catch return;
+        const bytes = buildUpstreamAnswer(&response_buffer, query, answers, authority, rcode, ecs) catch return;
         args.udp.send(args.io, &incoming.from, bytes) catch return;
     }
 }
 
 /// A response that answers the question the upstream was asked.
-fn buildDns64UpstreamAnswer(
+fn buildUpstreamAnswer(
     buffer: []u8,
     query: dns_message.Message,
     answers: []const dns_record.ResourceRecord,
@@ -7625,7 +8098,7 @@ fn serveDns64AliasUpstream(args: *Dns64AliasUpstream) void {
             authority = soa_slot[0..1];
         }
         var response_buffer: [2048]u8 = undefined;
-        const bytes = buildDns64UpstreamAnswer(&response_buffer, query, answers, authority, .no_error, null) catch return;
+        const bytes = buildUpstreamAnswer(&response_buffer, query, answers, authority, .no_error, null) catch return;
         args.udp.send(args.io, &incoming.from, bytes) catch return;
     }
 }
@@ -9216,7 +9689,7 @@ fn serveRefusingUpstream(args: *RefusingUpstream) void {
             answers = answer_slot[0..1];
         }
         var response_buffer: [2048]u8 = undefined;
-        const bytes = buildDns64UpstreamAnswer(&response_buffer, query, answers, &.{}, rcode, null) catch return;
+        const bytes = buildUpstreamAnswer(&response_buffer, query, answers, &.{}, rcode, null) catch return;
         args.udp.send(args.io, &incoming.from, bytes) catch return;
     }
 }

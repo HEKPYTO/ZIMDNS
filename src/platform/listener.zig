@@ -55,6 +55,14 @@ pub fn tcpLimits() config.TcpLimits {
     return tcp_limits;
 }
 
+/// RFC 9210 section 4.2: the timeout the server waits for a frame on an idle
+/// connection. The operator may set it; without the directive the project's
+/// own five seconds apply.
+pub fn tcpIdleTimeout() TcpIoTimeout {
+    const seconds = tcp_limits.idle_timeout orelse return TCP_IO_TIMEOUT;
+    return .{ .seconds = seconds };
+}
+
 pub fn validateTcpFrameLength(length: usize) Error!void {
     if (length == 0 or length > TCP_MAX_FRAME_SIZE) return Error.BadTcpFrame;
 }
@@ -204,11 +212,11 @@ pub fn serveUdpLoopOnAddressWithMetrics(io: std.Io, runtime: *Runtime, address: 
 }
 
 pub fn serveTcpStreamOnce(stream: std.Io.net.Stream, io: std.Io, runtime: *Runtime) !void {
-    return serveTcpStreamOnceWithTimeout(stream, io, runtime, TCP_IO_TIMEOUT, null);
+    return serveTcpStreamOnceWithTimeout(stream, io, runtime, tcpIdleTimeout(), null);
 }
 
 pub fn serveTcpStreamOnceWithMetrics(stream: std.Io.net.Stream, io: std.Io, runtime: *Runtime, counters: *metrics.Counters) !void {
-    return serveTcpStreamOnceWithTimeout(stream, io, runtime, TCP_IO_TIMEOUT, counters);
+    return serveTcpStreamOnceWithTimeout(stream, io, runtime, tcpIdleTimeout(), counters);
 }
 
 fn serveTcpStreamOnceWithTimeout(stream: std.Io.net.Stream, io: std.Io, runtime: *Runtime, timeout: TcpIoTimeout, counters: ?*metrics.Counters) !void {
@@ -221,7 +229,7 @@ fn serveTcpStreamOnceWithTimeout(stream: std.Io.net.Stream, io: std.Io, runtime:
 }
 
 pub fn serveTcpLoop(server: anytype, io: std.Io, runtime: *Runtime, max_requests: ?usize) !void {
-    return serveTcpLoopWithTimeout(server, io, runtime, max_requests, TCP_IO_TIMEOUT);
+    return serveTcpLoopWithTimeout(server, io, runtime, max_requests, tcpIdleTimeout());
 }
 
 fn serveTcpStreamWorker(stream: std.Io.net.Stream, io: std.Io, runtime: *Runtime, timeout: TcpIoTimeout, sources: *SourceCounter) void {
@@ -952,7 +960,7 @@ test "TCP connection cap serves sixteen frames and closes before the seventeenth
 /// Serves the TCP connections of one listener on a thread of its own, so a
 /// test can watch the connections while the loop accepts them.
 fn serveTcpLoopThread(server: *std.Io.net.Server, io: std.Io, runtime: *Runtime, max_requests: usize) void {
-    serveTcpLoopWithTimeout(server, io, runtime, max_requests, TCP_IO_TIMEOUT) catch {};
+    serveTcpLoopWithTimeout(server, io, runtime, max_requests, tcpIdleTimeout()) catch {};
 }
 
 test "TCP loop refuses a connection from a source over the per-source limit" {
@@ -1051,6 +1059,51 @@ test "TCP connection is closed after the configured connection duration" {
 
     // The answer arrived, and the connection behind it is closed when the
     // duration is over, not when the five-second frame deadline is.
+    var client_buffer: [64]u8 = undefined;
+    var client_reader = client.reader(io, &client_buffer);
+    try std.testing.expectError(error.EndOfStream, client_reader.interface.takeArray(2));
+    const elapsed = std.Io.Clock.real.now(io).nanoseconds - started;
+    try std.testing.expect(elapsed < @as(i96, 4) * std.time.ns_per_s);
+}
+
+test "TCP connection is closed after the configured idle timeout" {
+    var io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{
+        .concurrent_limit = .limited(TCP_MAX_CONNECTION_WORKERS),
+    });
+    defer io_backend.deinit();
+    const io = io_backend.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+
+    const previous_limits = tcpLimits();
+    defer setTcpLimits(previous_limits);
+    // RFC 9210 section 4.2: an idle connection is closed after a second.
+    setTcpLimits(.{ .idle_timeout = 1 });
+
+    var listen_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try std.Io.net.IpAddress.listen(&listen_addr, io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    const started = std.Io.Clock.real.now(io).nanoseconds;
+    var client = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer client.close(io);
+
+    var query_buffer: [512]u8 = undefined;
+    const query = try @import("../cli/query.zig").buildQueryPacket(&query_buffer, 0x6803, "dns.home.arpa.", .A, false);
+    try @import("../cli/query.zig").sendTcpQuery(client, io, query);
+
+    const server_thread = try std.Thread.spawn(.{}, serveTcpLoopThread, .{ &server, io, &runtime, 1 });
+    defer server_thread.join();
+
+    var response_buffer: [512]u8 = undefined;
+    const response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), client, io, &response_buffer, query);
+    try std.testing.expectEqual(@as(u16, 0x6803), response.header.id);
+
+    // The connection is idle after the answer, and the configured timeout
+    // closes it: the project's own five seconds would close it later.
     var client_buffer: [64]u8 = undefined;
     var client_reader = client.reader(io, &client_buffer);
     try std.testing.expectError(error.EndOfStream, client_reader.interface.takeArray(2));

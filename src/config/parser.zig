@@ -43,6 +43,12 @@ pub const ChainConfig = struct {
 pub const FAILURE_CACHE_MIN_SECONDS: u32 = 1;
 pub const FAILURE_CACHE_MAX_SECONDS: u32 = 300;
 
+/// RFC 9210 section 4.2: the idle timeout an operator may set, in seconds.
+/// The upper bound keeps the value inside the RFC 7828 section 3.1 units of
+/// the edns-tcp-keepalive option, which counts 100 milliseconds.
+pub const IDLE_TIMEOUT_MIN_SECONDS: u32 = 1;
+pub const IDLE_TIMEOUT_MAX_SECONDS: u32 = 3600;
+
 const Text = struct {
     bytes: [max_text]u8 = undefined,
     len: usize = 0,
@@ -241,6 +247,9 @@ pub const TcpLimits = struct {
     max_connections_per_source: ?u32 = null,
     /// The total duration of one connection, in seconds.
     max_connection_duration: ?u32 = null,
+    /// RFC 9210 section 4.2: the time a connection that waits for a frame is
+    /// held open, in seconds. The same deadline bounds a frame in flight.
+    idle_timeout: ?u32 = null,
 };
 
 pub const CookieConfig = struct {
@@ -516,6 +525,7 @@ pub const Config = struct {
         if (std.mem.eql(u8, first, "dnssec-chain")) return self.parseChain(&tokens);
         if (std.mem.eql(u8, first, "tcp-max-connections-per-source")) return self.parseTcpMaxConnectionsPerSource(&tokens);
         if (std.mem.eql(u8, first, "tcp-max-connection-duration")) return self.parseTcpMaxConnectionDuration(&tokens);
+        if (std.mem.eql(u8, first, "tcp-idle-timeout")) return self.parseTcpIdleTimeout(&tokens);
         return Error.UnknownDirective;
     }
 
@@ -856,6 +866,17 @@ pub const Config = struct {
         // A connection that is over before it starts serves nothing.
         if (parsed == 0) return Error.BadDirective;
         self.tcp_limits.max_connection_duration = parsed;
+    }
+
+    fn parseTcpIdleTimeout(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        if (self.tcp_limits.idle_timeout != null) return Error.BadDirective;
+        const value = tokens.next() orelse return Error.BadDirective;
+        try requireNoTrailingTokens(tokens);
+        const parsed = std.fmt.parseInt(u32, value, 10) catch return Error.BadDirective;
+        // RFC 9210 section 4.2: a connection closed at once is never usable,
+        // and one held longer than an hour stops being an idle connection.
+        if (parsed < IDLE_TIMEOUT_MIN_SECONDS or parsed > IDLE_TIMEOUT_MAX_SECONDS) return Error.BadDirective;
+        self.tcp_limits.idle_timeout = parsed;
     }
 };
 
@@ -1275,6 +1296,31 @@ test "config parser takes one TCP per-source limit and one connection duration" 
         "tcp-max-connection-duration 60\ntcp-max-connection-duration 120\n",
     ));
     try std.testing.expectError(error.UnknownDirective, Config.parse("tcp-max-connection 60\n"));
+}
+
+test "config parser takes one TCP idle timeout" {
+    // RFC 9210 section 4.2: without the directive the project's own timeout
+    // applies, and the operator did not change it.
+    const implicit = try Config.parse("zone one.example primary one.zone\n");
+    try std.testing.expect(implicit.tcp_limits.idle_timeout == null);
+
+    const configured = try Config.parse("tcp-idle-timeout 30\n");
+    try std.testing.expectEqual(@as(u32, 30), configured.tcp_limits.idle_timeout.?);
+
+    for ([_][]const u8{
+        "tcp-idle-timeout\n",
+        "tcp-idle-timeout 30 extra\n",
+        "tcp-idle-timeout abc\n",
+        "tcp-idle-timeout -1\n",
+        "tcp-idle-timeout 0\n",
+        "tcp-idle-timeout 3601\n",
+    }) |text| {
+        try std.testing.expectError(error.BadDirective, Config.parse(text));
+    }
+    try std.testing.expectError(error.BadDirective, Config.parse(
+        "tcp-idle-timeout 30\ntcp-idle-timeout 60\n",
+    ));
+    try std.testing.expectError(error.UnknownDirective, Config.parse("tcp-idle 30\n"));
 }
 
 test "config parser takes RFC 6052 NAT64 prefixes with their IPv4 ranges" {

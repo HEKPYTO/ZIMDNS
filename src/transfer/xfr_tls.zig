@@ -39,7 +39,6 @@ const axfr = @import("axfr.zig");
 pub const XFR_ALPN = tls_policy.dot_alpn;
 pub const MAX_FRAMES_PER_CONNECTION = listener.TCP_MAX_FRAMES_PER_CONNECTION;
 pub const MAX_CONNECTION_WORKERS = listener.TCP_MAX_CONNECTION_WORKERS;
-const IO_TIMEOUT = listener.TCP_IO_TIMEOUT;
 /// The cleartext stream buffer. The frame buffers live in the framing.
 const STREAM_BUFFER_SIZE: usize = 8192;
 
@@ -62,8 +61,8 @@ pub fn serveXfrTlsStream(
     // The channel reads and writes the raw descriptor under a poll deadline.
     // A socket timeout with a std.Io read would surface a timed-out read as
     // EAGAIN, and the standard library treats that as a fatal error.
-    var stream_reader = tcp_deadline.DeadlineReader.init(stream.socket.handle, io, &input_buffer, IO_TIMEOUT);
-    var stream_writer = tcp_deadline.DeadlineWriter.init(stream.socket.handle, io, &output_buffer, IO_TIMEOUT);
+    var stream_reader = tcp_deadline.DeadlineReader.init(stream.socket.handle, io, &input_buffer, listener.tcpIdleTimeout());
+    var stream_writer = tcp_deadline.DeadlineWriter.init(stream.socket.handle, io, &output_buffer, listener.tcpIdleTimeout());
     // The handshake is part of the connection, so it shares its deadline.
     if (connection_deadline) |value| {
         stream_reader.setFrameDeadline(value);
@@ -85,7 +84,7 @@ pub fn serveXfrTlsStream(
         .reader = &connection_reader.interface,
         .writer = &connection_writer.interface,
         .deadlines = .{ .reader = &stream_reader, .writer = &stream_writer },
-        .timeout = IO_TIMEOUT,
+        .timeout = listener.tcpIdleTimeout(),
         .connection_deadline = connection_deadline,
     };
     try serveXfrFrames(&channel, runtime, counters);

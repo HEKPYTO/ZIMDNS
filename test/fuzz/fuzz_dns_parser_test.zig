@@ -122,6 +122,8 @@ fn fuzzConfig(input: []const u8) !void {
         error.BadPort,
         error.BadAddress,
         error.BadCidr,
+        error.BadNat64Prefix,
+        error.BadExcludedRange,
         error.TextTooLong,
         error.TooManyItems,
         => return,

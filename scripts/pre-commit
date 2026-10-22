@@ -4,14 +4,7 @@ set -eu
 repo_root=$(git rev-parse --show-toplevel)
 cd "$repo_root"
 
-staged_zig=$(git diff --cached --name-only --diff-filter=ACM -- '*.zig')
-if [ -n "$staged_zig" ]; then
-    zig fmt --check $staged_zig
-fi
-
-# CI (.github/workflows/ci.yml) runs the full baseline on every push, so the
-# local build only guards the commits that can change what it produces.
-staged_build=$(git diff --cached --name-only --diff-filter=ACM -- '*.zig' '*.zig.zon')
-if [ -n "$staged_build" ]; then
-    zig build
-fi
+# One file per invocation, so a name with a space in it is still one name.
+git diff --cached --name-only --diff-filter=ACM -- '*.zig' | while IFS= read -r name; do
+    zig fmt --check "$name"
+done

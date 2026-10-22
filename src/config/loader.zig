@@ -6,6 +6,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const auth_runtime = @import("../auth/runtime.zig");
+const response_mod = @import("../auth/response.zig");
 const dns_message = @import("../dns/message.zig");
 const keyring_mod = @import("../auth/keyring.zig");
 const blocklist_mod = @import("../blocklist.zig");
@@ -350,6 +351,11 @@ pub const ServerContext = struct {
         runtime.answer_policy.zoneversion = self.config.zoneversion;
         if (self.config.minimal_any_ttl) |ttl| runtime.answer_policy.minimal_any_ttl = ttl;
         if (self.config.minimal_any_ttl_tcp) |ttl| runtime.answer_policy.minimal_any_ttl_tcp = ttl;
+        // RFC 7828 section 3.3.2: the option carries the idle timeout the
+        // connection holds, so it carries the timeout the operator set.
+        if (self.config.tcp_limits.idle_timeout) |seconds| {
+            runtime.answer_policy.tcp_keepalive_timeout = @intCast(seconds * response_mod.TCP_KEEPALIVE_UNITS_PER_SECOND);
+        }
         // The signing key moves into the runtime, which owns it from here on
         // and wipes it when it is deinited.
         runtime.dnssec_session = self.dnssec_session;
@@ -566,6 +572,44 @@ test "server context applies the configured TCP limits to the listener" {
     defer plain.deinit();
     try std.testing.expect(listener.tcpLimits().max_connections_per_source == null);
     try std.testing.expect(listener.tcpLimits().max_connection_duration == null);
+}
+
+test "server context carries the TCP idle timeout to the listener and the answer policy" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    const previous_limits = listener.tcpLimits();
+    defer listener.setTcpLimits(previous_limits);
+
+    try dir.dir.writeFile(io, .{ .sub_path = "one.zone", .data = "$ORIGIN one.example.\n$TTL 3600\n@ IN SOA ns.one.example. hostmaster.one.example. 1 3600 900 1209600 3600\n@ IN NS ns.one.example.\n" });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data =
+        \\zone one.example primary one.zone
+        \\tcp-idle-timeout 30
+        \\
+    });
+
+    var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+    defer context.deinit();
+    var runtime = try context.takeRuntime(io);
+    defer runtime.deinit();
+
+    // The listener waits the configured time for a frame on an idle
+    // connection, and the keepalive option carries that same timeout.
+    try std.testing.expectEqual(@as(u32, 30), listener.tcpLimits().idle_timeout.?);
+    try std.testing.expectEqual(@as(u32, 30), listener.tcpIdleTimeout().seconds);
+    try std.testing.expectEqual(@as(u16, 300), runtime.answer_policy.tcp_keepalive_timeout);
+
+    // A configuration without the directive leaves the project's own five
+    // seconds in force.
+    try dir.dir.writeFile(io, .{ .sub_path = "plain.gdns", .data = "zone one.example primary one.zone\n" });
+    var plain = try ServerContext.load(dir.dir, io, "plain.gdns", std.testing.allocator);
+    defer plain.deinit();
+    var plain_runtime = try plain.takeRuntime(io);
+    defer plain_runtime.deinit();
+    try std.testing.expect(listener.tcpLimits().idle_timeout == null);
+    try std.testing.expectEqual(@as(u32, 5), listener.tcpIdleTimeout().seconds);
+    try std.testing.expectEqual(@as(u16, 50), plain_runtime.answer_policy.tcp_keepalive_timeout);
 }
 
 test "server context loads the configured TSIG key file during startup" {
