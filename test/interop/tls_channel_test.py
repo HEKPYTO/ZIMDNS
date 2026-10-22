@@ -108,13 +108,17 @@ class BadTcpFrame(Exception):
     pass
 
 
-def negotiate_alpn(offered, want_doh):
-    """Mirror tls.zig negotiateAlpn: DoT wants dot, DoH wants http/1.1 only.
+# The ALPN token each encrypted transport speaks. DoT and the strict-TLS
+# transfer channel speak the IANA "dot" token; RFC 9103 section 7.1 asks for
+# the same token on the transfer channel. DoH speaks http/1.1 only, because
+# that is the mapping doh.zig implements, and selecting h2 would hand the
+# client a protocol this server cannot speak.
+ALPN_BY_TRANSPORT = {"dot": DOT_ALPN, "xfr": DOT_ALPN, "doh": DOH_ALPN_HTTP11}
 
-    doh.zig implements the HTTP/1.1 mapping, so selecting h2 would hand the
-    client a protocol this server cannot speak.
-    """
-    wanted = DOH_ALPN_HTTP11 if want_doh else DOT_ALPN
+
+def negotiate_alpn(offered, transport):
+    """Mirror the ALPN policy in tls.zig: the token a transport speaks."""
+    wanted = ALPN_BY_TRANSPORT[transport]
     for proto in offered:
         if proto == wanted:
             return wanted
@@ -143,9 +147,10 @@ def validate_pem_pair(cert_bytes, key_bytes):
 
 
 def require_listener(transport):
-    """Mirror tls.zig requireListener: the transports this build serves may
-    start, and a transport with no listener refuses before a port is bound."""
-    if transport == "dot":
+    """Mirror the startup policy: every encrypted transport this build knows
+    has a listener, and a transport it does not know is refused before a port
+    is bound."""
+    if transport in ALPN_BY_TRANSPORT:
         return
     raise TransportDeferred("no listener for " + transport)
 
@@ -280,11 +285,12 @@ HOME_ARPA_AXFR = (
 class TlsPolicyTest(unittest.TestCase):
     def test_alpn_selects_dot_for_dot_and_http11_only_for_doh(self):
         offered = ["h2", "dot", "http/1.1"]
-        self.assertEqual("dot", negotiate_alpn(offered, False))
-        self.assertEqual("http/1.1", negotiate_alpn(offered, True))
-        self.assertIsNone(negotiate_alpn(["h2"], True))
-        self.assertIsNone(negotiate_alpn(["h2"], False))
-        self.assertIsNone(negotiate_alpn([], True))
+        self.assertEqual("dot", negotiate_alpn(offered, "dot"))
+        self.assertEqual("dot", negotiate_alpn(offered, "xfr"))
+        self.assertEqual("http/1.1", negotiate_alpn(offered, "doh"))
+        self.assertIsNone(negotiate_alpn(["h2"], "doh"))
+        self.assertIsNone(negotiate_alpn(["h2"], "dot"))
+        self.assertIsNone(negotiate_alpn([], "doh"))
 
     def test_encrypted_listeners_require_opt_in(self):
         require_enabled(True)
@@ -307,14 +313,15 @@ class TlsPolicyTest(unittest.TestCase):
         with self.assertRaises(MissingKey):
             validate_pem_pair("-----BEGIN CERTIFICATE-----\nabc\n", b"")
 
-    def test_encrypted_listener_startup_fails_closed_and_doq_deferred(self):
-        # DoT is served: the gate lets it start.
+    def test_every_known_transport_has_a_listener(self):
+        # DoT, DoH, and the strict-TLS transfer channel are all served.
         require_listener("dot")
-        # The transports with no listener refuse before a port is bound.
+        require_listener("doh")
+        require_listener("xfr")
+        # A transport this build does not know refuses before a port is bound.
         with self.assertRaises(TransportDeferred):
-            require_listener("doh")
-        with self.assertRaises(TransportDeferred):
-            require_listener("xfr")
+            require_listener("doq")
+        # DoQ needs QUIC, not TCP plus TLS, so it stays deferred.
         with self.assertRaises(DoqDeferred):
             dial_doq()
 

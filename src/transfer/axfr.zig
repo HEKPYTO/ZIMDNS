@@ -3,9 +3,9 @@
 /// every zone RR appears exactly once in between; each message stays within
 /// the 64KiB TCP framing bound. IXFR queries fall back to a full transfer per
 /// RFC 1995. Plain-DNS policy (refuse out-of-zone, refuse TSIG-chained
-/// transfers) is encoded here as single error messages. ZIMDNS has no TLS
-/// server, so there is no channel to label: xfr_tls.zig owns no bind entry
-/// point and --serve-xfr refuses before opening a socket (transport/tls.zig).
+/// transfers) is encoded here as single error messages. The RFC 9103
+/// strict-TLS transfer channel in xfr_tls.zig serves the same sequences over
+/// a TLS 1.3 connection.
 /// Ownership: Returned messages own allocator-backed sections; the caller
 /// deinits each message and frees the slice. Zone storage stays borrowed.
 /// Errors: Non-transfer qtypes report NotTransferQuery so callers can run the

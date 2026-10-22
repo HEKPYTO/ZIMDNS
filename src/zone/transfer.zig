@@ -1309,14 +1309,14 @@ test "transfer chains one TSIG per message through the chainedMac primitive" {
         lens[index] = writer.len();
         const packet = encoded[index][0..lens[index]];
         const mac = try signTransferMessage(packet, .hmac_sha256, secret, prior[0..]);
-        const verified = try dns_tsig.verifyChained(&.{packet}, secret, prior[0..], 32);
+        const verified = try dns_tsig.verifyChained(&.{packet}, secret, prior[0..]);
         try std.testing.expectEqualSlices(u8, mac.slice(), verified.slice());
         @memcpy(prior[0..mac.slice().len], mac.slice());
     }
     try std.testing.expectEqual(messages.len, index);
 
     const last = encoded[index - 1][0..lens[index - 1]];
-    try std.testing.expectError(error.BadMac, dns_tsig.verifyChained(&.{last}, secret, request_mac[0..], 32));
+    try std.testing.expectError(error.BadMac, dns_tsig.verifyChained(&.{last}, secret, request_mac[0..]));
 }
 
 test "an AXFR answer carries the owner name the zone file spelled" {

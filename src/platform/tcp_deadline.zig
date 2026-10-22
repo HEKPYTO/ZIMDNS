@@ -1,4 +1,6 @@
-/// Contract: supplies one absolute deadline for a bounded TCP frame exchange.
+/// Contract: supplies one absolute deadline for a bounded TCP frame exchange,
+/// and the reader and writer that carry a frame over a raw descriptor under
+/// that deadline.
 /// Ownership: callers own the socket and buffers; helpers only poll/read/write.
 const std = @import("std");
 const builtin = @import("builtin");
@@ -45,6 +47,167 @@ pub fn deadline(io: std.Io, timeout: Timeout) std.Io.Clock.Timestamp {
 pub fn deadlineFromTimeout(io: std.Io, timeout: std.Io.Timeout) ?std.Io.Clock.Timestamp {
     const duration = timeout.toDurationFromNow(io) orelse return null;
     return std.Io.Clock.Timestamp.fromNow(io, duration);
+}
+
+/// The reader of a channel that carries frames over a raw descriptor. The
+/// io's own socket read cannot carry a deadline: a blocked read that hits
+/// SO_RCVTIMEO surfaces as EAGAIN, which the threaded backend treats as a
+/// programmer bug and answers with a panic, so the deadline is enforced
+/// over the raw descriptor with poll instead of a socket option.
+pub const DeadlineReader = struct {
+    interface: std.Io.Reader,
+    fd: std.posix.fd_t,
+    io: std.Io,
+    timeout: Timeout,
+    /// The absolute end of the frame in flight. Null means the timeout
+    /// applies to every read on its own.
+    frame_deadline: ?std.Io.Clock.Timestamp = null,
+
+    pub fn init(fd: std.posix.fd_t, io: std.Io, buffer: []u8, timeout: Timeout) DeadlineReader {
+        return .{
+            .interface = .{
+                .vtable = &.{ .stream = stream },
+                .buffer = buffer,
+                .seek = 0,
+                .end = 0,
+            },
+            .fd = fd,
+            .io = io,
+            .timeout = timeout,
+        };
+    }
+
+    /// Bounds the reads that follow to one absolute deadline, so a frame
+    /// cannot outlive it however many reads it takes.
+    pub fn setFrameDeadline(self: *DeadlineReader, frame_deadline: std.Io.Clock.Timestamp) void {
+        self.frame_deadline = frame_deadline;
+    }
+
+    fn effectiveDeadline(self: *const DeadlineReader) std.Io.Clock.Timestamp {
+        return self.frame_deadline orelse deadline(self.io, self.timeout);
+    }
+
+    fn stream(reader: *std.Io.Reader, writer: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *DeadlineReader = @alignCast(@fieldParentPtr("interface", reader));
+        const buffer = limit.slice(try writer.writableSliceGreedy(1));
+        const count = readWithDeadline(self.fd, self.io, buffer, self.effectiveDeadline()) catch |err| switch (err) {
+            error.EndOfStream => return error.EndOfStream,
+            else => return error.ReadFailed,
+        };
+        writer.advance(count);
+        return count;
+    }
+};
+
+/// The writer of a channel that carries frames over a raw descriptor, under
+/// the same deadline the reader keeps.
+pub const DeadlineWriter = struct {
+    interface: std.Io.Writer,
+    fd: std.posix.fd_t,
+    io: std.Io,
+    timeout: Timeout,
+    /// The absolute end of the frame in flight. Null means the timeout
+    /// applies to every write on its own.
+    frame_deadline: ?std.Io.Clock.Timestamp = null,
+
+    pub fn init(fd: std.posix.fd_t, io: std.Io, buffer: []u8, timeout: Timeout) DeadlineWriter {
+        return .{
+            .interface = .{
+                .vtable = &.{ .drain = drain },
+                .buffer = buffer,
+                .end = 0,
+            },
+            .fd = fd,
+            .io = io,
+            .timeout = timeout,
+        };
+    }
+
+    /// Bounds the writes that follow to one absolute deadline, so a frame
+    /// cannot outlive it however many writes it takes.
+    pub fn setFrameDeadline(self: *DeadlineWriter, frame_deadline: std.Io.Clock.Timestamp) void {
+        self.frame_deadline = frame_deadline;
+    }
+
+    fn effectiveDeadline(self: *const DeadlineWriter) std.Io.Clock.Timestamp {
+        return self.frame_deadline orelse deadline(self.io, self.timeout);
+    }
+
+    fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *DeadlineWriter = @alignCast(@fieldParentPtr("interface", writer));
+        try self.writeAll(writer.buffered());
+        writer.end = 0;
+        if (data.len == 0) return 0;
+        var written: usize = 0;
+        for (data[0 .. data.len - 1]) |bytes| {
+            try self.writeAll(bytes);
+            written += bytes.len;
+        }
+        const pattern = data[data.len - 1];
+        written += pattern.len * splat;
+        switch (pattern.len) {
+            0 => {},
+            1 => {
+                const repeated: [256]u8 = @splat(pattern[0]);
+                var remaining = splat;
+                while (remaining > 0) {
+                    const chunk = @min(remaining, repeated.len);
+                    try self.writeAll(repeated[0..chunk]);
+                    remaining -= chunk;
+                }
+            },
+            else => for (0..splat) |_| try self.writeAll(pattern),
+        }
+        return written;
+    }
+
+    fn writeAll(self: *DeadlineWriter, bytes: []const u8) std.Io.Writer.Error!void {
+        const frame_deadline = self.effectiveDeadline();
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            const count = writeWithDeadline(self.fd, self.io, bytes[offset..], frame_deadline) catch |err| switch (err) {
+                error.WouldBlock => continue,
+                else => return error.WriteFailed,
+            };
+            if (count == 0) return error.WriteFailed;
+            offset += count;
+        }
+    }
+};
+
+/// The deadline holders of one channel: the raw descriptor the reads and the
+/// writes of a frame travel over. A frame sets its deadline on them, so the
+/// whole frame shares one absolute deadline.
+pub const FrameDeadlines = struct {
+    reader: *DeadlineReader,
+    writer: *DeadlineWriter,
+
+    pub fn apply(self: *const FrameDeadlines, frame_deadline: std.Io.Clock.Timestamp) void {
+        self.reader.setFrameDeadline(frame_deadline);
+        self.writer.setFrameDeadline(frame_deadline);
+    }
+};
+
+/// Reads what the descriptor holds, waiting at most until the deadline.
+fn readWithDeadline(fd: std.posix.fd_t, io: std.Io, buffer: []u8, frame_deadline: std.Io.Clock.Timestamp) !usize {
+    try waitForSocket(fd, io, frame_deadline, std.posix.POLL.IN);
+    const count = std.posix.read(fd, buffer) catch |err| switch (err) {
+        error.WouldBlock => return error.Timeout,
+        else => return err,
+    };
+    if (count == 0) return error.EndOfStream;
+    return count;
+}
+
+/// Writes what the descriptor takes, waiting at most until the deadline.
+fn writeWithDeadline(fd: std.posix.fd_t, io: std.Io, buffer: []const u8, frame_deadline: std.Io.Clock.Timestamp) !usize {
+    try waitForSocket(fd, io, frame_deadline, std.posix.POLL.OUT);
+    const result = std.posix.system.sendto(fd, buffer.ptr, buffer.len, std.posix.MSG.NOSIGNAL, null, 0);
+    return switch (std.posix.errno(result)) {
+        .SUCCESS => @intCast(result),
+        .AGAIN, .INTR => error.WouldBlock,
+        else => error.WriteFailed,
+    };
 }
 
 pub fn readExact(fd: std.posix.fd_t, io: std.Io, buffer: []u8, frame_deadline: std.Io.Clock.Timestamp) !void {

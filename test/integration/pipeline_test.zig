@@ -141,7 +141,7 @@ test "UDP signed query pipeline authenticates and returns signed success and uns
     const request_final = (try dns_tsig.parseFinalAdditional(query.bytes[0..query.len])).?;
     const response_final = (try dns_tsig.parseFinalAdditional(incoming.data)).?;
     try std.testing.expectEqual(@as(u16, 0), response_final.tsig.error_code);
-    _ = try dns_tsig.verify(incoming.data, "01234567890123456789012345678901", request_final.tsig.macBytes(), 32);
+    _ = try dns_tsig.verify(incoming.data, "01234567890123456789012345678901", request_final.tsig.macBytes());
 
     query.bytes[query.owner_start + 1] = 'b';
     query.bytes[query.owner_start + 2] = 'a';

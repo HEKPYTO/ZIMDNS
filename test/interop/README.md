@@ -94,17 +94,49 @@ The response is `HTTP/1.1 200 OK` with a `content-type: application/dns-message`
 body. The unit tests in `src/transport/doh.zig` assert the same mapping,
 the ALPN refusal, and that the port never answers a cleartext HTTP request.
 
-## XFR-over-TLS (RFC 9103) — `dig +tls` — the listener is being built
+## XFR-over-TLS (RFC 9103) — `dig +tls` — LIVE
 
 ```sh
-dig @127.0.0.1 -p <xfr-port> +tls example. AXFR
+./zig-out/bin/zimdns server run --zone-file examples/zones/home.arpa.zone \
+  --serve-xfr --enable-encrypted-dns \
+  --tls-cert-file tls/cert.pem --tls-key-file tls/key.pem
+
+dig @127.0.0.1 -p 1053 +tls +time=5 home.arpa. AXFR
 ```
 
-The strict-TLS transfer channel is not reachable in this build yet, so
-`--serve-xfr` refuses to start and binds no port. The SOA-framed sequence
-(apex SOA first and last) and the out-of-zone and TSIG-signed refusals are
+The listener terminates the handshake with the `dot` token and then speaks
+the RFC 7858 framing, so the transfer arrives as the same SOA-framed AXFR
+sequence the Do53 TCP path serves. The outside-client probe needs a TLS
+client that offers the `dot` ALPN token, and `dig +tls` does not, so the
+probe below uses the Python `ssl` client. The SOA-framed sequence (apex
+SOA first and last) and the out-of-zone and TSIG-signed refusals are also
 covered by the `src/transfer/axfr.zig` and `src/transfer/xfr_tls.zig` unit
-tests instead.
+tests.
+
+```sh
+python3 - <<'PYCODE'
+import socket, ssl, struct
+query = struct.pack('>HHHHHH', 0x5eed, 0x0000, 1, 0, 0, 0)
+query += b'\x04home\x04arpa\x00' + struct.pack('>HH', 252, 1)
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+ctx.set_alpn_protocols(['dot'])
+with socket.create_connection(('127.0.0.1', 1053), timeout=10) as raw:
+    with ctx.wrap_socket(raw, server_hostname='localhost') as s:
+        s.sendall(struct.pack('>H', len(query)) + query)
+        data = b''
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+length = struct.unpack('>H', data[:2])[0]
+# The two-octet frame prefix precedes the DNS header, so the counts sit at
+# offsets 2 and 4 inside it: questions at 6, answers at 8.
+print('answers:', struct.unpack('>H', data[8:10])[0], 'in a', length, 'byte message')
+PYCODE
+```
 
 ## NSEC3 oracle rerun
 

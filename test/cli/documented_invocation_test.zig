@@ -58,14 +58,14 @@ const child_deadline = std.Io.Timeout{ .duration = .{
     .clock = .awake,
 } };
 
-const Transport = enum { udp, tcp, doh };
+const Transport = enum { udp, tcp, doh, xfr };
 
 const Kind = enum {
     /// `--help`, `--version`: runs and exits 0.
     informational,
     /// `server run` with no mode: exits `usage_exit` without opening anything.
     usage_refusal,
-    /// `--serve-dot|--serve-doh|--serve-xfr`: exits `usage_exit`, says why, and
+    /// A transport this build cannot serve: exits `usage_exit`, says why, and
     /// leaves its port unbound.
     encrypted_refusal,
     /// A bounded listener: must serve its quota and exit 0.
@@ -157,9 +157,8 @@ const Discovery = struct {
     invocations: [][]const []const u8,
     help_count: usize,
     examples_count: usize,
-    /// Flags the prose names as always refusing, which never appear as a
-    /// complete invocation in the Usage block.
-    refusing_flags: []const []const u8,
+    /// Flags the prose names without a complete invocation of their own.
+    prose_flags: []const []const u8,
 };
 
 fn discover(allocator: std.mem.Allocator, io: std.Io) !Discovery {
@@ -198,23 +197,23 @@ fn discover(allocator: std.mem.Allocator, io: std.Io) !Discovery {
     }
 
     // The prose names flags that never appear as a complete invocation.
-    var refusing: std.ArrayList([]const u8) = .empty;
+    var prose: std.ArrayList([]const u8) = .empty;
     var words = std.mem.tokenizeAny(u8, help.stdout, " \t\r\n,;.");
     while (words.next()) |word| {
         if (!std.mem.startsWith(u8, word, "--serve-")) continue;
         if (argvContains(found.items, word)) continue;
         var already = false;
-        for (refusing.items) |existing| {
+        for (prose.items) |existing| {
             if (std.mem.eql(u8, existing, word)) already = true;
         }
-        if (!already) try refusing.append(allocator, word);
+        if (!already) try prose.append(allocator, word);
     }
 
     return .{
         .invocations = try found.toOwnedSlice(allocator),
         .help_count = help_count,
         .examples_count = examples_count,
-        .refusing_flags = try refusing.toOwnedSlice(allocator),
+        .prose_flags = try prose.toOwnedSlice(allocator),
     };
 }
 
@@ -269,8 +268,8 @@ fn buildCases(allocator: std.mem.Allocator, io: std.Io, tmp_prefix: []const u8, 
         };
         try cases.append(allocator, case);
     }
-    for (discovered.refusing_flags) |flag| {
-        try cases.append(allocator, try classifyRefusal(allocator, flag, tls_cert, tls_key));
+    for (discovered.prose_flags) |flag| {
+        try cases.append(allocator, try classifyProseFlag(allocator, flag, tls_cert, tls_key));
         next_port += 2;
     }
     return cases.toOwnedSlice(allocator);
@@ -317,11 +316,13 @@ fn classify(allocator: std.mem.Allocator, io: std.Io, tmp_prefix: []const u8, ar
         // drives a DoH exchange over TLS.
         if (hasFlag(argv, "--serve-doh")) return classifyDoh(allocator, argv, tls_cert, tls_key);
 
+        // The zone-transfer channel is served over TLS too, so the case runs
+        // the real listener and drives one transfer over the handshake.
+        if (hasFlag(argv, "--serve-xfr")) return classifyXfr(allocator, argv, tls_cert, tls_key);
+
         // The transports this build cannot serve refuse; `--serve-dot` is
         // served, so its refusal has to come from the identity.
-        for ([_][]const u8{ "--serve-dot", "--serve-xfr" }) |flag| {
-            if (hasFlag(argv, flag)) return classifyRefusal(allocator, flag, tls_cert, tls_key);
-        }
+        if (hasFlag(argv, "--serve-dot")) return classifyRefusal(allocator, "--serve-dot", tls_cert, tls_key);
 
         switch (flagCount(argv)) {
             0 => return plain(argv, .usage_refusal, port),
@@ -395,19 +396,49 @@ fn classifyDoh(allocator: std.mem.Allocator, argv: []const []const u8, tls_cert:
     };
 }
 
+/// A flag the prose names without a complete invocation of its own. The
+/// transports this build serves run their real listener; a transport that
+/// still cannot be served refuses with its own reason.
+fn classifyProseFlag(allocator: std.mem.Allocator, flag: []const u8, tls_cert: []const u8, tls_key: []const u8) !Case {
+    if (std.mem.eql(u8, flag, "--serve-xfr")) {
+        const argv = [_][]const u8{ "server", "run", "--zone-file", "examples/zones/home.arpa.zone", "--serve-xfr" };
+        return classifyXfr(allocator, &argv, tls_cert, tls_key);
+    }
+    return classifyRefusal(allocator, flag, tls_cert, tls_key);
+}
+
+/// `--serve-xfr` is served: the case runs the real listener with a loadable
+/// identity and drives one transfer over TLS. The documented invocation
+/// names no listener, so the port is the CLI default.
+fn classifyXfr(allocator: std.mem.Allocator, argv: []const []const u8, tls_cert: []const u8, tls_key: []const u8) !Case {
+    var out: std.ArrayList([]const u8) = .empty;
+    try out.appendSlice(allocator, argv);
+    try out.append(allocator, "--enable-encrypted-dns");
+    try out.append(allocator, "--tls-cert-file");
+    try out.append(allocator, tls_cert);
+    try out.append(allocator, "--tls-key-file");
+    try out.append(allocator, tls_key);
+    // One connection is the whole quota, so the server stops on its own.
+    try out.append(allocator, "--max-requests");
+    try out.append(allocator, "1");
+    return .{
+        .documented = argv,
+        .executed = try out.toOwnedSlice(allocator),
+        .kind = .serve,
+        .transport = .xfr,
+        .quota = 1,
+        .port = documented_port,
+    };
+}
+
 /// The encrypted case the prose documents: the flag plus everything needed to
 /// reach the TLS-termination gate, so the harness observes the real refusal
-/// rather than an argument-validation stop.
+/// rather than an argument-validation stop. The DoT port is served in this
+/// build, so its refusal has to come from the identity: a certificate that
+/// is not there is the clean way to reach the gate that refuses before the
+/// port is bound.
 fn classifyRefusal(allocator: std.mem.Allocator, flag: []const u8, tls_cert: []const u8, tls_key: []const u8) !Case {
-    // The DoT port is served in this build, so its refusal has to come from
-    // the identity: a certificate that is not there is the clean way to reach
-    // the gate that refuses before the port is bound. The transports this
-    // build cannot serve refuse on the transport itself.
-    const is_dot = std.mem.eql(u8, flag, "--serve-dot");
-    const cert_path = if (is_dot)
-        try std.fmt.allocPrint(allocator, "{s}/absent-cert.pem", .{std.fs.path.dirname(tls_cert) orelse tls_cert})
-    else
-        tls_cert;
+    const cert_path = try std.fmt.allocPrint(allocator, "{s}/absent-cert.pem", .{std.fs.path.dirname(tls_cert) orelse tls_cert});
     // Arena-owned: a local array literal would dangle once this frame returns.
     const argv = [_][]const u8{
         "server",         "run",                    "--zone-file",     "examples/zones/home.arpa.zone",
@@ -415,13 +446,6 @@ fn classifyRefusal(allocator: std.mem.Allocator, flag: []const u8, tls_cert: []c
         "--tls-key-file", tls_key,
     };
     const owned = try allocator.dupe([]const u8, argv[0..]);
-    // The refusal names its own reason: the transports this build cannot
-    // serve say so, and the one it can serve says which identity it could
-    // not read.
-    const refusal_text = if (is_dot)
-        "cannot read TLS certificate file"
-    else
-        "has no listener in this build";
     return .{
         .documented = owned,
         .executed = owned,
@@ -430,7 +454,7 @@ fn classifyRefusal(allocator: std.mem.Allocator, flag: []const u8, tls_cert: []c
         .quota = 0,
         .port = documented_port,
         .refuse_port = documented_port,
-        .refusal_text = refusal_text,
+        .refusal_text = "cannot read TLS certificate file",
     };
 }
 
@@ -646,6 +670,7 @@ fn runServe(allocator: std.mem.Allocator, io: std.Io, case: Case, argv: []const 
         .udp => Drive{ .served = driveUdp(io, address, case.quota) },
         .tcp => driveTcp(allocator, io, address, case.quota),
         .doh => driveDoh(allocator, io, address, case.quota),
+        .xfr => driveXfr(allocator, io, address, case.quota),
     };
     const served = drive.served;
     if (served != case.quota) {
@@ -800,6 +825,75 @@ fn driveDoh(allocator: std.mem.Allocator, io: std.Io, address: std.Io.net.IpAddr
     const deadline = readyDeadline(io);
     while (drive.served < quota and !expired(io, deadline)) {
         exchangeDohOnce(allocator, io, address) catch |err| {
+            drive.last_error = @errorName(err);
+            continue;
+        };
+        drive.served += 1;
+    }
+    return drive;
+}
+
+/// The apex SOA, the record that ends a transfer sequence.
+const soa_type: @FieldType(zimdns.dns_record.ResourceRecord, "rrtype") = .SOA;
+
+/// One zone transfer over TLS: the handshake with the "dot" ALPN token that
+/// RFC 9103 section 7.1 requires, an AXFR query in the RFC 7858 framing, and
+/// the transfer frames that come back.
+fn exchangeXfrOnce(allocator: std.mem.Allocator, io: std.Io, address: std.Io.net.IpAddress) !void {
+    const stream = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer stream.close(io);
+
+    var client_input: [tls.input_buffer_len]u8 = undefined;
+    var client_output: [tls.output_buffer_len]u8 = undefined;
+    var client_reader = stream.reader(io, &client_input);
+    var client_writer = stream.writer(io, &client_output);
+    var rng_source: std.Random.IoSource = .{ .io = io };
+    var connection = try tls.client(&client_reader.interface, &client_writer.interface, .{
+        .rng = rng_source.interface(),
+        .host = "localhost",
+        .root_ca = .empty,
+        .insecure_skip_verify = true,
+        .now = std.Io.Clock.real.now(io),
+        .alpn_protocols = &.{"dot"},
+    });
+    defer connection.close() catch {};
+    // The transfer channel speaks "dot" and nothing else.
+    const negotiated = connection.alpn_protocol orelse return error.XfrAlpnMissing;
+    if (!std.mem.eql(u8, negotiated, "dot")) return error.XfrAlpnMismatch;
+
+    var read_buffer: [4096]u8 = undefined;
+    var write_buffer: [4096]u8 = undefined;
+    var connection_reader = connection.reader(&read_buffer);
+    var connection_writer = connection.writer(&write_buffer);
+
+    var packet: [512]u8 = undefined;
+    const query = try cli_query.buildQueryPacket(&packet, 0x5eed, "home.arpa.", .AXFR, false);
+    var prefix: [2]u8 = undefined;
+    std.mem.writeInt(u16, &prefix, @intCast(query.len), .big);
+    try connection_writer.interface.writeAll(&prefix);
+    try connection_writer.interface.writeAll(query);
+    try connection_writer.interface.flush();
+
+    // The sequence ends with the apex SOA, so the message that carries it
+    // last is the last one of the transfer.
+    var frames: usize = 0;
+    while (frames < 16) : (frames += 1) {
+        const len_bytes = try connection_reader.interface.takeArray(2);
+        const response_len = std.mem.readInt(u16, len_bytes, .big);
+        const response_bytes = try connection_reader.interface.take(response_len);
+        const message = try zimdns.dns_message.Message.parse(allocator, response_bytes);
+        const answers = message.answers.slice();
+        if (answers.len == 0) return error.XfrNoAnswer;
+        if (answers[answers.len - 1].rrtype.eql(soa_type)) return;
+    }
+    return error.XfrIncomplete;
+}
+
+fn driveXfr(allocator: std.mem.Allocator, io: std.Io, address: std.Io.net.IpAddress, quota: usize) Drive {
+    var drive: Drive = .{};
+    const deadline = readyDeadline(io);
+    while (drive.served < quota and !expired(io, deadline)) {
+        exchangeXfrOnce(allocator, io, address) catch |err| {
             drive.last_error = @errorName(err);
             continue;
         };

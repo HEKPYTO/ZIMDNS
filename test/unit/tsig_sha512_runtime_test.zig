@@ -88,7 +88,7 @@ test "an hmac-sha512 request authenticates and the answer is signed with hmac-sh
     // RFC 8945 section 5.3: the answer is signed with the request MAC as the
     // prior MAC, so the client verifies the reply the same way. The expected
     // bytes come from an independent HMAC over the section 4.3 digest input.
-    const verified = try dns_tsig.verify(response_bytes, secret, request_final.tsig.macBytes(), 64);
+    const verified = try dns_tsig.verify(response_bytes, secret, request_final.tsig.macBytes());
     try std.testing.expectEqualSlices(u8, response_final.tsig.macBytes(), verified.slice());
     try std.testing.expectEqualSlices(u8, &.{
         0xcf, 0x46, 0x0a, 0x47, 0x14, 0xef, 0x47, 0x83, 0x5b, 0xc4, 0x12, 0x5c, 0x44, 0xdc, 0x93, 0x7c,

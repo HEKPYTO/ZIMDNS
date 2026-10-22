@@ -559,13 +559,7 @@ pub const Runtime = struct {
         const request_mac = copyMac(final_record.tsig.macBytes()) orelse {
             return .{ .failure = .{ .code = .badsig, .final = final_record, .key = key } };
         };
-        _ = tsig.verify(packet, key.secretBytes(), null, tsig.minimumMacLength(algorithm)) catch |err| switch (err) {
-            error.BadTrunc => return .{ .failure = .{
-                .code = .badtrunc,
-                .final = final_record,
-                .key = key,
-                .request_mac = request_mac,
-            } },
+        _ = tsig.verify(packet, key.secretBytes(), null) catch |err| switch (err) {
             error.BadMac => return .{ .failure = .{ .code = .badsig, .final = final_record, .key = key } },
             error.UnsupportedAlgorithm => return .{ .failure = .{ .code = .badkey, .final = final_record } },
             error.Formerr => return .{ .failure = .{ .code = .formerr, .final = final_record } },
@@ -578,6 +572,18 @@ pub const Runtime = struct {
         if (delta > final_record.tsig.fudge) {
             return .{ .failure = .{
                 .code = .badtime,
+                .final = final_record,
+                .key = key,
+                .request_mac = request_mac,
+            } };
+        }
+
+        // RFC 8945 section 5.2: the truncation policy check comes after the
+        // time check. Section 5.2.4: a MAC too short for the local policy is
+        // answered with BADTRUNC.
+        if (@as(usize, request_mac.len) < tsig.minimumMacLength(algorithm)) {
+            return .{ .failure = .{
+                .code = .badtrunc,
                 .final = final_record,
                 .key = key,
                 .request_mac = request_mac,
@@ -1405,7 +1411,7 @@ test "runtime authenticates a signed query and signs the authoritative response"
     const response_final = (try tsig.parseFinalAdditional(response_bytes)).?;
     try std.testing.expectEqual(@as(u16, 0), response_final.tsig.error_code);
     try std.testing.expectEqual(@as(usize, 32), response_final.tsig.macBytes().len);
-    _ = try tsig.verify(response_bytes, "01234567890123456789012345678901", request_final.tsig.macBytes(), 32);
+    _ = try tsig.verify(response_bytes, "01234567890123456789012345678901", request_final.tsig.macBytes());
 }
 
 test "runtime authenticates a key name bundled with several algorithms" {
@@ -1441,8 +1447,8 @@ test "runtime authenticates a key name bundled with several algorithms" {
     // the key that authenticated it, not with the first key of the name.
     try std.testing.expectEqual(tsig.Algorithm.hmac_sha512, try tsig.algorithmForName(&response_final.tsig.algorithm));
     try std.testing.expectEqual(@as(usize, 64), response_final.tsig.macBytes().len);
-    _ = try tsig.verify(response_bytes, sha512_test_key.secret, request_final.tsig.macBytes(), 32);
-    try std.testing.expectError(error.BadMac, tsig.verify(response_bytes, sha256_test_key.secret, request_final.tsig.macBytes(), 32));
+    _ = try tsig.verify(response_bytes, sha512_test_key.secret, request_final.tsig.macBytes());
+    try std.testing.expectError(error.BadMac, tsig.verify(response_bytes, sha256_test_key.secret, request_final.tsig.macBytes()));
 }
 
 test "runtime refuses a request whose algorithm no key of the name carries" {
@@ -1528,7 +1534,7 @@ test "a reload adds the TSIG key the new key file names" {
     const request_final = (try tsig.parseFinalAdditional(query.packet[0..query.len])).?;
     const response_final = (try tsig.parseFinalAdditional(response_bytes)).?;
     try std.testing.expectEqual(@as(u16, 0), response_final.tsig.error_code);
-    _ = try tsig.verify(response_bytes, added.secret, request_final.tsig.macBytes(), 32);
+    _ = try tsig.verify(response_bytes, added.secret, request_final.tsig.macBytes());
 }
 
 test "a reload drops the TSIG key the new key file no longer names" {
@@ -1657,7 +1663,7 @@ test "runtime accepts a signed query whose Original ID differs from the packet I
     const request_final = (try tsig.parseFinalAdditional(query.packet[0..query.len])).?;
     const response_final = (try tsig.parseFinalAdditional(response_bytes)).?;
     try std.testing.expectEqual(@as(u16, 0x1234), response_final.tsig.original_id);
-    _ = try tsig.verify(response_bytes, "01234567890123456789012345678901", request_final.tsig.macBytes(), 32);
+    _ = try tsig.verify(response_bytes, "01234567890123456789012345678901", request_final.tsig.macBytes());
 }
 
 test "runtime maps TSIG key and MAC failures before query dispatch" {
@@ -1733,7 +1739,7 @@ test "runtime signs BADTIME responses" {
     expected_server_time[4] = @intCast(((request_time + 1000) >> 8) & 0xff);
     expected_server_time[5] = @intCast((request_time + 1000) & 0xff);
     try std.testing.expectEqualSlices(u8, &expected_server_time, response_final.tsig.otherData());
-    _ = try tsig.verify(response_bytes, "01234567890123456789012345678901", request_final.tsig.macBytes(), 32);
+    _ = try tsig.verify(response_bytes, "01234567890123456789012345678901", request_final.tsig.macBytes());
 }
 
 test "runtime answers a MAC below the policy floor with a signed BADTRUNC" {
@@ -1764,7 +1770,39 @@ test "runtime answers a MAC below the policy floor with a signed BADTRUNC" {
     try std.testing.expectEqual(@as(u16, 22), response_final.tsig.error_code);
     try std.testing.expectEqual(@as(usize, 20), response_final.tsig.macBytes().len);
     const request_final = (try tsig.parseFinalAdditional(query.packet[0..query.len])).?;
-    _ = try tsig.verify(response_bytes, sha1_test_key.secret, request_final.tsig.macBytes(), 12);
+    _ = try tsig.verify(response_bytes, sha1_test_key.secret, request_final.tsig.macBytes());
+}
+
+test "RFC 8945 section 5.2: a request that is out of time and short of the local MAC floor is answered BADTIME, not BADTRUNC" {
+    const request_time = 1_700_000_000;
+    var keyring = try keyring_mod.Keyring.parse("key \"key.\" { algorithm hmac-sha1; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODk=\"; };");
+    var runtime = try Runtime.fromZoneTextWithKeyring(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
+        \\
+    , &keyring);
+    defer runtime.deinit();
+    runtime.setTsigNow(request_time + 1000);
+
+    // RFC 8945 section 5.2: the checks run in the order key, MAC, time
+    // values, truncation policy. The request is out of the fudge window and
+    // its eleven-octet MAC is below the twelve-octet SHA-1 policy floor, so
+    // the time check answers BADTIME before the truncation policy is applied.
+    const query = try makeSignedQueryWithKey(request_time, 11, sha1_test_key);
+    var output: [1024]u8 = undefined;
+    const response_bytes = try runtime.answer(query.packet[0..query.len], &output);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@as(@TypeOf(parsed.header.rcode), .notauth), parsed.header.rcode);
+    const response_final = (try tsig.parseFinalAdditional(response_bytes)).?;
+    try std.testing.expectEqual(@as(u16, 18), response_final.tsig.error_code);
+    try std.testing.expectEqual(@as(usize, 6), response_final.tsig.otherData().len);
+    const request_final = (try tsig.parseFinalAdditional(query.packet[0..query.len])).?;
+    _ = try tsig.verify(response_bytes, sha1_test_key.secret, request_final.tsig.macBytes());
 }
 
 test "runtime accepts a truncated MAC and answers with a MAC at least as long" {
@@ -1797,7 +1835,7 @@ test "runtime accepts a truncated MAC and answers with a MAC at least as long" {
     // RFC 8945 section 7: the reply MAC is at least as long as the request's.
     try std.testing.expect(response_final.tsig.macBytes().len >= request_final.tsig.macBytes().len);
     try std.testing.expectEqual(@as(usize, 20), response_final.tsig.macBytes().len);
-    _ = try tsig.verify(response_bytes, sha1_test_key.secret, request_final.tsig.macBytes(), 12);
+    _ = try tsig.verify(response_bytes, sha1_test_key.secret, request_final.tsig.macBytes());
 }
 
 test "runtime rejects a MAC longer than the keyed hash output" {
@@ -3162,7 +3200,7 @@ test "runtime signs the answer to a signed NOTIFY" {
     const response_final = (try tsig.parseFinalAdditional(response_bytes)) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u16, 0), response_final.tsig.error_code);
     try std.testing.expectEqual(@as(usize, 32), response_final.tsig.macBytes().len);
-    _ = try tsig.verify(response_bytes, sha256_test_key.secret, request_final.tsig.macBytes(), 32);
+    _ = try tsig.verify(response_bytes, sha256_test_key.secret, request_final.tsig.macBytes());
 
     // The signed answer keeps the shape of the unsigned one: the same RCODE,
     // the same echoed question, and the zone's own SOA in the answer section.
@@ -3196,7 +3234,7 @@ test "runtime signs the answer to a signed NOTIFY" {
     const stale_final = (try tsig.parseFinalAdditional(stale_bytes)) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(usize, 32), stale_final.tsig.macBytes().len);
     const stale_request_final = (try tsig.parseFinalAdditional(stale)) orelse return error.TestExpectedEqual;
-    _ = try tsig.verify(stale_bytes, sha256_test_key.secret, stale_request_final.tsig.macBytes(), 32);
+    _ = try tsig.verify(stale_bytes, sha256_test_key.secret, stale_request_final.tsig.macBytes());
 }
 
 test "an unsigned NOTIFY is answered with no TSIG record" {
@@ -3367,10 +3405,10 @@ test "a signed AXFR is answered with signed frames a client can verify" {
             // RFC 8945 section 5.3.1: the first message of a multi-message
             // response is a standard answer, so it verifies with the request
             // MAC and the whole TSIG record.
-            _ = try tsig.verify(frame, sha256_test_key.secret, request_final.tsig.macBytes(), 16);
+            _ = try tsig.verify(frame, sha256_test_key.secret, request_final.tsig.macBytes());
         } else {
             // A later message chains on the MAC of the message before it.
-            _ = try tsig.verifyChained(&.{frame}, sha256_test_key.secret, prior_bytes[0..prior_len], 16);
+            _ = try tsig.verifyChained(&.{frame}, sha256_test_key.secret, prior_bytes[0..prior_len]);
         }
         prior_len = final.tsig.macBytes().len;
         @memcpy(prior_bytes[0..prior_len], final.tsig.macBytes());
@@ -3405,7 +3443,7 @@ test "a signed out-of-zone AXFR is refused with a signed frame" {
     const final = (try tsig.parseFinalAdditional(frame)) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(usize, 32), final.tsig.macBytes().len);
     const request_final = (try tsig.parseFinalAdditional(query.packet[0..query.len])) orelse return error.TestExpectedEqual;
-    _ = try tsig.verify(frame, sha256_test_key.secret, request_final.tsig.macBytes(), 16);
+    _ = try tsig.verify(frame, sha256_test_key.secret, request_final.tsig.macBytes());
 }
 
 const reload_zone =

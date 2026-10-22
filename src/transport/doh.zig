@@ -18,8 +18,13 @@
 const std = @import("std");
 const tls = @import("tls");
 const Runtime = @import("../auth/runtime.zig").Runtime;
+const cli_query = @import("../cli/query.zig");
 const metrics = @import("../metrics.zig");
 const dns_message = @import("../dns/message.zig");
+const dns_padding = @import("../dns/padding.zig");
+const dns_rdata = @import("../dns/rdata.zig");
+const dns_types = @import("../dns/types.zig");
+const dns_writer = @import("../dns/writer.zig");
 const tcp_deadline = @import("../platform/tcp_deadline.zig");
 const listener = @import("../platform/listener.zig");
 const tls_policy = @import("tls.zig");
@@ -314,7 +319,6 @@ pub fn serveDohExchange(
         try writer.flush();
         return true;
     };
-    _ = request_message;
 
     const response_buffer = arena.alloc(u8, MAX_BODY_LEN) catch {
         try writeError(writer, .internal_error);
@@ -326,12 +330,18 @@ pub fn serveDohExchange(
     else
         runtime.answer(query, response_buffer) catch |err| return serveRuntimeError(writer, err);
 
-    const response_message = dns_message.Message.parse(arena, response_bytes) catch {
+    // RFC 7830 section 4: the responder pads the answer when the query
+    // carried the Padding option. RFC 7830 section 6 keeps the option for
+    // encrypted transports, so this path and no other one calls the helper.
+    const body = (dns_padding.padResponse(arena, &request_message, response_bytes) catch |err|
+        return serveRuntimeError(writer, err)) orelse response_bytes;
+
+    const response_message = dns_message.Message.parse(arena, body) catch {
         try writeError(writer, .internal_error);
         try writer.flush();
         return true;
     };
-    try writeDnsResponse(writer, response_bytes, minTtl(&response_message), parsed.head.close);
+    try writeDnsResponse(writer, body, minTtl(&response_message), parsed.head.close);
     try writer.flush();
     return parsed.head.close;
 }
@@ -358,8 +368,8 @@ pub fn serveDohStreamOnce(stream: std.Io.net.Stream, io: std.Io, runtime: *const
 fn serveDohStream(stream: std.Io.net.Stream, io: std.Io, runtime: *const Runtime, counters: ?*metrics.Counters) !void {
     var read_buffer: [MAX_HEADER_BYTES]u8 = undefined;
     var write_buffer: [DOH_WRITE_BUFFER_SIZE]u8 = undefined;
-    var reader = DeadlineReader.init(stream.socket.handle, io, &read_buffer, DOH_IO_TIMEOUT);
-    var writer = DeadlineWriter.init(stream.socket.handle, io, &write_buffer, DOH_IO_TIMEOUT);
+    var reader = tcp_deadline.DeadlineReader.init(stream.socket.handle, io, &read_buffer, DOH_IO_TIMEOUT);
+    var writer = tcp_deadline.DeadlineWriter.init(stream.socket.handle, io, &write_buffer, DOH_IO_TIMEOUT);
     try serveDohExchanges(&reader.interface, &writer.interface, runtime, counters);
 }
 
@@ -398,8 +408,8 @@ pub fn serveDohTlsStream(
 
     var input_buffer: [tls_server.input_buffer_len]u8 = undefined;
     var output_buffer: [tls_server.output_buffer_len]u8 = undefined;
-    var stream_reader = DeadlineReader.init(stream.socket.handle, io, &input_buffer, DOH_IO_TIMEOUT);
-    var stream_writer = DeadlineWriter.init(stream.socket.handle, io, &output_buffer, DOH_IO_TIMEOUT);
+    var stream_reader = tcp_deadline.DeadlineReader.init(stream.socket.handle, io, &input_buffer, DOH_IO_TIMEOUT);
+    var stream_writer = tcp_deadline.DeadlineWriter.init(stream.socket.handle, io, &output_buffer, DOH_IO_TIMEOUT);
     var connection = try server.handshake(&stream_reader.interface, &stream_writer.interface);
 
     var read_buffer: [MAX_HEADER_BYTES]u8 = undefined;
@@ -469,135 +479,6 @@ fn serveDohTlsWorker(stream: std.Io.net.Stream, io: std.Io, server: *tls_server.
     defer stream.close(io);
     defer sources.release(&stream.socket.address);
     serveDohTlsStream(stream, io, server, runtime, null) catch {};
-}
-
-/// The TLS input: the raw socket, read with the frame deadline. The io's own
-/// socket read reports a timed-out read as a fatal error, so the deadline is
-/// enforced over the raw descriptor instead of a socket option.
-const DeadlineReader = struct {
-    interface: std.Io.Reader,
-    fd: std.posix.fd_t,
-    io: std.Io,
-    timeout: tcp_deadline.Timeout,
-
-    fn init(fd: std.posix.fd_t, io: std.Io, buffer: []u8, timeout: tcp_deadline.Timeout) DeadlineReader {
-        return .{
-            .interface = .{
-                .vtable = &.{ .stream = stream },
-                .buffer = buffer,
-                .seek = 0,
-                .end = 0,
-            },
-            .fd = fd,
-            .io = io,
-            .timeout = timeout,
-        };
-    }
-
-    fn stream(reader: *std.Io.Reader, writer: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
-        const self: *DeadlineReader = @fieldParentPtr("interface", reader);
-        const buffer = limit.slice(try writer.writableSliceGreedy(1));
-        const count = readWithDeadline(self.fd, self.io, buffer, self.timeout) catch |err| switch (err) {
-            error.EndOfStream => return error.EndOfStream,
-            else => return error.ReadFailed,
-        };
-        writer.advance(count);
-        return count;
-    }
-};
-
-/// The TLS output: the raw socket, written with the frame deadline.
-const DeadlineWriter = struct {
-    interface: std.Io.Writer,
-    fd: std.posix.fd_t,
-    io: std.Io,
-    timeout: tcp_deadline.Timeout,
-
-    fn init(fd: std.posix.fd_t, io: std.Io, buffer: []u8, timeout: tcp_deadline.Timeout) DeadlineWriter {
-        return .{
-            .interface = .{
-                .vtable = &.{ .drain = drain },
-                .buffer = buffer,
-                .end = 0,
-            },
-            .fd = fd,
-            .io = io,
-            .timeout = timeout,
-        };
-    }
-
-    fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
-        const self: *DeadlineWriter = @fieldParentPtr("interface", writer);
-        try self.writeAll(writer.buffered());
-        writer.end = 0;
-        if (data.len == 0) return 0;
-        var written: usize = 0;
-        for (data[0 .. data.len - 1]) |bytes| {
-            try self.writeAll(bytes);
-            written += bytes.len;
-        }
-        const pattern = data[data.len - 1];
-        written += pattern.len * splat;
-        switch (pattern.len) {
-            0 => {},
-            1 => {
-                const repeated: [256]u8 = @splat(pattern[0]);
-                var remaining = splat;
-                while (remaining > 0) {
-                    const chunk = @min(remaining, repeated.len);
-                    try self.writeAll(repeated[0..chunk]);
-                    remaining -= chunk;
-                }
-            },
-            else => for (0..splat) |_| try self.writeAll(pattern),
-        }
-        return written;
-    }
-
-    fn writeAll(self: *DeadlineWriter, bytes: []const u8) std.Io.Writer.Error!void {
-        const deadline = tcp_deadline.deadline(self.io, self.timeout);
-        var offset: usize = 0;
-        while (offset < bytes.len) {
-            const count = writeWithDeadline(self.fd, self.io, bytes[offset..], deadline) catch |err| switch (err) {
-                error.WouldBlock => continue,
-                else => return error.WriteFailed,
-            };
-            if (count == 0) return error.WriteFailed;
-            offset += count;
-        }
-    }
-};
-
-/// Reads what the socket holds, waiting at most the frame deadline for it.
-fn readWithDeadline(fd: std.posix.fd_t, io: std.Io, buffer: []u8, timeout: tcp_deadline.Timeout) !usize {
-    try waitForSocket(fd, io, tcp_deadline.deadline(io, timeout), std.posix.POLL.IN);
-    const count = std.posix.read(fd, buffer) catch |err| switch (err) {
-        error.WouldBlock => return error.Timeout,
-        else => return err,
-    };
-    if (count == 0) return error.EndOfStream;
-    return count;
-}
-
-/// Writes what the socket takes, waiting at most until the deadline.
-fn writeWithDeadline(fd: std.posix.fd_t, io: std.Io, buffer: []const u8, deadline: std.Io.Clock.Timestamp) !usize {
-    try waitForSocket(fd, io, deadline, std.posix.POLL.OUT);
-    const result = std.posix.system.sendto(fd, buffer.ptr, buffer.len, std.posix.MSG.NOSIGNAL, null, 0);
-    return switch (std.posix.errno(result)) {
-        .SUCCESS => @intCast(result),
-        .AGAIN, .INTR => error.WouldBlock,
-        else => error.WriteFailed,
-    };
-}
-
-/// Waits for the socket to become ready, at most until the deadline.
-fn waitForSocket(fd: std.posix.fd_t, io: std.Io, deadline: std.Io.Clock.Timestamp, events: i16) !void {
-    const remaining = deadline.durationFromNow(io).raw.nanoseconds;
-    if (remaining <= 0) return error.Timeout;
-    const millis = @divTrunc(remaining + std.time.ns_per_ms - 1, std.time.ns_per_ms);
-    var poll_fds = [_]std.posix.pollfd{.{ .fd = fd, .events = events, .revents = 0 }};
-    const count = try std.posix.poll(poll_fds[0..], @intCast(@min(millis, std.math.maxInt(i32))));
-    if (count == 0) return error.Timeout;
 }
 
 fn streamPair() ![2]std.Io.net.Stream {
@@ -750,6 +631,196 @@ test "DoH POST serves an application/dns-message body" {
     const response = try dns_message.Message.parse(arena.allocator(), body);
     try std.testing.expectEqual(@as(u16, 0xdcba), response.header.id);
     try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+}
+
+/// A query for the test zone whose OPT record advertises EDNS(0) and, when
+/// `padding` is set, carries a Padding option: the RFC 7830 section 3
+/// request that asks for a padded answer.
+fn buildEdnsQuery(buffer: []u8, id: u16, padding: bool) ![]const u8 {
+    var writer = dns_writer.Writer.init(buffer);
+    try writer.writeU16(id);
+    try writer.writeU16(0x0100);
+    try writer.writeU16(1);
+    try writer.writeU16(0);
+    try writer.writeU16(0);
+    try writer.writeU16(1);
+    try writer.writeBytes(&.{ 0x03, 'd', 'n', 's', 0x04, 'h', 'o', 'm', 'e', 0x04, 'a', 'r', 'p', 'a', 0x00 });
+    try writer.writeU16(1);
+    try writer.writeU16(1);
+    // The OPT pseudo-record: the root owner, the type, the requestor's
+    // payload size, a zero TTL, and the option framing.
+    try writer.writeU8(0);
+    try writer.writeU16(dns_types.RecordType.OPT.code());
+    try writer.writeU16(dns_message.DEFAULT_EDNS_UDP_PAYLOAD_SIZE);
+    try writer.writeU32(0);
+    if (!padding) {
+        try writer.writeU16(0);
+        return writer.written();
+    }
+    try writer.writeU16(8);
+    try writer.writeU16(dns_rdata.EDNS_PADDING_OPTION_CODE);
+    try writer.writeU16(4);
+    try writer.writeBytes(&.{ 0, 0, 0, 0 });
+    return writer.written();
+}
+
+/// Serves one DoH exchange with `query` and returns the DNS message the
+/// server answered with.
+fn dohAnswer(arena: std.mem.Allocator, runtime: *const Runtime, query: []const u8) ![]u8 {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const streams = try streamPair();
+    var client_stream = streams[0];
+    defer client_stream.close(io);
+    const server_stream = streams[1];
+    defer server_stream.close(io);
+
+    var request_buffer: [2048]u8 = undefined;
+    var request_stream = std.Io.Writer.fixed(&request_buffer);
+    try request_stream.print("POST /dns-query HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/dns-message\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{query.len});
+    try request_stream.writeAll(query);
+
+    var client_write_buffer: [2048]u8 = undefined;
+    var client_writer = client_stream.writer(io, &client_write_buffer);
+    try client_writer.interface.writeAll(request_stream.buffered());
+    try client_writer.interface.flush();
+
+    try serveDohStreamOnce(server_stream, io, runtime);
+
+    var response_buffer: [4096]u8 = undefined;
+    var client_reader = client_stream.reader(io, &response_buffer);
+    const status_line = try takeTestLine(&client_reader.interface);
+    try std.testing.expect(std.mem.startsWith(u8, status_line, "HTTP/1.1 200"));
+    var content_length: usize = 0;
+    while (true) {
+        const trimmed = try takeTestLine(&client_reader.interface);
+        if (trimmed.len == 0) break;
+        if (trimmed.len > 15 and std.ascii.eqlIgnoreCase(trimmed[0..14], "content-length")) {
+            content_length = try std.fmt.parseInt(usize, std.mem.trim(u8, trimmed[15..], " "), 10);
+        }
+    }
+    const body = try arena.alloc(u8, content_length);
+    try client_reader.interface.readSliceAll(body);
+    return body;
+}
+
+/// The option framing of a message's OPT record, or null when the message
+/// carries no EDNS(0) at all.
+fn messageOptions(message: *const dns_message.Message) ?[]const u8 {
+    for (message.additionals.slice()) |record| {
+        if (!record.rrtype.eql(.OPT)) continue;
+        return switch (record.rdata) {
+            .OPT => |opt| opt.bytes(),
+            else => unreachable,
+        };
+    }
+    return null;
+}
+
+test "RFC 7830: the DoH answer is padded when the query asked for it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+
+    var query_buffer: [128]u8 = undefined;
+    const query = try buildEdnsQuery(&query_buffer, 0xabcd, true);
+
+    // The answer the server builds on its own, without the padding option.
+    var answer_buffer: [4096]u8 = undefined;
+    const answer = try runtime.answer(query, &answer_buffer);
+
+    const body = try dohAnswer(arena.allocator(), &runtime, query);
+    try std.testing.expect(body.len > answer.len);
+
+    const parsed = try dns_message.Message.parse(arena.allocator(), body);
+    try std.testing.expectEqual(@as(u16, 0xabcd), parsed.header.id);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.answer_count);
+    const options = messageOptions(&parsed).?;
+    const padding = dns_rdata.findOption(options, dns_rdata.EDNS_PADDING_OPTION_CODE);
+    try std.testing.expect(padding != null);
+    for (padding.?) |octet| try std.testing.expectEqual(@as(u8, 0), octet);
+}
+
+test "RFC 7830: the DoH answer carries no padding when the query did not ask for it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+
+    var query_buffer: [128]u8 = undefined;
+    const query = try buildEdnsQuery(&query_buffer, 0xdcba, false);
+
+    const body = try dohAnswer(arena.allocator(), &runtime, query);
+    const parsed = try dns_message.Message.parse(arena.allocator(), body);
+    try std.testing.expectEqual(@as(u16, 0xdcba), parsed.header.id);
+    // The query indicated EDNS(0) support, so the answer carries an OPT
+    // record, but the query asked for no padding, so the option is absent.
+    const options = messageOptions(&parsed).?;
+    try std.testing.expectEqual(@as(usize, 0), options.len);
+    try std.testing.expect(dns_rdata.findOption(options, dns_rdata.EDNS_PADDING_OPTION_CODE) == null);
+}
+
+test "RFC 7830: the cleartext UDP and TCP paths never pad, even when the query asks for it" {
+    // RFC 7830 section 6: an implementation MUST NOT use the option when
+    // the DNS transport is not encrypted, so the cleartext paths keep
+    // answering without it.
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+
+    var query_buffer: [128]u8 = undefined;
+    const query = try buildEdnsQuery(&query_buffer, 0xef01, true);
+
+    // The cleartext UDP path.
+    var server_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server_socket = try std.Io.net.IpAddress.bind(&server_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer server_socket.close(io);
+    var client_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var client_socket = try std.Io.net.IpAddress.bind(&client_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer client_socket.close(io);
+
+    try client_socket.send(io, &server_socket.address, query);
+    try listener.serveUdpOnce(&server_socket, io, &runtime);
+
+    var datagram_buffer: [4096]u8 = undefined;
+    const datagram = try client_socket.receiveTimeout(io, &datagram_buffer, .{ .duration = .{
+        .raw = .fromMilliseconds(500),
+        .clock = .awake,
+    } });
+    const udp_answer = try dns_message.Message.parse(arena.allocator(), datagram.data);
+    try std.testing.expectEqual(@as(u16, 0xef01), udp_answer.header.id);
+    const udp_options = messageOptions(&udp_answer).?;
+    try std.testing.expect(dns_rdata.findOption(udp_options, dns_rdata.EDNS_PADDING_OPTION_CODE) == null);
+
+    // The cleartext TCP path. It runs over a real socket pair of sockets,
+    // the way the listener's own tests do, because the frame reader works on
+    // the raw descriptor.
+    var listen_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try std.Io.net.IpAddress.listen(&listen_addr, io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    var client_stream = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer client_stream.close(io);
+    const server_stream = try server.accept(io);
+    defer server_stream.close(io);
+
+    try cli_query.sendTcpQuery(client_stream, io, query);
+    try client_stream.shutdown(io, .send);
+
+    try listener.serveTcpStreamOnce(server_stream, io, &runtime);
+
+    var client_read_buffer: [4096]u8 = undefined;
+    var client_reader = client_stream.reader(io, &client_read_buffer);
+    const length_bytes = try client_reader.interface.takeArray(2);
+    const tcp_answer_bytes = try client_reader.interface.take(std.mem.readInt(u16, length_bytes, .big));
+    const tcp_answer = try dns_message.Message.parse(arena.allocator(), tcp_answer_bytes);
+    try std.testing.expectEqual(@as(u16, 0xef01), tcp_answer.header.id);
+    const tcp_options = messageOptions(&tcp_answer).?;
+    try std.testing.expect(dns_rdata.findOption(tcp_options, dns_rdata.EDNS_PADDING_OPTION_CODE) == null);
 }
 
 test "DoH rejects wrong method, path, media type, and bad wire" {

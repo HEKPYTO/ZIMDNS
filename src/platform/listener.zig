@@ -342,7 +342,7 @@ fn sourceKey(address: *const std.Io.net.IpAddress) SourceCounter.Key {
 
 /// The time one frame may take: the per-frame deadline, shortened to what is
 /// left of the connection's lifetime. Null means the connection is over.
-fn frameTimeout(io: std.Io, connection_deadline: ?std.Io.Clock.Timestamp, timeout: TcpIoTimeout) ?TcpIoTimeout {
+pub fn frameTimeout(io: std.Io, connection_deadline: ?std.Io.Clock.Timestamp, timeout: TcpIoTimeout) ?TcpIoTimeout {
     const deadline = connection_deadline orelse return timeout;
     const remaining = deadline.durationFromNow(io).raw.nanoseconds;
     if (remaining <= 0) return null;
@@ -630,7 +630,7 @@ fn expectSignedUdpTruncation(include_edns: bool) !void {
     const response_final = (try dns_tsig.parseFinalAdditional(incoming.data)).?;
     try std.testing.expectEqual(@as(u16, 0x1234), response_final.tsig.original_id);
     try std.testing.expectEqual(@as(usize, 32), response_final.tsig.macBytes().len);
-    _ = try dns_tsig.verify(incoming.data, "01234567890123456789012345678901", request_final.tsig.macBytes(), 32);
+    _ = try dns_tsig.verify(incoming.data, "01234567890123456789012345678901", request_final.tsig.macBytes());
 }
 
 test "TCP handler serves FIFO length-prefixed DNS queries on one stream" {

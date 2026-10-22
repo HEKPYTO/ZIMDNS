@@ -3057,7 +3057,7 @@ test "RFC 2181 section 9: the signed path omits the additional section the same 
     const reply_final = (try tsig.parseFinalAdditional(reply)).?;
     const resigned = try tsig.sign(reply, secret, reply_final.owner, reply_final.tsig, null);
     try tsig.patchMac(@constCast(reply), reply_final, resigned.slice());
-    _ = try tsig.verify(reply, secret, null, tsig.minimumMacLength(.hmac_sha256));
+    _ = try tsig.verify(reply, secret, null);
 }
 
 /// The EDE option a message carries, or null when it carries none.
@@ -3207,7 +3207,7 @@ test "RFC 8914 section 3: the signed path drops the EDE option the same way" {
     const reply_final = (try tsig.parseFinalAdditional(reply)).?;
     const resigned = try tsig.sign(reply, secret, reply_final.owner, reply_final.tsig, null);
     try tsig.patchMac(@constCast(reply), reply_final, resigned.slice());
-    _ = try tsig.verify(reply, secret, null, tsig.minimumMacLength(.hmac_sha256));
+    _ = try tsig.verify(reply, secret, null);
 }
 
 /// The secret the truncation tests sign the reply with.
@@ -3315,7 +3315,7 @@ test "RFC 8945 section 4.2: the TSIG is the last record of a truncated signed re
     const reply_final = (try tsig.parseFinalAdditional(reply)).?;
     const resigned = try tsig.sign(reply, truncation_test_secret, reply_final.owner, reply_final.tsig, null);
     try tsig.patchMac(@constCast(reply), reply_final, resigned.slice());
-    _ = try tsig.verify(reply, truncation_test_secret, null, tsig.minimumMacLength(.hmac_sha256));
+    _ = try tsig.verify(reply, truncation_test_secret, null);
 }
 
 test "RFC 8914 section 3: the signed truncation drops the EDE option and keeps the OPT record" {

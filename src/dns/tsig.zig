@@ -22,7 +22,6 @@ pub const Error = error{
     Formerr,
     UnsupportedAlgorithm,
     BadMac,
-    BadTrunc,
     InvalidPriorMac,
     InvalidOriginalId,
 };
@@ -189,14 +188,18 @@ pub fn sign(
 }
 
 /// Verifies the final TSIG record of a request. The MAC is compared against
-/// the truncated prefix of the computed keyed hash in constant time, and
-/// `minimum_mac_len` is the local truncation policy floor: a shorter MAC is
-/// rejected with BadTrunc (RFC 8945 sections 4.2, 5.2.2.1, and 5.2.4).
+/// the truncated prefix of the computed keyed hash in constant time. The local
+/// truncation policy floor is not applied here: RFC 8945 section 5.2 orders
+/// the truncation policy check after the time check, so the caller applies
+/// the floor once the time check has had its say (section 5.2.4).
+///
+/// The returned MAC is the one that appears in the message: RFC 8945 section
+/// 4.3.1 digests the MAC exactly as it is transmitted, so a caller that
+/// chains on it must use the transmitted value and not the whole keyed hash.
 pub fn verify(
     packet: []const u8,
     key: []const u8,
     prior_mac: ?[]const u8,
-    minimum_mac_len: usize,
 ) Error!Mac {
     const found = parseFinalAdditional(packet) catch return Error.Formerr;
     const final = found orelse return Error.Formerr;
@@ -216,8 +219,9 @@ pub fn verify(
     if (std.crypto.timing_safe.compare(u8, received, full.slice()[0..received.len], .big) != .eq) {
         return Error.BadMac;
     }
-    if (received.len < minimum_mac_len) return Error.BadTrunc;
-    return truncate(full, digestLength(algorithm));
+    // The MAC that appears in the message is the value the next message of a
+    // chain carries as its prior MAC (RFC 8945 sections 4.3.1 and 5.3.1).
+    return truncate(full, received.len);
 }
 
 pub fn signChained(
@@ -234,7 +238,6 @@ pub fn verifyChained(
     packets: []const []const u8,
     key: []const u8,
     prior_mac: []const u8,
-    minimum_mac_len: usize,
 ) Error!Mac {
     if (packets.len == 0) return Error.Formerr;
     const packet = packets[packets.len - 1];
@@ -251,8 +254,9 @@ pub fn verifyChained(
     if (std.crypto.timing_safe.compare(u8, received, full.slice()[0..received.len], .big) != .eq) {
         return Error.BadMac;
     }
-    if (received.len < minimum_mac_len) return Error.BadTrunc;
-    return truncate(full, digestLength(algorithm));
+    // The MAC that appears in the message is the value the next message of a
+    // chain carries as its prior MAC (RFC 8945 sections 4.3.1 and 5.3.1).
+    return truncate(full, received.len);
 }
 
 /// Signs one already-encoded transfer message that carries its own zeroed
@@ -305,9 +309,11 @@ pub fn hashLength(algorithm: Algorithm) usize {
     };
 }
 
-/// Local truncation policy: the shortest MAC accepted per algorithm, and every
-/// longer MAC up to the full keyed hash output is accepted too (RFC 8945
-/// section 7). SHA-1 takes 12 octets (section 6 SHOULD implement SHA-1
+/// Local truncation policy: the shortest MAC the server accepts per algorithm,
+/// and every longer MAC up to the full keyed hash output is accepted too
+/// (RFC 8945 section 7). The server applies the floor after the time check
+/// (section 5.2) and answers a shorter MAC with BADTRUNC (section 5.2.4).
+/// SHA-1 takes 12 octets (section 6 SHOULD implement SHA-1
 /// truncated to 96 bits) and SHA-256 takes 16 (the section 5.2.2.1 case 3
 /// floor, SHA-256-128). The other HMAC-SHA algorithms take the section
 /// 5.2.2.1 case 3 floor of half the keyed hash output, which is also the
@@ -648,7 +654,7 @@ test "tsig SHA-256 known-answer vector verifies the received raw wire message" {
         0x02, 0x45, 0x24, 0x0e, 0x8e, 0x49, 0xfb, 0x98, 0x17, 0x8e, 0xc6, 0x32, 0xd2, 0x05, 0x9f, 0xd7,
         0xab, 0xac, 0x45, 0x12, 0x34, 0x00, 0x00, 0x00, 0x00,
     };
-    const mac = try verify(&packet, "topsecret", null, 16);
+    const mac = try verify(&packet, "topsecret", null);
     try std.testing.expectEqual(@as(usize, 32), mac.slice().len);
     try std.testing.expectEqualSlices(u8, &.{
         0x2b, 0xcb, 0xce, 0x33, 0x18, 0xfb, 0x82, 0x4c,
@@ -659,12 +665,12 @@ test "tsig SHA-256 known-answer vector verifies the received raw wire message" {
 
     var altered_id = packet;
     altered_id[0] ^= 0xff;
-    const id_mac = try verify(&altered_id, "topsecret", null, 16);
+    const id_mac = try verify(&altered_id, "topsecret", null);
     try std.testing.expectEqualSlices(u8, mac.slice(), id_mac.slice());
 
     var altered_byte = packet;
     altered_byte[14] = 'f';
-    try std.testing.expectError(Error.BadMac, verify(&altered_byte, "topsecret", null, 16));
+    try std.testing.expectError(Error.BadMac, verify(&altered_byte, "topsecret", null));
 
     var truncated: [89]u8 = undefined;
     @memcpy(truncated[0..67], packet[0..67]);
@@ -672,13 +678,15 @@ test "tsig SHA-256 known-answer vector verifies the received raw wire message" {
     std.mem.writeInt(u16, truncated[65..67], 16, .big);
     @memcpy(truncated[67..83], packet[67..83]);
     @memcpy(truncated[83..], packet[99..]);
-    const truncated_mac = try verify(&truncated, "topsecret", null, 16);
-    try std.testing.expectEqualSlices(u8, mac.slice(), truncated_mac.slice());
-    try std.testing.expectError(Error.BadTrunc, verify(&truncated, "topsecret", null, 32));
+    const truncated_mac = try verify(&truncated, "topsecret", null);
+    // The MAC that appears in the message is the value the next message of a
+    // chain carries as its prior MAC (RFC 8945 sections 4.3.1 and 5.3.1).
+    try std.testing.expectEqual(@as(usize, 16), truncated_mac.slice().len);
+    try std.testing.expectEqualSlices(u8, mac.slice()[0..16], truncated_mac.slice());
 
     var forged_truncated = truncated;
     forged_truncated[67] ^= 0xff;
-    try std.testing.expectError(Error.BadMac, verify(&forged_truncated, "topsecret", null, 32));
+    try std.testing.expectError(Error.BadMac, verify(&forged_truncated, "topsecret", null));
 
     var too_short: [88]u8 = undefined;
     @memcpy(too_short[0..67], packet[0..67]);
@@ -686,7 +694,7 @@ test "tsig SHA-256 known-answer vector verifies the received raw wire message" {
     std.mem.writeInt(u16, too_short[65..67], 15, .big);
     @memcpy(too_short[67..82], packet[67..82]);
     @memcpy(too_short[82..], packet[99..]);
-    try std.testing.expectError(Error.Formerr, verify(&too_short, "topsecret", null, 16));
+    try std.testing.expectError(Error.Formerr, verify(&too_short, "topsecret", null));
 
     var too_long: [106]u8 = undefined;
     @memcpy(too_long[0..67], packet[0..67]);
@@ -695,7 +703,7 @@ test "tsig SHA-256 known-answer vector verifies the received raw wire message" {
     @memcpy(too_long[67..99], packet[67..99]);
     too_long[99] = 0;
     @memcpy(too_long[100..], packet[99..]);
-    try std.testing.expectError(Error.Formerr, verify(&too_long, "topsecret", null, 16));
+    try std.testing.expectError(Error.Formerr, verify(&too_long, "topsecret", null));
 
     var response = packet;
     response[2] = 0x81;
@@ -713,7 +721,7 @@ test "tsig SHA-256 known-answer vector verifies the received raw wire message" {
     try std.testing.expectEqualSlices(
         u8,
         response_mac.slice(),
-        (try verify(&response, "topsecret", mac.slice(), 16)).slice(),
+        (try verify(&response, "topsecret", mac.slice())).slice(),
     );
 
     var forwarded_response = response;
@@ -789,7 +797,6 @@ test "tsig SHA-256 known-answer vector verifies the received raw wire message" {
         &.{ intermediary[0..], chained_response[0..] },
         "topsecret",
         mac.slice(),
-        16,
     )).slice());
 
     var differently_id_response = response;
@@ -798,7 +805,6 @@ test "tsig SHA-256 known-answer vector verifies the received raw wire message" {
         &.{ differently_id_intermediary[0..], differently_id_response[0..] },
         "topsecret",
         mac.slice(),
-        16,
     )).slice());
 
     var chained_truncated: [89]u8 = undefined;
@@ -807,12 +813,17 @@ test "tsig SHA-256 known-answer vector verifies the received raw wire message" {
     std.mem.writeInt(u16, chained_truncated[65..67], 16, .big);
     @memcpy(chained_truncated[67..83], chained_response[67..83]);
     @memcpy(chained_truncated[83..], chained_response[99..]);
-    try std.testing.expectError(Error.BadTrunc, verifyChained(
+    // RFC 8945 section 5.2.2.1 case 4: the chained MAC is truncated to the
+    // size the peer sent and only the truncated values are compared. The MAC
+    // that appears in the message is the value the next message of the chain
+    // carries as its prior MAC (RFC 8945 sections 4.3.1 and 5.3.1).
+    const chained_truncated_mac = try verifyChained(
         &.{ intermediary[0..], chained_truncated[0..] },
         "topsecret",
         mac.slice(),
-        32,
-    ));
+    );
+    try std.testing.expectEqual(@as(usize, 16), chained_truncated_mac.slice().len);
+    try std.testing.expectEqualSlices(u8, chained_mac.slice()[0..16], chained_truncated_mac.slice());
 
     var forged_chained_truncated = chained_truncated;
     forged_chained_truncated[67] ^= 0xff;
@@ -820,7 +831,6 @@ test "tsig SHA-256 known-answer vector verifies the received raw wire message" {
         &.{ intermediary[0..], forged_chained_truncated[0..] },
         "topsecret",
         mac.slice(),
-        32,
     ));
 
     var altered_chained = chained_response;
@@ -829,7 +839,6 @@ test "tsig SHA-256 known-answer vector verifies the received raw wire message" {
         &.{ intermediary[0..], altered_chained[0..] },
         "topsecret",
         mac.slice(),
-        16,
     ));
 
     var altered_intermediary = intermediary;
@@ -838,7 +847,6 @@ test "tsig SHA-256 known-answer vector verifies the received raw wire message" {
         &.{ altered_intermediary[0..], chained_response[0..] },
         "topsecret",
         mac.slice(),
-        16,
     ));
 }
 
@@ -852,7 +860,7 @@ test "tsig SHA-1 known-answer vector verifies the received raw wire message" {
         0x14, 0xa6, 0xbf, 0x26, 0xfc, 0xb2, 0x0e, 0x83, 0x61, 0x62, 0x79, 0xb6, 0xca, 0xb9, 0xf4, 0x1f,
         0xce, 0xc1, 0x06, 0xa8, 0x19, 0x12, 0x34, 0x00, 0x00, 0x00, 0x00,
     };
-    const mac = try verify(&packet, "topsecret", null, 10);
+    const mac = try verify(&packet, "topsecret", null);
     try std.testing.expectEqual(@as(usize, 20), mac.slice().len);
     try std.testing.expectEqualSlices(u8, &.{
         0xa6, 0xbf, 0x26, 0xfc, 0xb2, 0x0e, 0x83, 0x61, 0x62, 0x79,
@@ -878,7 +886,7 @@ fn sha1RequestWithMac(packet: []const u8, out: []u8, mac_len: usize) void {
     @memcpy(out[mac_start + mac_len ..], packet[mac_start + known_mac_len ..]);
 }
 
-test "tsig SHA-1 truncation follows the local policy floor" {
+test "tsig SHA-1 truncation follows the protocol floor" {
     const packet = [_]u8{
         0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x07, 0x65, 0x78, 0x61,
         0x6d, 0x70, 0x6c, 0x65, 0x03, 0x63, 0x6f, 0x6d, 0x00, 0x00, 0x01, 0x00, 0x01, 0x03, 0x6b, 0x65,
@@ -892,41 +900,37 @@ test "tsig SHA-1 truncation follows the local policy floor" {
     // the twelve-octet truncation of the known digest authenticates.
     var truncated: [83]u8 = undefined;
     sha1RequestWithMac(&packet, &truncated, 12);
-    const mac = try verify(&truncated, "topsecret", null, minimumMacLength(.hmac_sha1));
+    const mac = try verify(&truncated, "topsecret", null);
     try std.testing.expectEqualSlices(u8, &.{
         0xa6, 0xbf, 0x26, 0xfc, 0xb2, 0x0e, 0x83, 0x61, 0x62, 0x79, 0xb6, 0xca,
-    }, mac.slice()[0..12]);
+    }, mac.slice());
 
-    // One octet below the policy floor is a truncation error.
-    var too_short: [82]u8 = undefined;
-    sha1RequestWithMac(&packet, &too_short, 11);
-    try std.testing.expectError(Error.BadTrunc, verify(
-        &too_short,
-        "topsecret",
-        null,
-        minimumMacLength(.hmac_sha1),
-    ));
+    // RFC 8945 section 5.2.2.1 case 3: the protocol floor is the larger of ten
+    // octets and half the hash length, so ten octets is the shortest MAC this
+    // module accepts. The local policy floor is the caller's, and section 5.2
+    // orders that check after the time check.
+    var at_floor: [81]u8 = undefined;
+    sha1RequestWithMac(&packet, &at_floor, 10);
+    const floor_mac = try verify(&at_floor, "topsecret", null);
+    try std.testing.expectEqualSlices(u8, &.{
+        0xa6, 0xbf, 0x26, 0xfc, 0xb2, 0x0e, 0x83, 0x61, 0x62, 0x79,
+    }, floor_mac.slice());
+
+    // One octet below the protocol floor is a format error.
+    var too_short: [80]u8 = undefined;
+    sha1RequestWithMac(&packet, &too_short, 9);
+    try std.testing.expectError(Error.Formerr, verify(&too_short, "topsecret", null));
 
     // RFC 8945 section 5.2.2.1 case 1: a MAC longer than the keyed hash
     // output is a format error.
     var too_long: [92]u8 = undefined;
     sha1RequestWithMac(&packet, &too_long, 21);
-    try std.testing.expectError(Error.Formerr, verify(
-        &too_long,
-        "topsecret",
-        null,
-        minimumMacLength(.hmac_sha1),
-    ));
+    try std.testing.expectError(Error.Formerr, verify(&too_long, "topsecret", null));
 
     // A MAC of zero octets is the unsigned case and never authenticates.
     var unsigned: [71]u8 = undefined;
     sha1RequestWithMac(&packet, &unsigned, 0);
-    try std.testing.expectError(Error.Formerr, verify(
-        &unsigned,
-        "topsecret",
-        null,
-        minimumMacLength(.hmac_sha1),
-    ));
+    try std.testing.expectError(Error.Formerr, verify(&unsigned, "topsecret", null));
 }
 
 /// Writes the known-answer request used by the SHA-1 and SHA-256 vectors
@@ -993,7 +997,7 @@ test "tsig verifies a request signed with a truncated algorithm name" {
 
         var signed: [512]u8 = undefined;
         requestWithMacPrefix(writer.written(), final, mac.slice(), case.mac_len, &signed);
-        const verified = try verify(signed[0..writer.len()], "topsecret", null, minimumMacLength(case.algorithm));
+        const verified = try verify(signed[0..writer.len()], "topsecret", null);
         try std.testing.expectEqualSlices(u8, mac.slice(), verified.slice());
 
         // RFC 8945 section 5.2.2.1 case 3: a MAC shorter than half the hash
@@ -1001,12 +1005,7 @@ test "tsig verifies a request signed with a truncated algorithm name" {
         var shorter: [512]u8 = undefined;
         var shorter_writer = Writer.init(&shorter);
         try writeRequest(&shorter_writer, case.name, case.mac_len - 1);
-        try std.testing.expectError(Error.Formerr, verify(
-            shorter_writer.written(),
-            "topsecret",
-            null,
-            minimumMacLength(case.algorithm),
-        ));
+        try std.testing.expectError(Error.Formerr, verify(shorter_writer.written(), "topsecret", null));
     }
 }
 
@@ -1028,9 +1027,79 @@ test "tsig verifies a truncated name whose MAC is longer than the algorithm's ow
         // the size the peer sent and only the truncated values are compared.
         // The truncated name names the hash function and its truncation, so
         // the bound is the keyed hash output and not the truncation.
-        const verified = try verify(writer.written(), "topsecret", null, minimumMacLength(case.algorithm));
-        try std.testing.expectEqualSlices(u8, mac.slice()[0..verified.slice().len], verified.slice());
+        const verified = try verify(writer.written(), "topsecret", null);
+        try std.testing.expectEqualSlices(u8, mac.slice(), verified.slice());
     }
+}
+
+test "the verified MAC is the MAC that appears in the message" {
+    var packet: [512]u8 = undefined;
+    var writer = Writer.init(&packet);
+    try writeRequest(&writer, "hmac-sha256.", 32);
+    const final = (try parseFinalAdditional(writer.written())).?;
+    const signed = try sign(writer.written(), "topsecret", final.owner, final.tsig, null);
+    try patchMac(packet[0..writer.len()], final, signed.slice());
+    // The MAC that goes on the wire and the MAC the verification returns are
+    // the same value (RFC 8945 section 4.2).
+    const verified = try verify(packet[0..writer.len()], "topsecret", null);
+    try std.testing.expectEqualSlices(u8, signed.slice(), verified.slice());
+}
+
+test "a truncated MAC chains the next message of the chain" {
+    var packet: [512]u8 = undefined;
+    var writer = Writer.init(&packet);
+    try writeRequest(&writer, "hmac-sha256.", 32);
+    const final = (try parseFinalAdditional(writer.written())).?;
+    const mac = try sign(writer.written(), "topsecret", final.owner, final.tsig, null);
+    try std.testing.expectEqual(@as(usize, 32), mac.slice().len);
+
+    // The peer sends a MAC of sixteen octets. The verification returns the
+    // MAC as it appears in the message, which is the value the next message
+    // of the chain carries as its prior MAC (RFC 8945 sections 4.3.1
+    // and 5.3.1).
+    var truncated: [512]u8 = undefined;
+    requestWithMacPrefix(writer.written(), final, mac.slice(), 16, &truncated);
+    const truncated_len = writer.len() - (mac.slice().len - 16);
+    const verified = try verify(truncated[0..truncated_len], "topsecret", null);
+    try std.testing.expectEqual(@as(usize, 16), verified.slice().len);
+    try std.testing.expectEqualSlices(u8, mac.slice()[0..16], verified.slice());
+
+    // The next message of the chain carries the verified MAC as its prior
+    // MAC, and the peer agrees with the chained MAC.
+    var next: [512]u8 = undefined;
+    var next_writer = Writer.init(&next);
+    try writeRequest(&next_writer, "hmac-sha256.", 32);
+    const next_final = (try parseFinalAdditional(next_writer.written())).?;
+    const chained = try signChainedFinal(
+        next_writer.written(),
+        next_final,
+        "topsecret",
+        next_final.tsig,
+        verified.slice(),
+    );
+    try patchMac(next[0..next_writer.len()], next_final, chained.slice());
+    const chained_verified = try verifyChained(
+        &.{next[0..next_writer.len()]},
+        "topsecret",
+        verified.slice(),
+    );
+    try std.testing.expectEqualSlices(u8, chained.slice(), chained_verified.slice());
+
+    // The untruncated digest is a different prior MAC: it chains to a
+    // different MAC and refuses the message the peer signed.
+    const untruncated = try signChainedFinal(
+        next_writer.written(),
+        next_final,
+        "topsecret",
+        next_final.tsig,
+        mac.slice(),
+    );
+    try std.testing.expect(!std.mem.eql(u8, chained.slice(), untruncated.slice()));
+    try std.testing.expectError(Error.BadMac, verifyChained(
+        &.{next[0..next_writer.len()]},
+        "topsecret",
+        mac.slice(),
+    ));
 }
 
 test "tsig refuses a MAC longer than the keyed hash output of a truncated name" {
@@ -1044,12 +1113,7 @@ test "tsig refuses a MAC longer than the keyed hash output of a truncated name" 
         try writeRequest(&writer, case.name, case.mac_len);
         // RFC 8945 section 5.2.2.1 case 1: a MAC longer than the keyed hash
         // output is a format error.
-        try std.testing.expectError(Error.Formerr, verify(
-            writer.written(),
-            "topsecret",
-            null,
-            minimumMacLength(case.algorithm),
-        ));
+        try std.testing.expectError(Error.Formerr, verify(writer.written(), "topsecret", null));
     }
 }
 
@@ -1091,7 +1155,7 @@ test "tsig matches the algorithm name case-insensitively and answers with the pe
     var upper = packet;
     @memcpy(upper[final.rdata_start + 1 ..][0..11], "HMAC-SHA256");
 
-    const mac = try verify(&upper, "topsecret", null, 16);
+    const mac = try verify(&upper, "topsecret", null);
     try std.testing.expectEqualSlices(u8, &.{
         0x2b, 0xcb, 0xce, 0x33, 0x18, 0xfb, 0x82, 0x4c,
         0x9e, 0x99, 0x95, 0x2a, 0x71, 0x02, 0x45, 0x24,
@@ -1113,7 +1177,7 @@ test "tsig matches the algorithm name case-insensitively and answers with the pe
     try std.testing.expectEqualSlices(
         u8,
         response_mac.slice(),
-        (try verify(&response, "topsecret", mac.slice(), 16)).slice(),
+        (try verify(&response, "topsecret", mac.slice())).slice(),
     );
     const reply_final = (try parseFinalAdditional(&response)).?;
     try std.testing.expectEqualSlices(u8, "HMAC-SHA256", reply_final.tsig.algorithm.asWire()[1..12]);
@@ -1167,12 +1231,7 @@ test "tsig rejects a MAC longer than the keyed hash output" {
     try writeRequest(&writer, "hmac-sha384.", 49);
     // RFC 8945 section 5.2.2.1 case 1: a MAC longer than the keyed hash
     // output is a format error.
-    try std.testing.expectError(Error.Formerr, verify(
-        writer.written(),
-        "topsecret",
-        null,
-        digestLength(.hmac_sha384),
-    ));
+    try std.testing.expectError(Error.Formerr, verify(writer.written(), "topsecret", null));
 }
 
 /// Rebuilds a signed request with a MAC field of `mac_len` octets holding the
@@ -1189,7 +1248,7 @@ fn requestWithMacPrefix(request: []const u8, final: FinalAdditional, mac: []cons
     @memcpy(out[mac_start + mac_len ..][0..tail.len], tail);
 }
 
-test "tsig truncation follows the policy floor of each HMAC-SHA algorithm" {
+test "tsig truncation follows the protocol floor of each HMAC-SHA algorithm" {
     const cases = [_]struct { name: []const u8, algorithm: Algorithm }{
         .{ .name = "hmac-sha224.", .algorithm = .hmac_sha224 },
         .{ .name = "hmac-sha384.", .algorithm = .hmac_sha384 },
@@ -1202,10 +1261,12 @@ test "tsig truncation follows the policy floor of each HMAC-SHA algorithm" {
         const final = (try parseFinalAdditional(writer.written())).?;
         const mac = try sign(writer.written(), "topsecret", final.owner, final.tsig, null);
 
-        const floor = minimumMacLength(case.algorithm);
+        // RFC 8945 section 5.2.2.1 case 3: the protocol floor is the larger
+        // of ten octets and half the keyed hash output.
+        const floor = @max(@as(usize, 10), hashLength(case.algorithm) / 2);
         var truncated: [512]u8 = undefined;
         requestWithMacPrefix(writer.written(), final, mac.slice(), floor, &truncated);
-        _ = try verify(truncated[0 .. writer.len() - (mac.slice().len - floor)], "topsecret", null, floor);
+        _ = try verify(truncated[0 .. writer.len() - (mac.slice().len - floor)], "topsecret", null);
 
         // One octet below the floor is below the section 5.2.2.1 case 3
         // minimum of half the keyed hash output, so it is a format error.
@@ -1215,7 +1276,6 @@ test "tsig truncation follows the policy floor of each HMAC-SHA algorithm" {
             too_short[0 .. writer.len() - (mac.slice().len - floor + 1)],
             "topsecret",
             null,
-            floor,
         ));
     }
 }

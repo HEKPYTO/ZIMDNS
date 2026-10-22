@@ -215,13 +215,13 @@ fn printHelp(writer: *std.Io.Writer) !void {
         \\  is SHA512. A signed zone needs its ZONEMD RRset signed again
         \\  after the record is published (section 3.4).
         \\
-        \\  --serve-dot serves DNS over TLS (RFC 7858) and --serve-doh serves
-        \\  DNS over HTTPS (RFC 8484): each listener terminates the handshake
-        \\  with its own ALPN token ("dot" and "http/1.1") before it speaks
-        \\  DNS, so the port never answers in cleartext. They need
-        \\  --enable-encrypted-dns and a certificate and key. --serve-xfr is
-        \\  accepted but still refuses to start: it has no listener in this
-        \\  build (see src/transport/README.md).
+        \\  --serve-dot serves DNS over TLS (RFC 7858) with the "dot" ALPN
+        \\  token, --serve-doh serves DNS over HTTPS (RFC 8484) with the
+        \\  "http/1.1" token, and --serve-xfr serves zone transfers over TLS
+        \\  with the "dot" token (RFC 9103 section 7.1): each listener
+        \\  terminates the handshake before it speaks DNS, so the port never
+        \\  answers in cleartext. They need --enable-encrypted-dns and a
+        \\  certificate and key.
         \\
         \\Implemented now:
         \\  --help, --version, server run, query, zonemd publish
@@ -593,22 +593,13 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
             try writer.writeAll("error: encrypted listeners require --enable-encrypted-dns or 'encrypted-dns on'\n");
             try exitUsage(writer);
         };
-        // Fail closed for the transports that still have no listener: an
-        // encrypted port must never answer DNS, HTTP, or AXFR in cleartext,
-        // so those runs refuse before a socket is opened.
+        // Every encrypted transport this build accepts has a listener of its
+        // own, so the transport decides the ALPN token the handshake selects.
         const transport: transport_tls.Transport = switch (mode) {
             .dot_loop => .dot,
             .doh_loop => .doh,
             .xfr_loop => .xfr,
             else => unreachable,
-        };
-        transport_tls.requireListener(transport) catch {
-            try writer.writeAll(
-                "error: --serve-xfr has no listener in this build: " ++
-                    "only --serve-dot and --serve-doh are served over TLS (see src/transport/README.md). " ++
-                    "The listener was not started and the port was not bound.\n",
-            );
-            try exitUsage(writer);
         };
         if (cert_path == null or key_path == null) {
             try writer.writeAll("error: encrypted listeners require --tls-cert-file and --tls-key-file (or tls-cert-file/tls-key-file)\n");
@@ -795,10 +786,22 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
                 try transport_doh.serveDohLoopOnAddress(doh_io, &runtime, &address, &server, max_requests);
             }
         },
-        // The strict-TLS transfer channel never reaches this switch: the
-        // startup gate above refuses it, so no code path is left that binds
-        // an encrypted port without a TLS server.
-        .xfr_loop => unreachable,
+        // The strict-TLS transfer channel: the same handshake and the same
+        // worker bound as the other encrypted listeners.
+        .xfr_loop => {
+            var server = tls_identity orelse return error.MissingTlsIdentity;
+            var io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{
+                .concurrent_limit = .limited(transfer_xfr_tls.MAX_CONNECTION_WORKERS),
+            });
+            defer io_backend.deinit();
+            const xfr_io = io_backend.io();
+            if (configured_address) |*address| {
+                try transfer_xfr_tls.serveXfrLoopOnAddress(xfr_io, &runtime, address, &server, max_requests);
+            } else {
+                var address = defaultListenerAddress(port);
+                try transfer_xfr_tls.serveXfrLoopOnAddress(xfr_io, &runtime, &address, &server, max_requests);
+            }
+        },
         .none => unreachable,
     }
 
@@ -862,36 +865,25 @@ test "no-config listener default is loopback" {
     try std.testing.expect(address.eql(&expected));
 }
 
-test "the encrypted listeners exist and the refused port never answers in cleartext" {
-    // 1. The DoT and DoH listeners are real now: each terminates the
-    //    handshake with its own ALPN token before any DNS byte is written.
+test "the encrypted listeners exist and each speaks its own ALPN token" {
+    // 1. Every encrypted transport this build accepts has a listener: each
+    //    terminates the handshake with its own ALPN token before any DNS
+    //    byte is written.
     try std.testing.expect(@hasDecl(transport_dot, "serveDotLoopOnAddress"));
     try std.testing.expect(@hasDecl(transport_doh, "serveDohLoopOnAddress"));
+    try std.testing.expect(@hasDecl(transfer_xfr_tls, "serveXfrLoopOnAddress"));
 
-    // 2. The transport that still has no listener keeps refusing to start,
-    //    so no code path is left that could put a plaintext socket behind a
-    //    TLS claim and answer AXFR in cleartext.
-    try std.testing.expect(!@hasDecl(transfer_xfr_tls, "serveXfrLoopOnAddress"));
-    try std.testing.expectError(transport_tls.Error.TransportDeferred, transport_tls.requireListener(.xfr));
+    // 2. The zone-transfer channel speaks "dot", which RFC 9103 section 7.1
+    //    requires for the transfer channel.
+    try std.testing.expectEqualStrings("dot", transport_tls.alpnFor(.xfr));
+    try std.testing.expectEqualStrings("dot", transfer_xfr_tls.XFR_ALPN);
 
     // 3. Each port speaks its own token and nothing else, so a client that
-    //    offers another protocol is refused instead of served.
-    try std.testing.expectEqualStrings("dot", transport_tls.negotiateAlpn(&.{"dot"}, .dot).?);
-    try std.testing.expect(transport_tls.negotiateAlpn(&.{"http/1.1"}, .dot) == null);
-    try std.testing.expectEqualStrings("http/1.1", transport_tls.negotiateAlpn(&.{"http/1.1"}, .doh).?);
-    try std.testing.expect(transport_tls.negotiateAlpn(&.{"h2"}, .doh) == null);
-
-    // 4. The refused port is unbound and serves no DNS: a plain TCP connect to
-    //    an encrypted listener port is refused outright instead of returning
-    //    the cleartext DNS frame the pre-fix build sent on it.
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const encrypted_port = std.Io.net.IpAddress{ .ip4 = .loopback(10531) };
-    const served = std.Io.net.IpAddress.connect(&encrypted_port, io, .{ .mode = .stream, .protocol = .tcp }) catch |err| switch (err) {
-        error.ConnectionRefused => return, // nothing is listening: no DNS served
-        else => return err,
-    };
-    served.close(io);
-    return error.EncryptedListenerServedAfterRefusal;
+    //    offers another protocol is refused instead of served. The refusal
+    //    itself is proven over a real handshake in src/transport/dot.zig and
+    //    src/transport/doh.zig, not here.
+    try std.testing.expectEqualStrings("dot", transport_tls.alpnFor(.dot));
+    try std.testing.expectEqualStrings("http/1.1", transport_tls.alpnFor(.doh));
 }
 
 fn exitUsage(writer: *std.Io.Writer) !noreturn {

@@ -447,12 +447,7 @@ test "a request signed with a truncated algorithm name is verified with the keyr
         const final = (try tsig.parseFinalAdditional(writer.written())).?;
         const mac = try tsig.sign(writer.written(), key.secretBytes(), final.owner, final.tsig, null);
         try tsig.patchMac(packet[0..writer.len()], final, mac.slice());
-        const verified = try tsig.verify(
-            packet[0..writer.len()],
-            key.secretBytes(),
-            null,
-            tsig.minimumMacLength(case.algorithm),
-        );
+        const verified = try tsig.verify(packet[0..writer.len()], key.secretBytes(), null);
         try std.testing.expectEqualSlices(u8, mac.slice(), verified.slice());
     }
 }

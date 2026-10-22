@@ -25,9 +25,13 @@ default has to be unprivileged. An operator reaches the registered ports
 with a `listen dns dot <address>:853` or `listen dns doh <address>:443`
 line.
 
-The strict-TLS transfer channel (RFC 9103) has no listener yet.
-`requireListener` (`tls.zig`) refuses it at startup, so `--serve-xfr` still
-exits before binding a port. DoQ (RFC 9250) is deferred with a typed error.
+The strict-TLS transfer channel (RFC 9103) is served: `--serve-xfr`
+terminates a TLS 1.3 handshake with the `dot` token, as section 7.1 requires,
+and then speaks the RFC 7858 framing over that channel, so a secondary can
+pull an AXFR or IXFR over an encrypted session. Section 7.3 recommends port
+853; this build binds 1053 by default, like the other two encrypted
+listeners, and an operator reaches 853 with a `listen dns dot
+<address>:853` line, the same endpoint the DoT port uses. DoQ (RFC 9250) is deferred with a typed error.
 
 The invariants that hold whichever transport is served: no cleartext on a
 port the operator configured as encrypted, ALPN `dot` selected on a
