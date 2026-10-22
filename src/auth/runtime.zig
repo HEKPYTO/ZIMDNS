@@ -115,10 +115,11 @@ pub const Runtime = struct {
     /// Per-zone override apexes (`local-zones except`), lowercase with
     /// trailing dot, heap-owned. Empty unless configured.
     local_zones_except: []const []const u8 = &.{},
-    /// What an authoritative answer may carry back in its OPT record, from the
-    /// `nsid`, `zoneversion`, and `error-report-agent` directives. `nsid` is
+    /// What an authoritative answer may carry back in its OPT record, and
+    /// which agent domain the server monitors, from the `nsid`, `zoneversion`,
+    /// `error-report-agent`, and `error-report-monitor` directives. `nsid` is
     /// heap-owned so it outlives the config text it was decoded from; the
-    /// agent domain is a name, so it is inline and owns nothing.
+    /// agent domains are names, so they are inline and own nothing.
     answer_policy: response.AnswerPolicy = .{},
     /// The signing material of a signed zone, kept so the answer path can sign
     /// an RRset that is not in the zone file (RFC 8482 section 4.2). Null

@@ -8,6 +8,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const config = @import("config/parser.zig");
 const dns_header = @import("dns/header.zig");
+const dns_error_report = @import("dns/error_report.zig");
 const dns_message = @import("dns/message.zig");
 const dns_name = @import("dns/name.zig");
 const dns_record = @import("dns/record.zig");
@@ -75,6 +76,19 @@ pub const EDE_DNSKEY_MISSING: u16 = dnssec.EDE_DNSKEY_MISSING;
 pub const EDE_RRSIGS_MISSING: u16 = dnssec.EDE_RRSIGS_MISSING;
 /// Strict-mode cookie replay window. Fixed ring, no allocator, FIFO overwrite.
 pub const MAX_COOKIE_REPLAY_ENTRIES = 32;
+
+/// The transport the forward path uses to reach the upstream. RFC 9567
+/// section 6.1 wants an error report over TCP, because a UDP source address
+/// is easy to forge; a client query keeps the UDP-first path.
+const UpstreamTransport = enum { udp, tcp };
+
+/// RFC 9567 section 5: what the upstream's answer said about the error: the
+/// agent domain that wants a report, and the error code the upstream
+/// reported. Both are read before the options are stripped from the answer.
+const UpstreamReport = struct {
+    agent: ?dns_name.Name,
+    ede_code: u16,
+};
 
 /// RFC 8914 EXTRA-TEXT purpose string for a locally generated EDE INFO-CODE.
 pub fn edeText(code: u16) []const u8 {
@@ -484,6 +498,31 @@ fn appendEcsScope(message: *dns_message.Message, scope: EcsScope, scope_prefix: 
     if (scope.family == 0) return;
     var buffer: [4 + 16]u8 = undefined;
     try appendOption(message, dns_rdata.EDNS_ECS_OPTION_CODE, ecsPayload(scope, scope_prefix, &buffer));
+}
+
+/// RFC 9567 section 5: the agent domain the upstream's answer named, and the
+/// error code it reported. An option the answer does not carry, a payload
+/// that is not a domain name, and an EDE that reports no error all leave
+/// the report with nothing to send.
+fn readUpstreamReport(message: dns_message.Message) UpstreamReport {
+    const agent = if (findOption(message, dns_error_report.option_code)) |payload|
+        dns_error_report.parseAgentDomain(payload)
+    else
+        null;
+    return .{ .agent = agent, .ede_code = upstreamEdeCode(message) };
+}
+
+/// RFC 8914 section 3: the INFO-CODE of the upstream's EDE option. A missing
+/// option, an option too short to hold a code, and a zero code all mean the
+/// upstream reported no error.
+fn upstreamEdeCode(message: dns_message.Message) u16 {
+    var index: usize = 0;
+    while (edeOptionAt(message, index)) |option| : (index += 1) {
+        if (option.len < 2) continue;
+        const code = std.mem.readInt(u16, option[0..2], .big);
+        if (code != 0) return code;
+    }
+    return 0;
 }
 
 const CacheEntry = struct {
@@ -1129,6 +1168,16 @@ pub const Resolver = struct {
     }
 
     pub fn answer(self: *Resolver, query_bytes: []const u8, query: dns_message.Message, client: *const std.Io.net.IpAddress, output: []u8) ![]const u8 {
+        return self.answerAtDepth(query_bytes, query, client, output, 0);
+    }
+
+    /// The forward path at a given depth. RFC 9567 section 6.1: a report is
+    /// sent only for a client query, never for the answer to a report query,
+    /// so the depth bounds the reports one client query can cause. A report
+    /// travels over TCP when the platform can reach the upstream over TCP,
+    /// because a UDP source address is easy to forge.
+    fn answerAtDepth(self: *Resolver, query_bytes: []const u8, query: dns_message.Message, client: *const std.Io.net.IpAddress, output: []u8, depth: u32) ![]const u8 {
+        const transport: UpstreamTransport = if (depth == 0) .udp else .tcp;
         if (query.header.opcode != .query) return Error.UnsupportedOpcode;
         const cookie = self.clientCookie(query, client);
         if (cookie == .invalid) return self.cookieFailure(query, client, output);
@@ -1205,7 +1254,7 @@ pub const Resolver = struct {
                 return bytes;
             }
         }
-        const exchange = self.queryUpstream(query_bytes, query, scope) catch |err| switch (err) {
+        const exchange = self.queryUpstream(query_bytes, query, scope, transport) catch |err| switch (err) {
             Error.UpstreamFailure,
             Error.BadUpstreamResponse,
             => {
@@ -1240,6 +1289,10 @@ pub const Resolver = struct {
         // The scope of the query that fetched it bounds it, so an answer
         // fetched without an ADDRESS never reports a scope of its own.
         var upstream_scope = upstreamEcsScope(response, exchange.scope orelse EcsScope{});
+        // RFC 9567 section 5: the agent domain the upstream named and the
+        // error it reported are read before the options are stripped from
+        // the answer.
+        const upstream_report = readUpstreamReport(response);
         stripOptions(&response);
         // RFC 5452 section 6: only data in the domain of the query may be
         // accepted, so the answer, the authority, and the additional section
@@ -1287,6 +1340,10 @@ pub const Resolver = struct {
                 // section 4.7.
                 .bogus => {
                     self.cache.failures.put(key, .{ .rcode = .servfail, .ede = result.ede, .validation = true }, now);
+                    // RFC 9567 section 4.1: the resolver detected the
+                    // failure itself, so the code it reports is the one the
+                    // validator produced.
+                    self.sendErrorReport(depth, query, client, upstream_report, result.ede);
                     return self.relayBogus(query, cookie, result.ede, output);
                 },
                 .insecure => {
@@ -1316,8 +1373,17 @@ pub const Resolver = struct {
                 // to validate more times than the threshold of RFC 4035
                 // section 4.7.
                 self.cache.failures.put(key, .{ .rcode = .servfail, .ede = ede, .validation = true }, now);
+                // RFC 9567 section 4.1: the resolver detected the failure
+                // itself, so the code it reports is the one the validator
+                // produced.
+                self.sendErrorReport(depth, query, client, upstream_report, ede);
                 return self.relayBogus(query, cookie, ede, output);
             },
+        }
+        // RFC 9567 section 4.1: the upstream's answer reported an error, so
+        // the agent domain it named is told about it.
+        if (upstream_report.ede_code != 0) {
+            self.sendErrorReport(depth, query, client, upstream_report, upstream_report.ede_code);
         }
         switch (response.header.rcode) {
             .servfail => self.cache.failures.put(key, .{ .rcode = .servfail }, now),
@@ -1405,6 +1471,42 @@ pub const Resolver = struct {
         var writer = dns_writer.Writer.init(output);
         message.encode(&writer) catch return Error.ResponseTooLarge;
         return writer.written();
+    }
+
+    /// RFC 9567 section 4: an error report is a TXT query for the report name
+    /// the agent domain owns. The report travels this server's own forward
+    /// path, so its answer is validated and cached like any other answer,
+    /// and its answer is never returned to the client. The report is best
+    /// effort: a failure to send it never changes the client's answer.
+    fn sendErrorReport(self: *Resolver, depth: u32, query: dns_message.Message, client: *const std.Io.net.IpAddress, upstream_report: UpstreamReport, ede_code: u16) void {
+        // RFC 9567 section 6.1: a report is sent only for a client query, so
+        // the answer to a report query never produces a second report.
+        if (depth != 0) return;
+        const question = query.question orelse return;
+        const agent = upstream_report.agent orelse return;
+        // RFC 9567 section 5: the root name names no agent.
+        if (agent.eql(&dns_name.Name.root())) return;
+        // RFC 1035 section 2.3.4: a name over 255 octets is not a name, so
+        // no report is sent when the report name does not fit.
+        const report_name = dns_error_report.buildReportName(question.qtype.code(), &question.name, ede_code, &agent) orelse return;
+
+        var report_query = dns_message.Message{
+            .allocator = self.allocator,
+            .header = .{ .id = 0, .recursion_desired = true, .question_count = 1 },
+            .question = .{ .name = report_name, .qtype = .TXT, .qclass = .IN },
+            .answers = dns_message.RecordSection.init(self.allocator, 0) catch return,
+            .authorities = dns_message.RecordSection.init(self.allocator, 0) catch return,
+            .additionals = dns_message.RecordSection.init(self.allocator, 0) catch return,
+        };
+        defer report_query.deinit();
+        // RFC 9567 section 6.1: a report query carries no Report-Channel
+        // option of its own, so it carries no EDNS at all and the upstream
+        // query this server builds adds only the DO bit.
+        var query_bytes: [512]u8 = undefined;
+        var writer = dns_writer.Writer.init(&query_bytes);
+        report_query.encode(&writer) catch return;
+        var output: [2048]u8 = undefined;
+        _ = self.answerAtDepth(writer.written(), report_query, client, &output, depth + 1) catch {};
     }
 
     /// RFC 9520 section 3.2: the cached failure is answered with the RCODE
@@ -1680,7 +1782,16 @@ pub const Resolver = struct {
     /// ADDRESS, so it can answer the question without the scope. The retry is
     /// bounded: it happens once, and a second REFUSED ends the exchange the
     /// way it ends without a client subnet.
-    fn queryUpstream(self: *Resolver, query_bytes: []const u8, query: dns_message.Message, scope: ?EcsScope) !UpstreamAnswer {
+    fn queryUpstream(self: *Resolver, query_bytes: []const u8, query: dns_message.Message, scope: ?EcsScope, transport: UpstreamTransport) !UpstreamAnswer {
+        // RFC 9567 section 6.1: an error report travels over TCP when the
+        // platform can reach the upstream over TCP, because a UDP source
+        // address is easy to forge. A platform that cannot waits no longer
+        // than the ordinary path.
+        if (transport == .tcp) {
+            if (comptime UPSTREAM_TCP_DEADLINES_SUPPORTED) {
+                return .{ .response = try self.queryUpstreamTcp(query_bytes, query, scope), .scope = scope };
+            }
+        }
         var response = try self.queryUdp(query_bytes, query, scope);
         const sent = scope orelse return .{ .response = response, .scope = scope };
         if (sent.prefix == 0 or response.header.rcode != .refused) return .{ .response = response, .scope = scope };
@@ -1690,6 +1801,20 @@ pub const Resolver = struct {
         without_address.prefix = 0;
         response.deinit();
         return .{ .response = try self.queryUdp(query_bytes, query, without_address), .scope = without_address };
+    }
+
+    /// RFC 9567 section 6.1: the error report travels over TCP. The query
+    /// carries a randomized ID, exactly as the UDP path does before it
+    /// sends, so a forged answer cannot name the query.
+    fn queryUpstreamTcp(self: *Resolver, query_bytes: []const u8, query: dns_message.Message, scope: ?EcsScope) !dns_message.Message {
+        var query_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
+        if (query_bytes.len < 2 or query_bytes.len > query_buffer.len) return Error.UpstreamFailure;
+        var randomized_id: [2]u8 = undefined;
+        self.io.randomSecure(&randomized_id) catch return Error.UpstreamFailure;
+        const upstream_query = try buildUpstreamQuery(query_bytes, query, &query_buffer, &self.policy.anchors, scope);
+        @memcpy(query_buffer[0..2], &randomized_id);
+        const expected_id = std.mem.readInt(u16, &randomized_id, .big);
+        return self.queryTcp(query_buffer[0..upstream_query.len], query, expected_id, scope);
     }
 
     fn queryUdp(self: *Resolver, query_bytes: []const u8, query: dns_message.Message, scope: ?EcsScope) !dns_message.Message {
@@ -1808,9 +1933,10 @@ const Dns64Outcome = union(enum) {
 /// records come from one more upstream query. An RCODE other than 0 counts as
 /// an empty answer, so the query for the A records runs for an error answer
 /// too. The scope is the one the AAAA answer was fetched for, so the A query
-/// is fetched for that same scope (RFC 7871 section 7.3.1). Returns `.none`
-/// when nothing is synthesized, which leaves the answer as the upstream sent
-/// it.
+/// is fetched for that same scope (RFC 7871 section 7.3.1), and an upstream
+/// that refuses it is asked again with no ADDRESS (RFC 7871 section 7.1.3).
+/// Returns `.none` when nothing is synthesized, which leaves the answer as
+/// the upstream sent it.
 fn synthesizeDns64Answer(self: *Resolver, query: dns_message.Message, response: *dns_message.Message, scope: ?EcsScope, now: i64) !Dns64Outcome {
     if (self.policy.nat64_prefixes.len == 0) return .none;
     if (!dns64Applies(query, response.*)) return .none;
@@ -1841,8 +1967,12 @@ fn synthesizeDns64Answer(self: *Resolver, query: dns_message.Message, response: 
         var a_query_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
         var a_writer = dns_writer.Writer.init(&a_query_buffer);
         a_query.encode(&a_writer) catch return .none;
-        var a_response = self.queryUdp(a_writer.written(), a_query, scope) catch return .none;
-        defer a_response.deinit();
+        // RFC 7871 section 7.1.3: the A query carries the scope the AAAA
+        // query carried, so an upstream that refuses it is asked once more
+        // with no ADDRESS, exactly as the AAAA query is.
+        var a_answer = self.queryUpstream(a_writer.written(), a_query, scope, .udp) catch return .none;
+        defer a_answer.response.deinit();
+        const a_response = a_answer.response;
         if (validating) {
             // RFC 6147 section 5.5: "If the data does not validate, the
             // vDNS64 MUST respond with RCODE=2 (Server failure)".
@@ -1853,8 +1983,9 @@ fn synthesizeDns64Answer(self: *Resolver, query: dns_message.Message, response: 
         const owner = followAliasChain(a_response, target, zone_name, &chain) orelse return .none;
         if (try synthesizeDns64(&self.policy, owner, response, a_response, &chain)) {
             // RFC 7871 section 7.3.1: the records the client gets come from
-            // the A answer, so the answer reports the scope of that answer.
-            return .{ .synthesized = upstreamEcsScope(a_response, scope orelse EcsScope{}) };
+            // the A answer, so the answer reports the scope of that answer:
+            // the /0 scope of a retry that carried no ADDRESS.
+            return .{ .synthesized = upstreamEcsScope(a_response, a_answer.scope orelse EcsScope{}) };
         }
         // No A records at the owner: the chain goes on, if it goes on at all.
         if (owner.eql(&target) or hops >= zone.MaxAliasHops) return .none;
@@ -7339,14 +7470,19 @@ const Dns64Upstream = struct {
     /// The RCODE the AAAA answer carries (RFC 6147 section 5.1.2).
     rcode: dns_header.Rcode = .no_error,
     requests: usize = 0,
+    /// The number of queries the fake answers before it stops.
+    max_requests: usize = 2,
     /// The client subnet option each query carried, so a test can tell which
     /// scope every query was fetched for.
-    seen: [2][4 + 16]u8 = .{ @splat(0), @splat(0) },
-    seen_len: [2]usize = .{ 0, 0 },
+    seen: [4][4 + 16]u8 = .{ @splat(0), @splat(0), @splat(0), @splat(0) },
+    seen_len: [4]usize = .{ 0, 0, 0, 0 },
     /// The scope the upstream answers the AAAA query with, and the scope it
     /// answers the A query with. Null means the answer carries no option.
     aaaa_scope: ?u8 = null,
     a_scope: ?u8 = null,
+    /// The upstream refuses the A query that carries a non-zero ADDRESS
+    /// (RFC 7871 section 7.1.3).
+    refuse_with_address: bool = false,
 };
 
 const Dns64Timeout: std.Io.Timeout = .{ .duration = .{
@@ -7357,35 +7493,42 @@ const Dns64Timeout: std.Io.Timeout = .{ .duration = .{
 fn serveDns64Upstream(args: *Dns64Upstream) void {
     var request_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
     var index: usize = 0;
-    while (index < 2) : (index += 1) {
+    while (index < args.max_requests) : (index += 1) {
         const incoming = args.udp.receiveTimeout(args.io, &request_buffer, Dns64Timeout) catch return;
         args.requests += 1;
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         const query = dns_message.Message.parseQuery(arena.allocator(), incoming.data) catch return;
         const question = query.question orelse return;
-        if (index < args.seen.len) {
-            if (findOption(query, dns_rdata.EDNS_ECS_OPTION_CODE)) |option| {
+        var carried: ?[]const u8 = null;
+        if (findOption(query, dns_rdata.EDNS_ECS_OPTION_CODE)) |option| {
+            carried = option;
+            if (index < args.seen.len) {
                 const len = @min(option.len, args.seen[index].len);
                 @memcpy(args.seen[index][0..len], option[0..len]);
                 args.seen_len[index] = len;
             }
         }
-        const answers = if (question.qtype.eql(.AAAA)) args.aaaa else args.a;
+        // RFC 7871 section 7.1.3: an upstream that refuses a query that
+        // carries a non-zero ADDRESS answers it with REFUSED.
+        const refused = args.refuse_with_address and question.qtype.eql(.A) and
+            carried != null and carried.?[2] > 0;
+        const empty: []const dns_record.ResourceRecord = &.{};
+        const answers = if (refused) empty else if (question.qtype.eql(.AAAA)) args.aaaa else args.a;
         var soa_slot: [1]dns_record.ResourceRecord = undefined;
         var authority: []const dns_record.ResourceRecord = &.{};
         if (question.qtype.eql(.AAAA) and args.soa.len != 0) {
             soa_slot[0] = args.soa[0];
             authority = soa_slot[0..1];
         }
-        const rcode = if (question.qtype.eql(.AAAA)) args.rcode else .no_error;
+        const rcode = if (refused) .refused else if (question.qtype.eql(.AAAA)) args.rcode else .no_error;
         // RFC 7871 section 6: an answer that carries the client subnet
         // option states the scope it covers in its SCOPE PREFIX-LENGTH.
         var echoed: [4 + 16]u8 = @splat(0);
         var ecs: ?[]const u8 = null;
         const scope = if (question.qtype.eql(.AAAA)) args.aaaa_scope else args.a_scope;
         if (scope) |value| {
-            if (findOption(query, dns_rdata.EDNS_ECS_OPTION_CODE)) |option| {
+            if (carried) |option| {
                 const len = @min(option.len, echoed.len);
                 @memcpy(echoed[0..len], option[0..len]);
                 echoed[3] = value;
@@ -9123,6 +9266,70 @@ test "RFC 7871 section 7.1.3: a refused query with a client subnet is asked agai
     try std.testing.expectEqual(@as(u8, 0), ecs[3]);
 }
 
+test "RFC 7871 section 7.1.3: a refused DNS64 A query is asked again without the address" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    const a_records = [_]dns_record.ResourceRecord{dns64TestARecord("v4only.example.")};
+    const soa_records = [_]dns_record.ResourceRecord{dns64TestSoaRecord("example.")};
+    // The upstream refuses the A query that carries the client's address and
+    // answers it when the query carries none.
+    var upstream = Dns64Upstream{
+        .io = io,
+        .udp = &upstream_socket,
+        .a = &a_records,
+        .soa = &soa_records,
+        .max_requests = 3,
+        .refuse_with_address = true,
+    };
+    const thread = try std.Thread.spawn(.{}, serveDns64Upstream, .{&upstream});
+
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = upstream_socket.address },
+        .nat64_prefixes = .init(&.{try config.Nat64Prefix.parse("64:ff9b::/96")}),
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2924, "v4only.example.", true);
+    defer query.deinit();
+    query.question.?.qtype = .AAAA;
+    try appendOption(&query, dns_rdata.EDNS_ECS_OPTION_CODE, &.{ 0, 1, 24, 0, 192, 0, 2 });
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42746);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    thread.join();
+
+    // The upstream saw the AAAA query, the A query that carried the address,
+    // and the retry that carried none.
+    try std.testing.expectEqual(@as(usize, 3), upstream.requests);
+    try std.testing.expectEqual(@as(usize, 7), upstream.seen_len[1]);
+    try std.testing.expectEqual(@as(u8, 24), upstream.seen[1][2]);
+    try std.testing.expectEqual(@as(usize, 4), upstream.seen_len[2]);
+    try std.testing.expectEqual(@as(u8, 0), upstream.seen[2][2]);
+
+    // The client gets the synthesized AAAA the retried A answer holds.
+    const response = try dns_message.Message.parse(arena.allocator(), bytes);
+    try std.testing.expectEqual(dns_header.Rcode.no_error, response.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+    try std.testing.expect(dns_types.RecordType.AAAA.eql(response.answers.items[0].rrtype));
+    try std.testing.expectEqualSlices(u8, &.{
+        0x00, 0x64, 0xff, 0x9b, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x5d, 0xb8, 0xd8, 0x22,
+    }, &response.answers.items[0].rdata.AAAA);
+    // RFC 7871 section 7.3.1: the answer was fetched for the /0 scope of the
+    // retry, so it reports that scope and not the one that was asked for.
+    const ecs = findOption(response, dns_rdata.EDNS_ECS_OPTION_CODE).?;
+    try std.testing.expectEqual(@as(usize, 7), ecs.len);
+    try std.testing.expectEqual(@as(u8, 24), ecs[2]);
+    try std.testing.expectEqual(@as(u8, 0), ecs[3]);
+}
+
 test "RFC 7871 section 7.1.3: a second refusal ends the exchange" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
@@ -9273,4 +9480,315 @@ test "the cached copy of an unverifiable answer carries the same code" {
     const second_response = try dns_message.Message.parse(arena.allocator(), second);
     try expectEde(second_response, dnssec.EDE_UNSUPPORTED_DNSKEY_ALGORITHM, "unsupported dnskey algorithm");
     try std.testing.expectEqual(@as(usize, 1), upstream.requests);
+}
+
+/// The fake upstream an error-report test forwards to. It answers the
+/// client's query over UDP with an answer that reports an error, and it
+/// answers the report query that follows over TCP.
+const ReportingUpstream = struct {
+    io: std.Io,
+    udp: *const std.Io.net.Socket,
+    tcp: *std.Io.net.Server,
+    /// The Report-Channel payload the answer carries, or null when the
+    /// answer carries no Report-Channel option at all.
+    channel: ?[]const u8,
+    /// The INFO-CODE the EDE option of the answer carries.
+    ede_code: u16,
+    /// The client queries the upstream saw.
+    requests: usize = 0,
+    /// The report queries the upstream saw.
+    reports: usize = 0,
+    /// The name of the last report query, in text.
+    report_name: [512]u8 = undefined,
+    report_name_len: usize = 0,
+    /// Whether the last report query carried a Report-Channel option.
+    report_carried_channel: bool = false,
+    /// Set when the fixture ends, so the TCP thread stops waiting.
+    stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
+/// The fake upstream answers the client's query with an error: no records,
+/// an EDE option that reports the error, and a Report-Channel option that
+/// names the agent domain.
+fn serveReportingUpstream(args: *ReportingUpstream) void {
+    var request_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
+    while (true) {
+        const incoming = args.udp.receiveTimeout(args.io, &request_buffer, FailingUpstreamTimeout) catch return;
+        args.requests += 1;
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const query = dns_message.Message.parseQuery(arena.allocator(), incoming.data) catch return;
+        var response_buffer: [1024]u8 = undefined;
+        const bytes = buildErrorAnswer(&response_buffer, query, args.channel, args.ede_code) catch return;
+        args.udp.send(args.io, &incoming.from, bytes) catch return;
+    }
+}
+
+/// The report query arrives over TCP, because RFC 9567 section 6.1 wants a
+/// report over a transport whose source address is hard to forge.
+fn serveReportingUpstreamTcp(args: *ReportingUpstream) void {
+    while (!args.stop.load(.monotonic)) {
+        // The wait for a report query is bounded, so the thread ends when
+        // the fixture ends and no report arrives.
+        if (!socketReadable(args.tcp.socket.handle, 50)) continue;
+        const stream = args.tcp.accept(args.io) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => return,
+        };
+        defer stream.close(args.io);
+        serveReportQuery(args, stream);
+    }
+}
+
+/// The report query the upstream received: the name it asked for, and the
+/// answer it gives back.
+fn serveReportQuery(args: *ReportingUpstream, stream: std.Io.net.Stream) void {
+    var read_buffer: [1024]u8 = undefined;
+    var reader = stream.reader(args.io, &read_buffer);
+    var prefix: [2]u8 = undefined;
+    reader.interface.readSliceAll(&prefix) catch return;
+    const length = std.mem.readInt(u16, &prefix, .big);
+    if (length == 0 or length > 1024) return;
+    var query_bytes: [1024]u8 = undefined;
+    reader.interface.readSliceAll(query_bytes[0..length]) catch return;
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const query = dns_message.Message.parseQuery(arena.allocator(), query_bytes[0..length]) catch return;
+    args.reports += 1;
+    if (query.question) |question| {
+        var text: [512]u8 = undefined;
+        const name_text = question.name.toText(&text) catch return;
+        const copied = @min(name_text.len, args.report_name.len);
+        @memcpy(args.report_name[0..copied], name_text[0..copied]);
+        args.report_name_len = copied;
+        args.report_carried_channel = findOption(query, dns_error_report.option_code) != null;
+    }
+
+    var response_buffer: [1024]u8 = undefined;
+    const bytes = buildErrorAnswer(&response_buffer, query, args.channel, args.ede_code) catch return;
+    var write_buffer: [1024]u8 = undefined;
+    var writer = stream.writer(args.io, &write_buffer);
+    writer.interface.writeAll(&prefix) catch return;
+    writer.interface.writeAll(bytes) catch return;
+    writer.interface.flush() catch return;
+}
+
+/// The answer the upstream sends: the error it reports and the agent domain
+/// that wants to hear about it. The answer to the report query carries the
+/// same error, so a resolver that reported on every answer would report
+/// again.
+fn buildErrorAnswer(buffer: []u8, query: dns_message.Message, channel: ?[]const u8, ede_code: u16) ![]const u8 {
+    var message = dns_message.Message{
+        .allocator = query.allocator,
+        .header = .{
+            .id = query.header.id,
+            .qr = true,
+            .recursion_desired = true,
+            .recursion_available = true,
+            .rcode = .servfail,
+            .question_count = 1,
+        },
+        .question = query.question,
+        .answers = try dns_message.RecordSection.init(query.allocator, 0),
+        .authorities = try dns_message.RecordSection.init(query.allocator, 0),
+        .additionals = try dns_message.RecordSection.init(query.allocator, 0),
+        .edns = .{ .udp_payload_size = 1232, .extended_rcode = 0, .version = 0, .dnssec_ok = false },
+    };
+    defer message.deinit();
+    try message.additionals.append(.{
+        .owner = dns_name.Name.root(),
+        .rrtype = .OPT,
+        .class = dns_types.Class.fromCode(1232),
+        .ttl = 0,
+        .rdata = .{ .OPT = .{} },
+    });
+    message.header.additional_count = 1;
+    try appendReportOptions(&message, channel, ede_code);
+    var writer = dns_writer.Writer.init(buffer);
+    try message.encode(&writer);
+    return writer.written();
+}
+
+/// The RFC 8914 EDE option that reports the error and the RFC 9567
+/// Report-Channel option that names the agent domain.
+fn appendReportOptions(message: *dns_message.Message, channel: ?[]const u8, ede_code: u16) !void {
+    var ede: [2]u8 = undefined;
+    std.mem.writeInt(u16, &ede, ede_code, .big);
+    try appendOption(message, EDE_OPTION_CODE, &ede);
+    if (channel) |payload| try appendOption(message, dns_error_report.option_code, payload);
+}
+
+/// Whether the socket has a pending connection within the timeout.
+fn socketReadable(handle: std.posix.fd_t, timeout_ms: i32) bool {
+    var fds = [_]std.posix.pollfd{.{ .fd = handle, .events = std.posix.POLL.IN, .revents = 0 }};
+    const ready = std.posix.poll(&fds, timeout_ms) catch return false;
+    return ready > 0;
+}
+
+/// A resolver in front of a fake upstream that reports an error and names
+/// an agent domain. The upstream serves the client's query over UDP and the
+/// report query over TCP.
+const ReportingFixture = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    udp_socket: std.Io.net.Socket,
+    tcp_server: std.Io.net.Server,
+    upstream: ReportingUpstream,
+    udp_thread: std.Thread,
+    tcp_thread: std.Thread,
+    resolver: Resolver,
+    arena: std.heap.ArenaAllocator,
+    query: dns_message.Message,
+    query_bytes: [1024]u8 = undefined,
+    encoded: []const u8 = &.{},
+
+    fn create(io: std.Io, channel: ?[]const u8, ede_code: u16, name_text: []const u8) !*ReportingFixture {
+        const allocator = std.testing.allocator;
+        const self = try allocator.create(ReportingFixture);
+        errdefer allocator.destroy(self);
+        var loopback: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        self.* = .{
+            .allocator = allocator,
+            .io = io,
+            .udp_socket = undefined,
+            .tcp_server = undefined,
+            .upstream = undefined,
+            .udp_thread = undefined,
+            .tcp_thread = undefined,
+            .resolver = undefined,
+            .arena = std.heap.ArenaAllocator.init(allocator),
+            .query = undefined,
+        };
+        errdefer self.arena.deinit();
+        self.tcp_server = try std.Io.net.IpAddress.listen(&loopback, io, .{ .mode = .stream, .protocol = .tcp });
+        errdefer self.tcp_server.deinit(io);
+        // The upstream answers the client's query over UDP and the report
+        // query over TCP, so the two sockets share one port.
+        var udp_address = self.tcp_server.socket.address;
+        self.udp_socket = try std.Io.net.IpAddress.bind(&udp_address, io, .{ .mode = .dgram, .protocol = .udp });
+        errdefer self.udp_socket.close(io);
+        self.upstream = .{
+            .io = io,
+            .udp = &self.udp_socket,
+            .tcp = &self.tcp_server,
+            .channel = channel,
+            .ede_code = ede_code,
+        };
+        self.udp_thread = try std.Thread.spawn(.{}, serveReportingUpstream, .{&self.upstream});
+        errdefer self.udp_thread.join();
+        self.tcp_thread = try std.Thread.spawn(.{}, serveReportingUpstreamTcp, .{&self.upstream});
+        errdefer self.tcp_thread.join();
+
+        self.resolver = try Resolver.init(allocator, io, .{
+            .forwarder = .{ .address = self.tcp_server.socket.address },
+        });
+        errdefer self.resolver.deinit();
+        self.query = try makeTestQuery(self.arena.allocator(), 0x2a01, name_text, true);
+        errdefer self.query.deinit();
+        self.encoded = try encodeTestMessage(self.query, &self.query_bytes);
+        return self;
+    }
+
+    fn destroy(self: *ReportingFixture) void {
+        self.upstream.stop.store(true, .monotonic);
+        self.udp_thread.join();
+        self.tcp_thread.join();
+        self.udp_socket.close(self.io);
+        self.tcp_server.deinit(self.io);
+        self.resolver.deinit();
+        self.query.deinit();
+        self.arena.deinit();
+        self.allocator.destroy(self);
+    }
+};
+
+test "RFC 9567 section 4.1: an upstream error sends a report to the agent domain" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const agent = try dns_name.Name.fromText("a01.agent-domain.example.");
+    const fixture = try ReportingFixture.create(io, dns_error_report.agentDomainWire(&agent), 7, "broken.test.");
+    defer fixture.destroy();
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42770);
+
+    const bytes = try fixture.resolver.answer(fixture.encoded, fixture.query, &client, &output);
+    // The client still gets the failure the upstream reported.
+    const response = try dns_message.Message.parse(fixture.arena.allocator(), bytes);
+    try std.testing.expectEqual(dns_header.Rcode.servfail, response.header.rcode);
+
+    // The upstream saw the client query and a TXT query for the report name
+    // of section 6.1.1.
+    try std.testing.expectEqual(@as(usize, 1), fixture.upstream.requests);
+    try std.testing.expectEqual(@as(usize, 1), fixture.upstream.reports);
+    try std.testing.expectEqualStrings(
+        "_er.1.broken.test.7._er.a01.agent-domain.example.",
+        fixture.upstream.report_name[0..fixture.upstream.report_name_len],
+    );
+    // RFC 9567 section 6.1: a report query carries no Report-Channel option.
+    try std.testing.expect(!fixture.upstream.report_carried_channel);
+}
+
+test "RFC 9567 section 5: an answer without a Report-Channel option sends no report" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const fixture = try ReportingFixture.create(io, null, 7, "broken.test.");
+    defer fixture.destroy();
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42771);
+
+    _ = try fixture.resolver.answer(fixture.encoded, fixture.query, &client, &output);
+    try std.testing.expectEqual(@as(usize, 0), fixture.upstream.reports);
+}
+
+test "RFC 9567 section 5: a Report-Channel payload that names no agent sends no report" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    // An empty payload names no agent, and a payload that is not a name is
+    // not one either.
+    const empty = try ReportingFixture.create(io, "", 7, "broken.test.");
+    defer empty.destroy();
+    const pointed = [_]u8{ 0xc0, 0x00 };
+    const malformed = try ReportingFixture.create(io, &pointed, 7, "broken.test.");
+    defer malformed.destroy();
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42772);
+
+    _ = try empty.resolver.answer(empty.encoded, empty.query, &client, &output);
+    try std.testing.expectEqual(@as(usize, 0), empty.upstream.reports);
+    _ = try malformed.resolver.answer(malformed.encoded, malformed.query, &client, &output);
+    try std.testing.expectEqual(@as(usize, 0), malformed.upstream.reports);
+}
+
+test "RFC 1035 section 2.3.4: a report name over 255 octets sends no report" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const agent = try dns_name.Name.fromText("a01.agent-domain.example.");
+    // A name of long labels leaves no room for the report name.
+    var text: [256]u8 = undefined;
+    @memset(text[0..63], 'a');
+    text[63] = '.';
+    @memset(text[64..127], 'b');
+    text[127] = '.';
+    @memset(text[128..191], 'c');
+    text[191] = '.';
+    @memset(text[192..217], 'd');
+    text[217] = '.';
+    const fixture = try ReportingFixture.create(io, dns_error_report.agentDomainWire(&agent), 7, text[0..218]);
+    defer fixture.destroy();
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42773);
+
+    _ = try fixture.resolver.answer(fixture.encoded, fixture.query, &client, &output);
+    try std.testing.expectEqual(@as(usize, 0), fixture.upstream.reports);
+}
+
+test "RFC 9567 section 6.1: the answer to a report query produces no second report" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const agent = try dns_name.Name.fromText("a01.agent-domain.example.");
+    // The answer to the report query reports an error too, so a resolver
+    // that reported on every answer would report again.
+    const fixture = try ReportingFixture.create(io, dns_error_report.agentDomainWire(&agent), 7, "broken.test.");
+    defer fixture.destroy();
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42774);
+
+    _ = try fixture.resolver.answer(fixture.encoded, fixture.query, &client, &output);
+    try std.testing.expectEqual(@as(usize, 1), fixture.upstream.reports);
 }

@@ -4378,7 +4378,7 @@ const nsec3_zonemd_absent_zone_text =
     \\$TTL 3600
     \\@ IN SOA ns1.example.com. hostmaster.example.com. 1 3600 900 1209600 3600
     \\@ IN NS ns1.example.com.
-    \\@ IN NSEC3PARAM 1 0 0 73616c74
+    \\@ IN NSEC3PARAM 1 0 0 -
     \\ns1 IN A 192.0.2.1
 ;
 
@@ -4428,8 +4428,8 @@ const nsec3_rollover_zone_text =
     \\$TTL 3600
     \\@ IN SOA ns1.example.com. hostmaster.example.com. 1 3600 900 1209600 3600
     \\@ IN NS ns1.example.com.
-    \\@ IN NSEC3PARAM 1 0 0 73616c74
-    \\@ IN NSEC3PARAM 1 0 0 aabbccdd
+    \\@ IN NSEC3PARAM 1 0 0 -
+    \\@ IN NSEC3PARAM 1 1 0 -
     \\ns1 IN A 192.0.2.1
 ;
 

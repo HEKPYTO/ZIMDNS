@@ -124,6 +124,37 @@ pub const ServerContext = struct {
                 return Error.BadDnssecKey;
             }
         }
+        // RFC 6781 section 4.1.2: the Double-Signature scheme publishes a
+        // second key-signing key that signs the DNSKEY RRset beside the
+        // first, while the parent's DS still points at the first.
+        if (context.config.dnssecNewKskFileText()) |key_path| {
+            const key_text = try readReferencedFile(dir, io, key_path, allocator);
+            defer allocator.free(key_text);
+            var ksk = parseDnssecKeyTextAndClear(key_text) catch return Error.BadDnssecKey;
+            defer ksk.deinit();
+            const zone_key = if (dnssec_key) |*key| key else {
+                // A second key-signing key without a zone-signing key signs
+                // nothing.
+                return Error.BadDnssecKey;
+            };
+            const first_ksk = if (zone_key.ksk) |*first| first else {
+                // The DS the zone publishes states one key, and the scheme
+                // needs that key to name the second one beside.
+                return Error.BadDnssecKey;
+            };
+            // The same key twice would put the same DNSKEY in the RRset
+            // twice, and an RRset with a duplicate RR is not the RRset a
+            // signature covers.
+            if (signer.samePublicKey(ksk.material, first_ksk.material)) return Error.BadDnssecKey;
+            if (signer.samePublicKey(ksk.material, zone_key.material)) return Error.BadDnssecKey;
+            // RFC 6781 section 4.1.2.1: the key the operator marks `revoked` is
+            // the one being removed, so it is published with the REVOKE bit
+            // set and it still signs the DNSKEY RRset that carries it.
+            zone_key.published_ksk = .{
+                .material = ksk.material,
+                .revoked = context.config.dnssecNewKskRevoked(),
+            };
+        }
 
         // Read before any zone is loaded, so a bad anchor file fails startup
         // rather than leaving a forwarder running with no trust domain.
@@ -274,6 +305,13 @@ pub const ServerContext = struct {
             agentDomainName(text) catch return error.BadConfiguration
         else
             null;
+        // RFC 9567 section 6.3: the monitored agent domain is a domain name
+        // too, and a value that is not one stops the server at startup rather
+        // than monitoring a domain that cannot be named.
+        const report_monitor = if (self.config.errorReportMonitorText()) |text|
+            agentDomainName(text) catch return error.BadConfiguration
+        else
+            null;
         // Per-zone override apexes outlive the config text: lowercased with a
         // trailing dot, owned by the runtime. Decoded before the runtime
         // exists, so a failure here leaves the context whole.
@@ -308,6 +346,7 @@ pub const ServerContext = struct {
         }
         runtime.answer_policy.nsid = nsid;
         runtime.answer_policy.report_agent = report_agent;
+        runtime.answer_policy.report_monitor = report_monitor;
         runtime.answer_policy.zoneversion = self.config.zoneversion;
         if (self.config.minimal_any_ttl) |ttl| runtime.answer_policy.minimal_any_ttl = ttl;
         if (self.config.minimal_any_ttl_tcp) |ttl| runtime.answer_policy.minimal_any_ttl_tcp = ttl;
@@ -419,10 +458,10 @@ fn decodeNsid(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     return bytes;
 }
 /// RFC 9567 section 5: the agent domain an operator configured, as the name
-/// the Report-Channel option carries. A name written without its trailing
-/// dot is completed, and a value that is not a domain name is refused, so a
-/// broken agent domain stops the server instead of advertising a channel
-/// nobody can report to.
+/// the Report-Channel option carries, and the domain the monitoring agent
+/// monitors. A name written without its trailing dot is completed, and a
+/// value that is not a domain name is refused, so a broken agent domain stops
+/// the server instead of advertising a channel nobody can report to.
 fn agentDomainName(text: []const u8) !dns_name.Name {
     if (text.len == 0) return error.BadConfiguration;
     var buffer: [256]u8 = undefined;
@@ -591,6 +630,10 @@ const dnssec_test_key = "ed25519 DSSF3o0s0f+ElWzj9E/Osxw8hLpk55chkmx0LYN5WiY=\n"
 /// is the key-signing key of the zone that separates the roles.
 const dnssec_test_ksk_key = "ecdsap256sha256 GU6SnQ/Ou+xC5RumuIUIuJZteXT2z0O/ok1s38Et6mQ=\n";
 
+/// The RFC 6605 section 6.2 ECDSA P-384 example key, published in the RFC. It
+/// is the second key-signing key of a Double-Signature rollover.
+const dnssec_test_new_ksk_key = "ecdsap384sha384 WURgWHCcYIYUPWgeLmiPY2DJJk02vgrmTfitxgqcL4vwW7BOrbawVmVe0d9V94SR\n";
+
 const dnssec_test_zone =
     \\$ORIGIN signed.example.
     \\$TTL 3600
@@ -615,18 +658,26 @@ fn countType(zone: zone_index.Zone, rrtype: @import("../dns/types.zig").RecordTy
 }
 
 fn hasRrsigCovering(zone: zone_index.Zone, owner: []const u8, covered: u16) bool {
+    return countRrsigCovering(zone, owner, covered) != 0;
+}
+
+/// How many signatures cover `covered` at `owner`. RFC 6781 section 4.1.2
+/// gives the DNSKEY RRset one signature per key-signing key, so the count
+/// tells the two apart.
+fn countRrsigCovering(zone: zone_index.Zone, owner: []const u8, covered: u16) usize {
+    var total: usize = 0;
     for (zone.records.items[0..zone.records.len]) |record| {
         if (!record.rrtype.eql(.RRSIG)) continue;
         if (!std.ascii.eqlIgnoreCase(record.owner, owner)) continue;
-        const rdata = zone_parser.parseRData(.RRSIG, record.rdataText()) catch return false;
+        const rdata = zone_parser.parseRData(.RRSIG, record.rdataText()) catch return total;
         const bytes = switch (rdata) {
             .Unknown => |unknown| unknown.bytes(),
-            else => return false,
+            else => return total,
         };
-        if (bytes.len < 2) return false;
-        if (std.mem.readInt(u16, bytes[0..2], .big) == covered) return true;
+        if (bytes.len < 2) continue;
+        if (std.mem.readInt(u16, bytes[0..2], .big) == covered) total += 1;
     }
-    return false;
+    return total;
 }
 
 /// The DNSKEY RDATA the zone publishes, which a validator anchors on. The
@@ -715,6 +766,24 @@ fn dsKeyTag(zone: zone_index.Zone) !u16 {
     return error.TestUnexpectedResult;
 }
 
+/// The DNSKEY flags the zone publishes for the key of `algorithm`. RFC 5011
+/// section 3 puts the REVOKE bit in the flags of the key being revoked.
+fn dnskeyFlags(zone: zone_index.Zone, algorithm: u8) !u16 {
+    for (zone.records.items[0..zone.records.len]) |record| {
+        if (!record.rrtype.eql(.DNSKEY)) continue;
+        const rdata = try zone_parser.parseRData(.DNSKEY, record.rdataText());
+        switch (rdata) {
+            .Unknown => |unknown| {
+                const bytes = unknown.bytes();
+                if (bytes[3] != algorithm) continue;
+                return std.mem.readInt(u16, bytes[0..2], .big);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
 test "server context signs every zone named by the configured DNSSEC key file" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var dir = std.testing.tmpDir(.{});
@@ -768,6 +837,166 @@ test "server context signs a zone with a key-signing key beside the zone-signing
     // zone by the zone-signing key.
     try std.testing.expect(hasRrsigCovering(zone, "signed.example.", RecordType.DNSKEY.code()));
     try std.testing.expect(hasRrsigCovering(zone, "signed.example.", RecordType.SOA.code()));
+}
+
+test "a zone with a second key-signing key publishes both DNSKEYs at the apex" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{ .sub_path = "signed.example.zone", .data = dnssec_test_zone });
+    try dir.dir.writeFile(io, .{ .sub_path = "zsk.key", .data = dnssec_test_key });
+    try dir.dir.writeFile(io, .{ .sub_path = "ksk.key", .data = dnssec_test_ksk_key });
+    try dir.dir.writeFile(io, .{ .sub_path = "new-ksk.key", .data = dnssec_test_new_ksk_key });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone signed.example primary signed.example.zone\ndnssec-key-file zsk.key\ndnssec-ksk-file ksk.key\ndnssec-new-ksk-file new-ksk.key\n" });
+
+    var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+    defer context.deinit();
+
+    // RFC 6781 section 4.1.2: the zone publishes the zone-signing key and
+    // both key-signing keys, and the one DS it publishes states the key the
+    // parent's DS points at.
+    const zone = context.zones.items[0];
+    try std.testing.expectEqual(@as(usize, 3), countType(zone, .DNSKEY));
+    try std.testing.expectEqual(@as(usize, 1), countType(zone, .DS));
+    try std.testing.expectEqual(@as(u16, 55648), try dsKeyTag(zone));
+    // The DNSKEY RRset carries one signature per key-signing key.
+    try std.testing.expectEqual(@as(usize, 2), countRrsigCovering(zone, "signed.example.", RecordType.DNSKEY.code()));
+    try std.testing.expectEqual(@as(usize, 1), countRrsigCovering(zone, "signed.example.", RecordType.SOA.code()));
+}
+
+test "a revoked second key-signing key is published with the REVOKE bit" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{ .sub_path = "signed.example.zone", .data = dnssec_test_zone });
+    try dir.dir.writeFile(io, .{ .sub_path = "zsk.key", .data = dnssec_test_key });
+    try dir.dir.writeFile(io, .{ .sub_path = "ksk.key", .data = dnssec_test_ksk_key });
+    try dir.dir.writeFile(io, .{ .sub_path = "new-ksk.key", .data = dnssec_test_new_ksk_key });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone signed.example primary signed.example.zone\ndnssec-key-file zsk.key\ndnssec-ksk-file ksk.key\ndnssec-new-ksk-file new-ksk.key revoked\n" });
+
+    var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+    defer context.deinit();
+
+    // RFC 6781 section 4.1.2.1: the key being removed is published with the
+    // REVOKE bit of RFC 5011 section 3 set, so its DNSKEY carries flags 385
+    // and not the 257 of a key that is not revoked.
+    const zone = context.zones.items[0];
+    try std.testing.expectEqual(@as(usize, 3), countType(zone, .DNSKEY));
+    try std.testing.expectEqual(@as(u16, 385), try dnskeyFlags(zone, 14));
+    try std.testing.expectEqual(@as(u16, 257), try dnskeyFlags(zone, 13));
+    // The DS still states the key `dnssec-ksk-file` names, and the DNSKEY
+    // RRset is still covered by one signature per key-signing key.
+    try std.testing.expectEqual(@as(u16, 55648), try dsKeyTag(zone));
+    try std.testing.expectEqual(@as(usize, 2), countRrsigCovering(zone, "signed.example.", RecordType.DNSKEY.code()));
+}
+
+test "server context refuses a second key-signing key marked with a word it does not know" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{ .sub_path = "signed.example.zone", .data = dnssec_test_zone });
+    try dir.dir.writeFile(io, .{ .sub_path = "zsk.key", .data = dnssec_test_key });
+    try dir.dir.writeFile(io, .{ .sub_path = "ksk.key", .data = dnssec_test_ksk_key });
+    try dir.dir.writeFile(io, .{ .sub_path = "new-ksk.key", .data = dnssec_test_new_ksk_key });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone signed.example primary signed.example.zone\ndnssec-key-file zsk.key\ndnssec-ksk-file ksk.key\ndnssec-new-ksk-file new-ksk.key bogus\n" });
+
+    // Only the word `revoked` marks the key, so the server refuses to start
+    // rather than publish a key the operator did not ask to revoke.
+    try std.testing.expectError(
+        error.BadDirective,
+        ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator),
+    );
+}
+
+test "server context refuses a second key-signing key without a zone-signing key" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{ .sub_path = "signed.example.zone", .data = dnssec_test_zone });
+    try dir.dir.writeFile(io, .{ .sub_path = "ksk.key", .data = dnssec_test_ksk_key });
+    try dir.dir.writeFile(io, .{ .sub_path = "new-ksk.key", .data = dnssec_test_new_ksk_key });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone signed.example primary signed.example.zone\ndnssec-ksk-file ksk.key\ndnssec-new-ksk-file new-ksk.key\n" });
+
+    // A second key-signing key without a zone-signing key has nothing to
+    // sign and no DS to name, so the server refuses to start.
+    try std.testing.expectError(
+        error.BadDnssecKey,
+        ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator),
+    );
+}
+
+test "server context refuses a second key-signing key without a key-signing key to name in the DS" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{ .sub_path = "signed.example.zone", .data = dnssec_test_zone });
+    try dir.dir.writeFile(io, .{ .sub_path = "zsk.key", .data = dnssec_test_key });
+    try dir.dir.writeFile(io, .{ .sub_path = "new-ksk.key", .data = dnssec_test_new_ksk_key });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone signed.example primary signed.example.zone\ndnssec-key-file zsk.key\ndnssec-new-ksk-file new-ksk.key\n" });
+
+    // The DS the zone publishes states one key, and a second key-signing key
+    // with no key-signing key to name in it has no place in the scheme.
+    try std.testing.expectError(
+        error.BadDnssecKey,
+        ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator),
+    );
+}
+
+test "server context refuses a second key-signing key that is a key the zone already publishes" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{ .sub_path = "signed.example.zone", .data = dnssec_test_zone });
+    try dir.dir.writeFile(io, .{ .sub_path = "zsk.key", .data = dnssec_test_key });
+    try dir.dir.writeFile(io, .{ .sub_path = "ksk.key", .data = dnssec_test_ksk_key });
+
+    // The same key as the first key-signing key: the DNSKEY RRset would
+    // hold the same record twice.
+    try dir.dir.writeFile(io, .{ .sub_path = "new-ksk.key", .data = dnssec_test_ksk_key });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone signed.example primary signed.example.zone\ndnssec-key-file zsk.key\ndnssec-ksk-file ksk.key\ndnssec-new-ksk-file new-ksk.key\n" });
+    try std.testing.expectError(
+        error.BadDnssecKey,
+        ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator),
+    );
+
+    // The same key as the zone-signing key: the same DNSKEY twice.
+    try dir.dir.writeFile(io, .{ .sub_path = "new-ksk.key", .data = dnssec_test_key });
+    try std.testing.expectError(
+        error.BadDnssecKey,
+        ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator),
+    );
+}
+
+test "server context refuses a second key-signing key file that is missing or unusable" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{ .sub_path = "signed.example.zone", .data = dnssec_test_zone });
+    try dir.dir.writeFile(io, .{ .sub_path = "zsk.key", .data = dnssec_test_key });
+    try dir.dir.writeFile(io, .{ .sub_path = "ksk.key", .data = dnssec_test_ksk_key });
+
+    // A key file the configuration names but that does not exist is refused
+    // like every other key file.
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone signed.example primary signed.example.zone\ndnssec-key-file zsk.key\ndnssec-ksk-file ksk.key\ndnssec-new-ksk-file missing.key\n" });
+    try std.testing.expectError(
+        error.MissingReferencedFile,
+        ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator),
+    );
+
+    // A key file that does not parse is refused like every other key file.
+    try dir.dir.writeFile(io, .{ .sub_path = "bad.key", .data = "ed25519 not-base64\n" });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone signed.example primary signed.example.zone\ndnssec-key-file zsk.key\ndnssec-ksk-file ksk.key\ndnssec-new-ksk-file bad.key\n" });
+    try std.testing.expectError(
+        error.BadDnssecKey,
+        ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator),
+    );
 }
 
 test "server context refuses a configuration whose key-signing key file does not exist" {

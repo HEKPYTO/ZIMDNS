@@ -50,6 +50,11 @@ pub const AnswerPolicy = struct {
     /// domain is never advertised (section 4). The name is inline, so the
     /// policy owns nothing.
     report_agent: ?dns_name.Name = null,
+    /// RFC 9567 section 6.3: the agent domain this server monitors as a
+    /// monitoring agent. Null when the operator configured none, so the
+    /// server hosts no monitoring agent. The name is inline, so the policy
+    /// owns nothing.
+    report_monitor: ?dns_name.Name = null,
     /// RFC 9660 section 3.2 makes answering optional. On by default because
     /// the value is the answer's own SOA serial, with nothing to leak.
     zoneversion: bool = true,
@@ -339,6 +344,11 @@ pub fn buildResponseWithPolicy(
     // FORMERR to anything else rather than ignoring it. RFC 7314 section 2
     // gives the EXPIRE option the same zero-length query form.
     if (ednsOptionIsMalformed(&request)) return buildFormerrResponse(request);
+    // RFC 9567 section 6.3: the monitoring agent answers the report queries
+    // for the agent domain it monitors, and section 8.2 forbids it from
+    // denying a name at or below that domain.
+    const monitor = policy.report_monitor;
+    const monitored_name = if (monitor) |domain| nameEndsWith(&q.name, &domain) else false;
     var qname_text_buffer: [256]u8 = undefined;
     const qname_text = q.name.toText(&qname_text_buffer) catch return Error.BadQName;
     var lookup = zone.lookup(request.allocator, qname_text, q.qtype);
@@ -349,7 +359,9 @@ pub fn buildResponseWithPolicy(
         .header = (header.ResponseFlags{
             .authoritative = lookup.kind != .not_authoritative and lookup.kind != .referral and lookup.kind != .servfail,
             .rcode = switch (lookup.kind) {
-                .nxdomain => .nxdomain,
+                // RFC 9567 section 8.2: a name at or below a monitored agent
+                // domain is never a name error.
+                .nxdomain => if (monitored_name) header.Rcode.no_error else header.Rcode.nxdomain,
                 .yxdomain => .yxdomain,
                 .servfail => .servfail,
                 .not_authoritative => .refused,
@@ -387,6 +399,8 @@ pub fn buildResponseWithPolicy(
     // payload it has to fit carries them too.
     var any_answer = false;
     var any_ttl: u32 = policy.minimal_any_ttl;
+    // True when the monitoring agent answered the name instead of the zone.
+    var monitor_answer = false;
 
     switch (lookup.kind) {
         .answer, .cname, .dname, .yxdomain => {
@@ -409,32 +423,52 @@ pub fn buildResponseWithPolicy(
             }
         },
         .nodata, .nxdomain => {
-            const alias_chain = lookup.records.len != 0 or lookup.synthesized_cname != null;
-            // RFC 8482 section 4.2: an ANY query at an existing owner with no
-            // CNAME gets one synthesized HINFO instead of the conventional
-            // all-RRsets answer, which unmodified resolvers cache and reuse.
-            // An empty non-terminal has no RRset to summarize so it keeps
-            // NODATA, and an alias chain keeps its own denial below.
-            const minimal_any = !alias_chain and
-                q.qtype.eql(dns_types.RecordType.ANY) and
-                zone.hasOwner(qname_text);
-            if (minimal_any) {
-                // RFC 8482 section 4.4: the operator may answer an ANY query
-                // differently per transport. The TCP TTL applies to a query
-                // that arrived over TCP, the base TTL everywhere else.
-                any_ttl = if (over_tcp) (policy.minimal_any_ttl_tcp orelse policy.minimal_any_ttl) else policy.minimal_any_ttl;
-                any_answer = true;
-            } else {
-                // RFC 8020 section 2 Warning: a denial reached through a CNAME
-                // or DNAME chain is for the last name of the chain, so the
-                // alias records ride in the answer and the SOA in the
-                // authority section carries the negative TTL.
-                var index: usize = 0;
-                while (index < lookup.records.len) : (index += 1) {
-                    try response.answers.append(try toResourceRecord(lookup.records.items[index], lookup.answer_owner));
+            // RFC 9567 section 6.3 and 8.2: a name the zone does not have
+            // but that is at or below the monitored agent domain is answered
+            // by the monitoring agent, never with a name error.
+            if (lookup.kind == .nxdomain and monitored_name) {
+                monitor_answer = true;
+                if (monitor) |domain| {
+                    if (dns_error_report.isReportName(&q.name, &domain)) {
+                        // Section 6.3: a report query is answered positively.
+                        // The report is in the query name, so the record only
+                        // says what it is.
+                        try response.answers.append(monitorReportRecord(q.name));
+                    } else if (lookup.soa) |soa| {
+                        // Section 8.2: any other name at or below the domain
+                        // is answered with no data, so the answer stays
+                        // cacheable with the zone's own negative TTL.
+                        try response.authorities.append(try toNegativeSoa(soa));
+                    }
                 }
-                if (lookup.synthesized_cname) |synthetic| try response.answers.append(synthesizedCnameRecord(synthetic));
-                if (lookup.soa) |soa| try response.authorities.append(try toNegativeSoa(soa));
+            } else {
+                const alias_chain = lookup.records.len != 0 or lookup.synthesized_cname != null;
+                // RFC 8482 section 4.2: an ANY query at an existing owner with no
+                // CNAME gets one synthesized HINFO instead of the conventional
+                // all-RRsets answer, which unmodified resolvers cache and reuse.
+                // An empty non-terminal has no RRset to summarize so it keeps
+                // NODATA, and an alias chain keeps its own denial below.
+                const minimal_any = !alias_chain and
+                    q.qtype.eql(dns_types.RecordType.ANY) and
+                    zone.hasOwner(qname_text);
+                if (minimal_any) {
+                    // RFC 8482 section 4.4: the operator may answer an ANY query
+                    // differently per transport. The TCP TTL applies to a query
+                    // that arrived over TCP, the base TTL everywhere else.
+                    any_ttl = if (over_tcp) (policy.minimal_any_ttl_tcp orelse policy.minimal_any_ttl) else policy.minimal_any_ttl;
+                    any_answer = true;
+                } else {
+                    // RFC 8020 section 2 Warning: a denial reached through a CNAME
+                    // or DNAME chain is for the last name of the chain, so the
+                    // alias records ride in the answer and the SOA in the
+                    // authority section carries the negative TTL.
+                    var index: usize = 0;
+                    while (index < lookup.records.len) : (index += 1) {
+                        try response.answers.append(try toResourceRecord(lookup.records.items[index], lookup.answer_owner));
+                    }
+                    if (lookup.synthesized_cname) |synthetic| try response.answers.append(synthesizedCnameRecord(synthetic));
+                    if (lookup.soa) |soa| try response.authorities.append(try toNegativeSoa(soa));
+                }
             }
         },
 
@@ -447,18 +481,32 @@ pub fn buildResponseWithPolicy(
     // QTYPE asked for them explicitly. The AD bit is never set here: the
     // authoritative path does not validate (validation lives on the
     // forwarding path in `src/dns/validate.zig`).
-    if (dnssec_ok) {
-        // The minimal ANY answer signs its own RRsets, so the covering
-        // signatures are attached with it.
-        if (!any_answer) appendCoveringRrsigs(&response, zone, .ANY, lookup.answer_owner) catch {};
-        if (lookup.kind == .nodata or lookup.kind == .nxdomain) {
-            const proved = appendDenialProofs(&response, zone, qname_text, q.qtype, lookup.kind) catch false;
-            if (!proved) refuseUnprovenDenial(&response);
-        } else if (lookup.kind == .referral) {
-            appendReferralProofs(&response, zone, lookup.authorities.items) catch {};
+    // A monitored answer carries no DNSSEC records: the answer is no longer a
+    // denial, so it keeps no denial proof (RFC 9567 section 8.2), and the
+    // synthesized TXT record is not in the zone, so no signature over it
+    // exists. The monitored agent domain therefore belongs in an unsigned
+    // zone, as section 8.2 recommends.
+    if (!monitor_answer) {
+        if (dnssec_ok) {
+            // The minimal ANY answer signs its own RRsets, so the covering
+            // signatures are attached with it.
+            if (!any_answer) appendCoveringRrsigs(&response, zone, .ANY, lookup.answer_owner) catch {};
+            if (lookup.kind == .nodata or lookup.kind == .nxdomain) {
+                const proved = appendDenialProofs(&response, zone, qname_text, q.qtype, lookup.kind) catch false;
+                if (!proved) refuseUnprovenDenial(&response);
+            } else if (lookup.kind == .referral) {
+                appendReferralProofs(&response, zone, lookup.authorities.items) catch {};
+            }
+        } else {
+            dns_dnssec.stripProofRecords(&response, q.qtype);
         }
-    } else {
-        dns_dnssec.stripProofRecords(&response, q.qtype);
+    }
+
+    // RFC 9567 section 6.3: a monitoring agent SHOULD answer a query that
+    // arrived over UDP and carries no DNS Cookie with the truncation bit
+    // set, so the reporting resolver requeries over TCP.
+    if (monitor_answer and !over_tcp and !carriesDnsCookie(&request)) {
+        response.header.truncated = true;
     }
 
     // RFC 8482 section 4.2: the minimal ANY answer, built after the DNSSEC
@@ -572,6 +620,41 @@ fn synthesizedCnameRecord(synthetic: zone_index.SynthesizedCname) dns_record.Res
         .ttl = synthetic.ttl,
         .rdata = .{ .CNAME = synthetic.target },
     };
+}
+
+/// RFC 9567 section 6.3: the TTL of the synthesized TXT record that answers
+/// a report query.
+const monitor_report_ttl: u32 = 60;
+
+/// RFC 9567 section 6.3: the text of the synthesized TXT record. The report
+/// itself is in the query name, so the record only says what it is.
+const monitor_report_text = "RFC 9567 error report";
+
+/// RFC 9567 section 6.3: the synthesized TXT record that answers a report
+/// query. It is not in the zone, so it carries no RRSIG: section 8.2 says an
+/// agent domain is better left unsigned, so the reporting resolver is never
+/// asked to validate an answer it has no use for.
+fn monitorReportRecord(owner: dns_name.Name) dns_record.ResourceRecord {
+    var txt = dns_rdata.Txt{ .len = @intCast(monitor_report_text.len) };
+    @memcpy(txt.data[0..monitor_report_text.len], monitor_report_text);
+    return .{
+        .owner = owner,
+        .rrtype = .TXT,
+        .class = dns_types.Class.IN,
+        .ttl = monitor_report_ttl,
+        .rdata = .{ .TXT = txt },
+    };
+}
+
+/// RFC 7873 section 4: the code of the DNS Cookie option.
+const dns_cookie_option_code: u16 = 10;
+
+/// Whether the request carries a DNS Cookie option. The parsed EDNS state
+/// holds no options, so the request's OPT record is the only place the
+/// option can be found.
+fn carriesDnsCookie(request: *const dns_message.Message) bool {
+    const options = ednsOptions(request) orelse return false;
+    return dns_rdata.findOption(options, dns_cookie_option_code) != null;
 }
 
 /// RFC 8482 section 4.2 minimal ANY answer: one HINFO whose CPU field is
@@ -5994,5 +6077,214 @@ test "RFC 9567: an answer that is not authoritative carries no Report-Channel op
         try std.testing.expect(!response.header.authoritative);
         const options = ednsOptions(&response) orelse return error.TestExpectedEqual;
         try std.testing.expectEqual(@as(usize, 0), countOption(options, dns_error_report.option_code));
+    }
+}
+
+/// A zone that holds the monitored agent domain, so a report query for a
+/// name the zone does not have reaches the monitoring agent's answer.
+const report_monitor_test_zone =
+    \\$ORIGIN example.net.
+    \\$TTL 3600
+    \\@ IN SOA ns.example.net. hostmaster.example.net. 1 3600 900 1209600 300
+    \\@ IN NS ns.example.net.
+    \\ns IN A 192.0.2.53
+    \\www IN A 192.0.2.1
+    \\
+;
+
+/// The report query name of a failed A lookup, and the name of the monitored
+/// agent domain it is sent to.
+fn reportMonitorQuery(agent: dns_name.Name, name_buffer: []u8) ![]const u8 {
+    const failed = try dns_name.Name.fromText("broken.test.");
+    const report = dns_error_report.buildReportName(1, &failed, 7, &agent).?;
+    return report.toText(name_buffer);
+}
+
+test "RFC 9567 section 6.3: a report query under the monitored domain is answered positively" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(report_monitor_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    const agent = try dns_name.Name.fromText("agent.example.net.");
+    var name_buffer: [256]u8 = undefined;
+    const name_text = try reportMonitorQuery(agent, &name_buffer);
+
+    const request = try testQuery(arena.allocator(), name_text, .TXT);
+    const response = try buildResponseWithPolicy(request, &zone, .{ .report_monitor = agent }, null, false);
+
+    // Section 6.3: the report query is answered with NOERROR and the
+    // authoritative bit set.
+    try std.testing.expectEqual(header.Rcode.no_error, response.header.rcode);
+    try std.testing.expect(response.header.authoritative);
+    // One TXT record, owned by the queried name.
+    try std.testing.expectEqual(@as(usize, 1), response.answers.len);
+    const answer = response.answers.items[0];
+    try std.testing.expect(answer.rrtype.eql(.TXT));
+    try std.testing.expect(answer.owner.eql(&request.question.?.name));
+    try std.testing.expectEqual(@as(u32, 60), answer.ttl);
+    // The report itself is in the query name, so the record only says what
+    // it is.
+    try std.testing.expectEqualStrings("RFC 9567 error report", answer.rdata.TXT.text());
+}
+
+test "RFC 9567 section 8.2: a name under the monitored domain that is not a report query is answered with no data" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(report_monitor_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    const agent = try dns_name.Name.fromText("agent.example.net.");
+    const request = try testQuery(arena.allocator(), "www.agent.example.net.", .TXT);
+    const response = try buildResponseWithPolicy(request, &zone, .{ .report_monitor = agent }, null, false);
+
+    // Section 8.2: a name at or below a monitored domain is never NXDOMAIN,
+    // because a resolver that cached the name error treats everything below
+    // that domain as unreachable and the reports stop arriving.
+    try std.testing.expectEqual(header.Rcode.no_error, response.header.rcode);
+    try std.testing.expectEqual(@as(usize, 0), response.answers.len);
+    // The zone's SOA rides in the authority section, so the negative answer
+    // is cacheable with the zone's own negative TTL.
+    try std.testing.expectEqual(@as(usize, 1), response.authorities.len);
+    try std.testing.expect(response.authorities.items[0].rrtype.eql(.SOA));
+}
+
+test "RFC 9567 section 8.2: a name outside the monitored domain is still a name error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(report_monitor_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    const agent = try dns_name.Name.fromText("agent.example.net.");
+    const request = try testQuery(arena.allocator(), "missing.example.net.", .A);
+    const response = try buildResponseWithPolicy(request, &zone, .{ .report_monitor = agent }, null, false);
+
+    try std.testing.expectEqual(header.Rcode.nxdomain, response.header.rcode);
+    try std.testing.expectEqual(@as(usize, 0), response.answers.len);
+
+    // A name the zone does have is answered as the zone says.
+    const held = try buildResponseWithPolicy(
+        try testQuery(arena.allocator(), "www.example.net.", .A),
+        &zone,
+        .{ .report_monitor = agent },
+        null,
+        false,
+    );
+    try std.testing.expectEqual(header.Rcode.no_error, held.header.rcode);
+    try std.testing.expectEqual(@as(usize, 1), held.answers.len);
+    try std.testing.expect(held.answers.items[0].rrtype.eql(.A));
+}
+
+test "RFC 9567 section 6.3: a server with no monitored domain denies a name it does not have" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(report_monitor_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    const request = try testQuery(arena.allocator(), "missing.example.net.", .A);
+    const response = try buildResponseWithPolicy(request, &zone, .{}, null, false);
+
+    try std.testing.expectEqual(header.Rcode.nxdomain, response.header.rcode);
+    try std.testing.expectEqual(@as(usize, 0), response.answers.len);
+}
+
+test "RFC 9567 section 6.3: a monitored answer over UDP without a DNS Cookie carries the truncation bit" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(report_monitor_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    const agent = try dns_name.Name.fromText("agent.example.net.");
+    var name_buffer: [256]u8 = undefined;
+    const name_text = try reportMonitorQuery(agent, &name_buffer);
+
+    // A query that arrived over UDP and carries no DNS Cookie is answered
+    // with the truncation bit, so the reporter requeries over TCP.
+    const udp_request = try testQuery(arena.allocator(), name_text, .TXT);
+    const udp_response = try buildResponseWithPolicy(udp_request, &zone, .{ .report_monitor = agent }, null, false);
+    try std.testing.expect(udp_response.header.truncated);
+
+    // The no-data answer of a name that is not a report query is truncated
+    // the same way.
+    const nodata_request = try testQuery(arena.allocator(), "www.agent.example.net.", .TXT);
+    const nodata_response = try buildResponseWithPolicy(nodata_request, &zone, .{ .report_monitor = agent }, null, false);
+    try std.testing.expect(nodata_response.header.truncated);
+
+    // Over TCP the bit is not set.
+    const tcp_request = try testQuery(arena.allocator(), name_text, .TXT);
+    const tcp_response = try buildResponseWithPolicy(tcp_request, &zone, .{ .report_monitor = agent }, null, true);
+    try std.testing.expect(!tcp_response.header.truncated);
+
+    // A UDP query that carries a DNS Cookie does not get the bit either.
+    const cookie_request = try testOptionsQuery(arena.allocator(), name_text, .TXT, &.{.{ .code = 10, .data = &.{ 1, 2, 3, 4, 5, 6, 7, 8 } }});
+    const cookie_response = try buildResponseWithPolicy(cookie_request, &zone, .{ .report_monitor = agent }, null, false);
+    try std.testing.expect(!cookie_response.header.truncated);
+}
+
+/// A zone with an NSEC chain that holds the monitored agent domain, so a
+/// monitored answer can be shown to keep no denial proof.
+const report_monitor_dnssec_test_zone =
+    \\$ORIGIN example.net.
+    \\$TTL 3600
+    \\@ IN SOA ns.example.net. hostmaster.example.net. 1 3600 900 1209600 300
+    \\@ IN NS ns.example.net.
+    \\@ IN NSEC ns.example.net. SOA NS RRSIG NSEC
+    \\ns IN A 192.0.2.53
+    \\ns IN NSEC ns.example.net. A RRSIG NSEC
+    \\
+;
+
+test "RFC 9567 section 8.2: a monitored answer keeps no denial proof" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(report_monitor_dnssec_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    const agent = try dns_name.Name.fromText("agent.example.net.");
+
+    // Without the monitoring agent the name is denied, and the denial
+    // carries its proof.
+    const denied = try buildResponseWithPolicy(
+        try testDoQuery(arena.allocator(), 0x4420, "www.agent.example.net.", .TXT, true),
+        &zone,
+        .{},
+        null,
+        false,
+    );
+    try std.testing.expectEqual(header.Rcode.nxdomain, denied.header.rcode);
+    var denied_nsec = false;
+    for (denied.authorities.slice()) |record| {
+        if (record.rrtype.eql(.NSEC)) denied_nsec = true;
+    }
+    try std.testing.expect(denied_nsec);
+
+    // With the monitoring agent the answer is no longer a denial, so the
+    // proof is gone and the zone's SOA stays.
+    const monitored = try buildResponseWithPolicy(
+        try testDoQuery(arena.allocator(), 0x4421, "www.agent.example.net.", .TXT, true),
+        &zone,
+        .{ .report_monitor = agent },
+        null,
+        false,
+    );
+    try std.testing.expectEqual(header.Rcode.no_error, monitored.header.rcode);
+    try std.testing.expectEqual(@as(usize, 1), monitored.authorities.len);
+    try std.testing.expect(monitored.authorities.items[0].rrtype.eql(.SOA));
+    // The synthesized TXT record is not in the zone, so it carries no
+    // signature over it.
+    for (monitored.answers.slice()) |record| {
+        try std.testing.expect(!record.rrtype.eql(.RRSIG));
     }
 }

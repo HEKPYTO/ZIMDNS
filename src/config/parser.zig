@@ -312,6 +312,16 @@ pub const Config = struct {
     /// in the loader.
     dnssec_ksk_file: Text = .{},
     has_dnssec_ksk_file: bool = false,
+    /// Path to the second DNSSEC key-signing key file. RFC 6781 section
+    /// 4.1.2: the key is published at the apex and signs the DNSKEY RRset
+    /// beside the key `dnssec-ksk-file` names, while the parent's DS still
+    /// states that one; see `dnssec-new-ksk-file` in the loader.
+    dnssec_new_ksk_file: Text = .{},
+    has_dnssec_new_ksk_file: bool = false,
+    /// RFC 6781 section 4.1.2.1: the second key-signing key is the one being
+    /// removed, so it is published with the RFC 5011 section 3 REVOKE bit
+    /// set. False when the key is not being revoked.
+    dnssec_new_ksk_revoked: bool = false,
     /// Path to the DNSSEC trust-anchor file the forwarding path validates
     /// against; see `trust-anchor-file` in the loader.
     trust_anchor_file: Text = .{},
@@ -345,6 +355,10 @@ pub const Config = struct {
     /// advertises no agent at all.
     error_report_agent: Text = .{},
     has_error_report_agent: bool = false,
+    /// RFC 9567 section 6.3: the agent domain this server monitors. There is
+    /// no default, so an unconfigured server monitors no domain at all.
+    error_report_monitor: Text = .{},
+    has_error_report_monitor: bool = false,
     /// RFC 9660 section 3.2 lets a server decline to answer ZONEVERSION.
     /// Default on: the value is the answer's own SOA serial.
     zoneversion: bool = true,
@@ -421,6 +435,17 @@ pub const Config = struct {
         return self.dnssec_ksk_file.text();
     }
 
+    pub fn dnssecNewKskFileText(self: *const Config) ?[]const u8 {
+        if (!self.has_dnssec_new_ksk_file) return null;
+        return self.dnssec_new_ksk_file.text();
+    }
+
+    /// Whether the second key-signing key is the one being removed, which
+    /// RFC 6781 section 4.1.2.1 publishes with the REVOKE bit set.
+    pub fn dnssecNewKskRevoked(self: *const Config) bool {
+        return self.dnssec_new_ksk_revoked;
+    }
+
     pub fn trustAnchorFileText(self: *const Config) ?[]const u8 {
         if (!self.has_trust_anchor_file) return null;
         return self.trust_anchor_file.text();
@@ -439,6 +464,11 @@ pub const Config = struct {
     pub fn errorReportAgentText(self: *const Config) ?[]const u8 {
         if (!self.has_error_report_agent) return null;
         return self.error_report_agent.text();
+    }
+
+    pub fn errorReportMonitorText(self: *const Config) ?[]const u8 {
+        if (!self.has_error_report_monitor) return null;
+        return self.error_report_monitor.text();
     }
 
     pub fn parse(text: []const u8) !Config {
@@ -465,6 +495,7 @@ pub const Config = struct {
         if (std.mem.eql(u8, first, "tsig-key-file")) return self.parseTsigKeyFile(&tokens);
         if (std.mem.eql(u8, first, "dnssec-key-file")) return self.parseDnssecKeyFile(&tokens);
         if (std.mem.eql(u8, first, "dnssec-ksk-file")) return self.parseDnssecKskFile(&tokens);
+        if (std.mem.eql(u8, first, "dnssec-new-ksk-file")) return self.parseDnssecNewKskFile(&tokens);
         if (std.mem.eql(u8, first, "trust-anchor-file")) return self.parseTrustAnchorFile(&tokens);
         if (std.mem.eql(u8, first, "ixfr-journal-file")) return self.parseIxfrJournalFile(&tokens);
         if (std.mem.eql(u8, first, "tls-cert-file")) return self.parseTlsCertFile(&tokens);
@@ -473,6 +504,7 @@ pub const Config = struct {
         if (std.mem.eql(u8, first, "local-zones")) return self.parseLocalZones(&tokens);
         if (std.mem.eql(u8, first, "nsid")) return self.parseNsid(&tokens);
         if (std.mem.eql(u8, first, "error-report-agent")) return self.parseErrorReportAgent(&tokens);
+        if (std.mem.eql(u8, first, "error-report-monitor")) return self.parseErrorReportMonitor(&tokens);
         if (std.mem.eql(u8, first, "zoneversion")) return self.parseZoneversion(&tokens);
         if (std.mem.eql(u8, first, "minimal-any-ttl")) return self.parseMinimalAnyTtl(&tokens);
         if (std.mem.eql(u8, first, "minimal-any-ttl-tcp")) return self.parseMinimalAnyTtlTcp(&tokens);
@@ -578,6 +610,23 @@ pub const Config = struct {
         self.has_dnssec_ksk_file = true;
     }
 
+    fn parseDnssecNewKskFile(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        if (self.has_dnssec_new_ksk_file) return Error.BadDirective;
+        const path = tokens.next() orelse return Error.BadDirective;
+        if (path.len == 0) return Error.BadDirective;
+        // RFC 6781 section 4.1.2.1: the key to be removed is marked with the
+        // word `revoked`, and with no other word.
+        var revoked = false;
+        if (tokens.next()) |word| {
+            if (!std.mem.eql(u8, word, "revoked")) return Error.BadDirective;
+            revoked = true;
+            try requireNoTrailingTokens(tokens);
+        }
+        try self.dnssec_new_ksk_file.set(path);
+        self.has_dnssec_new_ksk_file = true;
+        self.dnssec_new_ksk_revoked = revoked;
+    }
+
     fn parseTrustAnchorFile(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
         if (self.has_trust_anchor_file) return Error.BadDirective;
         const path = tokens.next() orelse return Error.BadDirective;
@@ -674,6 +723,15 @@ pub const Config = struct {
         self.has_error_report_agent = true;
     }
 
+    fn parseErrorReportMonitor(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        if (self.has_error_report_monitor) return Error.BadDirective;
+        const value = tokens.next() orelse return Error.BadDirective;
+        try requireNoTrailingTokens(tokens);
+        if (value.len == 0) return Error.BadDirective;
+        try self.error_report_monitor.set(value);
+        self.has_error_report_monitor = true;
+    }
+
     fn parseZoneversion(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
         if (self.has_zoneversion) return Error.BadDirective;
         const value = tokens.next() orelse return Error.BadDirective;
@@ -757,11 +815,15 @@ pub const Config = struct {
         const iterations = tokens.next() orelse return Error.BadDirective;
         const salt = tokens.next() orelse return Error.BadDirective;
         try requireNoTrailingTokens(tokens);
-        var chain = ChainConfig{
+        // RFC 9276 section 3.1: "Operators SHOULD NOT use a salt by indicating
+        // a zero-length salt value instead", so the directive names the empty
+        // salt only, written "-" in the presentation format of RFC 5155
+        // section 4.3.
+        if (!std.mem.eql(u8, salt, "-")) return Error.BadDirective;
+        const chain = ChainConfig{
             .chain = .nsec3,
             .iterations = std.fmt.parseInt(u16, iterations, 10) catch return Error.BadDirective,
         };
-        chain.salt_len = try parseSalt(salt, &chain.salt);
         self.chain = chain;
     }
 
@@ -799,21 +861,6 @@ pub const Config = struct {
 
 fn requireNoTrailingTokens(tokens: *std.mem.TokenIterator(u8, .any)) Error!void {
     if (tokens.next() != null) return Error.BadDirective;
-}
-
-/// RFC 5155 section 4.3: the salt is a sequence of hexadecimal digits, or
-/// "-" when the chain has no salt. The salt length is one octet, so the salt
-/// itself is at most 255 octets.
-fn parseSalt(text: []const u8, out: *[255]u8) Error!u8 {
-    if (std.mem.eql(u8, text, "-")) return 0;
-    if (text.len == 0 or text.len % 2 != 0 or text.len > 510) return Error.BadDirective;
-    var index: usize = 0;
-    while (index < text.len) : (index += 2) {
-        const high = std.fmt.charToDigit(text[index], 16) catch return Error.BadDirective;
-        const low = std.fmt.charToDigit(text[index + 1], 16) catch return Error.BadDirective;
-        out[index / 2] = (high << 4) | low;
-    }
-    return @intCast(text.len / 2);
 }
 
 fn parseTransport(text: []const u8) !Transport {
@@ -974,6 +1021,34 @@ test "config parser accepts one DNSSEC key-signing key-file path and no inline s
     try std.testing.expectError(error.BadDirective, Config.parse("dnssec-ksk-file\n"));
     try std.testing.expectError(error.BadDirective, Config.parse("dnssec-ksk-file a.key b.key\n"));
     try std.testing.expectError(error.UnknownDirective, Config.parse("dnssec-ksk ed25519-secret\n"));
+}
+
+test "config parser accepts one DNSSEC new key-signing key-file path and no other shape" {
+    const config = try Config.parse("dnssec-new-ksk-file new-ksk.key\n");
+    try std.testing.expectEqualStrings("new-ksk.key", config.dnssecNewKskFileText().?);
+    try std.testing.expect((try Config.parse("zone one.example primary one.zone\n")).dnssecNewKskFileText() == null);
+    try std.testing.expect(!config.dnssecNewKskRevoked());
+    // Same shape as `dnssec-ksk-file`: one directive, exactly one value, and
+    // no inline key material.
+    try std.testing.expectError(error.BadDirective, Config.parse(
+        "dnssec-new-ksk-file a.key\ndnssec-new-ksk-file b.key\n",
+    ));
+    try std.testing.expectError(error.BadDirective, Config.parse("dnssec-new-ksk-file\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("dnssec-new-ksk-file a.key b.key\n"));
+    try std.testing.expectError(error.UnknownDirective, Config.parse("dnssec-new-ksk ed25519-secret\n"));
+}
+
+test "config parser marks the second key-signing key as revoked with one word" {
+    // RFC 6781 section 4.1.2.1: the key to be removed is published with the
+    // REVOKE bit set, and the word `revoked` says so.
+    const config = try Config.parse("dnssec-new-ksk-file new-ksk.key revoked\n");
+    try std.testing.expectEqualStrings("new-ksk.key", config.dnssecNewKskFileText().?);
+    try std.testing.expect(config.dnssecNewKskRevoked());
+    // A zone with no second key-signing key has no revoked key.
+    try std.testing.expect(!(try Config.parse("zone one.example primary one.zone\n")).dnssecNewKskRevoked());
+    // Any other word is refused, and so is a word after it.
+    try std.testing.expectError(error.BadDirective, Config.parse("dnssec-new-ksk-file a.key bogus\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("dnssec-new-ksk-file a.key revoked extra\n"));
 }
 
 test "config parser accepts one DNSSEC trust-anchor path and rejects every other shape" {
@@ -1352,11 +1427,12 @@ test "config parser takes one signed chain and refuses every other shape" {
     try std.testing.expectEqual(Chain.nsec, nsec.chain.?.chain);
 
     // RFC 5155 section 4.1: an NSEC3 chain names its iteration count and
-    // its salt; the salt is hexadecimal digits, or "-" when it has none.
-    const nsec3 = try Config.parse("dnssec-chain nsec3 2 73616c74\n");
+    // its salt. RFC 9276 section 3.1 says the operator SHOULD NOT use a
+    // salt, so the only salt the directive may name is the empty one, "-".
+    const nsec3 = try Config.parse("dnssec-chain nsec3 2 -\n");
     try std.testing.expectEqual(Chain.nsec3, nsec3.chain.?.chain);
     try std.testing.expectEqual(@as(u16, 2), nsec3.chain.?.iterations);
-    try std.testing.expectEqualStrings("salt", nsec3.chain.?.saltBytes());
+    try std.testing.expectEqual(@as(usize, 0), nsec3.chain.?.saltBytes().len);
 
     const no_salt = try Config.parse("dnssec-chain nsec3 0 -\n");
     try std.testing.expectEqual(@as(usize, 0), no_salt.chain.?.saltBytes().len);
@@ -1368,8 +1444,9 @@ test "config parser takes one signed chain and refuses every other shape" {
         "dnssec-chain nsec3\n",
         "dnssec-chain nsec3 2\n",
         "dnssec-chain nsec3 2 73616c74 extra\n",
-        "dnssec-chain nsec3 2 73616c7\n",
-        "dnssec-chain nsec3 2 73616c7z\n",
+        // RFC 9276 section 3.1: a salt is refused, however it is written.
+        "dnssec-chain nsec3 0 salt\n",
+        "dnssec-chain nsec3 0 73616c74\n",
         "dnssec-chain nsec3 -1 -\n",
         "dnssec-chain nsec3 65536 -\n",
     }) |text| {

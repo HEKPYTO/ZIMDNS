@@ -41,6 +41,33 @@ domain that is a subdomain of the zone the server reports on is left out of
 that zone's answers (§8.1). The two names are compared on label boundaries,
 so "xfoo.example." is not taken for a subdomain of "foo.example.".
 
+## Monitoring agent (RFC 9567)
+
+The other side of the same RFC is the monitoring agent: the server that
+hosts the agent domain a reporting resolver sends its error reports to. The
+`error-report-monitor <domain>` directive names that domain, and the answer
+policy (`src/auth/response.zig`) carries it as an inline name, so the policy
+owns no memory for it. A query name is at or below the monitored domain when
+the domain's wire form is a label-aligned suffix of the query name's wire
+form, which is the same label-by-label test the Report-Channel option uses
+for §8.1.
+
+A name the zone does not have but that is at or below the monitored domain
+is answered by the monitoring agent and never with a name error (§8.2): a
+report-shaped name — one the report-channel module recognizes with
+`isReportName` — is answered positively with one synthesized TXT record at
+the queried name, a TTL of 60 seconds, and the text `RFC 9567 error report`,
+because the report itself is in the query name (§6.3). Any other name at or
+below the domain is answered with no data and the zone's SOA in the
+authority section, so the negative answer is cacheable with the zone's own
+negative TTL. The answer that is no longer a denial keeps no denial proof,
+and the synthesized TXT record is not in the zone, so it carries no RRSIG:
+the monitored domain belongs in an unsigned zone, as §8.2 recommends, so the
+reporting resolver is never asked to validate an answer it has no use for. A
+monitored answer carries the truncation bit when the query arrived over UDP
+and carried no DNS Cookie (§6.3), so the reporting resolver requeries over
+TCP.
+
 ## DNSSEC deferral — current status
 
 Accepted 2026-09-09 for the authoritative-serving-minimum profile; partially
@@ -48,6 +75,11 @@ superseded 2026-10-19. What landed since: zone signing (`dnssec-key-file`,
 `src/zone/signer.zig`), chain validation on the forwarding path
 (`trust-anchor-file`, `src/dns/validate.zig`, AD on secure / SERVFAIL+EDE on
 bogus / EDE on an insecure answer that says why it is insecure), and a static
-trust-anchor store (`Anchors.parse`). Still deferred:
-iterative recursion, root priming, RFC 5011 automated rollover, KSK/ZSK
-rollover tooling. Matrix rows 77/91/96 describe the shipped split.
+trust-anchor store (`Anchors.parse`). The child-side half of the RFC 6781
+§4.1.2 key-signing key rollover landed with it (`dnssec-new-ksk-file`; see
+`src/zone/README.md`), and with it the revoke phase of §4.1.2.1
+(`dnssec-new-ksk-file <path> revoked`), which publishes the key being
+removed with the RFC 5011 §3 REVOKE bit set. Still deferred: iterative
+recursion, root priming, RFC 5011 automated rollover, the parent-side half
+of a key-signing key rollover, and the zone-signing key rollover tooling.
+Matrix rows 77/91/96 describe the shipped split.
