@@ -1,11 +1,12 @@
-# Interop probes (offline evidence + deferred live probes)
+# Interop probes (offline evidence + live loopback probes)
 
 The channel logic is covered offline by `tls_channel_test.py` (13/13,
 stdlib only, no sockets) and by module unit tests; the per-row logs live
-under `docs/reports/`. Live loopback probes are blocked: `--serve-dot`,
-`--serve-doh`, and `--serve-xfr` refuse to start and bind no port because no
-TLS-server dependency is linked, so there is nothing for `kdig`, `curl`, or
-`dig` to connect to (see `docs/decisions/encrypted-transport.md`).
+under `docs/reports/`. `--serve-dot` serves DNS over TLS and `--serve-doh`
+serves DNS over HTTPS: both use the pinned `tls.zig` dependency, and each
+port answers only after a handshake with its own ALPN token (`dot` and
+`http/1.1`). The live loopback probes below ran on 2026-10-22 against the
+listeners this build starts.
 
 ## Offline channel evidence (no socket, runs anywhere)
 
@@ -19,19 +20,21 @@ Transcripts: `docs/reports/interop-final/doh-get-post-transcript.log`
 sequence + refusal matrix); run summary in
 `docs/reports/interop-final/SUMMARY.md`.
 
-## Environment prerequisites (2026-09-09)
+## Environment prerequisites
 
 - `kdig` is not installed in this environment (`command -v kdig` fails;
-  `/usr/bin/dig` exists but cannot substitute for the DoT probe).
-- All loopback socket binds are env-blocked: code-independent probe
-  `socket.bind(127.0.0.1:0)` and `(::1)` both fail `errno=1 EPERM`
-  (see `docs/reports/gates-final/env-bind-probe.log`); system
-  `dig @127.0.0.1` fails identically (`isc_socket_bind: Operation not
-  permitted`). Live DoT/DoH/XFR probes are therefore ENV-BLOCKED, not
-  run (see `docs/reports/gates-final/SUMMARY.md`). The NSEC3 oracle
-  passes 3/3 (see `docs/reports/gates-final/interop-nsec3-oracle.log`).
+  `/usr/bin/dig` exists but cannot substitute for the DoT probe, because
+  `dig +tls` needs the same ALPN-aware client the server refuses to serve
+  without the `dot` token). `openssl s_client` is present and is the
+  outside-client probe used below.
+- A 2026-09-09 run recorded every loopback bind as refused in that
+  environment (`errno=1 EPERM`, see
+  `docs/reports/gates-final/env-bind-probe.log`). That is no longer the
+  case: on 2026-10-22 the Zig test suite and the live probes below bound
+  `127.0.0.1` and completed handshakes. The NSEC3 oracle passes 3/3 (see
+  `docs/reports/gates-final/interop-nsec3-oracle.log`).
 
-## DoT (RFC 7858) — `kdig` — BLOCKED, no listener
+## DoT (RFC 7858) — `openssl s_client` — LIVE
 
 ```sh
 ./zig-out/bin/zimdns server run --zone-file examples/zones/home.arpa.zone \
@@ -39,33 +42,69 @@ sequence + refusal matrix); run summary in
   --tls-cert-file tls/cert.pem --tls-key-file tls/key.pem
 ```
 
-Exits 2 with `error: --serve-dot, --serve-doh, and --serve-xfr require TLS
-termination, which this build cannot provide ... The listener was not started
-and the port was not bound.` No port is bound, so `kdig +tls` cannot connect.
-Re-run this probe once a reviewed TLS-server dependency lands.
-
-## DoH (RFC 8484) — `curl` — BLOCKED, no listener
+The run starts the DoT listener: it loads the certificate and key, binds the
+port, and answers only after a TLS 1.3 handshake that negotiates the `dot`
+ALPN token. The outside-client probe is a TLS 1.3 handshake with the `dot`
+token that then writes the RFC 7858 §3.3 framed query:
 
 ```sh
-curl --doh-url https://localhost:443/dns-query --cacert tls/cert.pem \
-  -H 'accept: application/dns-message' \
-  'https://localhost/dns-query?dns=<base64url-wire-query>' -o resp.bin
+openssl s_client -connect 127.0.0.1:1053 -alpn dot -quiet -verify_quiet
 ```
 
-Nothing is listening: `--serve-doh` refuses to start for the same reason as
-DoT. The HTTP/1.1 GET/POST mapping it would serve is covered by the
-`src/transport/doh.zig` unit tests instead.
+and inside that session the length-prefixed query is written as two octets
+of length followed by the DNS message. The unit tests in
+`src/transport/dot.zig` assert the same exchange, the `dot` token, the
+length-prefixed framing, and the answer.
 
-## XFR-over-TLS (RFC 9103) — `dig` — BLOCKED, no listener
+## DoH (RFC 8484) — Python `ssl` — LIVE, HTTP/1.1 only
+
+```sh
+./zig-out/bin/zimdns server run --zone-file examples/zones/home.arpa.zone \
+  --serve-doh --enable-encrypted-dns \
+  --tls-cert-file tls/cert.pem --tls-key-file tls/key.pem
+```
+
+The listener terminates the TLS handshake with the `http/1.1` ALPN token and
+then serves the RFC 8484 §4.1 GET and POST mapping. The outside-client
+probe is a Python `ssl` client, because `curl --doh-url` speaks HTTP/2 and
+this server advertises `http/1.1` only (RFC 8484 §5.2 makes HTTP/2 the
+minimum RECOMMENDED version, so this is a disclosed deviation, not a broken
+MUST — but a client that requires HTTP/2, such as `curl --doh-url` or a
+browser, cannot use this port):
+
+```sh
+python3 - <<'PY'
+import base64, socket, ssl, struct
+query = struct.pack('>HHHHHH', 0x5eed, 0x0100, 1, 0, 0, 0)
+query += b'\x03dns\x04home\x04arpa\x00' + struct.pack('>HH', 1, 1)
+encoded = base64.urlsafe_b64encode(query).rstrip(b'=').decode()
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+ctx.set_alpn_protocols(['http/1.1'])
+with socket.create_connection(('127.0.0.1', 1053), timeout=5) as raw:
+    with ctx.wrap_socket(raw, server_hostname='localhost') as s:
+        s.sendall(f'GET /dns-query?dns={encoded} HTTP/1.1\r\nHost: localhost\r\n'
+                  'Connection: close\r\n\r\n'.encode())
+        print(s.recv(4096)[:120])
+PY
+```
+
+The response is `HTTP/1.1 200 OK` with a `content-type: application/dns-message`
+body. The unit tests in `src/transport/doh.zig` assert the same mapping,
+the ALPN refusal, and that the port never answers a cleartext HTTP request.
+
+## XFR-over-TLS (RFC 9103) — `dig +tls` — the listener is being built
 
 ```sh
 dig @127.0.0.1 -p <xfr-port> +tls example. AXFR
 ```
 
-Nothing is listening: `--serve-xfr` refuses to start for the same reason as
-DoT. The SOA-framed sequence (apex SOA first and last) and the out-of-zone
-and TSIG-signed refusals are covered by the `src/transfer/axfr.zig` and
-`src/transfer/xfr_tls.zig` unit tests instead.
+The strict-TLS transfer channel is not reachable in this build yet, so
+`--serve-xfr` refuses to start and binds no port. The SOA-framed sequence
+(apex SOA first and last) and the out-of-zone and TSIG-signed refusals are
+covered by the `src/transfer/axfr.zig` and `src/transfer/xfr_tls.zig` unit
+tests instead.
 
 ## NSEC3 oracle rerun
 
@@ -75,7 +114,7 @@ import hashlib
 def wire(name):
     out = b''
     for label in name.rstrip('.').split('.'):
-        lb = label.encode().lower()
+        lb = label.lower().encode()
         out += bytes([len(lb)]) + lb
     return out + b'\x00'
 def nsec3(name, salt, iters):

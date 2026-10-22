@@ -1,25 +1,38 @@
 /// Contract: Serves the RFC 8484 DNS-over-HTTPS message mapping (GET
 /// /dns-query?dns=<base64url> and POST /dns-query with application/dns-message
-/// bodies) on an already-TLS-terminated HTTP/1.1 byte channel, sharing
-/// runtime.answer with the Do53/DoT paths. ZIMDNS has no TLS server, so nothing
-/// in this repository can produce such a channel: there is deliberately no
-/// bind/accept entry point here, and the --serve-doh startup gate refuses
-/// before opening a socket (tls.zig; see src/transport/README.md).
-/// HTTP/2 framing additionally needs the reviewed HTTP/2 dependency, so this
-/// module is the HTTP/1.1 mapping subset, not a full RFC 8484 transport claim.
+/// bodies) over a TLS 1.3 channel, sharing runtime.answer with the Do53/DoT
+/// paths. The listener in this module binds the port, terminates the
+/// handshake with the "http/1.1" ALPN token, and only then speaks HTTP/1.1
+/// exchanges, so the port never answers in cleartext: a client that offers no
+/// common token is refused with the RFC 7301 no_application_protocol alert.
+/// The channel carries the same bounds the cleartext TCP listener carries: at
+/// most MAX_EXCHANGES_PER_CONNECTION exchanges per connection, the operator's
+/// per-source connection cap, a worker bound, and a per-frame socket
+/// deadline. HTTP/2 framing additionally needs the reviewed HTTP/2
+/// dependency, so this module is the HTTP/1.1 mapping subset, not a full
+/// RFC 8484 transport claim.
 /// Ownership: Request/response scratch lives in caller buffers or a
 /// per-exchange arena; runtime zones stay borrowed.
 /// Errors: HTTP mapping failures map to HTTP status codes and never reach
 /// the resolver; socket failures propagate as I/O errors.
 const std = @import("std");
+const tls = @import("tls");
 const Runtime = @import("../auth/runtime.zig").Runtime;
 const metrics = @import("../metrics.zig");
 const dns_message = @import("../dns/message.zig");
 const tcp_deadline = @import("../platform/tcp_deadline.zig");
+const listener = @import("../platform/listener.zig");
 const tls_policy = @import("tls.zig");
+const tls_server = @import("tls_server.zig");
 
 pub const doh_path = "/dns-query";
 pub const dns_message_media_type = "application/dns-message";
+/// The ALPN token the DoH port speaks. RFC 7301 section 6 registers
+/// "http/1.1" as the HTTP/1.1 protocol ID; RFC 8484 section 5.2 makes
+/// HTTP/2 the minimum RECOMMENDED version, which this build does not speak.
+pub const DOH_ALPN = tls_policy.doh_alpn_http11;
+pub const DOH_PORT = tls_policy.doh_port;
+pub const MAX_CONNECTION_WORKERS = listener.TCP_MAX_CONNECTION_WORKERS;
 pub const MAX_BODY_LEN: usize = 65535;
 pub const MAX_HEADER_BYTES: usize = 8192;
 pub const MAX_EXCHANGES_PER_CONNECTION: usize = 16;
@@ -229,10 +242,24 @@ pub fn dnsQueryFromRequest(arena: std.mem.Allocator, head: ParsedRequest, body: 
     return body;
 }
 
+/// The freshness lifetime the response carries. RFC 8484 section 5.1: it is
+/// the smallest TTL in the answer section, and with no answer records it is
+/// the SOA's MINIMUM field.
 fn minTtl(message: *const dns_message.Message) u32 {
     var floor: ?u32 = null;
-    for ([2][]const @import("../dns/record.zig").ResourceRecord{ message.answers.slice(), message.authorities.slice() }) |section| {
-        for (section) |record| {
+    for (message.answers.slice()) |record| {
+        floor = if (floor) |current| @min(current, record.ttl) else record.ttl;
+    }
+    if (floor == null) {
+        for (message.authorities.slice()) |record| {
+            switch (record.rdata) {
+                .SOA => |soa| floor = soa.minimum,
+                else => {},
+            }
+        }
+    }
+    if (floor == null) {
+        for (message.authorities.slice()) |record| {
             floor = if (floor) |current| @min(current, record.ttl) else record.ttl;
         }
     }
@@ -329,12 +356,16 @@ pub fn serveDohStreamOnce(stream: std.Io.net.Stream, io: std.Io, runtime: *const
 }
 
 fn serveDohStream(stream: std.Io.net.Stream, io: std.Io, runtime: *const Runtime, counters: ?*metrics.Counters) !void {
-    tcp_deadline.setSocketTimeout(stream.socket.handle, DOH_IO_TIMEOUT);
-
     var read_buffer: [MAX_HEADER_BYTES]u8 = undefined;
     var write_buffer: [DOH_WRITE_BUFFER_SIZE]u8 = undefined;
-    var reader = stream.reader(io, &read_buffer);
-    var writer = stream.writer(io, &write_buffer);
+    var reader = DeadlineReader.init(stream.socket.handle, io, &read_buffer, DOH_IO_TIMEOUT);
+    var writer = DeadlineWriter.init(stream.socket.handle, io, &write_buffer, DOH_IO_TIMEOUT);
+    try serveDohExchanges(&reader.interface, &writer.interface, runtime, counters);
+}
+
+/// The exchange loop both channels share: HTTP/1.1 keep-alive over one
+/// connection, bounded by MAX_EXCHANGES_PER_CONNECTION.
+fn serveDohExchanges(reader: *std.Io.Reader, writer: *std.Io.Writer, runtime: *const Runtime, counters: ?*metrics.Counters) !void {
     var exchanges: usize = 0;
     while (exchanges < MAX_EXCHANGES_PER_CONNECTION) : (exchanges += 1) {
         // Block-scoped so the arena frees at the end of each exchange, not
@@ -342,7 +373,7 @@ fn serveDohStream(stream: std.Io.net.Stream, io: std.Io, runtime: *const Runtime
         const must_close = blk: {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
-            break :blk serveDohExchange(&reader.interface, &writer.interface, arena.allocator(), runtime, counters) catch |err| {
+            break :blk serveDohExchange(reader, writer, arena.allocator(), runtime, counters) catch |err| {
                 if (err == error.EndOfStream or err == error.ReadFailed) {
                     if (exchanges == 0) return error.EndOfStream;
                     return;
@@ -352,6 +383,221 @@ fn serveDohStream(stream: std.Io.net.Stream, io: std.Io, runtime: *const Runtime
         };
         if (must_close) return;
     }
+}
+
+/// Serves one DoH connection: the TLS handshake with the "http/1.1" ALPN
+/// token, then HTTP/1.1 exchanges over the encrypted channel.
+pub fn serveDohTlsStream(
+    stream: std.Io.net.Stream,
+    io: std.Io,
+    server: *tls_server.Server,
+    runtime: *const Runtime,
+    counters: ?*metrics.Counters,
+) !void {
+    if (comptime !listener.TCP_DEADLINES_SUPPORTED) return listener.Error.UnsupportedPlatform;
+
+    var input_buffer: [tls_server.input_buffer_len]u8 = undefined;
+    var output_buffer: [tls_server.output_buffer_len]u8 = undefined;
+    var stream_reader = DeadlineReader.init(stream.socket.handle, io, &input_buffer, DOH_IO_TIMEOUT);
+    var stream_writer = DeadlineWriter.init(stream.socket.handle, io, &output_buffer, DOH_IO_TIMEOUT);
+    var connection = try server.handshake(&stream_reader.interface, &stream_writer.interface);
+
+    var read_buffer: [MAX_HEADER_BYTES]u8 = undefined;
+    var write_buffer: [DOH_WRITE_BUFFER_SIZE]u8 = undefined;
+    var connection_reader = connection.reader(&read_buffer);
+    var connection_writer = connection.writer(&write_buffer);
+    defer {
+        connection_writer.interface.flush() catch {};
+        connection.close() catch {};
+        stream_writer.interface.flush() catch {};
+    }
+    try serveDohExchanges(&connection_reader.interface, &connection_writer.interface, runtime, counters);
+}
+
+/// Binds the DoH port and serves DoH connections. Every accepted connection
+/// gets a TLS handshake with the "http/1.1" ALPN token before any HTTP byte
+/// is written, so the port never answers in cleartext. Each connection is
+/// served on its own task, so a peer that stalls in the handshake does not
+/// hold up the others.
+pub fn serveDohLoopOnAddress(
+    io: std.Io,
+    runtime: *const Runtime,
+    address: *const std.Io.net.IpAddress,
+    server: *tls_server.Server,
+    max_requests: ?usize,
+) !void {
+    var bind_address = address.*;
+    var listener_socket = try std.Io.net.IpAddress.listen(&bind_address, io, .{ .reuse_address = true });
+    defer listener_socket.deinit(io);
+    return serveDohLoop(&listener_socket, io, runtime, server, max_requests);
+}
+
+/// Serves the DoH port on an already-bound listener.
+pub fn serveDohLoop(
+    listener_socket: *std.Io.net.Server,
+    io: std.Io,
+    runtime: *const Runtime,
+    server: *tls_server.Server,
+    max_requests: ?usize,
+) !void {
+    var group: std.Io.Group = .init;
+    defer group.await(io) catch unreachable;
+
+    var sources = listener.SourceCounter{};
+    var accepted: usize = 0;
+    while (max_requests == null or accepted < max_requests.?) {
+        const stream = try listener_socket.accept(io);
+        accepted += 1;
+        // The encrypted listener holds the same bounds as the cleartext one: a
+        // source address holds only so many connections at once (RFC 9210
+        // section 4.2), and a connection with no worker slot is closed at once.
+        if (!sources.admit(&stream.socket.address)) {
+            stream.close(io);
+            continue;
+        }
+        group.concurrent(io, serveDohTlsWorker, .{ stream, io, server, runtime, &sources }) catch |err| switch (err) {
+            error.ConcurrencyUnavailable => {
+                sources.release(&stream.socket.address);
+                stream.close(io);
+            },
+        };
+    }
+}
+
+/// Serves one accepted DoH connection.
+fn serveDohTlsWorker(stream: std.Io.net.Stream, io: std.Io, server: *tls_server.Server, runtime: *const Runtime, sources: *listener.SourceCounter) void {
+    defer stream.close(io);
+    defer sources.release(&stream.socket.address);
+    serveDohTlsStream(stream, io, server, runtime, null) catch {};
+}
+
+/// The TLS input: the raw socket, read with the frame deadline. The io's own
+/// socket read reports a timed-out read as a fatal error, so the deadline is
+/// enforced over the raw descriptor instead of a socket option.
+const DeadlineReader = struct {
+    interface: std.Io.Reader,
+    fd: std.posix.fd_t,
+    io: std.Io,
+    timeout: tcp_deadline.Timeout,
+
+    fn init(fd: std.posix.fd_t, io: std.Io, buffer: []u8, timeout: tcp_deadline.Timeout) DeadlineReader {
+        return .{
+            .interface = .{
+                .vtable = &.{ .stream = stream },
+                .buffer = buffer,
+                .seek = 0,
+                .end = 0,
+            },
+            .fd = fd,
+            .io = io,
+            .timeout = timeout,
+        };
+    }
+
+    fn stream(reader: *std.Io.Reader, writer: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *DeadlineReader = @fieldParentPtr("interface", reader);
+        const buffer = limit.slice(try writer.writableSliceGreedy(1));
+        const count = readWithDeadline(self.fd, self.io, buffer, self.timeout) catch |err| switch (err) {
+            error.EndOfStream => return error.EndOfStream,
+            else => return error.ReadFailed,
+        };
+        writer.advance(count);
+        return count;
+    }
+};
+
+/// The TLS output: the raw socket, written with the frame deadline.
+const DeadlineWriter = struct {
+    interface: std.Io.Writer,
+    fd: std.posix.fd_t,
+    io: std.Io,
+    timeout: tcp_deadline.Timeout,
+
+    fn init(fd: std.posix.fd_t, io: std.Io, buffer: []u8, timeout: tcp_deadline.Timeout) DeadlineWriter {
+        return .{
+            .interface = .{
+                .vtable = &.{ .drain = drain },
+                .buffer = buffer,
+                .end = 0,
+            },
+            .fd = fd,
+            .io = io,
+            .timeout = timeout,
+        };
+    }
+
+    fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *DeadlineWriter = @fieldParentPtr("interface", writer);
+        try self.writeAll(writer.buffered());
+        writer.end = 0;
+        if (data.len == 0) return 0;
+        var written: usize = 0;
+        for (data[0 .. data.len - 1]) |bytes| {
+            try self.writeAll(bytes);
+            written += bytes.len;
+        }
+        const pattern = data[data.len - 1];
+        written += pattern.len * splat;
+        switch (pattern.len) {
+            0 => {},
+            1 => {
+                const repeated: [256]u8 = @splat(pattern[0]);
+                var remaining = splat;
+                while (remaining > 0) {
+                    const chunk = @min(remaining, repeated.len);
+                    try self.writeAll(repeated[0..chunk]);
+                    remaining -= chunk;
+                }
+            },
+            else => for (0..splat) |_| try self.writeAll(pattern),
+        }
+        return written;
+    }
+
+    fn writeAll(self: *DeadlineWriter, bytes: []const u8) std.Io.Writer.Error!void {
+        const deadline = tcp_deadline.deadline(self.io, self.timeout);
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            const count = writeWithDeadline(self.fd, self.io, bytes[offset..], deadline) catch |err| switch (err) {
+                error.WouldBlock => continue,
+                else => return error.WriteFailed,
+            };
+            if (count == 0) return error.WriteFailed;
+            offset += count;
+        }
+    }
+};
+
+/// Reads what the socket holds, waiting at most the frame deadline for it.
+fn readWithDeadline(fd: std.posix.fd_t, io: std.Io, buffer: []u8, timeout: tcp_deadline.Timeout) !usize {
+    try waitForSocket(fd, io, tcp_deadline.deadline(io, timeout), std.posix.POLL.IN);
+    const count = std.posix.read(fd, buffer) catch |err| switch (err) {
+        error.WouldBlock => return error.Timeout,
+        else => return err,
+    };
+    if (count == 0) return error.EndOfStream;
+    return count;
+}
+
+/// Writes what the socket takes, waiting at most until the deadline.
+fn writeWithDeadline(fd: std.posix.fd_t, io: std.Io, buffer: []const u8, deadline: std.Io.Clock.Timestamp) !usize {
+    try waitForSocket(fd, io, deadline, std.posix.POLL.OUT);
+    const result = std.posix.system.sendto(fd, buffer.ptr, buffer.len, std.posix.MSG.NOSIGNAL, null, 0);
+    return switch (std.posix.errno(result)) {
+        .SUCCESS => @intCast(result),
+        .AGAIN, .INTR => error.WouldBlock,
+        else => error.WriteFailed,
+    };
+}
+
+/// Waits for the socket to become ready, at most until the deadline.
+fn waitForSocket(fd: std.posix.fd_t, io: std.Io, deadline: std.Io.Clock.Timestamp, events: i16) !void {
+    const remaining = deadline.durationFromNow(io).raw.nanoseconds;
+    if (remaining <= 0) return error.Timeout;
+    const millis = @divTrunc(remaining + std.time.ns_per_ms - 1, std.time.ns_per_ms);
+    var poll_fds = [_]std.posix.pollfd{.{ .fd = fd, .events = events, .revents = 0 }};
+    const count = try std.posix.poll(poll_fds[0..], @intCast(@min(millis, std.math.maxInt(i32))));
+    if (count == 0) return error.Timeout;
 }
 
 fn streamPair() ![2]std.Io.net.Stream {
@@ -413,6 +659,51 @@ test "DoH GET serves a base64url query with DNS media type" {
     const response = try dns_message.Message.parse(arena.allocator(), body);
     try std.testing.expectEqual(@as(u16, 0xabcd), response.header.id);
     try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+}
+
+test "DoH freshness lifetime for a negative answer follows the SOA minimum" {
+    // RFC 8484 section 5.1: with no answer records the freshness lifetime
+    // must not be greater than the SOA's MINIMUM field, which here is 60 and
+    // not the record TTL of 3600.
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var runtime = try Runtime.fromZoneText(nodata_zone);
+    defer runtime.deinit();
+
+    const streams = try streamPair();
+    var client_stream = streams[0];
+    defer client_stream.close(io);
+    const server_stream = streams[1];
+    defer server_stream.close(io);
+
+    var query_buffer: [512]u8 = undefined;
+    const query = try @import("../cli/query.zig").buildQueryPacket(&query_buffer, 0xabcd, "dns.home.arpa.", .TXT, false);
+    var encoded: [1024]u8 = undefined;
+    const encoded_query = std.base64.url_safe_no_pad.Encoder.encode(&encoded, query);
+
+    var request_buffer: [2048]u8 = undefined;
+    const request = try std.fmt.bufPrint(&request_buffer, "GET /dns-query?dns={s} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", .{encoded_query});
+    var client_write_buffer: [2048]u8 = undefined;
+    var client_writer = client_stream.writer(io, &client_write_buffer);
+    try client_writer.interface.writeAll(request);
+    try client_writer.interface.flush();
+
+    try serveDohStreamOnce(server_stream, io, &runtime);
+
+    var response_buffer: [4096]u8 = undefined;
+    var client_reader = client_stream.reader(io, &response_buffer);
+    const status_line = try takeTestLine(&client_reader.interface);
+    try std.testing.expect(std.mem.startsWith(u8, status_line, "HTTP/1.1 200"));
+    var max_age: ?u32 = null;
+    while (true) {
+        const trimmed = try takeTestLine(&client_reader.interface);
+        if (trimmed.len == 0) break;
+        if (trimmed.len > 13 and std.ascii.eqlIgnoreCase(trimmed[0..13], "cache-control")) {
+            const value = std.mem.trim(u8, trimmed[13..], " ");
+            const after = std.mem.indexOf(u8, value, "max-age=") orelse continue;
+            max_age = try std.fmt.parseInt(u32, value[after + 8 ..], 10);
+        }
+    }
+    try std.testing.expectEqual(@as(?u32, 60), max_age);
 }
 
 test "DoH POST serves an application/dns-message body" {
@@ -551,10 +842,344 @@ test "DoH status reasons cover the served subset" {
     try std.testing.expectEqualStrings("Not Found", Status.not_found.reason());
 }
 
+/// The identity the DoH tests load: a throwaway self-signed certificate and
+/// its key, written to a temporary directory.
+fn writeTestIdentity(dir: std.Io.Dir, io: std.Io) !void {
+    try dir.writeFile(io, .{
+        .sub_path = "cert.pem",
+        .data = tls_server.test_identity.cert_pem,
+        .flags = .{},
+    });
+    try dir.writeFile(io, .{
+        .sub_path = "key.pem",
+        .data = tls_server.test_identity.key_pem,
+        .flags = .{},
+    });
+}
+
+/// The server side of the DoH tests: one accepted connection, served.
+fn serveOneConnection(
+    listener_socket: *std.Io.net.Server,
+    io: std.Io,
+    server: *tls_server.Server,
+    runtime: *const Runtime,
+) void {
+    const stream = listener_socket.accept(io) catch return;
+    defer stream.close(io);
+    serveDohTlsStream(stream, io, server, runtime, null) catch {};
+}
+
+/// Reads one HTTP/1.1 response head and body.
+fn readTestResponse(reader: *std.Io.Reader) !struct { status: []u8, body: []u8 } {
+    const status = try takeTestLine(reader);
+    var content_length: usize = 0;
+    while (true) {
+        const line = try takeTestLine(reader);
+        if (line.len == 0) break;
+        if (line.len > 15 and std.ascii.eqlIgnoreCase(line[0..14], "content-length")) {
+            content_length = try std.fmt.parseInt(usize, std.mem.trim(u8, line[15..], " "), 10);
+        }
+    }
+    return .{ .status = status, .body = try reader.take(content_length) };
+}
+
+test "DoH answers a GET and a POST over a real TLS 1.3 handshake with the http/1.1 ALPN token" {
+    var io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_backend.deinit();
+    const io = io_backend.io();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestIdentity(tmp.dir, io);
+
+    var server: tls_server.Server = undefined;
+    try server.init(allocator, io, tmp.dir, "cert.pem", "key.pem", DOH_ALPN);
+    defer server.deinit();
+
+    var bind_address = std.Io.net.IpAddress{ .ip4 = .loopback(0) };
+    var listener_socket = try std.Io.net.IpAddress.listen(&bind_address, io, .{ .reuse_address = true });
+    defer listener_socket.deinit(io);
+    const port = listener_socket.socket.address.getPort();
+
+    const thread = try std.Thread.spawn(.{}, serveOneConnection, .{ &listener_socket, io, &server, &runtime });
+
+    var address = std.Io.net.IpAddress{ .ip4 = .loopback(port) };
+    const stream = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer stream.close(io);
+
+    var client_input: [tls_server.input_buffer_len]u8 = undefined;
+    var client_output: [tls_server.output_buffer_len]u8 = undefined;
+    var client_reader = stream.reader(io, &client_input);
+    var client_writer = stream.writer(io, &client_output);
+    var rng_source: std.Random.IoSource = .{ .io = io };
+    var connection = try tls.client(&client_reader.interface, &client_writer.interface, .{
+        .rng = rng_source.interface(),
+        .host = "localhost",
+        .root_ca = .empty,
+        .insecure_skip_verify = true,
+        .now = std.Io.Clock.real.now(io),
+        .alpn_protocols = &.{DOH_ALPN},
+    });
+    // The server speaks "http/1.1" and nothing else.
+    try std.testing.expectEqualStrings(DOH_ALPN, connection.alpn_protocol.?);
+
+    var read_buffer: [4096]u8 = undefined;
+    var write_buffer: [4096]u8 = undefined;
+    var connection_reader = connection.reader(&read_buffer);
+    var connection_writer = connection.writer(&write_buffer);
+
+    // RFC 8484 section 4.1: the GET method carries the query in the "dns"
+    // variable, encoded with base64url.
+    var get_query_buffer: [512]u8 = undefined;
+    const get_query = try @import("../cli/query.zig").buildQueryPacket(&get_query_buffer, 0x1111, "dns.home.arpa.", .A, false);
+    var encoded: [1024]u8 = undefined;
+    const encoded_query = std.base64.url_safe_no_pad.Encoder.encode(&encoded, get_query);
+    try connection_writer.interface.print("GET /dns-query?dns={s} HTTP/1.1\r\nHost: localhost\r\n\r\n", .{encoded_query});
+    try connection_writer.interface.flush();
+
+    const get_response = try readTestResponse(&connection_reader.interface);
+    try std.testing.expect(std.mem.startsWith(u8, get_response.status, "HTTP/1.1 200"));
+    const get_message = try dns_message.Message.parse(allocator, get_response.body);
+    try std.testing.expect(get_message.header.qr);
+    try std.testing.expectEqual(@as(u16, 0x1111), get_message.header.id);
+    try std.testing.expectEqual(@as(u16, 1), get_message.header.answer_count);
+
+    // RFC 8484 section 4.1: the POST method carries the query in the body,
+    // with the media type of section 6. One connection serves both.
+    var post_query_buffer: [512]u8 = undefined;
+    const post_query = try @import("../cli/query.zig").buildQueryPacket(&post_query_buffer, 0x2222, "dns.home.arpa.", .A, false);
+    try connection_writer.interface.print("POST /dns-query HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/dns-message\r\nContent-Length: {d}\r\n\r\n", .{post_query.len});
+    try connection_writer.interface.writeAll(post_query);
+    try connection_writer.interface.flush();
+
+    const post_response = try readTestResponse(&connection_reader.interface);
+    try std.testing.expect(std.mem.startsWith(u8, post_response.status, "HTTP/1.1 200"));
+    const post_message = try dns_message.Message.parse(allocator, post_response.body);
+    try std.testing.expect(post_message.header.qr);
+    try std.testing.expectEqual(@as(u16, 0x2222), post_message.header.id);
+    try std.testing.expectEqual(@as(u16, 1), post_message.header.answer_count);
+
+    connection.close() catch {};
+    thread.join();
+}
+
+test "the DoH listener answers a query over the bound port" {
+    var io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_backend.deinit();
+    const io = io_backend.io();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestIdentity(tmp.dir, io);
+
+    var server: tls_server.Server = undefined;
+    try server.init(allocator, io, tmp.dir, "cert.pem", "key.pem", DOH_ALPN);
+    defer server.deinit();
+
+    var bind_address = std.Io.net.IpAddress{ .ip4 = .loopback(0) };
+    var listener_socket = try std.Io.net.IpAddress.listen(&bind_address, io, .{ .reuse_address = true });
+    defer listener_socket.deinit(io);
+    const port = listener_socket.socket.address.getPort();
+
+    // The listener serves one connection and then stops, so the test ends.
+    const thread = try std.Thread.spawn(.{}, serveDohLoop, .{ &listener_socket, io, &runtime, &server, @as(?usize, 1) });
+
+    var address = std.Io.net.IpAddress{ .ip4 = .loopback(port) };
+    const stream = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer stream.close(io);
+
+    var client_input: [tls_server.input_buffer_len]u8 = undefined;
+    var client_output: [tls_server.output_buffer_len]u8 = undefined;
+    var client_reader = stream.reader(io, &client_input);
+    var client_writer = stream.writer(io, &client_output);
+    var rng_source: std.Random.IoSource = .{ .io = io };
+    var connection = try tls.client(&client_reader.interface, &client_writer.interface, .{
+        .rng = rng_source.interface(),
+        .host = "localhost",
+        .root_ca = .empty,
+        .insecure_skip_verify = true,
+        .now = std.Io.Clock.real.now(io),
+        .alpn_protocols = &.{DOH_ALPN},
+    });
+    try std.testing.expectEqualStrings(DOH_ALPN, connection.alpn_protocol.?);
+
+    var read_buffer: [4096]u8 = undefined;
+    var write_buffer: [4096]u8 = undefined;
+    var connection_reader = connection.reader(&read_buffer);
+    var connection_writer = connection.writer(&write_buffer);
+
+    var query_buffer: [512]u8 = undefined;
+    const query = try @import("../cli/query.zig").buildQueryPacket(&query_buffer, 0x3333, "dns.home.arpa.", .A, false);
+    var encoded: [1024]u8 = undefined;
+    const encoded_query = std.base64.url_safe_no_pad.Encoder.encode(&encoded, query);
+    try connection_writer.interface.print("GET /dns-query?dns={s} HTTP/1.1\r\nHost: localhost\r\n\r\n", .{encoded_query});
+    try connection_writer.interface.flush();
+
+    const response = try readTestResponse(&connection_reader.interface);
+    try std.testing.expect(std.mem.startsWith(u8, response.status, "HTTP/1.1 200"));
+    const message = try dns_message.Message.parse(allocator, response.body);
+    try std.testing.expectEqual(@as(u16, 0x3333), message.header.id);
+    try std.testing.expectEqual(@as(u16, 1), message.header.answer_count);
+
+    connection.close() catch {};
+    thread.join();
+}
+
+test "DoH refuses a client that offers another ALPN token" {
+    var io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_backend.deinit();
+    const io = io_backend.io();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestIdentity(tmp.dir, io);
+
+    var server: tls_server.Server = undefined;
+    try server.init(allocator, io, tmp.dir, "cert.pem", "key.pem", DOH_ALPN);
+    defer server.deinit();
+
+    var bind_address = std.Io.net.IpAddress{ .ip4 = .loopback(0) };
+    var listener_socket = try std.Io.net.IpAddress.listen(&bind_address, io, .{ .reuse_address = true });
+    defer listener_socket.deinit(io);
+    const port = listener_socket.socket.address.getPort();
+
+    const thread = try std.Thread.spawn(.{}, serveOneConnection, .{ &listener_socket, io, &server, &runtime });
+
+    var address = std.Io.net.IpAddress{ .ip4 = .loopback(port) };
+    const stream = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer stream.close(io);
+
+    var client_input: [tls_server.input_buffer_len]u8 = undefined;
+    var client_output: [tls_server.output_buffer_len]u8 = undefined;
+    var client_reader = stream.reader(io, &client_input);
+    var client_writer = stream.writer(io, &client_output);
+    var rng_source: std.Random.IoSource = .{ .io = io };
+    // The client offers the HTTP/2 token, which this build does not speak.
+    const handshake = tls.client(&client_reader.interface, &client_writer.interface, .{
+        .rng = rng_source.interface(),
+        .host = "localhost",
+        .root_ca = .empty,
+        .insecure_skip_verify = true,
+        .now = std.Io.Clock.real.now(io),
+        .alpn_protocols = &.{"h2"},
+    });
+    // RFC 7301 section 3.2: the server answers a client that offers no ALPN
+    // token it speaks with the no_application_protocol alert.
+    try std.testing.expectError(error.TlsAlertNoApplicationProtocol, handshake);
+
+    thread.join();
+}
+
+test "the DoH port never answers a cleartext HTTP request" {
+    var io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_backend.deinit();
+    const io = io_backend.io();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestIdentity(tmp.dir, io);
+
+    var server: tls_server.Server = undefined;
+    try server.init(allocator, io, tmp.dir, "cert.pem", "key.pem", DOH_ALPN);
+    defer server.deinit();
+
+    var bind_address = std.Io.net.IpAddress{ .ip4 = .loopback(0) };
+    var listener_socket = try std.Io.net.IpAddress.listen(&bind_address, io, .{ .reuse_address = true });
+    defer listener_socket.deinit(io);
+    const port = listener_socket.socket.address.getPort();
+
+    const thread = try std.Thread.spawn(.{}, serveOneConnection, .{ &listener_socket, io, &server, &runtime });
+
+    var address = std.Io.net.IpAddress{ .ip4 = .loopback(port) };
+    const stream = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer stream.close(io);
+
+    var query_buffer: [512]u8 = undefined;
+    const query = try @import("../cli/query.zig").buildQueryPacket(&query_buffer, 0x4444, "dns.home.arpa.", .A, false);
+    var encoded: [1024]u8 = undefined;
+    const encoded_query = std.base64.url_safe_no_pad.Encoder.encode(&encoded, query);
+    var request_buffer: [2048]u8 = undefined;
+    const request = try std.fmt.bufPrint(&request_buffer, "GET /dns-query?dns={s} HTTP/1.1\r\nHost: localhost\r\n\r\n", .{encoded_query});
+    var client_write_buffer: [2048]u8 = undefined;
+    var client_writer = stream.writer(io, &client_write_buffer);
+    try client_writer.interface.writeAll(request);
+    try client_writer.interface.flush();
+    // No more request bytes are coming, so the server's handshake ends at once.
+    try stream.shutdown(io, .send);
+
+    // The server is doing a TLS handshake, so the cleartext request is never
+    // answered: the connection ends, possibly with a TLS alert, but never
+    // with an HTTP response or a DNS message.
+    var poll_fds = [_]std.posix.pollfd{.{
+        .fd = stream.socket.handle,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    const ready = try std.posix.poll(&poll_fds, 500);
+    var received: [512]u8 = undefined;
+    const received_len: usize = if (ready == 0) 0 else std.posix.read(stream.socket.handle, &received) catch 0;
+    try std.testing.expect(!std.mem.startsWith(u8, received[0..received_len], "HTTP/1.1"));
+    if (received_len >= 12) {
+        const message = dns_message.Message.parse(allocator, received[0..received_len]) catch {
+            thread.join();
+            return;
+        };
+        // A DNS answer for the cleartext query would carry its ID and the QR
+        // bit; nothing else on this connection may look like one.
+        try std.testing.expect(!(message.header.qr and message.header.id == 0x4444));
+    }
+    thread.join();
+}
+
+test "DoH defaults name the IANA http/1.1 ALPN token" {
+    try std.testing.expectEqualStrings("http/1.1", DOH_ALPN);
+    try std.testing.expectEqual(@as(u16, 443), DOH_PORT);
+    try std.testing.expectEqual(listener.TCP_MAX_CONNECTION_WORKERS, MAX_CONNECTION_WORKERS);
+}
+
 const test_zone =
     \\$ORIGIN home.arpa.
     \\$TTL 3600
     \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+    \\@ IN NS ns1.home.arpa.
+    \\dns IN A 192.168.1.1
+    \\
+;
+
+/// The same zone with an SOA MINIMUM below the record TTL, so the RFC 8484
+/// section 5.1 rule for a response with no answer records is observable.
+const nodata_zone =
+    \\$ORIGIN home.arpa.
+    \\$TTL 3600
+    \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 60
     \\@ IN NS ns1.home.arpa.
     \\dns IN A 192.168.1.1
     \\

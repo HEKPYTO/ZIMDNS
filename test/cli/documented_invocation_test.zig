@@ -16,6 +16,7 @@ const zimdns = @import("zimdns");
 const build_options = @import("build_options");
 
 const cli_query = zimdns.cli_query;
+const tls = zimdns.tls;
 
 /// `exitUsage` in src/main.zig.
 const usage_exit: u8 = 2;
@@ -57,7 +58,7 @@ const child_deadline = std.Io.Timeout{ .duration = .{
     .clock = .awake,
 } };
 
-const Transport = enum { udp, tcp };
+const Transport = enum { udp, tcp, doh };
 
 const Kind = enum {
     /// `--help`, `--version`: runs and exits 0.
@@ -93,6 +94,8 @@ const Case = struct {
     port: u16,
     /// For a refusal, the port that must still be unbound afterwards.
     refuse_port: u16 = 0,
+    /// For a refusal, the text the run must print to say why it refused.
+    refusal_text: []const u8 = "",
     /// True when `--print-metrics` promises Prometheus output on stdout.
     metrics: bool = false,
     /// The documented `--config` the executed argv's copy came from, so a
@@ -119,16 +122,17 @@ test "every documented invocation runs and ends in its documented outcome class"
     try std.testing.expect(discovered.examples_count > 0);
 
     // The encrypted cases read these at run time, so the fixture must outlive
-    // the whole run.
+    // the whole run. The identity is the project's own throwaway certificate,
+    // so the DoH case can serve a real listener.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{
         .sub_path = "cert.pem",
-        .data = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n",
+        .data = zimdns.transport_tls_server.test_identity.cert_pem,
     });
     try tmp.dir.writeFile(io, .{
         .sub_path = "key.pem",
-        .data = "-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n",
+        .data = zimdns.transport_tls_server.test_identity.key_pem,
     });
     // Every fixture a child reads lives under the temporary directory, so the
     // one `cleanup` takes a rewritten configuration with it, pass or fail.
@@ -309,9 +313,13 @@ fn classify(allocator: std.mem.Allocator, io: std.Io, tmp_prefix: []const u8, ar
     if (std.mem.eql(u8, argv[0], "server")) {
         if (argv.len < 2 or !std.mem.eql(u8, argv[1], "run")) return error.UndocumentedInvocation;
 
-        // Only the encrypted listeners refuse; `--serve-udp`/`--serve-tcp`
-        // are cleartext and must actually serve.
-        for (mode_flags[4..]) |flag| {
+        // The DoH port is served now, so the case runs the real listener and
+        // drives a DoH exchange over TLS.
+        if (hasFlag(argv, "--serve-doh")) return classifyDoh(allocator, argv, tls_cert, tls_key);
+
+        // The transports this build cannot serve refuse; `--serve-dot` is
+        // served, so its refusal has to come from the identity.
+        for ([_][]const u8{ "--serve-dot", "--serve-xfr" }) |flag| {
             if (hasFlag(argv, flag)) return classifyRefusal(allocator, flag, tls_cert, tls_key);
         }
 
@@ -363,17 +371,57 @@ fn classify(allocator: std.mem.Allocator, io: std.Io, tmp_prefix: []const u8, ar
     return error.UndocumentedInvocation;
 }
 
+/// `--serve-doh` is served: the case runs the real listener with a loadable
+/// identity and drives one DoH exchange over TLS. The documented invocation
+/// names no listener, so the port is the CLI default.
+fn classifyDoh(allocator: std.mem.Allocator, argv: []const []const u8, tls_cert: []const u8, tls_key: []const u8) !Case {
+    var out: std.ArrayList([]const u8) = .empty;
+    try out.appendSlice(allocator, argv);
+    try out.append(allocator, "--enable-encrypted-dns");
+    try out.append(allocator, "--tls-cert-file");
+    try out.append(allocator, tls_cert);
+    try out.append(allocator, "--tls-key-file");
+    try out.append(allocator, tls_key);
+    // One connection is the whole quota, so the server stops on its own.
+    try out.append(allocator, "--max-requests");
+    try out.append(allocator, "1");
+    return .{
+        .documented = argv,
+        .executed = try out.toOwnedSlice(allocator),
+        .kind = .serve,
+        .transport = .doh,
+        .quota = 1,
+        .port = documented_port,
+    };
+}
+
 /// The encrypted case the prose documents: the flag plus everything needed to
 /// reach the TLS-termination gate, so the harness observes the real refusal
 /// rather than an argument-validation stop.
 fn classifyRefusal(allocator: std.mem.Allocator, flag: []const u8, tls_cert: []const u8, tls_key: []const u8) !Case {
+    // The DoT port is served in this build, so its refusal has to come from
+    // the identity: a certificate that is not there is the clean way to reach
+    // the gate that refuses before the port is bound. The transports this
+    // build cannot serve refuse on the transport itself.
+    const is_dot = std.mem.eql(u8, flag, "--serve-dot");
+    const cert_path = if (is_dot)
+        try std.fmt.allocPrint(allocator, "{s}/absent-cert.pem", .{std.fs.path.dirname(tls_cert) orelse tls_cert})
+    else
+        tls_cert;
     // Arena-owned: a local array literal would dangle once this frame returns.
     const argv = [_][]const u8{
         "server",         "run",                    "--zone-file",     "examples/zones/home.arpa.zone",
-        flag,             "--enable-encrypted-dns", "--tls-cert-file", tls_cert,
+        flag,             "--enable-encrypted-dns", "--tls-cert-file", cert_path,
         "--tls-key-file", tls_key,
     };
     const owned = try allocator.dupe([]const u8, argv[0..]);
+    // The refusal names its own reason: the transports this build cannot
+    // serve say so, and the one it can serve says which identity it could
+    // not read.
+    const refusal_text = if (is_dot)
+        "cannot read TLS certificate file"
+    else
+        "has no listener in this build";
     return .{
         .documented = owned,
         .executed = owned,
@@ -382,6 +430,7 @@ fn classifyRefusal(allocator: std.mem.Allocator, flag: []const u8, tls_cert: []c
         .quota = 0,
         .port = documented_port,
         .refuse_port = documented_port,
+        .refusal_text = refusal_text,
     };
 }
 
@@ -596,8 +645,14 @@ fn runServe(allocator: std.mem.Allocator, io: std.Io, case: Case, argv: []const 
     const drive = switch (case.transport) {
         .udp => Drive{ .served = driveUdp(io, address, case.quota) },
         .tcp => driveTcp(allocator, io, address, case.quota),
+        .doh => driveDoh(allocator, io, address, case.quota),
     };
     const served = drive.served;
+    if (served != case.quota) {
+        const dbg_out = try tmp.dir.readFileAlloc(io, "out", allocator, .limited(1024 * 1024));
+        const dbg_err = try tmp.dir.readFileAlloc(io, "err", allocator, .limited(1024 * 1024));
+        std.debug.print("DEBUG case port={d} argv={s}\nDEBUG out={s}\nDEBUG err={s}\n", .{ case.port, case.executed[case.executed.len - 1], dbg_out, dbg_err });
+    }
     // `--once-tcp` blocks in accept() with no deadline, so a case that never
     // reached its quota must not be waited on forever.
     // `Child.kill` blocks until the child is reaped, so there is no `wait`
@@ -682,6 +737,77 @@ fn driveTcp(allocator: std.mem.Allocator, io: std.Io, address: std.Io.net.IpAddr
     return drive;
 }
 
+/// One DoH exchange over TLS: the handshake with the "http/1.1" ALPN token, a
+/// GET request for /dns-query, and the DNS answer in the response body.
+fn exchangeDohOnce(allocator: std.mem.Allocator, io: std.Io, address: std.Io.net.IpAddress) !void {
+    const stream = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer stream.close(io);
+
+    var client_input: [tls.input_buffer_len]u8 = undefined;
+    var client_output: [tls.output_buffer_len]u8 = undefined;
+    var client_reader = stream.reader(io, &client_input);
+    var client_writer = stream.writer(io, &client_output);
+    var rng_source: std.Random.IoSource = .{ .io = io };
+    var connection = try tls.client(&client_reader.interface, &client_writer.interface, .{
+        .rng = rng_source.interface(),
+        .host = "localhost",
+        .root_ca = .empty,
+        .insecure_skip_verify = true,
+        .now = std.Io.Clock.real.now(io),
+        .alpn_protocols = &.{"http/1.1"},
+    });
+    defer connection.close() catch {};
+
+    var read_buffer: [4096]u8 = undefined;
+    var write_buffer: [4096]u8 = undefined;
+    var connection_reader = connection.reader(&read_buffer);
+    var connection_writer = connection.writer(&write_buffer);
+
+    var packet: [512]u8 = undefined;
+    const query = try cli_query.buildQueryPacket(&packet, 0x5eed, "dns.home.arpa.", .A, false);
+    var encoded: [1024]u8 = undefined;
+    const encoded_query = std.base64.url_safe_no_pad.Encoder.encode(&encoded, query);
+    try connection_writer.interface.print("GET /dns-query?dns={s} HTTP/1.1\r\nHost: localhost\r\n\r\n", .{encoded_query});
+    try connection_writer.interface.flush();
+
+    const status = try takeLine(&connection_reader.interface);
+    if (!std.mem.startsWith(u8, status, "HTTP/1.1 200")) return error.DohRefused;
+    var content_length: usize = 0;
+    while (true) {
+        const line = try takeLine(&connection_reader.interface);
+        if (line.len == 0) break;
+        if (line.len > 15 and std.ascii.eqlIgnoreCase(line[0..14], "content-length")) {
+            content_length = try std.fmt.parseInt(usize, std.mem.trim(u8, line[15..], " "), 10);
+        }
+    }
+    if (content_length == 0) return error.DohNoAnswer;
+    const body = try connection_reader.interface.take(content_length);
+    const message = try zimdns.dns_message.Message.parse(allocator, body);
+    if (message.header.answer_count != 1) return error.DohNoAnswer;
+}
+
+/// Reads one CRLF-terminated line without the terminator.
+fn takeLine(reader: *std.Io.Reader) ![]u8 {
+    const line = try reader.takeDelimiterExclusive('\n');
+    // takeDelimiterExclusive leaves the delimiter in the stream.
+    _ = try reader.takeByte();
+    if (line.len > 0 and line[line.len - 1] == '\r') return line[0 .. line.len - 1];
+    return line;
+}
+
+fn driveDoh(allocator: std.mem.Allocator, io: std.Io, address: std.Io.net.IpAddress, quota: usize) Drive {
+    var drive: Drive = .{};
+    const deadline = readyDeadline(io);
+    while (drive.served < quota and !expired(io, deadline)) {
+        exchangeDohOnce(allocator, io, address) catch |err| {
+            drive.last_error = @errorName(err);
+            continue;
+        };
+        drive.served += 1;
+    }
+    return drive;
+}
+
 /// A documented `query` needs a server. The companion is the documented
 /// `--once-udp` shape bound to the same per-case port; one probe query proves
 /// the listener is up, and the documented query consumes the second.
@@ -752,7 +878,8 @@ fn runRefusal(allocator: std.mem.Allocator, io: std.Io, case: Case, argv: []cons
     };
 
     const code = exitCode(result.term);
-    const refused = code == usage_exit and std.mem.indexOf(u8, result.stdout, "require TLS termination") != null;
+    const refused = code == usage_exit and case.refusal_text.len != 0 and
+        std.mem.indexOf(u8, result.stdout, case.refusal_text) != null;
 
     // The half of the incident that matters: a refused listener must not leave
     // a socket behind serving cleartext on the encrypted port.

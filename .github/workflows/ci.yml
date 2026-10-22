@@ -57,7 +57,7 @@ jobs:
           "$zig_dir/zig" version
 
       - name: Check formatting
-        run: zig fmt --check .
+        run: zig fmt --check --exclude zig-pkg .
 
       - name: Build
         run: zig build
@@ -151,7 +151,7 @@ jobs:
           "$zig_dir/zig" version
 
       - name: Check formatting
-        run: zig fmt --check .
+        run: zig fmt --check --exclude zig-pkg .
 
       - name: Build
         run: zig build

@@ -65,6 +65,8 @@ pub const EDE_STALE_ANSWER: u16 = 3;
 /// the upstream was unreachable, not the answer served from cache.
 pub const EDE_STALE_NXDOMAIN: u16 = 19;
 pub const EDE_NETWORK_ERROR: u16 = 23;
+/// RFC 8914 section 4.14: the resolver is returning an error from its cache.
+pub const EDE_CACHED_ERROR: u16 = 13;
 /// RFC 8914 DNSSEC-bogus INFO-CODEs (see dns/dnssec.zig for purpose text).
 pub const EDE_DNSSEC_BOGUS: u16 = dnssec.EDE_DNSSEC_BOGUS;
 pub const EDE_SIGNATURE_EXPIRED: u16 = dnssec.EDE_SIGNATURE_EXPIRED;
@@ -80,6 +82,7 @@ pub fn edeText(code: u16) []const u8 {
         EDE_STALE_ANSWER => "stale answer",
         EDE_STALE_NXDOMAIN => "stale nxdomain",
         EDE_NETWORK_ERROR => "network error",
+        EDE_CACHED_ERROR => "cached error",
         // The DNSSEC codes the validator produces (6-10 on a bogus answer,
         // 1, 2, 5 and 11 on an answer the server could not verify) carry
         // their own purpose text.
@@ -1407,10 +1410,14 @@ pub const Resolver = struct {
     /// RFC 9520 section 3.2: the cached failure is answered with the RCODE
     /// the client would have seen, so a cached SERVFAIL stays a SERVFAIL and
     /// is never an NXDOMAIN, a NODATA, or an authenticated answer.
+    /// RFC 8914 section 4.14: the error comes from the cache, so the client
+    /// is told the error is a cached one. The code the fresh failure carried
+    /// rides along as well, so the client still learns what the error was.
     fn failureResponse(self: *Resolver, query: dns_message.Message, failure: Failure, output: []u8) ![]const u8 {
         _ = self;
         var message = try errorResponse(query, failure.rcode, failure.ede);
         defer message.deinit();
+        try appendEde(&message, EDE_CACHED_ERROR);
         var writer = dns_writer.Writer.init(output);
         message.encode(&writer) catch return Error.ResponseTooLarge;
         return writer.written();
@@ -3855,6 +3862,39 @@ fn expectEde(message: dns_message.Message, code: u16, text: []const u8) !void {
     try std.testing.expectEqualSlices(u8, text, option[2..]);
 }
 
+/// The nth EDE option of a message, in the order the options were appended.
+/// RFC 8914 section 3 lets a sender carry more than one EDE option.
+fn edeOptionAt(message: dns_message.Message, index: usize) ?[]const u8 {
+    for (message.additionals.items[0..message.additionals.len]) |*record| {
+        if (!record.rrtype.eql(.OPT)) continue;
+        const options = switch (record.rdata) {
+            .OPT => |*opt| opt.bytes(),
+            else => return null,
+        };
+        var offset: usize = 0;
+        var seen: usize = 0;
+        while (offset + 4 <= options.len) {
+            const code = std.mem.readInt(u16, options[offset..][0..2], .big);
+            const length = std.mem.readInt(u16, options[offset + 2 ..][0..2], .big);
+            if (length > options.len - offset - 4) break;
+            if (code == EDE_OPTION_CODE) {
+                if (seen == index) return options[offset + 4 ..][0..length];
+                seen += 1;
+            }
+            offset += 4 + length;
+        }
+        return null;
+    }
+    return null;
+}
+
+fn expectEdeAt(message: dns_message.Message, index: usize, code: u16, text: []const u8) !void {
+    const option = edeOptionAt(message, index) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 2 + text.len), option.len);
+    try std.testing.expectEqual(code, std.mem.readInt(u16, option[0..2], .big));
+    try std.testing.expectEqualSlices(u8, text, option[2..]);
+}
+
 test "stale nxdomain ede wire code is 19 not 22" {
     try std.testing.expectEqual(@as(u16, 19), EDE_STALE_NXDOMAIN);
 }
@@ -3863,12 +3903,146 @@ test "ede purpose text covers emitted codes" {
     try std.testing.expectEqualStrings("stale answer", edeText(EDE_STALE_ANSWER));
     try std.testing.expectEqualStrings("stale nxdomain", edeText(EDE_STALE_NXDOMAIN));
     try std.testing.expectEqualStrings("network error", edeText(EDE_NETWORK_ERROR));
+    try std.testing.expectEqualStrings("cached error", edeText(EDE_CACHED_ERROR));
     try std.testing.expectEqualStrings("dnssec bogus", edeText(EDE_DNSSEC_BOGUS));
     try std.testing.expectEqualStrings("signature expired", edeText(EDE_SIGNATURE_EXPIRED));
     try std.testing.expectEqualStrings("signature not yet valid", edeText(EDE_SIGNATURE_NOT_YET_VALID));
     try std.testing.expectEqualStrings("dnskey missing", edeText(EDE_DNSKEY_MISSING));
     try std.testing.expectEqualStrings("rrsigs missing", edeText(EDE_RRSIGS_MISSING));
     try std.testing.expectEqualStrings("", edeText(0));
+}
+
+test "RFC 8914 section 2: the EDE options the server already emits are byte for byte the same" {
+    const cases = [_]struct { code: u16, text: []const u8 }{
+        .{ .code = EDE_STALE_ANSWER, .text = "stale answer" },
+        .{ .code = EDE_STALE_NXDOMAIN, .text = "stale nxdomain" },
+        .{ .code = EDE_NETWORK_ERROR, .text = "network error" },
+        .{ .code = dnssec.EDE_UNSUPPORTED_DNSKEY_ALGORITHM, .text = "unsupported dnskey algorithm" },
+        .{ .code = dnssec.EDE_UNSUPPORTED_DS_DIGEST_TYPE, .text = "unsupported ds digest type" },
+        .{ .code = dnssec.EDE_DNSSEC_INDETERMINATE, .text = "dnssec indeterminate" },
+        .{ .code = dnssec.EDE_DNSSEC_BOGUS, .text = "dnssec bogus" },
+        .{ .code = dnssec.EDE_SIGNATURE_EXPIRED, .text = "signature expired" },
+        .{ .code = dnssec.EDE_SIGNATURE_NOT_YET_VALID, .text = "signature not yet valid" },
+        .{ .code = dnssec.EDE_DNSKEY_MISSING, .text = "dnskey missing" },
+        .{ .code = dnssec.EDE_RRSIGS_MISSING, .text = "rrsigs missing" },
+        .{ .code = dnssec.EDE_NO_ZONE_KEY_BIT, .text = "no zone key bit set" },
+    };
+    for (cases) |case| {
+        var message = try makeTestQuery(std.testing.allocator, 0x2920, "ede.example.", true);
+        defer message.deinit();
+        try appendEde(&message, case.code);
+
+        // RFC 8914 section 2: OPTION-CODE 15, OPTION-LENGTH, the INFO-CODE,
+        // and the EXTRA-TEXT.
+        const options = message.additionals.items[0].rdata.OPT.bytes();
+        try std.testing.expectEqual(@as(u16, EDE_OPTION_CODE), std.mem.readInt(u16, options[0..2], .big));
+        try std.testing.expectEqual(@as(u16, @intCast(2 + case.text.len)), std.mem.readInt(u16, options[2..4], .big));
+        var expected: [2 + 64]u8 = undefined;
+        std.mem.writeInt(u16, expected[0..2], case.code, .big);
+        @memcpy(expected[2..][0..case.text.len], case.text);
+        try std.testing.expectEqualSlices(u8, expected[0 .. 2 + case.text.len], findOption(message, EDE_OPTION_CODE).?);
+    }
+}
+
+test "RFC 8914 section 4.14: a client served the cached failure is told the error is a cached one" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var resolver = try Resolver.init(std.testing.allocator, io, .{});
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2921, "fail.example.", true);
+    defer query.deinit();
+    const key = try CacheKey.fromQuestion(query);
+    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    defer cache.deinit();
+    cache.failures.put(key, .{ .rcode = .servfail, .ede = EDE_NETWORK_ERROR }, 1000);
+    const failure = cache.failures.lookup(&key, 1001).?.failure;
+
+    var output: [2048]u8 = undefined;
+    const bytes = try resolver.failureResponse(query, failure, &output);
+    const message = try dns_message.Message.parse(arena.allocator(), bytes);
+
+    // The code the fresh failure carried rides along, and the cached-error
+    // code says the error came from the cache.
+    try expectEde(message, EDE_NETWORK_ERROR, "network error");
+    try expectEdeAt(message, 1, EDE_CACHED_ERROR, "cached error");
+    try std.testing.expect(edeOptionAt(message, 2) == null);
+}
+
+test "RFC 8914 section 2: a query without EDNS gets no EDE option and the same bytes as before" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var resolver = try Resolver.init(std.testing.allocator, io, .{});
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2922, "fail.example.", false);
+    defer query.deinit();
+    const key = try CacheKey.fromQuestion(query);
+    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    defer cache.deinit();
+    cache.failures.put(key, .{ .rcode = .servfail, .ede = EDE_NETWORK_ERROR }, 1000);
+    const failure = cache.failures.lookup(&key, 1001).?.failure;
+
+    var output: [2048]u8 = undefined;
+    const bytes = try resolver.failureResponse(query, failure, &output);
+    const message = try dns_message.Message.parse(arena.allocator(), bytes);
+
+    // No OPT record and no EDE option: the answer is the plain SERVFAIL.
+    try std.testing.expect(message.edns == null);
+    try std.testing.expect(findOption(message, EDE_OPTION_CODE) == null);
+    var plain = try errorResponse(query, .servfail, null);
+    defer plain.deinit();
+    var plain_output: [2048]u8 = undefined;
+    var plain_writer = dns_writer.Writer.init(&plain_output);
+    try plain.encode(&plain_writer);
+    try std.testing.expectEqualSlices(u8, plain_writer.written(), bytes);
+}
+
+test "RFC 8914 section 3: a shortened answer drops the EDE options first and keeps the OPT record" {
+    const response_builder = @import("auth/response.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var message = try makeTestQuery(arena.allocator(), 0x2923, "ede.example.", false);
+    message.header.qr = true;
+    try appendOpt(&message, .{ .udp_payload_size = 512, .extended_rcode = 0, .version = 0, .dnssec_ok = true });
+    var index: usize = 0;
+    var name_buffer: [64]u8 = undefined;
+    while (index < 24) : (index += 1) {
+        // Distinct owner names: a repeated one is compressed away.
+        const name_text = try std.fmt.bufPrint(&name_buffer, "n{d}-long-name-for-the-shortening-test.example.", .{index});
+        try message.answers.append(.{
+            .owner = try dns_name.Name.fromText(name_text),
+            .rrtype = .A,
+            .class = .IN,
+            .ttl = 60,
+            .rdata = .{ .A = .{ 192, 0, 2, 1 } },
+        });
+    }
+    message.header.answer_count = 24;
+    try appendEde(&message, EDE_NETWORK_ERROR);
+    try appendEde(&message, EDE_CACHED_ERROR);
+
+    var encoded: [4096]u8 = undefined;
+    var writer = dns_writer.Writer.init(&encoded);
+    try message.encode(&writer);
+    try std.testing.expect(writer.len() > 512);
+
+    var output: [4096]u8 = undefined;
+    const reply = try response_builder.truncateClassicUdpResponse(writer.written(), &output);
+    const parsed = try dns_message.Message.parse(arena.allocator(), reply);
+
+    // The EDE options are the first thing a shortened message drops, and the
+    // TC bit says the message is not the whole one.
+    try std.testing.expect(parsed.header.truncated);
+    try std.testing.expect(findOption(parsed, EDE_OPTION_CODE) == null);
+    // The OPT record stays: the DO bit and the payload size are header
+    // fields of the record, not of the option.
+    try std.testing.expect(parsed.edns != null);
+    try std.testing.expect(parsed.edns.?.dnssec_ok);
+    try std.testing.expectEqual(@as(u16, 512), parsed.edns.?.udp_payload_size);
 }
 
 fn makeTestRrsig(now_expired: bool) dns_rdata.Unknown {

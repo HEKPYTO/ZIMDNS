@@ -57,7 +57,12 @@ pub fn build(b: *std.Build) void {
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
 
-    const app_module = mainModule(b, target, optimize, build_options);
+    // The DNS-over-TLS server: inic/tls.zig, pinned to one commit in
+    // build.zig.zon. Its module is named "tls".
+    const tls_dep = b.dependency("tls", .{ .target = target, .optimize = optimize });
+    const tls_module = tls_dep.module("tls");
+
+    const app_module = mainModule(b, target, optimize, build_options, tls_module);
 
     const exe = b.addExecutable(.{
         .name = "zimdns",
@@ -89,7 +94,7 @@ pub fn build(b: *std.Build) void {
 
     // groups[0] is the unit group: the unit tests embedded in src/main.zig
     // stay the root module of the main test artifact and share that step.
-    const unit_test_module = mainModule(b, target, optimize, build_options);
+    const unit_test_module = mainModule(b, target, optimize, build_options, tls_module);
     const unit_tests = b.addTest(.{
         .root_module = unit_test_module,
     });
@@ -105,7 +110,7 @@ pub fn build(b: *std.Build) void {
                 .target = target,
                 .optimize = optimize,
             });
-            module.addImport("zimdns", mainModule(b, target, optimize, build_options));
+            module.addImport("zimdns", mainModule(b, target, optimize, build_options, tls_module));
             switch (group.extra) {
                 .none => {},
                 .fuzz => module.addOptions("fuzz_options", fuzz_options),
@@ -123,13 +128,14 @@ pub fn build(b: *std.Build) void {
 
 /// Every artifact above compiles `src/main.zig`, so the build options it reads
 /// are attached here once instead of at every call site.
-fn mainModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, build_options: *std.Build.Step.Options) *std.Build.Module {
+fn mainModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, build_options: *std.Build.Step.Options, tls_module: *std.Build.Module) *std.Build.Module {
     const module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
     module.addOptions("build_options", build_options);
+    module.addImport("tls", tls_module);
     return module;
 }
 

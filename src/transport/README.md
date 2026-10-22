@@ -1,32 +1,67 @@
 # `src/transport` — encrypted-transport decisions
 
-## Encrypted transport (fail-closed)
+## What is served
 
-Accepted 2026-09-09 (amended 2026-10-05). DNS-layer behavior for DoT
-(RFC 7858), DoH (RFC 8484, HTTP/1.1 mapping), and XoT (RFC 9103) runs on the
-post-handshake byte channel, reusing the runtime answer path and TCP framing
-bounds. `requireTlsServer` (`tls.zig`) fails closed: `--serve-dot`,
-`--serve-doh`, `--serve-xfr` exit before binding. No encrypted transport is a
-user-facing capability today. No TLS, HTTP/2, or QUIC code is in the tree and
-`build.zig.zon` lists no dependency; whether one is added is the open
-decision below.
+DNS-over-TLS (RFC 7858) is served: `--serve-dot` terminates a TLS 1.3
+handshake with the `dot` ALPN token and then speaks the RFC 7858 §3.3
+two-octet length-prefixed framing over that channel, reusing the runtime
+answer path and the TCP framing bounds. The port never answers DNS in
+cleartext: the handshake comes first, a client that offers no common ALPN
+token is refused with the RFC 7301 no_application_protocol alert, and the
+identity is loaded before the port is bound, so a broken certificate or key
+refuses the run and leaves no port open.
 
-The invariants hold whichever way that decision goes: no cleartext on a port
-the operator configured as encrypted, ALPN `dot` selected on a strict-TLS
-transfer channel (RFC 9103 §7.1), TLS 1.3 or later on that channel (RFC 9103
-§7.2), and a fail-closed refusal when the transport cannot be provided.
+DoH (RFC 8484) is served too: `--serve-doh` terminates a TLS 1.3 handshake
+with the `http/1.1` ALPN token and then maps the RFC 8484 section 4.1 GET
+and POST requests to DNS wire bytes, answering with `application/dns-message`.
+RFC 8484 section 5.2 makes HTTP/2 the minimum RECOMMENDED version of HTTP
+for DoH, so an HTTP/1.1-only server breaks no MUST of that document, but the
+negotiated token is `http/1.1` and never `h2`, so a client that requires
+HTTP/2 cannot use this port.
 
-## TLS-server dependency
+The port this build binds by default is 1053 for both encrypted listeners,
+not the IANA-registered 853 for DoT nor the HTTPS default 443 for DoH: the
+default has to be unprivileged. An operator reaches the registered ports
+with a `listen dns dot <address>:853` or `listen dns doh <address>:443`
+line.
 
-Accepted 2026-10-05: add no TLS-server dependency on the old 0.16 baseline
-(the only pure-Zig 0.16 server pin cannot select any ALPN token, failing
-RFC 9103 §7.1). Recommended path: Zig 0.17 baseline (done) + `tls.zig`
-(pinned commit) in the change that opens the gate. Reaching `supported`
-needs: pinned dep, handshake-before-parse accept loop, `dot`-token test,
-TLS-1.3-on-transfer test, loopback `openssl s_client`/`kdig`/`curl` interop.
-DoH additionally needs HTTP/2 (RFC 8484 §5.2). ALPN note: the `dot` token
-comes from the IANA registry (ref RFC 7858), not RFC 7858 §3.1; RFC 9103
-§§7.1–7.2 scope to transfers.
+The strict-TLS transfer channel (RFC 9103) has no listener yet.
+`requireListener` (`tls.zig`) refuses it at startup, so `--serve-xfr` still
+exits before binding a port. DoQ (RFC 9250) is deferred with a typed error.
+
+The invariants that hold whichever transport is served: no cleartext on a
+port the operator configured as encrypted, ALPN `dot` selected on a
+strict-TLS transfer channel (RFC 9103 §7.1), TLS 1.3 or later on that
+channel (RFC 9103 §7.2), and a fail-closed refusal when the transport
+cannot be provided.
+
+One limit of the pinned dependency is recorded in the code: the standard
+library's DER parser aborts the process on a truncated length field, and the
+dependency calls that parser directly, so a certificate whose DER is
+truncated ends the run with a stack trace rather than a typed error. The
+port is not bound either way, so nothing is served in the clear.
+
+## The TLS-server dependency (decided)
+
+Accepted 2026-10-22 by the owner: the project's first dependency is
+`tls.zig` (<https://github.com/ianic/tls.zig>, MIT), pinned to commit
+`bd22bcb73f423389441a1de80bf031ef1b623cce` in `build.zig.zon` with the
+package hash `tls-0.1.0-ER2e0l6qBgDEYo6RBkVZw5UrxOqtI6-OqLwyFJvEr3RK`.
+The handshake comes from that dependency; this repository owns the
+operator's identity paths, the ALPN token, the opt-in gate, and the
+refusal of a transport that has no listener. The dependency is fetched
+into `zig-pkg/`, which is not tracked.
+
+## What the DoT slice still owes
+
+Reaching `supported` for the DoT row needs: the pinned dependency (done),
+a handshake-before-parse accept loop (done), a `dot`-token test (done), and
+loopback interop with an outside client (`openssl s_client`, `kdig`) — the
+interop run is still open. The RFC 9103 §7.2 TLS 1.3 floor applies to the
+strict-TLS transfer channel, so the transfer row stays `partial` until
+that channel exists. DoH is served over HTTP/1.1 (RFC 8484 §5.2 makes HTTP/2 the minimum RECOMMENDED version, so this is a disclosed deviation and not a broken MUST). ALPN
+note: the `dot` token comes from the IANA registry (ref RFC 7858), not
+RFC 7858 §3.1; RFC 9103 §§7.1–7.2 scope to transfers.
 
 ### The ALPN objection no longer holds (re-checked 2026-10-21)
 
@@ -53,16 +88,16 @@ dependency is linked, so the encrypted listeners still refuse to start.
   holds by default. A second MIT server with TLS 1.2 and 1.3
   (<https://github.com/zig-utils/zig-tls>) also builds on Zig 0.17.0.
 
-## Open decision (pending the owner): the project's first dependency
+## The decision that was open (resolved 2026-10-22)
 
-The tree has no dependencies today, and every path from `planned` to a
+The tree had no dependencies, and every path from `planned` to a
 `supported` encrypted-transport row adds one: a TLS server for DoT and DoH,
 an HTTP/2 implementation for DoH as well (RFC 8484 §5.2 makes HTTP/2 the
 minimum RECOMMENDED version; an HTTP/1.1-only DoH breaks no RFC but will not
 interoperate with mainstream clients), and a QUIC stack for DoQ (RFC 9250,
-which cannot be approximated by TCP plus TLS). Adding the project's first
-dependency is the owner's call, so the options are stated here and none is
-chosen.
+which cannot be approximated by TCP plus TLS). The owner chose option (a):
+one pinned MIT TLS dependency, `tls.zig`. The record of the options is kept
+here because the reasons still hold for the transports that remain.
 
 - (a) Pin one MIT TLS dependency: the cheapest credible path to a
   `supported` DoT row. The candidate the evidence supports is `tls.zig`
@@ -82,5 +117,6 @@ chosen.
 - (c) Hand-roll TLS in-tree. Not credible: handshake parsing is the attack
   surface, and the project would own the security fixes.
 
-No option is recorded as chosen. The owner decides, and this record is
-updated when the decision is made.
+Option (a) is chosen and implemented; the other two are closed. DoT and DoH
+now run on it. The next dependency question is the same shape: DoQ needs a
+QUIC stack.

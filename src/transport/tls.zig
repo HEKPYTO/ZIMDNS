@@ -1,13 +1,14 @@
 /// Contract: Owns the encrypted-transport policy surface (RFC 7858/8484/9103
-/// substrate). The Zig 0.16 standard library ships a TLS client only, so ZIMDNS
-/// cannot terminate a TLS handshake and no encrypted listener may start:
-/// --serve-dot, --serve-doh, and --serve-xfr fail closed before a port is bound
-/// (see src/transport/README.md). dot.zig and doh.zig hold the
-/// DNS-layer mappings for an already-terminated byte channel; no cipher,
-/// certificate-parsing, or key-exchange code lives in this module.
+/// substrate). The TLS server comes from the reviewed inic/tls.zig dependency,
+/// pinned to one commit in build.zig.zon, so this module owns the policy
+/// around it: the ALPN tokens, the opt-in gate, the identity-path checks, the
+/// PEM sanity check, and the rule that a transport with no listener refuses
+/// to start instead of binding a port. dot.zig serves the DoT port and
+/// doh.zig serves the DoH port over that server; the strict-TLS transfer
+/// channel has no listener yet and refuses to start.
 /// Ownership: Config and PEM byte slices are borrowed; nothing is allocated.
 /// Errors: Missing/disabled identity and deferred transports are typed; the
-/// startup gate always fails closed.
+/// startup gate fails closed.
 const std = @import("std");
 
 pub const dot_port: u16 = 853;
@@ -20,19 +21,37 @@ pub const Error = error{
     MissingCertificate,
     MissingKey,
     CertKeySameFile,
-    TlsServerUnavailable,
+    TransportDeferred,
     DoqDeferred,
 };
 
-/// Server ALPN preference for one handshake offer list. DoT selects "dot",
-/// the IANA ALPN protocol ID whose registry reference is RFC 7858; RFC 7858
-/// section 3.1 fixes the DoT port and never mentions ALPN. RFC 9103 section
-/// 7.1 additionally requires "dot" for zone transfer over TLS. DoH selects
+/// The encrypted transports this build knows.
+pub const Transport = enum {
+    /// DNS over TLS, served on the dot port.
+    dot,
+    /// DNS over HTTPS, served on the doh port.
+    doh,
+    /// The strict-TLS zone transfer channel.
+    xfr,
+};
+
+/// The ALPN token a transport speaks. DoT selects "dot", the IANA ALPN
+/// protocol ID whose registry reference is RFC 7858; RFC 7858 section 3.1
+/// fixes the DoT port and never mentions ALPN. RFC 9103 section 7.1
+/// additionally requires "dot" for zone transfer over TLS. DoH selects
 /// "http/1.1" only, because doh.zig implements the HTTP/1.1 mapping:
 /// selecting "h2" would hand the client a protocol this server cannot speak
 /// (see src/transport/README.md).
-pub fn negotiateAlpn(offered: []const []const u8, want_doh: bool) ?[]const u8 {
-    const wanted = if (want_doh) doh_alpn_http11 else dot_alpn;
+pub fn alpnFor(transport: Transport) []const u8 {
+    return switch (transport) {
+        .dot, .xfr => dot_alpn,
+        .doh => doh_alpn_http11,
+    };
+}
+
+/// Server ALPN preference for one handshake offer list.
+pub fn negotiateAlpn(offered: []const []const u8, transport: Transport) ?[]const u8 {
+    const wanted = alpnFor(transport);
     for (offered) |protocol| {
         if (std.mem.eql(u8, protocol, wanted)) return wanted;
     }
@@ -59,12 +78,14 @@ pub fn validatePemPair(cert_bytes: []const u8, key_bytes: []const u8) Error!void
     if (key_bytes.len == 0) return Error.MissingKey;
 }
 
-/// Startup gate for every encrypted listener. Always fails: with no reviewed
-/// TLS-server dependency ZIMDNS cannot terminate a handshake, so it must not
-/// open a socket and serve DNS in cleartext on a port the operator configured
-/// as encrypted. Callers report the refusal and exit before any bind.
-pub fn requireTlsServer() Error!void {
-    return Error.TlsServerUnavailable;
+/// Startup gate for an encrypted listener: only the transports this build
+/// serves may start. A transport with no listener refuses here, before a
+/// socket is opened, so an encrypted port never answers in cleartext.
+pub fn requireListener(transport: Transport) Error!void {
+    switch (transport) {
+        .dot, .doh => {},
+        .xfr => return Error.TransportDeferred,
+    }
 }
 
 /// RFC 9250 DNS over QUIC is deferred: QUIC cannot be approximated by TCP
@@ -76,12 +97,14 @@ pub fn dialDoq() Error!void {
 
 test "ALPN selects dot for DoT and only http/1.1 for DoH, never unimplemented h2" {
     const offered = &.{ "h2", "dot", "http/1.1" };
-    try std.testing.expectEqualStrings("dot", negotiateAlpn(offered, false).?);
-    try std.testing.expectEqualStrings("http/1.1", negotiateAlpn(offered, true).?);
+    try std.testing.expectEqualStrings("dot", negotiateAlpn(offered, .dot).?);
+    try std.testing.expectEqualStrings("http/1.1", negotiateAlpn(offered, .doh).?);
     // doh.zig speaks HTTP/1.1 only, so an h2-only client gets no selection.
-    try std.testing.expect(negotiateAlpn(&.{"h2"}, true) == null);
-    try std.testing.expect(negotiateAlpn(&.{"h2"}, false) == null);
-    try std.testing.expect(negotiateAlpn(&.{}, true) == null);
+    try std.testing.expect(negotiateAlpn(&.{"h2"}, .doh) == null);
+    try std.testing.expect(negotiateAlpn(&.{"h2"}, .dot) == null);
+    try std.testing.expect(negotiateAlpn(&.{}, .doh) == null);
+    // RFC 9103 section 7.1 scopes the "dot" token to transfers as well.
+    try std.testing.expectEqualStrings("dot", alpnFor(.xfr));
 }
 
 test "encrypted listeners require the opt-in flag" {
@@ -103,6 +126,10 @@ test "PEM pair check rejects non-PEM certificates and empty keys" {
 }
 
 test "encrypted listener startup fails closed and DoQ is deferred" {
-    try std.testing.expectError(Error.TlsServerUnavailable, requireTlsServer());
+    // DoT and DoH have a listener; the strict-TLS transfer channel refuses
+    // to start, before a port is bound.
+    try requireListener(.dot);
+    try requireListener(.doh);
+    try std.testing.expectError(Error.TransportDeferred, requireListener(.xfr));
     try std.testing.expectError(Error.DoqDeferred, dialDoq());
 }

@@ -1,6 +1,7 @@
 .zig-cache/
 .zig-global-cache/
 zig-out/
+zig-pkg/
 .DS_Store
 .worktrees/
 *.log

@@ -257,7 +257,10 @@ fn serveTcpLoopWithTimeout(server: anytype, io: std.Io, runtime: *Runtime, max_r
 
 /// The connections one source address holds, so the per-source limit of
 /// RFC 9210 section 4.2 is enforced across the workers.
-const SourceCounter = struct {
+/// The per-source connection counter. RFC 9210 section 4.2: a source address
+/// holds only so many connections at once. The cleartext and the encrypted
+/// listeners share it, so the same bound applies to both.
+pub const SourceCounter = struct {
     const max_sources = 64;
 
     const Key = struct {
@@ -280,7 +283,7 @@ const SourceCounter = struct {
 
     /// Takes a slot for the source of a connection, or refuses the
     /// connection when the source already holds as many as the limit allows.
-    fn admit(self: *SourceCounter, address: *const std.Io.net.IpAddress) bool {
+    pub fn admit(self: *SourceCounter, address: *const std.Io.net.IpAddress) bool {
         const limit = tcp_limits.max_connections_per_source orelse return true;
         const key = sourceKey(address);
         self.lock();
@@ -300,7 +303,7 @@ const SourceCounter = struct {
     }
 
     /// Gives the slot back when the connection closes.
-    fn release(self: *SourceCounter, address: *const std.Io.net.IpAddress) void {
+    pub fn release(self: *SourceCounter, address: *const std.Io.net.IpAddress) void {
         const key = sourceKey(address);
         self.lock();
         defer self.unlock();

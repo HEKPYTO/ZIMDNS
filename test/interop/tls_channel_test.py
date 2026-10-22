@@ -64,7 +64,7 @@ class CertKeySameFile(Exception):
     pass
 
 
-class TlsServerUnavailable(Exception):
+class TransportDeferred(Exception):
     pass
 
 
@@ -142,10 +142,12 @@ def validate_pem_pair(cert_bytes, key_bytes):
         raise MissingKey("key is empty")
 
 
-def require_tls_server():
-    """Mirror tls.zig requireTlsServer: no TLS server, so no encrypted
-    listener may start and no port may be bound."""
-    raise TlsServerUnavailable("no TLS-server dependency; refuse to start")
+def require_listener(transport):
+    """Mirror tls.zig requireListener: the transports this build serves may
+    start, and a transport with no listener refuses before a port is bound."""
+    if transport == "dot":
+        return
+    raise TransportDeferred("no listener for " + transport)
 
 
 def dial_doq():
@@ -306,8 +308,13 @@ class TlsPolicyTest(unittest.TestCase):
             validate_pem_pair("-----BEGIN CERTIFICATE-----\nabc\n", b"")
 
     def test_encrypted_listener_startup_fails_closed_and_doq_deferred(self):
-        with self.assertRaises(TlsServerUnavailable):
-            require_tls_server()
+        # DoT is served: the gate lets it start.
+        require_listener("dot")
+        # The transports with no listener refuse before a port is bound.
+        with self.assertRaises(TransportDeferred):
+            require_listener("doh")
+        with self.assertRaises(TransportDeferred):
+            require_listener("xfr")
         with self.assertRaises(DoqDeferred):
             dial_doq()
 
