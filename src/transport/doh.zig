@@ -359,12 +359,8 @@ pub fn serveDohExchange(
         try writer.flush();
         return true;
     };
-    // The workers run concurrently, so the counters they share are updated
-    // under one lock: no count is lost and no count is taken twice.
     const response_bytes = blk: {
-        if (counters != null) lockCounters();
-        defer if (counters != null) unlockCounters();
-        if (counters) |value| value.doh_queries_total += 1;
+        if (counters) |value| metrics.bump(&value.doh_queries_total);
         // One runtime entry point serves every DoH query, and it takes the
         // peer address: the recursion policy, the cookie check, and the
         // locally served zones apply as they do on the cleartext TCP port.
@@ -416,18 +412,6 @@ pub fn serveDohStreamOnce(stream: std.Io.net.Stream, io: std.Io, runtime: *Runti
 fn connectionDeadline(io: std.Io) ?std.Io.Clock.Timestamp {
     const seconds = listener.tcpLimits().max_connection_duration orelse return null;
     return tcp_deadline.deadline(io, .{ .seconds = seconds });
-}
-
-/// The DoH workers run concurrently, so the counters they share are updated
-/// under one lock: no count is lost between two workers.
-var counters_mutex: std.Io.Mutex = .init;
-
-fn lockCounters() void {
-    std.Io.Threaded.mutexLockUncancelable(&counters_mutex);
-}
-
-fn unlockCounters() void {
-    std.Io.Threaded.mutexUnlock(&counters_mutex);
 }
 
 /// One DoH connection: the channel the exchanges travel over and the
@@ -1369,10 +1353,10 @@ test "a DoH query moves the counters the DoH path counts" {
 
     // The DoH path counts the query, the answer and the transport, the way
     // the cleartext TCP path counts them.
-    try std.testing.expectEqual(@as(u64, 1), counters.queries_total);
-    try std.testing.expectEqual(@as(u64, 1), counters.responses_total);
-    try std.testing.expectEqual(@as(u64, 0), counters.bad_queries_total);
-    try std.testing.expectEqual(@as(u64, 1), counters.doh_queries_total);
+    try std.testing.expectEqual(@as(u64, 1), counters.queries_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), counters.responses_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), counters.bad_queries_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), counters.doh_queries_total.load(.monotonic));
 }
 
 test "a DoH query for a locally served name is answered from the local zone table" {
@@ -1449,7 +1433,7 @@ test "the DoH answer is the same with and without the counters wired" {
     // One answer path serves both: the counters change the count, not the
     // message the client receives.
     try std.testing.expectEqualSlices(u8, counted, uncounted);
-    try std.testing.expectEqual(@as(u64, 1), counters.doh_queries_total);
+    try std.testing.expectEqual(@as(u64, 1), counters.doh_queries_total.load(.monotonic));
 }
 
 /// The identity the DoH tests load: a throwaway self-signed certificate and

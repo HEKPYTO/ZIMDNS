@@ -309,8 +309,11 @@ pub const CookieReplayDb = struct {
 
     entries: [MAX_COOKIE_REPLAY_ENTRIES]Entry = @splat(Entry{}),
     next: usize = 0,
+    mutex: std.Io.Mutex = .init,
 
     pub fn contains(self: *const CookieReplayDb, client: *const std.Io.net.IpAddress, cookie: []const u8) bool {
+        std.Io.Threaded.mutexLockUncancelable(@constCast(&self.mutex));
+        defer std.Io.Threaded.mutexUnlock(@constCast(&self.mutex));
         const identity = clientIdentity(client);
         for (&self.entries) |*entry| {
             if (entry.ip_tag == 0) continue;
@@ -321,7 +324,32 @@ pub const CookieReplayDb = struct {
         return false;
     }
 
+    /// Records the cookie and reports whether it was new, in one critical
+    /// section: two requests carrying the same cookie see exactly one
+    /// acceptance.
+    pub fn checkAndTrack(self: *CookieReplayDb, client: *const std.Io.net.IpAddress, cookie: []const u8) bool {
+        std.Io.Threaded.mutexLockUncancelable(&self.mutex);
+        defer std.Io.Threaded.mutexUnlock(&self.mutex);
+        const identity = clientIdentity(client);
+        for (&self.entries) |*entry| {
+            if (entry.ip_tag == 0) continue;
+            if (entry.ip_tag != identity.tag or entry.cookie_len != cookie.len) continue;
+            if (!std.mem.eql(u8, entry.ip[0..], identity.bytes[0..])) continue;
+            if (std.mem.eql(u8, entry.cookie[0..entry.cookie_len], cookie)) return false;
+        }
+        if (cookie.len > self.entries[0].cookie.len) return true;
+        const entry = &self.entries[self.next];
+        self.next = (self.next + 1) % self.entries.len;
+        entry.ip_tag = identity.tag;
+        entry.ip = identity.bytes;
+        @memcpy(entry.cookie[0..cookie.len], cookie);
+        entry.cookie_len = @intCast(cookie.len);
+        return true;
+    }
+
     pub fn track(self: *CookieReplayDb, client: *const std.Io.net.IpAddress, cookie: []const u8) void {
+        std.Io.Threaded.mutexLockUncancelable(&self.mutex);
+        defer std.Io.Threaded.mutexUnlock(&self.mutex);
         if (cookie.len > self.entries[0].cookie.len) return;
         const identity = clientIdentity(client);
         const entry = &self.entries[self.next];
@@ -1161,6 +1189,9 @@ fn stripOptions(message: *dns_message.Message) void {
 pub const Resolver = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
+    // policy: one forward at a time; split the cache from the aggressive
+    // cache and lock each if concurrent forwarding throughput matters.
+    mutex: std.Io.Mutex = .init,
     policy: Policy,
     upstream: ?std.Io.net.IpAddress,
     cache: Cache,
@@ -1206,7 +1237,17 @@ pub const Resolver = struct {
         return message;
     }
 
+    fn lock(self: *Resolver) void {
+        std.Io.Threaded.mutexLockUncancelable(&self.mutex);
+    }
+
+    fn unlock(self: *Resolver) void {
+        std.Io.Threaded.mutexUnlock(&self.mutex);
+    }
+
     pub fn answer(self: *Resolver, query_bytes: []const u8, query: dns_message.Message, client: *const std.Io.net.IpAddress, output: []u8) ![]const u8 {
+        self.lock();
+        defer self.unlock();
         return self.answerAtDepth(query_bytes, query, client, output, 0);
     }
 
@@ -1780,8 +1821,7 @@ pub const Resolver = struct {
         // Challenges carry no server cookie and clients legitimately retry
         // them, so only full cookies enter the bounded replay window.
         if (option.len != 8 and self.policy.cookies.replay_protection) {
-            if (self.policy.cookies.replay_db.contains(client, option)) return .invalid;
-            self.policy.cookies.replay_db.track(client, option);
+            if (!self.policy.cookies.replay_db.checkAndTrack(client, option)) return .invalid;
         }
         var server_cookie: [24]u8 = undefined;
         self.policy.cookies.makeServerCookie(client, option[0..8], &server_cookie);
@@ -6437,6 +6477,59 @@ test "cookie reuse stays accepted when replay protection is off" {
 
     _ = try resolver.validateCookie(query, &client);
     _ = try resolver.validateCookie(query, &client);
+}
+
+test "four concurrent requests carrying one full cookie see exactly one acceptance" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 5356);
+    const client_cookie = [_]u8{ 9, 8, 7, 6, 5, 4, 3, 2 };
+
+    var cookie_policy = CookiePolicy.init("current-secret", null);
+    var server_cookie: [24]u8 = undefined;
+    cookie_policy.makeServerCookie(&client, &client_cookie, &server_cookie);
+    cookie_policy.replay_protection = true;
+
+    var resolver = try Resolver.init(std.testing.allocator, io, .{ .cookies = cookie_policy });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2606, "example.com.", true);
+    defer query.deinit();
+    try setCookieOption(&query, &server_cookie);
+
+    const Runner = struct {
+        resolver: *Resolver,
+        query: dns_message.Message,
+        client: *const std.Io.net.IpAddress,
+        accepted: *std.atomic.Value(usize),
+        rejected: *std.atomic.Value(usize),
+
+        fn run(self: @This()) void {
+            if (self.resolver.validateCookie(self.query, self.client)) |_| {
+                _ = self.accepted.fetchAdd(1, .monotonic);
+            } else |_| {
+                _ = self.rejected.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+
+    var accepted = std.atomic.Value(usize).init(0);
+    var rejected = std.atomic.Value(usize).init(0);
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*thread| {
+        thread.* = try std.Thread.spawn(.{}, Runner.run, .{Runner{
+            .resolver = &resolver,
+            .query = query,
+            .client = &client,
+            .accepted = &accepted,
+            .rejected = &rejected,
+        }});
+    }
+    for (threads) |thread| thread.join();
+
+    try std.testing.expectEqual(@as(usize, 1), accepted.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 3), rejected.load(.monotonic));
 }
 
 test "RFC 6052 section 2.2: the IPv4 address sits in the prefix as the RFC's table shows" {

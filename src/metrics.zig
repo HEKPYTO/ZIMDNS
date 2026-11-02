@@ -1,20 +1,29 @@
+const std = @import("std");
+
+/// Counters are written by every transport worker at once and read by the
+/// metrics endpoint, so each one is atomic rather than guarded by a lock.
 pub const Counters = struct {
-    queries_total: u64 = 0,
-    responses_total: u64 = 0,
-    bad_queries_total: u64 = 0,
-    encode_failures_total: u64 = 0,
-    dot_queries_total: u64 = 0,
-    doh_queries_total: u64 = 0,
-    xfr_transfers_total: u64 = 0,
+    queries_total: std.atomic.Value(u64) = .init(0),
+    responses_total: std.atomic.Value(u64) = .init(0),
+    bad_queries_total: std.atomic.Value(u64) = .init(0),
+    encode_failures_total: std.atomic.Value(u64) = .init(0),
+    dot_queries_total: std.atomic.Value(u64) = .init(0),
+    doh_queries_total: std.atomic.Value(u64) = .init(0),
+    xfr_transfers_total: std.atomic.Value(u64) = .init(0),
     /// Queries received with the reserved Z bit set, which RFC 1035 section
     /// 4.1.1 says must be zero in all queries and responses.
-    reserved_bit_queries_total: u64 = 0,
+    reserved_bit_queries_total: std.atomic.Value(u64) = .init(0),
     /// Queries received with the AD bit set, which RFC 4035 section 3 says a
     /// name server must ignore in queries.
-    ad_bit_queries_total: u64 = 0,
+    ad_bit_queries_total: std.atomic.Value(u64) = .init(0),
 };
 
-const std = @import("std");
+/// Adds one to a counter. A free function keeps the call sites short: the
+/// atomic's own `fetchAdd` returns the previous value, which every caller
+/// would otherwise have to discard.
+pub fn bump(counter: *std.atomic.Value(u64)) void {
+    _ = counter.fetchAdd(1, .monotonic);
+}
 
 /// The writer bounds the output by its content, so a new counter cannot overflow it.
 pub fn formatPrometheus(counters: Counters, writer: *std.Io.Writer) !void {
@@ -39,26 +48,26 @@ pub fn formatPrometheus(counters: Counters, writer: *std.Io.Writer) !void {
         \\zimdns_ad_bit_queries_total {d}
         \\
     , .{
-        counters.queries_total,
-        counters.responses_total,
-        counters.bad_queries_total,
-        counters.encode_failures_total,
-        counters.dot_queries_total,
-        counters.doh_queries_total,
-        counters.xfr_transfers_total,
-        counters.reserved_bit_queries_total,
-        counters.ad_bit_queries_total,
+        counters.queries_total.load(.monotonic),
+        counters.responses_total.load(.monotonic),
+        counters.bad_queries_total.load(.monotonic),
+        counters.encode_failures_total.load(.monotonic),
+        counters.dot_queries_total.load(.monotonic),
+        counters.doh_queries_total.load(.monotonic),
+        counters.xfr_transfers_total.load(.monotonic),
+        counters.reserved_bit_queries_total.load(.monotonic),
+        counters.ad_bit_queries_total.load(.monotonic),
     });
 }
 
 test "metrics format emits prometheus counters" {
     const counters = Counters{
-        .queries_total = 2,
-        .responses_total = 1,
-        .bad_queries_total = 1,
-        .encode_failures_total = 0,
-        .reserved_bit_queries_total = 3,
-        .ad_bit_queries_total = 4,
+        .queries_total = .init(2),
+        .responses_total = .init(1),
+        .bad_queries_total = .init(1),
+        .encode_failures_total = .init(0),
+        .reserved_bit_queries_total = .init(3),
+        .ad_bit_queries_total = .init(4),
     };
     var output = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer output.deinit();
@@ -95,15 +104,15 @@ test "metrics text is not bounded by a fixed buffer" {
     var output = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer output.deinit();
     try formatPrometheus(.{
-        .queries_total = widest,
-        .responses_total = widest,
-        .bad_queries_total = widest,
-        .encode_failures_total = widest,
-        .dot_queries_total = widest,
-        .doh_queries_total = widest,
-        .xfr_transfers_total = widest,
-        .reserved_bit_queries_total = widest,
-        .ad_bit_queries_total = widest,
+        .queries_total = .init(widest),
+        .responses_total = .init(widest),
+        .bad_queries_total = .init(widest),
+        .encode_failures_total = .init(widest),
+        .dot_queries_total = .init(widest),
+        .doh_queries_total = .init(widest),
+        .xfr_transfers_total = .init(widest),
+        .reserved_bit_queries_total = .init(widest),
+        .ad_bit_queries_total = .init(widest),
     }, &output.writer);
 
     const text = output.written();

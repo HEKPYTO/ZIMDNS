@@ -128,14 +128,14 @@ fn serveXfrFrames(channel: *const channel_mod.Channel, runtime: *Runtime, counte
             try channel.writer.writeAll(blob);
             try channel.writer.flush();
             if (counters) |value| {
-                value.queries_total += 1;
-                value.responses_total += 1;
+                metrics.bump(&value.queries_total);
+                metrics.bump(&value.responses_total);
                 // A refusal carries no answer record and is not a transfer.
-                if (answerRecords(frame_arena.allocator(), blob) > 0) value.xfr_transfers_total += 1;
+                if (answerRecords(frame_arena.allocator(), blob) > 0) metrics.bump(&value.xfr_transfers_total);
             }
             continue;
         }
-        if (counters) |value| value.dot_queries_total += 1;
+        if (counters) |value| metrics.bump(&value.dot_queries_total);
         const response_bytes = if (counters) |value|
             try runtime.answerWithMetrics(request, &response_buffer, value)
         else

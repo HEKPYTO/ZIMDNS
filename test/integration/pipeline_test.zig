@@ -3134,10 +3134,10 @@ fn expectAaaaResponse(response: anytype, expected_id: u16) !void {
 }
 
 fn expectMetrics(counters: metrics.Counters) !void {
-    try std.testing.expectEqual(@as(u64, 1), counters.queries_total);
-    try std.testing.expectEqual(@as(u64, 1), counters.responses_total);
-    try std.testing.expectEqual(@as(u64, 0), counters.bad_queries_total);
-    try std.testing.expectEqual(@as(u64, 0), counters.encode_failures_total);
+    try std.testing.expectEqual(@as(u64, 1), counters.queries_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), counters.responses_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), counters.bad_queries_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), counters.encode_failures_total.load(.monotonic));
 }
 
 fn expectAddress(response: anytype, expected: [4]u8) !void {

@@ -139,7 +139,12 @@ pub const Runtime = struct {
     /// The handler only stores the flag; the file is read outside it.
     reload_requested: std.atomic.Value(bool) = .init(false),
     // ceiling: global runtime lock serializes all zone reads; use per-zone or read/write locks if contention matters.
-    mutex: std.Io.Mutex = .init,
+    mutex: std.Io.RwLock = .init,
+    /// The io the read-write lock waits on. A runtime built without one falls
+    /// back to the single-threaded instance, whose futex wait is a no-op, so
+    /// only uncontended paths may run there: tests answer with readers only,
+    /// and the server passes the io it serves on through `fromZonesWithPolicy`.
+    io: std.Io = std.Io.Threaded.global_single_threaded.io(),
 
     /// The returned runtime owns its authoritative zone; call deinit when done.
     pub fn fromZoneText(text: []const u8) !Runtime {
@@ -196,6 +201,7 @@ pub const Runtime = struct {
     pub fn fromZonesWithPolicy(allocator: std.mem.Allocator, zones: *std.ArrayList(zone_index.Zone), blocklist: blocklist_mod.Blocklist, io: std.Io, policy: resolver_mod.Policy) !Runtime {
         var runtime = fromZones(allocator, zones, blocklist);
         errdefer runtime.deinit();
+        runtime.io = io;
         runtime.resolver = try resolver_mod.Resolver.init(allocator, io, policy);
         return runtime;
     }
@@ -223,8 +229,8 @@ pub const Runtime = struct {
     }
 
     pub fn deinit(self: *Runtime) void {
-        self.lock();
-        defer self.unlock();
+        self.lockExclusive();
+        defer self.unlockExclusive();
         if (self.resolver) |*resolver| resolver.deinit();
         self.resolver = null;
         self.keyring.deinit();
@@ -315,8 +321,8 @@ pub const Runtime = struct {
             reportReload(io, "error: cannot parse the TSIG key file {s}: {t}", .{ source.path(), err });
             return .load_failed;
         };
-        self.lock();
-        defer self.unlock();
+        self.lockExclusive();
+        defer self.unlockExclusive();
         // The swap happens under the lock, so a request is verified against
         // the old keyring or the new one, never a half-built one.
         self.keyring.replace(&ring);
@@ -371,8 +377,8 @@ pub const Runtime = struct {
 
         // The new zone is built before the lock is taken, so a reload does
         // not hold up the answers it does not change.
-        self.lock();
-        defer self.unlock();
+        self.lockExclusive();
+        defer self.unlockExclusive();
 
         const target = self.zoneIndexForOrigin(origin) orelse {
             reportReload(io, "error: the server does not serve a zone for {s}", .{origin});
@@ -465,12 +471,20 @@ pub const Runtime = struct {
         return null;
     }
 
-    fn lock(self: *const Runtime) void {
-        std.Io.Threaded.mutexLockUncancelable(@constCast(&self.mutex));
+    fn lockShared(self: *const Runtime) void {
+        @constCast(&self.mutex).lockSharedUncancelable(self.io);
     }
 
-    fn unlock(self: *const Runtime) void {
-        std.Io.Threaded.mutexUnlock(@constCast(&self.mutex));
+    fn unlockShared(self: *const Runtime) void {
+        @constCast(&self.mutex).unlockShared(self.io);
+    }
+
+    fn lockExclusive(self: *const Runtime) void {
+        @constCast(&self.mutex).lockUncancelable(self.io);
+    }
+
+    fn unlockExclusive(self: *const Runtime) void {
+        @constCast(&self.mutex).unlock(self.io);
     }
 
     fn currentTsigTime(self: *const Runtime) u64 {
@@ -792,15 +806,15 @@ pub const Runtime = struct {
         counters: ?*metrics.Counters,
         over_tcp: bool,
     ) ![]const u8 {
-        if (counters) |value| value.queries_total += 1;
+        if (counters) |value| metrics.bump(&value.queries_total);
         const result = self.answerIncoming(allocator, query_bytes, output, client, counters, over_tcp) catch |err| {
             if (counters) |value| {
-                if (err == Error.BadQuery) value.bad_queries_total += 1;
-                if (err == Error.EncodeFailed) value.encode_failures_total += 1;
+                if (err == Error.BadQuery) metrics.bump(&value.bad_queries_total);
+                if (err == Error.EncodeFailed) metrics.bump(&value.encode_failures_total);
             }
             return err;
         };
-        if (counters) |value| value.responses_total += 1;
+        if (counters) |value| metrics.bump(&value.responses_total);
         return result;
     }
 
@@ -830,8 +844,8 @@ pub const Runtime = struct {
     pub fn answer(self: *const Runtime, query_bytes: []const u8, output: []u8) ![]const u8 {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
-        self.lock();
-        defer self.unlock();
+        self.lockShared();
+        defer self.unlockShared();
         const parsed = try self.parseIncoming(arena.allocator(), query_bytes);
         switch (parsed) {
             .failure => |failure| return self.encodeFailure(arena.allocator(), query_bytes, output, failure),
@@ -848,8 +862,8 @@ pub const Runtime = struct {
     pub fn answerFrom(self: *Runtime, query_bytes: []const u8, output: []u8, client: *const std.Io.net.IpAddress) ![]const u8 {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
-        self.lock();
-        defer self.unlock();
+        self.lockShared();
+        defer self.unlockShared();
         return self.answerCounted(arena.allocator(), query_bytes, output, client, null, false);
     }
 
@@ -865,8 +879,8 @@ pub const Runtime = struct {
     ) ![]const u8 {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
-        self.lock();
-        defer self.unlock();
+        self.lockShared();
+        defer self.unlockShared();
         return self.answerCounted(arena.allocator(), query_bytes, output, client, counters, true);
     }
 
@@ -878,8 +892,8 @@ pub const Runtime = struct {
             return response.truncateSignedClassicUdpResponse(response_bytes, output) catch return Error.EncodeFailed;
         }
 
-        self.lock();
-        defer self.unlock();
+        self.lockShared();
+        defer self.unlockShared();
         const request_final = (tsig.parseFinalAdditional(query_bytes) catch return Error.EncodeFailed) orelse return Error.EncodeFailed;
         const algorithm = tsig.algorithmForName(&request_final.tsig.algorithm) catch return Error.EncodeFailed;
         const key = self.keyring.findAlgorithm(request_final.owner, algorithm) orelse return Error.EncodeFailed;
@@ -910,8 +924,8 @@ pub const Runtime = struct {
     ) ![]u8 {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
-        self.lock();
-        defer self.unlock();
+        self.lockShared();
+        defer self.unlockShared();
         const parsed = try self.parseIncoming(arena.allocator(), request_bytes);
         switch (parsed) {
             .failure => |failure| {
@@ -1190,26 +1204,26 @@ pub const Runtime = struct {
     /// section 3: a name server must ignore the setting of the AD bit in
     /// queries).
     fn countInboundBits(counters: *metrics.Counters, query: dns_message.Message) void {
-        if (query.header.reserved) counters.reserved_bit_queries_total += 1;
-        if (query.header.authenticated_data) counters.ad_bit_queries_total += 1;
+        if (query.header.reserved) metrics.bump(&counters.reserved_bit_queries_total);
+        if (query.header.authenticated_data) metrics.bump(&counters.ad_bit_queries_total);
     }
 
     pub fn answerFromWithMetrics(self: *Runtime, query_bytes: []const u8, output: []u8, client: *const std.Io.net.IpAddress, counters: *metrics.Counters) ![]const u8 {
-        self.lock();
-        defer self.unlock();
+        self.lockShared();
+        defer self.unlockShared();
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         return self.answerCounted(arena.allocator(), query_bytes, output, client, counters, false);
     }
 
     pub fn answerWithMetrics(self: *const Runtime, query_bytes: []const u8, output: []u8, counters: *metrics.Counters) ![]const u8 {
-        counters.queries_total += 1;
+        metrics.bump(&counters.queries_total);
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
-        self.lock();
-        defer self.unlock();
+        self.lockShared();
+        defer self.unlockShared();
         const parsed = self.parseIncoming(arena.allocator(), query_bytes) catch |err| {
-            counters.bad_queries_total += 1;
+            metrics.bump(&counters.bad_queries_total);
             return err;
         };
         const result = switch (parsed) {
@@ -1222,11 +1236,11 @@ pub const Runtime = struct {
                     self.encodeMessage(try self.buildMessage(incoming.query, true), output);
             },
         } catch |err| {
-            if (err == Error.BadQuery) counters.bad_queries_total += 1;
-            if (err == Error.EncodeFailed) counters.encode_failures_total += 1;
+            if (err == Error.BadQuery) metrics.bump(&counters.bad_queries_total);
+            if (err == Error.EncodeFailed) metrics.bump(&counters.encode_failures_total);
             return err;
         };
-        counters.responses_total += 1;
+        metrics.bump(&counters.responses_total);
         return result;
     }
 
@@ -1343,6 +1357,60 @@ test "authoritative runtime answers raw query bytes" {
     try std.testing.expect(parsed.header.qr);
     try std.testing.expectEqual(@as(u16, 1), parsed.header.answer_count);
     try std.testing.expectEqualSlices(u8, &.{ 192, 168, 1, 1 }, &parsed.answers.items[0].rdata.A);
+}
+
+test "two threads answering one authoritative query return the same bytes" {
+    var runtime = try Runtime.fromZoneText(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
+        \\
+    );
+    defer runtime.deinit();
+
+    const query = [_]u8{
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        3,    'd',  'n',  's',  4,    'h',  'o',  'm',  'e',  4,    'a',  'r',
+        'p',  'a',  0,    0x00, 0x01, 0x00, 0x01,
+    };
+
+    var expected: [512]u8 = undefined;
+    const expected_bytes = try runtime.answer(&query, &expected);
+
+    const Runner = struct {
+        runtime: *Runtime,
+        query: []const u8,
+        expected: []const u8,
+        failures: *std.atomic.Value(usize),
+
+        fn run(self: @This()) void {
+            var output: [512]u8 = undefined;
+            var iteration: usize = 0;
+            while (iteration < 100) : (iteration += 1) {
+                const bytes = self.runtime.answer(self.query, &output) catch {
+                    _ = self.failures.fetchAdd(1, .monotonic);
+                    return;
+                };
+                if (!std.mem.eql(u8, bytes, self.expected)) _ = self.failures.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+
+    var failures = std.atomic.Value(usize).init(0);
+    var threads: [2]std.Thread = undefined;
+    for (&threads) |*thread| {
+        thread.* = try std.Thread.spawn(.{}, Runner.run, .{Runner{
+            .runtime = &runtime,
+            .query = &query,
+            .expected = expected_bytes,
+            .failures = &failures,
+        }});
+    }
+    for (threads) |thread| thread.join();
+
+    try std.testing.expectEqual(@as(usize, 0), failures.load(.monotonic));
 }
 
 test "the runtime holds no signing key once it is deinitialized" {
@@ -2261,13 +2329,13 @@ test "authoritative runtime records metrics for successful, bad, and bit-flagged
     }, &output, &counters);
     try std.testing.expectError(Error.BadQuery, runtime.answerWithMetrics(&.{ 0x12, 0x34 }, &output, &counters));
 
-    try std.testing.expectEqual(@as(u64, 2), counters.queries_total);
-    try std.testing.expectEqual(@as(u64, 1), counters.responses_total);
-    try std.testing.expectEqual(@as(u64, 1), counters.bad_queries_total);
-    try std.testing.expectEqual(@as(u64, 0), counters.encode_failures_total);
+    try std.testing.expectEqual(@as(u64, 2), counters.queries_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), counters.responses_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), counters.bad_queries_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), counters.encode_failures_total.load(.monotonic));
     // A query that carries neither bit leaves the inbound-bit counters alone.
-    try std.testing.expectEqual(@as(u64, 0), counters.reserved_bit_queries_total);
-    try std.testing.expectEqual(@as(u64, 0), counters.ad_bit_queries_total);
+    try std.testing.expectEqual(@as(u64, 0), counters.reserved_bit_queries_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), counters.ad_bit_queries_total.load(.monotonic));
 
     // RFC 1035 section 4.1.1: the reserved Z bit must be zero in a query, so
     // a query that carries it is counted on the network answer path.
@@ -2285,8 +2353,8 @@ test "authoritative runtime records metrics for successful, bad, and bit-flagged
         'p',  'a',  0,    0x00, 0x01, 0x00, 0x01,
     }, &output, &counters);
 
-    try std.testing.expectEqual(@as(u64, 1), counters.reserved_bit_queries_total);
-    try std.testing.expectEqual(@as(u64, 1), counters.ad_bit_queries_total);
+    try std.testing.expectEqual(@as(u64, 1), counters.reserved_bit_queries_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), counters.ad_bit_queries_total.load(.monotonic));
 
     var metrics_output = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer metrics_output.deinit();

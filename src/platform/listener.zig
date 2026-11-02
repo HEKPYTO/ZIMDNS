@@ -536,9 +536,9 @@ test "UDP listener records metrics for a bounded datagram batch" {
     try client_socket.send(io, &server_socket.address, simple_a_query);
     try serveUdpCountWithMetrics(&server_socket, io, &runtime, 1, &counters);
 
-    try std.testing.expectEqual(@as(u64, 1), counters.queries_total);
-    try std.testing.expectEqual(@as(u64, 1), counters.responses_total);
-    try std.testing.expectEqual(@as(u64, 0), counters.bad_queries_total);
+    try std.testing.expectEqual(@as(u64, 1), counters.queries_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), counters.responses_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), counters.bad_queries_total.load(.monotonic));
 }
 
 test "classic UDP response over 512 bytes sets TC instead of clipping" {
@@ -1722,12 +1722,12 @@ const unix_tcp_deadlines = if (TCP_DEADLINES_SUPPORTED) struct {
         timeout: TcpIoTimeout,
         counters: ?*metrics.Counters,
     ) !void {
-        if (counters) |value| value.queries_total += 1;
+        if (counters) |value| metrics.bump(&value.queries_total);
         const blob = try runtime.encodeTransferFrames(std.heap.page_allocator, request);
         defer std.heap.page_allocator.free(blob);
         const write_deadline = tcp_deadline.deadline(io, timeout);
         try tcp_deadline.writeExact(stream.socket.handle, io, blob, write_deadline);
-        if (counters) |value| value.responses_total += 1;
+        if (counters) |value| metrics.bump(&value.responses_total);
     }
 
     fn readFrame(fd: std.posix.fd_t, io: std.Io, frame_buffer: []u8, frame_deadline: std.Io.Clock.Timestamp) ![]const u8 {

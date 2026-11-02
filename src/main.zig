@@ -662,6 +662,9 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
             runtime = try auth_runtime.Runtime.fromZoneText(zone_text);
         }
     }
+    // The read-write lock a reload waits on is woken through the serving io;
+    // a runtime built from zone text carries none of its own.
+    runtime.io = io;
     defer runtime.deinit();
     // The handler must not reach a runtime that is already gone.
     defer reload_runtime = null;

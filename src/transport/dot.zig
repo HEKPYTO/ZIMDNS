@@ -129,7 +129,7 @@ fn serveDotFrames(
         const response_bytes = try runtime.answerFromTcp(request, &response_buffer, client, counters);
         // The counter moves after the answer, so a refused or failed query
         // is not counted as served.
-        if (counters) |value| value.dot_queries_total += 1;
+        if (counters) |value| metrics.bump(&value.dot_queries_total);
         // RFC 7830 section 4: the responder pads the answer when the query
         // carried the Padding option. RFC 7830 section 6 keeps the option for
         // encrypted transports, so this path and no other one calls it.
@@ -580,9 +580,9 @@ test "a DoT query for a locally served name answers the same way with and withou
     try std.testing.expect(answer.header.qr);
     try std.testing.expectEqual(@as(usize, 1), answer.answers.items.len);
     try std.testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, &answer.answers.items[0].rdata.A);
-    try std.testing.expectEqual(@as(u64, 1), counters.queries_total);
-    try std.testing.expectEqual(@as(u64, 1), counters.responses_total);
-    try std.testing.expectEqual(@as(u64, 1), counters.dot_queries_total);
+    try std.testing.expectEqual(@as(u64, 1), counters.queries_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), counters.responses_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), counters.dot_queries_total.load(.monotonic));
 }
 
 test "DoT defaults name the RFC 7858 port and the IANA dot ALPN token" {
@@ -1199,10 +1199,10 @@ test "a DoT query moves the counters the cleartext TCP path moves" {
 
     // The DoT path counts the query, the answer and the transport, the way
     // the cleartext TCP path counts them.
-    try std.testing.expectEqual(@as(u64, 1), counters.queries_total);
-    try std.testing.expectEqual(@as(u64, 1), counters.responses_total);
-    try std.testing.expectEqual(@as(u64, 0), counters.bad_queries_total);
-    try std.testing.expectEqual(@as(u64, 1), counters.dot_queries_total);
+    try std.testing.expectEqual(@as(u64, 1), counters.queries_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), counters.responses_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), counters.bad_queries_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), counters.dot_queries_total.load(.monotonic));
 }
 
 test "the DoT listener answers a query over the bound port" {
