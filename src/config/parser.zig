@@ -282,6 +282,21 @@ pub const Zone = struct {
     }
 };
 
+/// One `allow-update <apex> <key-name>` line: the zone an operator allowed
+/// RFC 2136 updates for and the one TSIG key allowed to write it.
+pub const AllowUpdate = struct {
+    apex: Text = .{},
+    key: Text = .{},
+
+    pub fn apexText(self: *const AllowUpdate) []const u8 {
+        return self.apex.text();
+    }
+
+    pub fn keyText(self: *const AllowUpdate) []const u8 {
+        return self.key.text();
+    }
+};
+
 pub const BlocklistFile = struct {
     path: Text = .{},
 
@@ -310,6 +325,7 @@ pub const Config = struct {
     cookies: CookieConfig = .{},
     zones: List(Zone) = .{},
     blocklists: List(BlocklistFile) = .{},
+    allow_updates: List(AllowUpdate) = .{},
     tsig_key_file: Text = .{},
     has_tsig_key_file: bool = false,
     /// Path to the DNSSEC signing key file. One key signs every configured
@@ -419,6 +435,17 @@ pub const Config = struct {
     /// NSEC3PARAM decides, as it always did; set via `dnssec-chain`.
     chain: ?ChainConfig = null,
 
+    /// RFC 9432 section 4: the apex of the catalog zone the server publishes
+    /// for the zones it serves. Null means no catalog is served; set via
+    /// `catalog-zone <apex>`.
+    catalog_zone: Text = .{},
+    has_catalog_zone: bool = false,
+
+    pub fn catalogZoneText(self: *const Config) ?[]const u8 {
+        if (!self.has_catalog_zone) return null;
+        return self.catalog_zone.text();
+    }
+
     pub fn tlsCertFileText(self: *const Config) ?[]const u8 {
         if (!self.has_tls_cert_file) return null;
         return self.tls_cert_file.text();
@@ -501,6 +528,7 @@ pub const Config = struct {
         if (std.mem.eql(u8, first, "cookies")) return self.parseCookies(&tokens);
         if (std.mem.eql(u8, first, "zone")) return self.parseZone(&tokens);
         if (std.mem.eql(u8, first, "blocklist")) return self.parseBlocklist(&tokens);
+        if (std.mem.eql(u8, first, "allow-update")) return self.parseAllowUpdate(&tokens);
         if (std.mem.eql(u8, first, "tsig-key-file")) return self.parseTsigKeyFile(&tokens);
         if (std.mem.eql(u8, first, "dnssec-key-file")) return self.parseDnssecKeyFile(&tokens);
         if (std.mem.eql(u8, first, "dnssec-ksk-file")) return self.parseDnssecKskFile(&tokens);
@@ -523,6 +551,7 @@ pub const Config = struct {
         if (std.mem.eql(u8, first, "forwarder-deny-port")) return self.parseForwarderDenyPort(&tokens);
         if (std.mem.eql(u8, first, "client-subnet-max-prefix")) return self.parseClientSubnetMaxPrefix(&tokens);
         if (std.mem.eql(u8, first, "dnssec-chain")) return self.parseChain(&tokens);
+        if (std.mem.eql(u8, first, "catalog-zone")) return self.parseCatalogZone(&tokens);
         if (std.mem.eql(u8, first, "tcp-max-connections-per-source")) return self.parseTcpMaxConnectionsPerSource(&tokens);
         if (std.mem.eql(u8, first, "tcp-max-connection-duration")) return self.parseTcpMaxConnectionDuration(&tokens);
         if (std.mem.eql(u8, first, "tcp-idle-timeout")) return self.parseTcpIdleTimeout(&tokens);
@@ -583,6 +612,26 @@ pub const Config = struct {
         try zone.file.set(tokens.next() orelse return Error.BadDirective);
         try requireNoTrailingTokens(tokens);
         try self.zones.append(zone);
+    }
+
+    fn parseCatalogZone(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        if (self.has_catalog_zone) return Error.BadDirective;
+        var apex = Text{};
+        try apex.set(tokens.next() orelse return Error.BadDirective);
+        try requireNoTrailingTokens(tokens);
+        self.catalog_zone = apex;
+        self.has_catalog_zone = true;
+    }
+
+    fn parseAllowUpdate(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        var entry = AllowUpdate{};
+        try entry.apex.set(tokens.next() orelse return Error.BadDirective);
+        try entry.key.set(tokens.next() orelse return Error.BadDirective);
+        try requireNoTrailingTokens(tokens);
+        for (self.allow_updates.items[0..self.allow_updates.len]) |existing| {
+            if (std.ascii.eqlIgnoreCase(existing.apexText(), entry.apexText())) return Error.BadDirective;
+        }
+        try self.allow_updates.append(entry);
     }
 
     fn parseBlocklist(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
@@ -880,6 +929,27 @@ pub const Config = struct {
     }
 };
 
+test "allow-update names a zone and its key" {
+    const config = try Config.parse(
+        \\zone example.com. primary zones/example.zone
+        \\allow-update example.com. update-key.
+        \\
+    );
+    try std.testing.expectEqual(@as(usize, 1), config.allow_updates.len);
+    try std.testing.expectEqualStrings("example.com.", config.allow_updates.items[0].apexText());
+    try std.testing.expectEqualStrings("update-key.", config.allow_updates.items[0].keyText());
+}
+
+test "allow-update rejects a duplicate apex and a missing key" {
+    try std.testing.expectError(Error.BadDirective, Config.parse(
+        \\allow-update example.com. key.
+        \\allow-update example.com. other.
+        \\
+    ));
+    try std.testing.expectError(Error.BadDirective, Config.parse("allow-update example.com."));
+    try std.testing.expectError(Error.BadDirective, Config.parse("allow-update example.com. key. extra"));
+}
+
 fn requireNoTrailingTokens(tokens: *std.mem.TokenIterator(u8, .any)) Error!void {
     if (tokens.next() != null) return Error.BadDirective;
 }
@@ -970,6 +1040,16 @@ test "config parser rejects unsupported zone kinds and trailing tokens" {
     try std.testing.expectError(error.BadDirective, Config.parse("listen dns udp 127.0.0.1:1053 extra\n"));
     try std.testing.expectError(error.BadDirective, Config.parse("zone home.arpa primary /etc/zimdns/zones/home.arpa.zone extra\n"));
     try std.testing.expectError(error.BadDirective, Config.parse("blocklist file /etc/zimdns/blocklists/ads.txt extra\n"));
+}
+
+test "catalog-zone names one catalog apex" {
+    const config = try Config.parse("catalog-zone catalog.example.\n");
+    try std.testing.expectEqualStrings("catalog.example.", config.catalogZoneText().?);
+    const plain = try Config.parse("zone one.example primary one.zone\n");
+    try std.testing.expect(plain.catalogZoneText() == null);
+    try std.testing.expectError(error.BadDirective, Config.parse("catalog-zone\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("catalog-zone a.example. extra\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("catalog-zone a.example.\ncatalog-zone b.example.\n"));
 }
 
 test "config parser requires bracketed IPv6 endpoints and one cookie policy" {

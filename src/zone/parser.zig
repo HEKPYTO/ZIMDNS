@@ -419,6 +419,13 @@ pub fn parseRDataPreservingCase(rrtype: RecordType, text: []const u8) Error!dns_
 }
 
 fn parseRDataWithCase(rrtype: RecordType, text: []const u8, fold_case: bool) Error!dns_rdata.RData {
+    // RFC 3597 section 5: the generic form is accepted for every type, not
+    // only the ones with no presentation form, so an update or an operator can
+    // write any RDATA as wire octets.
+    if (parseDnssecGeneric(text)) |generic| {
+        const bytes = generic.bytes();
+        return dns_rdata.RData.parse(rrtype, bytes, 0, bytes.len) catch Error.BadRecord;
+    }
     if (rrtype.eql(.A)) return .{ .A = try parseIpv4(text) };
     if (rrtype.eql(.AAAA)) return .{ .AAAA = try parseIpv6(text) };
     if (rrtype.eql(.NS)) return .{ .NS = try parseRdataName(text, fold_case) };
@@ -1623,6 +1630,11 @@ fn parseSoa(text: []const u8, fold_case: bool) Error!dns_rdata.Soa {
 }
 
 fn normalizeRData(allocator: std.mem.Allocator, rrtype: RecordType, origin: []const u8, text: []const u8) ![]const u8 {
+    // RFC 3597 section 5: the generic form carries wire octets, so there is no
+    // presentation field to expand. Every type accepts it (see
+    // parseRDataWithCase), and the RDATA is validated there.
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len >= 2 and trimmed[0] == '\\' and trimmed[1] == '#') return ZoneFile.copyText(allocator, text);
     if (rrtype.eql(.NAPTR)) return normalizeNaptrRData(allocator, origin, text);
     const minimum_tokens: usize = if (rrtype.eql(.MX)) 2 else if (rrtype.eql(.RT)) 2 else if (rrtype.eql(.RP)) 2 else if (rrtype.eql(.AFSDB)) 2 else if (rrtype.eql(.SRV)) 4 else if (rrtype.eql(.SOA)) 2 else if (rrtype.eql(.SVCB) or rrtype.eql(.HTTPS)) 2 else if (rrtype.eql(.NS) or rrtype.eql(.CNAME) or rrtype.eql(.DNAME) or rrtype.eql(.PTR)) 1 else 0;
     if (minimum_tokens == 0) return ZoneFile.copyText(allocator, text);

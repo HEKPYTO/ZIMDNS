@@ -44,16 +44,21 @@ const EcdsaP256Sha256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 const EcdsaP384Sha384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
 const Ed25519 = std.crypto.sign.Ed25519;
 
-/// The signing algorithms this build carries. RSA (IANA algorithms 5, 7, 8,
-/// 10) and Ed448 (RFC 8080 algorithm 16) are absent: the standard library has
-/// no primitive for either, and adding one is out of scope.
+/// The signing algorithms this build carries. RFC 5702's RSA/SHA-256 (8) and
+/// RSA/SHA-512 (10) are here; RSA/SHA-1 (5) and RSA/SHA-1-NSEC3 (7) are not,
+/// because RFC 8624 section 3.1 says a signer MUST NOT use them. Ed448 (RFC
+/// 8080 algorithm 16) is absent: the standard library has no primitive for it.
 pub const Algorithm = enum(u8) {
+    rsa_sha256 = 8,
+    rsa_sha512 = 10,
     ecdsa_p256_sha256 = 13,
     ecdsa_p384_sha384 = 14,
     ed25519 = 15,
 
     pub fn mnemonic(self: Algorithm) []const u8 {
         return switch (self) {
+            .rsa_sha256 => "RSASHA256",
+            .rsa_sha512 => "RSASHA512",
             .ecdsa_p256_sha256 => "ECDSAP256SHA256",
             .ecdsa_p384_sha384 => "ECDSAP384SHA384",
             .ed25519 => "ED25519",
@@ -94,7 +99,35 @@ const dnskey_protocol: u8 = 3;
 /// second one.
 const max_rdata_len = dns_rdata.max_unknown_len;
 
+/// An RSA private key, big-endian and unnormalized: it is the DNSSEC key,
+/// copied by value into `Material` and wiped by `Key.deinit`.
+pub const max_rsa_modulus_bytes = 512;
+pub const max_rsa_exponent_bytes = 8;
+
+pub const RsaKey = struct {
+    modulus: [max_rsa_modulus_bytes]u8 = undefined,
+    exponent: [max_rsa_exponent_bytes]u8 = undefined,
+    private_exponent: [max_rsa_modulus_bytes]u8 = undefined,
+    modulus_len: u16 = 0,
+    exponent_len: u8 = 0,
+    private_len: u16 = 0,
+
+    pub fn modulusBytes(self: *const RsaKey) []const u8 {
+        return self.modulus[0..self.modulus_len];
+    }
+
+    pub fn exponentBytes(self: *const RsaKey) []const u8 {
+        return self.exponent[0..self.exponent_len];
+    }
+
+    pub fn privateBytes(self: *const RsaKey) []const u8 {
+        return self.private_exponent[0..self.private_len];
+    }
+};
+
 pub const Material = union(Algorithm) {
+    rsa_sha256: RsaKey,
+    rsa_sha512: RsaKey,
     ecdsa_p256_sha256: EcdsaP256Sha256.KeyPair,
     ecdsa_p384_sha384: EcdsaP384Sha384.KeyPair,
     ed25519: Ed25519.KeyPair,
@@ -199,6 +232,12 @@ pub const Ksk = struct {
 /// the protocol, and the algorithm (RFC 4034 section 5.1.1).
 fn publicKeyBytes(material: Material, buffer: []u8) []const u8 {
     switch (material) {
+        .rsa_sha256, .rsa_sha512 => |key| {
+            // RFC 3110 section 2: a one-octet exponent length, or a zero
+            // octet and a two-octet length when the exponent is 256 octets or
+            // longer, then the exponent and the modulus.
+            return rsaPublicKeyBytes(key, buffer);
+        },
         .ecdsa_p256_sha256 => |key_pair| {
             const sec1 = EcdsaP256Sha256.PublicKey.toUncompressedSec1(key_pair.public_key);
             @memcpy(buffer[0 .. sec1.len - 1], sec1[1..]);
@@ -236,6 +275,10 @@ fn dnskeyRdataOf(material: Material, allocator: std.mem.Allocator, flags: u16) E
     buffer[3] = @backingInt(material);
     var len: usize = 4;
     switch (material) {
+        .rsa_sha256, .rsa_sha512 => |key| {
+            const public = rsaPublicKeyBytes(key, buffer[4..]);
+            len += public.len;
+        },
         .ecdsa_p256_sha256 => |key_pair| {
             const sec1 = EcdsaP256Sha256.PublicKey.toUncompressedSec1(key_pair.public_key);
             @memcpy(buffer[len..][0 .. sec1.len - 1], sec1[1..]);
@@ -293,6 +336,8 @@ fn dsRdataOf(
 /// Signs with one key's material.
 fn signMaterial(material: Material, message: []const u8, out: []u8) Error![]const u8 {
     switch (material) {
+        .rsa_sha256 => |key| return rsaPkcs1Sign(key, message, out, std.crypto.hash.sha2.Sha256),
+        .rsa_sha512 => |key| return rsaPkcs1Sign(key, message, out, std.crypto.hash.sha2.Sha512),
         .ecdsa_p256_sha256 => |key_pair| {
             const bytes = (try signEcdsa(EcdsaP256Sha256, key_pair, message)).toBytes();
             @memcpy(out[0..bytes.len], &bytes);
@@ -324,6 +369,127 @@ fn signEcdsa(
     return key_pair.sign(message, null) catch Error.SigningFailed;
 }
 
+/// RFC 3110 section 2: the DNSKEY public key of an RSA key.
+fn rsaPublicKeyBytes(key: RsaKey, buffer: []u8) []const u8 {
+    const exponent = key.exponentBytes();
+    const modulus = key.modulusBytes();
+    var len: usize = 0;
+    if (exponent.len < 256) {
+        buffer[0] = @intCast(exponent.len);
+        len = 1;
+    } else {
+        buffer[0] = 0;
+        std.mem.writeInt(u16, buffer[1..3], @intCast(exponent.len), .big);
+        len = 3;
+    }
+    @memcpy(buffer[len..][0..exponent.len], exponent);
+    len += exponent.len;
+    @memcpy(buffer[len..][0..modulus.len], modulus);
+    len += modulus.len;
+    return buffer[0..len];
+}
+
+/// RFC 8017 section 9.2, RSASSA-PKCS1-v1_5 with the DigestInfo the DNS
+/// algorithm names (RFC 5702 section 3): EM = 0x00 || 0x01 || PS || 0x00 || T,
+/// and the signature is EM^d mod n, encoded in k octets.
+fn rsaPkcs1Sign(key: RsaKey, message: []const u8, out: []u8, comptime Hash: type) Error![]const u8 {
+    const k: usize = key.modulus_len;
+    if (k < 64 or k > max_rsa_modulus_bytes or out.len < k) return Error.SigningFailed;
+    const prefix = digestInfoPrefix(Hash);
+    const t_len = prefix.len + Hash.digest_length;
+    if (k < t_len + 11) return Error.SigningFailed;
+    var em: [max_rsa_modulus_bytes]u8 = @splat(0);
+    em[0] = 0x00;
+    em[1] = 0x01;
+    const padding = k - t_len - 3;
+    @memset(em[2..][0..padding], 0xff);
+    em[2 + padding] = 0x00;
+    var digest: [Hash.digest_length]u8 = undefined;
+    Hash.hash(message, &digest, .{});
+    @memcpy(em[3 + padding ..][0..prefix.len], prefix);
+    @memcpy(em[3 + padding + prefix.len ..][0..digest.len], &digest);
+
+    const Modulus = std.crypto.ff.Modulus(max_rsa_modulus_bytes * 8);
+    const modulus = Modulus.fromBytes(key.modulusBytes(), .big) catch return Error.SigningFailed;
+    const base = Modulus.Fe.fromBytes(modulus, em[0..k], .big) catch return Error.SigningFailed;
+    // The exponent is the private one, so the constant-time path is required.
+    const signature = modulus.powWithEncodedExponent(base, key.privateBytes(), .big) catch return Error.SigningFailed;
+    signature.toBytes(out[0..k], .big) catch return Error.SigningFailed;
+    return out[0..k];
+}
+
+fn digestInfoPrefix(comptime Hash: type) []const u8 {
+    return switch (Hash) {
+        std.crypto.hash.sha2.Sha256 => &[_]u8{ 0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20 },
+        std.crypto.hash.sha2.Sha512 => &[_]u8{ 0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03, 0x05, 0x00, 0x04, 0x40 },
+        else => @compileError("no PKCS#1 DigestInfo for this hash"),
+    };
+}
+
+/// One DER element: tag and value, with the definite length forms a
+/// PKCS#1 RSAPrivateKey uses (RFC 8017 A.1.2).
+const DerElement = struct {
+    tag: u8,
+    value: []const u8,
+};
+
+fn derElement(bytes: []const u8, offset: *usize) Error!DerElement {
+    if (offset.* + 2 > bytes.len) return Error.BadKeyFile;
+    const tag = bytes[offset.*];
+    offset.* += 1;
+    var len: usize = bytes[offset.*];
+    offset.* += 1;
+    if (len & 0x80 != 0) {
+        const count = len & 0x7f;
+        if (count == 0 or count > 2 or offset.* + count > bytes.len) return Error.BadKeyFile;
+        len = 0;
+        for (bytes[offset.*..][0..count]) |byte| len = (len << 8) | byte;
+        offset.* += count;
+    }
+    if (offset.* + len > bytes.len) return Error.BadKeyFile;
+    const value = bytes[offset.*..][0..len];
+    offset.* += len;
+    return .{ .tag = tag, .value = value };
+}
+
+fn stripLeadingZero(bytes: []const u8) []const u8 {
+    var index: usize = 0;
+    while (index + 1 < bytes.len and bytes[index] == 0) index += 1;
+    return bytes[index..];
+}
+
+/// RFC 8017 A.1.2: the modulus, the public exponent, and the private exponent
+/// of a PKCS#1 RSAPrivateKey. The primes are not needed for a single
+/// exponentiation and are skipped.
+fn rsaKeyFromDer(der: []const u8) Error!RsaKey {
+    var offset: usize = 0;
+    const sequence = try derElement(der, &offset);
+    if (sequence.tag != 0x30) return Error.BadKeyFile;
+    var inner: usize = 0;
+    _ = try derElement(sequence.value, &inner); // version
+    const modulus_element = try derElement(sequence.value, &inner);
+    const exponent_element = try derElement(sequence.value, &inner);
+    const private_element = try derElement(sequence.value, &inner);
+    if (modulus_element.tag != 0x02 or exponent_element.tag != 0x02 or private_element.tag != 0x02) {
+        return Error.BadKeyFile;
+    }
+    const modulus = stripLeadingZero(modulus_element.value);
+    const exponent = stripLeadingZero(exponent_element.value);
+    const private_exponent = stripLeadingZero(private_element.value);
+    var key = RsaKey{};
+    if (modulus.len > key.modulus.len or exponent.len > key.exponent.len or private_exponent.len > key.private_exponent.len) {
+        return Error.BadKeyFile;
+    }
+    if (modulus.len == 0 or exponent.len == 0 or private_exponent.len == 0) return Error.BadKeyFile;
+    @memcpy(key.modulus[0..modulus.len], modulus);
+    @memcpy(key.exponent[0..exponent.len], exponent);
+    @memcpy(key.private_exponent[0..private_exponent.len], private_exponent);
+    key.modulus_len = @intCast(modulus.len);
+    key.exponent_len = @intCast(exponent.len);
+    key.private_len = @intCast(private_exponent.len);
+    return key;
+}
+
 // ------------------------------------------------------------------ key file
 
 /// Reads the project key file: one whitespace-separated `<algorithm> <secret>`
@@ -348,7 +514,7 @@ pub fn parseKey(text: []const u8) Error!Key {
 }
 
 fn keyFromBase64(algorithm_text: []const u8, secret_text: []const u8) Error!Key {
-    var decoded: [128]u8 = undefined;
+    var decoded: [4096]u8 = undefined;
     const expected = std.base64.standard.Decoder.calcSizeForSlice(secret_text) catch return Error.BadSecret;
     if (expected > decoded.len) return Error.BadSecret;
     std.base64.standard.Decoder.decode(decoded[0..expected], secret_text) catch return Error.BadSecret;
@@ -365,6 +531,12 @@ fn keyFromBase64(algorithm_text: []const u8, secret_text: []const u8) Error!Key 
         const scalar: [EcdsaP384Sha384.SecretKey.encoded_length]u8 = decoded[0..EcdsaP384Sha384.SecretKey.encoded_length].*;
         const secret_key = EcdsaP384Sha384.SecretKey.fromBytes(scalar) catch return Error.BadSecret;
         return .{ .material = .{ .ecdsa_p384_sha384 = EcdsaP384Sha384.KeyPair.fromSecretKey(secret_key) catch return Error.BadSecret } };
+    }
+    if (std.ascii.eqlIgnoreCase(algorithm_text, "rsasha256")) {
+        return .{ .material = .{ .rsa_sha256 = try rsaKeyFromDer(decoded[0..expected]) } };
+    }
+    if (std.ascii.eqlIgnoreCase(algorithm_text, "rsasha512")) {
+        return .{ .material = .{ .rsa_sha512 = try rsaKeyFromDer(decoded[0..expected]) } };
     }
     if (std.ascii.eqlIgnoreCase(algorithm_text, "ed25519")) {
         if (expected != Ed25519.KeyPair.seed_length) return Error.BadSecret;
@@ -1473,6 +1645,167 @@ const rfc6605_p384_key = "ecdsap384sha384 WURgWHCcYIYUPWgeLmiPY2DJJk02vgrmTfitxg
 const rfc6605_p384_dnskey = "xKYaNhWdGOfJ+nPrL8/arkwf2EY3MDJ+SErKivBVSum1w/egsXvSADtNJhyem5RCOpgQ6K8X1DRSEkrbYQ+OB+v8/uX45NBwY8rp65F6Glur8I/mlVNgF6W/qTI37m40";
 const rfc6605_p384_ds = "72d7b62976ce06438e9c0bf319013cf801f09ecc84b8d7e9495f27e305c6a9b0563a9b5f4d288405c3008a946df983d6";
 const rfc6605_p384_key_tag: u16 = 10771;
+
+const rfc5702_zone =
+    \\$ORIGIN example.net.
+    \\$TTL 3600
+    \\@ IN SOA ns1.example.net. hostmaster.example.net. 1 3600 900 1209600 3600
+    \\@ IN NS ns1.example.net.
+    \\www IN A 192.0.2.91
+;
+
+/// RFC 5702 section 6.1: a 512-bit RSA/SHA-256 key (BIND private-key-format
+/// components) and the signature it produces over the example RRset.
+const rfc5702_sha256_modulus = "wVwaxrHF2CK64aYKRUibLiH30KpPuPBjel7E8ZydQW1HYWHfoGmidzC2RnhwCC293hCzw+TFR2nqn8OVSY5t2Q==";
+const rfc5702_sha256_private = "UR44xX6zB3eaeyvTRzmskHADrPCmPWnr8dxsNwiDGHzrMKLN+i/HAam+97HxIKVWNDH2ba9Mf1SA8xu9dcHZAQ==";
+const rfc5702_sha256_exponent = "AQAB";
+const rfc5702_sha256_dnskey = "AwEAAcFcGsaxxdgiuuGmCkVImy4h99CqT7jwY3pexPGcnUFtR2Fh36BponcwtkZ4cAgtvd4Qs8PkxUdp6p/DlUmObdk=";
+const rfc5702_sha256_key_tag: u16 = 9033;
+const rfc5702_sha256_signature = "kRCOH6u7l0QGy9qpC9l1sLncJcOKFLJ7GhiUOibu4teYp5VE9RncriShZNz85mwlMgNEacFYK/lPtPiVYP4bwg==";
+const rfc5702_sha256_window = Options{ .inception = 946684800, .expiration = 1893456000 };
+
+/// RFC 5702 section 6.2: the 1024-bit RSA/SHA-512 example.
+const rfc5702_sha512_modulus = "0eg1M5b563zoq4k5ZEOnWmd2/BvpjzedJVdfIsDcMuuhE5SQ3pfQ7qmdaeMlC6Nf8DKGoUPGPXe06cP27/WRODtxXquSUytkO0kJDk8KX8PtA0+yBWwy7UnZDyCkynO00Uuk8HPVtZeMO1pHtlAGVnc8VjXZlNKdyit99waaE4s=";
+const rfc5702_sha512_private = "rFS1IPbJllFFgFc33B5DDlC1egO8e81P4fFadODbp56V7sphKa6AZQCx8NYAew6VXFFPAKTw41QdHnK5kIYOwxvfFDjDcUGza88qbjyrDPSJenkeZbISMUSSqy7AMFzEolkk6WSn6k3thUVRgSlqDoOV3SEIAsrB043XzGrKIVE=";
+const rfc5702_sha512_dnskey = "AwEAAdHoNTOW+et86KuJOWRDp1pndvwb6Y83nSVXXyLA3DLroROUkN6X0O6pnWnjJQujX/AyhqFDxj13tOnD9u/1kTg7cV6rklMrZDtJCQ5PCl/D7QNPsgVsMu1J2Q8gpMpztNFLpPBz1bWXjDtaR7ZQBlZ3PFY12ZTSncorffcGmhOL";
+const rfc5702_sha512_key_tag: u16 = 3740;
+const rfc5702_sha512_signature = "tsb4wnjRUDnB1BUi+t6TMTXThjVnG+eCkWqjvvjhzQL1d0YRoOe0CbxrVDYd0xDtsuJRaeUw1ep94PzEWzr0iGYgZBWm/zpq+9fOuagYJRfDqfReKBzMweOLDiNa8iP5g9vMhpuv6OPlvpXwm9Sa9ZXIbNl1MBGk0fthPgxdDLw=";
+
+/// A PKCS#1 RSAPrivateKey built from the RFC's components, in the key file
+/// form the signer reads: `<algorithm> <base64 DER>`.
+fn rsaKeyFile(
+    allocator: std.mem.Allocator,
+    algorithm: []const u8,
+    modulus_b64: []const u8,
+    exponent_b64: []const u8,
+    private_b64: []const u8,
+) ![]u8 {
+    const modulus = try decodeBase64Dynamic(allocator, modulus_b64);
+    const exponent = try decodeBase64Dynamic(allocator, exponent_b64);
+    const private = try decodeBase64Dynamic(allocator, private_b64);
+    const version = try derInteger(allocator, &.{0});
+    const n = try derInteger(allocator, modulus);
+    const e = try derInteger(allocator, exponent);
+    const d = try derInteger(allocator, private);
+    const body = try std.mem.concat(allocator, u8, &.{ version, n, e, d });
+    var sequence = std.ArrayList(u8).empty;
+    try sequence.append(allocator, 0x30);
+    if (body.len < 128) {
+        try sequence.append(allocator, @intCast(body.len));
+    } else if (body.len < 256) {
+        try sequence.append(allocator, 0x81);
+        try sequence.append(allocator, @intCast(body.len));
+    } else {
+        try sequence.append(allocator, 0x82);
+        try sequence.append(allocator, @intCast(body.len >> 8));
+        try sequence.append(allocator, @intCast(body.len & 0xff));
+    }
+    try sequence.appendSlice(allocator, body);
+    const encoded = try encodeBase64(allocator, sequence.items);
+    return std.fmt.allocPrint(allocator, "{s} {s}\n", .{ algorithm, encoded });
+}
+
+fn decodeBase64Dynamic(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    const out = try allocator.alloc(u8, try std.base64.standard.Decoder.calcSizeForSlice(text));
+    try std.base64.standard.Decoder.decode(out, text);
+    return out;
+}
+
+fn derInteger(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    const pad: usize = if (bytes.len == 0 or (bytes[0] & 0x80) != 0) 1 else 0;
+    const value_len = pad + bytes.len;
+    const header_len: usize = if (value_len < 128) 2 else 3;
+    const out = try allocator.alloc(u8, header_len + value_len);
+    out[0] = 0x02;
+    var offset: usize = 1;
+    if (value_len < 128) {
+        out[1] = @intCast(value_len);
+        offset = 2;
+    } else {
+        out[1] = 0x81;
+        out[2] = @intCast(value_len);
+        offset = 3;
+    }
+    if (pad == 1) {
+        out[offset] = 0;
+        offset += 1;
+    }
+    @memcpy(out[offset..], bytes);
+    return out;
+}
+
+test "RFC 5702 section 6.1: the RSA/SHA-256 DNSKEY, key tag, and signature match the published vector" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const key_file = try rsaKeyFile(allocator, "RSASHA256", rfc5702_sha256_modulus, rfc5702_sha256_exponent, rfc5702_sha256_private);
+    var key = try parseKey(key_file);
+    defer key.deinit();
+    try std.testing.expectEqual(Algorithm.rsa_sha256, key.algorithm());
+
+    // The RFC's example key carries flags 256 (no Secure Entry Point bit), so
+    // the vector is compared against that form of the DNSKEY.
+    const dnskey = try key.dnskeyRdataWithFlags(allocator, 0x0100);
+    try std.testing.expectEqual(@as(u8, 8), dnskey[3]);
+    try std.testing.expectEqualStrings(rfc5702_sha256_dnskey, try encodeBase64(allocator, dnskey[4..]));
+    try std.testing.expectEqual(rfc5702_sha256_key_tag, dns_dnssec.keyTag(dnskey));
+
+    const data = try signedData(allocator, .{
+        .owner_wire = (try Name.fromText("www.example.net.")).asWire(),
+        .rrtype = RecordType.A.code(),
+        .ttl = 3600,
+        .rdata = try oneRdata(allocator, &.{ 192, 0, 2, 91 }),
+    }, .rsa_sha256, rfc5702_sha256_key_tag, (try Name.fromText("example.net.")).asWire(), rfc5702_sha256_window);
+
+    var signature_buffer: [512]u8 = undefined;
+    const signature = try key.sign(data.bytes, &signature_buffer);
+    try std.testing.expectEqualStrings(rfc5702_sha256_signature, try encodeBase64(allocator, signature));
+}
+
+test "RFC 5702 section 6.2: the RSA/SHA-512 DNSKEY, key tag, and signature match the published vector" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const key_file = try rsaKeyFile(allocator, "RSASHA512", rfc5702_sha512_modulus, rfc5702_sha256_exponent, rfc5702_sha512_private);
+    var key = try parseKey(key_file);
+    defer key.deinit();
+    try std.testing.expectEqual(Algorithm.rsa_sha512, key.algorithm());
+
+    const dnskey = try key.dnskeyRdataWithFlags(allocator, 0x0100);
+    try std.testing.expectEqual(@as(u8, 10), dnskey[3]);
+    try std.testing.expectEqualStrings(rfc5702_sha512_dnskey, try encodeBase64(allocator, dnskey[4..]));
+    try std.testing.expectEqual(rfc5702_sha512_key_tag, dns_dnssec.keyTag(dnskey));
+
+    const data = try signedData(allocator, .{
+        .owner_wire = (try Name.fromText("www.example.net.")).asWire(),
+        .rrtype = RecordType.A.code(),
+        .ttl = 3600,
+        .rdata = try oneRdata(allocator, &.{ 192, 0, 2, 91 }),
+    }, .rsa_sha512, rfc5702_sha512_key_tag, (try Name.fromText("example.net.")).asWire(), rfc5702_sha256_window);
+
+    var signature_buffer: [512]u8 = undefined;
+    const signature = try key.sign(data.bytes, &signature_buffer);
+    try std.testing.expectEqualStrings(rfc5702_sha512_signature, try encodeBase64(allocator, signature));
+}
+
+test "a zone signed with an RSA/SHA-256 key validates against its own DNSKEY" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const key_file = try rsaKeyFile(allocator, "RSASHA256", rfc5702_sha256_modulus, rfc5702_sha256_exponent, rfc5702_sha256_private);
+    var key = try parseKey(key_file);
+    defer key.deinit();
+
+    var zone = try loadZone(rfc5702_zone);
+    defer zone.deinit();
+    try signZone(allocator, &zone, &key, rfc5702_sha256_window);
+
+    const dnskey = try publishedKey(allocator, &zone, 8);
+    try expectSignedBy(allocator, &zone, dnskey, dns_dnssec.keyTag(dnskey));
+}
 
 const rfc8080_zone =
     \\$ORIGIN example.com.

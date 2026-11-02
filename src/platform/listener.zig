@@ -4,7 +4,8 @@
 /// Errors: DNS failures are typed; socket read/write and bind failures propagate as I/O errors.
 const std = @import("std");
 const builtin = @import("builtin");
-const Runtime = @import("../auth/runtime.zig").Runtime;
+const auth_runtime = @import("../auth/runtime.zig");
+const Runtime = auth_runtime.Runtime;
 const metrics = @import("../metrics.zig");
 const response_mod = @import("../auth/response.zig");
 const config = @import("../config/parser.zig");
@@ -641,7 +642,7 @@ fn expectSignedUdpTruncation(include_edns: bool) !void {
     _ = try dns_tsig.verify(incoming.data, "01234567890123456789012345678901", request_final.tsig.macBytes());
 }
 
-test "TCP handler serves FIFO length-prefixed DNS queries on one stream" {
+test "TCP handler serves two length-prefixed DNS queries on one stream" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -683,21 +684,21 @@ test "TCP handler serves FIFO length-prefixed DNS queries on one stream" {
 
     var client_read_buffer: [512]u8 = undefined;
     var client_reader = client_stream.reader(io, &client_read_buffer);
-    const first_response_len_bytes = try client_reader.interface.takeArray(2);
-    const first_response_len = std.mem.readInt(u16, first_response_len_bytes, .big);
-    const first_response_bytes = try client_reader.interface.take(first_response_len);
-    const first_response = try @import("../dns/message.zig").Message.parse(arena.allocator(), first_response_bytes);
-    try std.testing.expect(first_response.header.qr);
-    try std.testing.expectEqual(@as(u16, 0x1234), first_response.header.id);
-    try std.testing.expectEqual(@as(u16, 1), first_response.header.answer_count);
-
-    const second_response_len_bytes = try client_reader.interface.takeArray(2);
-    const second_response_len = std.mem.readInt(u16, second_response_len_bytes, .big);
-    const second_response_bytes = try client_reader.interface.take(second_response_len);
-    const second_response = try @import("../dns/message.zig").Message.parse(arena.allocator(), second_response_bytes);
-    try std.testing.expect(second_response.header.qr);
-    try std.testing.expectEqual(@as(u16, 0x5678), second_response.header.id);
-    try std.testing.expectEqual(@as(u16, 1), second_response.header.answer_count);
+    // RFC 7766 section 7: each response is matched to its query by message
+    // ID, because the two answers may leave in completion order.
+    var seen_ids: [2]bool = @splat(false);
+    var frames: usize = 0;
+    while (frames < 2) : (frames += 1) {
+        const response_len_bytes = try client_reader.interface.takeArray(2);
+        const response_len = std.mem.readInt(u16, response_len_bytes, .big);
+        const response_bytes = try client_reader.interface.take(response_len);
+        const response = try @import("../dns/message.zig").Message.parse(arena.allocator(), response_bytes);
+        try std.testing.expect(response.header.qr);
+        try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+        const slot: usize = if (response.header.id == 0x1234) 0 else if (response.header.id == 0x5678) 1 else return error.UnexpectedResponseId;
+        try std.testing.expect(!seen_ids[slot]);
+        seen_ids[slot] = true;
+    }
 
     server_stream.close(io);
     server_stream_closed = true;
@@ -940,14 +941,23 @@ test "TCP connection cap serves sixteen frames and closes before the seventeenth
 
     var response_read_buffer: [1024]u8 = undefined;
     var response_reader = client_stream.reader(io, &response_read_buffer);
-    for (0..TCP_MAX_FRAMES_PER_CONNECTION) |index| {
+    // RFC 7766 section 7: responses leave in completion order, so each frame
+    // is matched to its query by message ID, and a duplicate or a stranger
+    // fails the test.
+    var seen: [TCP_MAX_FRAMES_PER_CONNECTION]bool = @splat(false);
+    for (0..TCP_MAX_FRAMES_PER_CONNECTION) |_| {
         const response_len_bytes = try response_reader.interface.takeArray(2);
         const response_len = std.mem.readInt(u16, response_len_bytes, .big);
         const response_bytes = try response_reader.interface.take(response_len);
         const response = try @import("../dns/message.zig").Message.parse(arena.allocator(), response_bytes);
-        try std.testing.expectEqual(@as(u16, @intCast(0x6000 + index)), response.header.id);
+        const id = response.header.id;
+        try std.testing.expect(id >= 0x6000 and id < 0x6000 + TCP_MAX_FRAMES_PER_CONNECTION);
+        const index = id - 0x6000;
+        try std.testing.expect(!seen[index]);
+        seen[index] = true;
         try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
     }
+    for (seen) |matched| try std.testing.expect(matched);
 
     server_stream.close(io);
     server_stream_closed = true;
@@ -1322,6 +1332,79 @@ test "a forwarding query over the inbound TCP path is answered with the upstream
     try std.testing.expectEqual(@as(usize, 1), upstream.requests);
 }
 
+test "RFC 7766 section 7: a pipelined answer is not held behind a slow forwarded one" {
+    var io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{
+        .concurrent_limit = .limited(TCP_MAX_CONNECTION_WORKERS),
+    });
+    defer io_backend.deinit();
+    const io = io_backend.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // A real loopback upstream that answers late, so the forwarded query is
+    // still pending when the authoritative one is answered.
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+    var upstream = ForwardingUpstream{ .io = io, .udp = &upstream_socket, .delay_ms = 400 };
+    const upstream_thread = try std.Thread.spawn(.{}, serveForwardingUpstream, .{&upstream});
+
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+    runtime.resolver = try resolver_mod.Resolver.init(std.testing.allocator, io, try forwarding_policy(upstream_socket.address, "127.0.0.0/8"));
+
+    var listen_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try std.Io.net.IpAddress.listen(&listen_addr, io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    var client_stream = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer client_stream.close(io);
+
+    var slow_query_buffer: [512]u8 = undefined;
+    const slow_query = try @import("../cli/query.zig").buildQueryPacket(&slow_query_buffer, 0x7201, "example.com.", .A, false);
+    var fast_query_buffer: [512]u8 = undefined;
+    const fast_query = try @import("../cli/query.zig").buildQueryPacket(&fast_query_buffer, 0x7202, "dns.home.arpa.", .A, false);
+    try @import("../cli/query.zig").sendTcpQuery(client_stream, io, slow_query);
+    try @import("../cli/query.zig").sendTcpQuery(client_stream, io, fast_query);
+
+    const server_stream = try server.accept(io);
+    const ServerRunner = struct {
+        stream: std.Io.net.Stream,
+        io: std.Io,
+        runtime: *Runtime,
+
+        fn run(self: @This()) void {
+            defer self.stream.close(self.io);
+            serveTcpStreamOnce(self.stream, self.io, self.runtime) catch {};
+        }
+    };
+    const server_thread = try std.Thread.spawn(.{}, ServerRunner.run, .{ServerRunner{
+        .stream = server_stream,
+        .io = io,
+        .runtime = &runtime,
+    }});
+
+    // Each frame lands in its own buffer: the parser keeps slices of the
+    // packet it was given.
+    var first_frame: [TCP_MAX_FRAME_SIZE]u8 = undefined;
+    var second_frame: [TCP_MAX_FRAME_SIZE]u8 = undefined;
+    const first_bytes = try readTcpFrameExact(client_stream.socket.handle, io, &first_frame, tcp_deadline.deadline(io, .{ .seconds = 2 }));
+    const second_bytes = try readTcpFrameExact(client_stream.socket.handle, io, &second_frame, tcp_deadline.deadline(io, .{ .seconds = 2 }));
+    const first = try dns_message.Message.parse(arena.allocator(), first_bytes);
+    const second = try dns_message.Message.parse(arena.allocator(), second_bytes);
+
+    try client_stream.shutdown(io, .send);
+    server_thread.join();
+    upstream_thread.join();
+
+    // The authoritative answer was prepared while the forwarded one waited,
+    // and it reaches the wire first.
+    try std.testing.expectEqual(@as(u16, 0x7202), first.header.id);
+    try std.testing.expectEqual(@as(u16, 0x7201), second.header.id);
+    try std.testing.expectEqual(@as(u16, 1), first.header.answer_count);
+    try std.testing.expectEqual(@as(u16, 1), second.header.answer_count);
+}
+
 test "the same forwarding query over UDP is answered the same way" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1490,6 +1573,9 @@ const ForwardingUpstream = struct {
     io: std.Io,
     udp: *const std.Io.net.Socket,
     requests: usize = 0,
+    /// How long the upstream waits before answering. A pipelining test makes
+    /// one forwarded query slower than an authoritative one.
+    delay_ms: u64 = 0,
 };
 
 const upstream_timeout: std.Io.Timeout = .{ .duration = .{
@@ -1506,6 +1592,7 @@ fn serveForwardingUpstream(args: *ForwardingUpstream) void {
     const query = dns_message.Message.parseQuery(arena.allocator(), incoming.data) catch return;
     var response_buffer: [512]u8 = undefined;
     const bytes = buildForwardingAnswer(&response_buffer, query, false) catch return;
+    if (args.delay_ms != 0) std.Io.sleep(args.io, .fromMilliseconds(@intCast(args.delay_ms)), .awake) catch {};
     args.udp.send(args.io, &incoming.from, bytes) catch return;
 }
 
@@ -1666,7 +1753,114 @@ fn buildSignedListenerQueryWithEdns(time_signed: u64, include_edns: bool) !Signe
     return .{ .bytes = packet, .len = writer.len() };
 }
 
+const TCP_MAX_INFLIGHT_PER_CONNECTION: usize = 4;
+
 const unix_tcp_deadlines = if (TCP_DEADLINES_SUPPORTED) struct {
+    /// One frame answered on its own task. The request bytes and the response
+    /// buffer live in one allocation; the prefix and payload are written under
+    /// the connection's write mutex, so frames never interleave.
+    const ResponseTask = struct {
+        io: std.Io,
+        runtime: *Runtime,
+        stream: std.Io.net.Stream,
+        client: std.Io.net.IpAddress,
+        counters: ?*metrics.Counters,
+        write_mutex: *std.Io.Mutex,
+        state: *ConnectionState,
+        buffer: []u8,
+        request_len: usize,
+        connection_deadline: ?std.Io.Clock.Timestamp,
+        timeout: TcpIoTimeout,
+    };
+
+    /// The first failure that ends the connection. The failing task shuts the
+    /// socket down so the reader stops waiting for frames that can no longer
+    /// be answered.
+    const ConnectionState = struct {
+        mutex: std.Io.Mutex = .init,
+        failure: ?anyerror = null,
+
+        fn fail(self: *ConnectionState, io: std.Io, err: anyerror, stream: std.Io.net.Stream) void {
+            self.mutex.lockUncancelable(io);
+            if (self.failure == null) self.failure = err;
+            self.mutex.unlock(io);
+            stream.shutdown(io, .both) catch {};
+        }
+
+        fn get(self: *ConnectionState, io: std.Io) ?anyerror {
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            return self.failure;
+        }
+    };
+
+    fn respondFrame(task: ResponseTask) void {
+        defer std.heap.page_allocator.free(task.buffer);
+        // This thread answers one frame and exits, so it frees the scratch
+        // buffers it retained instead of leaving them to a dead thread.
+        defer auth_runtime.releaseAnswerScratch();
+        const request = task.buffer[0..task.request_len];
+        const response_buffer = task.buffer[task.request_len..];
+        const response_bytes = task.runtime.answerFromTcp(request, response_buffer, &task.client, task.counters) catch |err| {
+            task.state.fail(task.io, err, task.stream);
+            return;
+        };
+        writeResponse(task, response_bytes) catch |err| task.state.fail(task.io, err, task.stream);
+    }
+
+    fn writeResponse(task: ResponseTask, response_bytes: []const u8) !void {
+        if (response_bytes.len > TCP_MAX_FRAME_SIZE) return Error.ResponseTooLarge;
+        // The deadline is taken now: a forwarded answer can arrive long after
+        // the frame was read.
+        const frame_timeout = frameTimeout(task.io, task.connection_deadline, task.timeout) orelse return error.Timeout;
+        const write_deadline = tcp_deadline.deadline(task.io, frame_timeout);
+        var prefix: [2]u8 = undefined;
+        std.mem.writeInt(u16, &prefix, @intCast(response_bytes.len), .big);
+        task.write_mutex.lockUncancelable(task.io);
+        defer task.write_mutex.unlock(task.io);
+        try tcp_deadline.writeExact(task.stream.socket.handle, task.io, &prefix, write_deadline);
+        try tcp_deadline.writeExact(task.stream.socket.handle, task.io, response_bytes, write_deadline);
+    }
+
+    /// Answers one frame on the connection's own thread, for the two cases
+    /// where a task cannot be used: no task slot and no allocation. The write
+    /// still takes the mutex, because earlier frames may be in flight.
+    fn serveFrameInline(
+        request: []const u8,
+        response_buffer: []u8,
+        stream: std.Io.net.Stream,
+        io: std.Io,
+        runtime: *Runtime,
+        counters: ?*metrics.Counters,
+        write_mutex: *std.Io.Mutex,
+        frame_timeout: TcpIoTimeout,
+    ) !void {
+        const response_bytes = try runtime.answerFromTcp(request, response_buffer, &stream.socket.address, counters);
+        if (response_bytes.len > TCP_MAX_FRAME_SIZE) return Error.ResponseTooLarge;
+        const write_deadline = tcp_deadline.deadline(io, frame_timeout);
+        var prefix: [2]u8 = undefined;
+        std.mem.writeInt(u16, &prefix, @intCast(response_bytes.len), .big);
+        write_mutex.lockUncancelable(io);
+        defer write_mutex.unlock(io);
+        try tcp_deadline.writeExact(stream.socket.handle, io, &prefix, write_deadline);
+        try tcp_deadline.writeExact(stream.socket.handle, io, response_bytes, write_deadline);
+    }
+
+    /// The answers prepared ahead of the reader. A response runs on its own
+    /// thread rather than the io's task pool: a connection worker blocks in a
+    /// socket read while it waits for the next frame, and a queued task that
+    /// needs the same pool would not run until that read ended.
+    const ResponseThreads = struct {
+        threads: [TCP_MAX_INFLIGHT_PER_CONNECTION]std.Thread = undefined,
+        len: usize = 0,
+
+        fn drain(self: *ResponseThreads, io: std.Io, state: *ConnectionState) ?anyerror {
+            for (self.threads[0..self.len]) |thread| thread.join();
+            self.len = 0;
+            return state.get(io);
+        }
+    };
+
     fn serve(stream: std.Io.net.Stream, io: std.Io, runtime: *Runtime, timeout: TcpIoTimeout, counters: ?*metrics.Counters) !void {
         tcp_deadline.setSocketTimeout(stream.socket.handle, timeout);
         // RFC 9210 section 4.2: the operator may bound the lifetime of one
@@ -1676,42 +1870,67 @@ const unix_tcp_deadlines = if (TCP_DEADLINES_SUPPORTED) struct {
         else
             null;
 
+        var write_mutex: std.Io.Mutex = .init;
+        var state = ConnectionState{};
+        var threads = ResponseThreads{};
+        // Every exit path joins the threads before the connection's buffers go
+        // out of scope.
+        defer _ = threads.drain(io, &state);
+
         var request_buffer: [TCP_MAX_FRAME_SIZE]u8 = undefined;
         var response_buffer: [TCP_MAX_FRAME_SIZE]u8 = undefined;
         var frame_count: usize = 0;
         while (frame_count < TCP_MAX_FRAMES_PER_CONNECTION) : (frame_count += 1) {
             // A connection that has outlived its duration ends here, whatever
             // the per-frame deadline says.
-            const frame_timeout = frameTimeout(io, connection_deadline, timeout) orelse return;
+            const frame_timeout = frameTimeout(io, connection_deadline, timeout) orelse break;
             const read_deadline = tcp_deadline.deadline(io, frame_timeout);
             const request = readFrame(stream.socket.handle, io, &request_buffer, read_deadline) catch |err| {
                 if (err == error.EndOfStream) {
                     if (frame_count == 0) return error.EndOfStream;
-                    return;
+                    break;
                 }
                 if (err == error.Truncated) return Error.BadTcpFrame;
                 return err;
             };
             if (transfer_mod.peekIsTransferRequest(request)) {
+                // A transfer is its own stream, so the answers prepared before
+                // it reach the wire before its first frame.
+                if (threads.drain(io, &state)) |failure| return failure;
                 try serveTransfer(request, stream, io, runtime, frame_timeout, counters);
                 continue;
             }
-            // RFC 9210 section 3: a query that arrived over TCP is answered
-            // the way the same query over UDP is answered, forwarding
-            // included, and the peer address is the client the policy sees.
-            // RFC 7828 section 3.3.2: only a TCP session is answered with
-            // the edns-tcp-keepalive option, so the transport names the
-            // entry point.
-            const client = &stream.socket.address;
-            const response_bytes = try runtime.answerFromTcp(request, &response_buffer, client, counters);
-            if (response_bytes.len > TCP_MAX_FRAME_SIZE) return Error.ResponseTooLarge;
-
-            var prefix: [2]u8 = undefined;
-            std.mem.writeInt(u16, &prefix, @intCast(response_bytes.len), .big);
-            const write_deadline = tcp_deadline.deadline(io, frame_timeout);
-            try tcp_deadline.writeExact(stream.socket.handle, io, &prefix, write_deadline);
-            try tcp_deadline.writeExact(stream.socket.handle, io, response_bytes, write_deadline);
+            if (threads.len == TCP_MAX_INFLIGHT_PER_CONNECTION) {
+                if (threads.drain(io, &state)) |failure| return failure;
+            }
+            // RFC 7766 section 7: responses are prepared in parallel and sent
+            // in completion order, so a pipelined client is not held behind a
+            // slow one.
+            const owned = std.heap.page_allocator.alloc(u8, request.len + TCP_MAX_FRAME_SIZE) catch {
+                try serveFrameInline(request, &response_buffer, stream, io, runtime, counters, &write_mutex, frame_timeout);
+                continue;
+            };
+            @memcpy(owned[0..request.len], request);
+            threads.threads[threads.len] = std.Thread.spawn(.{}, respondFrame, .{ResponseTask{
+                .io = io,
+                .runtime = runtime,
+                .stream = stream,
+                .client = stream.socket.address,
+                .counters = counters,
+                .write_mutex = &write_mutex,
+                .state = &state,
+                .buffer = owned,
+                .request_len = request.len,
+                .connection_deadline = connection_deadline,
+                .timeout = timeout,
+            }}) catch {
+                std.heap.page_allocator.free(owned);
+                try serveFrameInline(request, &response_buffer, stream, io, runtime, counters, &write_mutex, frame_timeout);
+                continue;
+            };
+            threads.len += 1;
         }
+        if (threads.drain(io, &state)) |failure| return failure;
     }
 
     fn serveTransfer(

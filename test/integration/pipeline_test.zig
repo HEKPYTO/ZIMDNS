@@ -1744,13 +1744,25 @@ test "concurrent TCP connections each answer every pipelined frame while workers
     defer closeStreams(&clients, io);
     defer closeStreams(&stalled, io);
 
-    var response_buffer: [512]u8 = undefined;
+    // RFC 7766 section 7: a server may send pipelined responses out of order,
+    // so the client matches each frame to its query by message ID and checks
+    // every expected answer arrives exactly once.
     for (&clients, 0..) |client, connection_index| {
-        for (0..listener.TCP_MAX_FRAMES_PER_CONNECTION) |frame_index| {
-            const query = try buildConcurrentQuery(&query_buffer, connection_index, frame_index);
-            const response = try cli_query.receiveTcpResponse(arena.allocator(), client.?, io, &response_buffer, query);
+        var seen: [listener.TCP_MAX_FRAMES_PER_CONNECTION]bool = @splat(false);
+        var read_buffer: [1024]u8 = undefined;
+        var client_reader = client.?.reader(io, &read_buffer);
+        const base: u16 = @intCast(0x5400 + connection_index * listener.TCP_MAX_FRAMES_PER_CONNECTION);
+        for (0..listener.TCP_MAX_FRAMES_PER_CONNECTION) |_| {
+            const frame = try arena.allocator().alloc(u8, 512);
+            const response = try receivePipelinedFrame(arena.allocator(), &client_reader.interface, frame);
+            try std.testing.expect(response.header.id >= base);
+            const frame_index = response.header.id - base;
+            try std.testing.expect(frame_index < listener.TCP_MAX_FRAMES_PER_CONNECTION);
+            try std.testing.expect(!seen[frame_index]);
+            seen[frame_index] = true;
             try expectAddress(response, concurrentQueryFixture(connection_index, frame_index).address);
         }
+        for (seen) |matched| try std.testing.expect(matched);
     }
 
     closeStreams(&stalled, io);
@@ -2599,6 +2611,15 @@ fn closeStreams(streams: []?std.Io.net.Stream, io: std.Io) void {
 }
 
 const ConcurrentQueryFixture = struct { name: []const u8, address: [4]u8 };
+
+/// Reads one length-prefixed response frame from a pipelined connection.
+fn receivePipelinedFrame(allocator: std.mem.Allocator, reader: *std.Io.Reader, buffer: []u8) !dns_message.Message {
+    const length_bytes = try reader.takeArray(2);
+    const length = std.mem.readInt(u16, length_bytes, .big);
+    if (length == 0 or length > buffer.len) return error.BadResponse;
+    try reader.readSliceAll(buffer[0..length]);
+    return dns_message.Message.parse(allocator, buffer[0..length]);
+}
 
 /// Alternates qnames so a response swapped between connections or frames
 /// carries the wrong answer, not just a wrong id.

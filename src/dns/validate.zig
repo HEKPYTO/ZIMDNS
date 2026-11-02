@@ -4,7 +4,8 @@
 /// negative answer is checked against the RFC 6840 sections 4.1, 4.3 and 4.4
 /// spoof rules and the RFC 5155 section 8 NSEC3 proofs.
 /// What this module does: DS and DNSKEY anchors, RFC 4034 section 6 canonical
-/// signed-data assembly, ECDSA P-256/P-384 and Ed25519 verification, the
+/// signed-data assembly, RSA/SHA-256, RSA/SHA-512, ECDSA P-256/P-384, and
+/// Ed25519 verification, the
 /// RFC 5011 section 3 REVOKE bit that keeps a revoked key out of the trusted
 /// set, NSEC NXDOMAIN and NODATA proofs, NSEC3 closest-encloser and opt-out
 /// proofs, and the secure/insecure/bogus outcome with an RFC 8914 INFO-CODE
@@ -17,8 +18,9 @@
 /// configured anchor (RFC 8976 section 4 step 3).
 /// What this module does NOT do: iterative resolution, chasing a delegation
 /// chain across several zones, the RFC 5011 anchor rollover beyond the REVOKE
-/// bit, NSEC3 generation, and RSA or Ed448, for which the standard library
-/// carries no primitive.
+/// bit, NSEC3 generation, RSA/SHA-1 (5 and 7, which RFC 8624 section 3.1
+/// says a validator SHOULD NOT use), and Ed448, for which the standard
+/// library carries no primitive.
 /// Ownership: `validate` runs on one arena and frees it before returning.
 /// `Anchors` owns its parsed RDATA until `deinit`.
 /// Errors: a malformed anchor file or opaque RDATA is a typed error. A failed
@@ -482,13 +484,16 @@ fn verifyEd25519(key: []const u8, signature: []const u8, data: []const u8) Error
     Ed25519.Signature.fromBytes(raw).verifyStrict(data, public_key) catch return Error.SignatureInvalid;
 }
 
-/// The DNSSEC algorithms this build verifies: 13 and 14 (RFC 6605) and 15
-/// (RFC 8080). A DNSKEY RRset of any other algorithm is the case RFC 8914
-/// section 4.2 names; a DS RRset of them is the case RFC 4035 section 5.2
-/// names. Either way the zone has no supported authentication path.
+/// The DNSSEC algorithms this build verifies: 8 and 10 (RFC 5702), 13 and 14
+/// (RFC 6605), and 15 (RFC 8080). A DNSKEY RRset of any other algorithm is
+/// the case RFC 8914 section 4.2 names; a DS RRset of them is the case
+/// RFC 4035 section 5.2 names. Either way the zone has no supported
+/// authentication path. RSA/SHA-1 (5 and 7) is not here: RFC 8624 section 3.1
+/// says a signer MUST NOT use it and a validator SHOULD NOT, and this build
+/// treats it as unsupported rather than insecure-by-silence.
 fn algorithmSupported(number: u8) bool {
     return switch (number) {
-        13, 14, 15 => true,
+        8, 10, 13, 14, 15 => true,
         else => false,
     };
 }
@@ -540,6 +545,8 @@ fn verifyWithKey(dnskey_rdata: []const u8, rrsig: Rrsig, data: []const u8) Error
     if (dnskey_rdata[3] != rrsig.algorithm) return Error.KeyMismatch;
     const key = dnskey_rdata[4..];
     switch (rrsig.algorithm) {
+        8 => try verifyRsa(key, rrsig.signature, data, std.crypto.hash.sha2.Sha256),
+        10 => try verifyRsa(key, rrsig.signature, data, std.crypto.hash.sha2.Sha512),
         13 => try verifyEcdsa(EcdsaP256Sha256, key, rrsig.signature, data),
         14 => try verifyEcdsa(EcdsaP384Sha384, key, rrsig.signature, data),
         15 => try verifyEd25519(key, rrsig.signature, data),
@@ -547,6 +554,47 @@ fn verifyWithKey(dnskey_rdata: []const u8, rrsig: Rrsig, data: []const u8) Error
         // no authentication path, which the caller reports as insecure.
         else => return Error.UnsupportedAlgorithm,
     }
+}
+
+/// RFC 3110 section 2: the DNSKEY public key of an RSA key, one-octet or
+/// three-octet exponent length, exponent, modulus.
+fn rsaPublicKeyParts(key: []const u8) ?struct { exponent: []const u8, modulus: []const u8 } {
+    if (key.len < 3) return null;
+    var exponent_len: usize = key[0];
+    var offset: usize = 1;
+    if (exponent_len == 0) {
+        exponent_len = std.mem.readInt(u16, key[1..3], .big);
+        offset = 3;
+    }
+    if (exponent_len == 0 or offset + exponent_len >= key.len) return null;
+    return .{ .exponent = key[offset..][0..exponent_len], .modulus = key[offset + exponent_len ..] };
+}
+
+/// RFC 5702 section 3: RSASSA-PKCS1-v1_5 over the RRSIG RDATA and the
+/// canonical RRset, with the hash the algorithm names.
+fn verifyRsa(key: []const u8, signature: []const u8, data: []const u8, comptime Hash: type) Error!void {
+    const parts = rsaPublicKeyParts(key) orelse return Error.MalformedDnskey;
+    const modulus_len = parts.modulus.len;
+    if (modulus_len < 64 or modulus_len > 512) return Error.UnsupportedAlgorithm;
+    if (signature.len != modulus_len) return Error.SignatureInvalid;
+    const public_key = std.crypto.Certificate.rsa.PublicKey.fromBytes(parts.exponent, parts.modulus) catch
+        return Error.MalformedDnskey;
+    // The verifier's modulus length is comptime, so the standard key sizes are
+    // the sizes this build accepts (512 to 4096 bits in 8-bit steps).
+    const modulus_sizes = .{ 64, 96, 128, 160, 192, 224, 256, 320, 384, 448, 512 };
+    inline for (modulus_sizes) |len| {
+        // RFC 8017 section 9.2 needs k >= tLen + 11; a smaller field would
+        // underflow inside the standard verifier at compile time.
+        if (comptime len >= Hash.digest_length + 30) {
+            if (modulus_len == len) {
+                const sig: *const [len]u8 = @ptrCast(signature.ptr);
+                std.crypto.Certificate.rsa.PKCS1v1_5Signature.verify(len, sig, data, public_key, Hash) catch
+                    return Error.SignatureInvalid;
+                return;
+            }
+        }
+    }
+    return Error.UnsupportedAlgorithm;
 }
 
 /// RFC 4034 section 5.1.4:
@@ -2838,7 +2886,7 @@ test "a DNSKEY RRset with only an unsupported algorithm leaves the answer insecu
 
     // The zone publishes one DNSKEY, whose algorithm this build cannot
     // verify with, and the DS at the parent names it.
-    const key = dnskeyRdata(256, 8);
+    const key = dnskeyRdata(256, 16);
     var anchors = try dsAnchor(std.testing.allocator, "example.com.", &key, false);
     defer anchors.deinit(std.testing.allocator);
 

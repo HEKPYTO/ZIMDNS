@@ -44,6 +44,9 @@ pub const Error = error{
     ZonemdAbsenceUnproven,
     BadDnssecKey,
     BadTrustAnchorFile,
+    /// The RFC 9432 catalog zone names a zone the server also serves, so the
+    /// synthesized catalog and the configuration would contradict.
+    BadCatalogZone,
 };
 
 pub const ServerContext = struct {
@@ -176,93 +179,43 @@ pub const ServerContext = struct {
             .nsec3 => .{ .chain = .nsec3, .iterations = chain.iterations, .salt = chain.saltBytes() },
         } else null;
 
-        var zone_index_value: usize = 0;
-        while (zone_index_value < context.config.zones.len) : (zone_index_value += 1) {
-            const zone_path = context.config.zones.items[zone_index_value].fileText();
-            const zone_text = try readReferencedFile(dir, io, zone_path, allocator);
+        for (context.config.zones.items[0..context.config.zones.len]) |*configured| {
+            const zone_text = try readReferencedFile(dir, io, configured.fileText(), allocator);
             defer allocator.free(zone_text);
+            try loadZoneText(
+                &context,
+                allocator,
+                io,
+                zone_text,
+                configured.nameText(),
+                if (dnssec_key) |*key| key else null,
+                now_seconds,
+                chain_policy,
+            );
+        }
 
-            var zone_file = try zone_parser.ZoneFile.parse(zone_text);
-            errdefer zone_file.deinit();
-            if (!zoneNamesEqual(context.config.zones.items[zone_index_value].nameText(), zone_file.originText())) {
-                return Error.ZoneNameMismatch;
+        // RFC 9432 section 4: a catalog zone is a normal zone. The producer
+        // role publishes one for the zones this server serves, so the
+        // membership list has one source and cannot drift from the zones the
+        // configuration actually names.
+        if (context.config.catalogZoneText()) |catalog_text| {
+            const catalog_apex = try lowerDot(allocator, catalog_text);
+            defer allocator.free(catalog_apex);
+            for (context.config.zones.items[0..context.config.zones.len]) |*configured| {
+                if (zoneNamesEqual(catalog_apex, configured.nameText())) return Error.BadCatalogZone;
             }
-            var zone = try zone_index.Zone.fromZoneFile(&zone_file);
-            errdefer zone.deinit();
-            // RFC 4035 section 2.3: signing adds DNSKEY, DS, RRSIG, and NSEC to
-            // the loaded zone, so the signed RRsets are served from here on
-            // without touching the zone file on disk.
-            if (dnssec_key) |*key| {
-                signer.signZone(context.allocator, &zone, key, .{
-                    .inception = now_seconds,
-                    .expiration = now_seconds + signature_validity_seconds,
-                    .chain = chain_policy,
-                }) catch |err| switch (err) {
-                    // The zone states the parameters of its own chain and the
-                    // configuration names other ones: the zone is refused
-                    // rather than served as two chains.
-                    error.BadChainParameters => {
-                        var report: [256]u8 = undefined;
-                        const message = std.fmt.bufPrint(&report, "zone {s}: the configuration names NSEC3 parameters the zone's apex NSEC3PARAM contradicts", .{zone.originText()}) catch "zone: the configuration names NSEC3 parameters the zone's apex NSEC3PARAM contradicts";
-                        printStartupError(io, message);
-                        return Error.BadDnssecKey;
-                    },
-                    else => return Error.BadDnssecKey,
-                };
-            }
-            // RFC 8976 section 4 steps 1 to 3: a zone that carries an apex
-            // ZONEMD record and is named by a configured trust anchor is
-            // expected to be signed, and its SOA and ZONEMD RRsets must carry
-            // valid signatures chaining up to that anchor. The chain is
-            // checked before the digest, so a zone that is not authentic is
-            // never accepted on the strength of its digest alone.
-            if (zonemd.hasApexRecord(&zone)) {
-                const chained = validate_mod.zoneSignedToAnchor(
-                    allocator,
-                    &context.anchors,
-                    &zone,
-                    &.{ RecordType.SOA.code(), RecordType.ZONEMD.code() },
-                    now_seconds,
-                ) catch false;
-                if (!chained) {
-                    var report: [256]u8 = undefined;
-                    const message = std.fmt.bufPrint(&report, "zone {s}: the SOA and ZONEMD RRsets do not carry valid signatures chaining to a configured trust anchor", .{zone.originText()}) catch "zone: the SOA and ZONEMD RRsets are not signed to a configured trust anchor";
-                    printStartupError(io, message);
-                    return Error.ZonemdSignatureInvalid;
-                }
-            } else {
-                // RFC 8976 section 4 step 2: for a zone where signatures are
-                // expected, the existence of the apex ZONEMD record must be
-                // validated. A zone that publishes no ZONEMD is a different
-                // answer from a zone whose ZONEMD does not match, and the zone
-                // tells the two apart with its own denial records: the absence
-                // is proven only when an NSEC or NSEC3 record of the zone
-                // denies the RRset. An unproven absence leaves absent and
-                // unknown indistinguishable, so the server refuses to start.
-                const absence = validate_mod.zoneZonemdAbsence(
-                    allocator,
-                    &context.anchors,
-                    &zone,
-                    now_seconds,
-                ) catch .unknown;
-                if (absence == .unknown) {
-                    var report: [256]u8 = undefined;
-                    const message = std.fmt.bufPrint(&report, "zone {s}: no apex ZONEMD record, and no NSEC or NSEC3 record of the zone proves that it does not exist", .{zone.originText()}) catch "zone: the absence of the apex ZONEMD record is not proven";
-                    printStartupError(io, message);
-                    return Error.ZonemdAbsenceUnproven;
-                }
-            }
-            // RFC 8976 section 4: refuse to serve a zone whose apex ZONEMD
-            // record does not match the loaded data, so a corrupted or
-            // tampered zone file fails closed at startup instead of answering
-            // queries. The report names the zone and both digests.
-            var zonemd_report: [zonemd.report_max_len]u8 = undefined;
-            _ = zonemd.verify(&zone, allocator, &zonemd_report) catch {
-                const written = std.mem.indexOfScalar(u8, &zonemd_report, 0) orelse zonemd_report.len;
-                printStartupError(io, zonemd_report[0..written]);
-                return Error.ZonemdMismatch;
-            };
-            try context.zones.append(allocator, zone);
+            const catalog_zone_text = try synthesizeCatalogZoneText(allocator, catalog_apex, context.config.zones.items[0..context.config.zones.len]);
+            defer allocator.free(catalog_zone_text);
+            try loadZoneText(
+                &context,
+                allocator,
+                io,
+                catalog_zone_text,
+                catalog_apex,
+                if (dnssec_key) |*key| key else null,
+                now_seconds,
+                chain_policy,
+            );
         }
 
         // The key outlives the startup signing pass: the serving path signs
@@ -336,6 +289,20 @@ pub const ServerContext = struct {
         // owner frees them and no reload path exists to double-free.
         policy.anchors = self.anchors;
         self.anchors = .{};
+        // RFC 2136: an update is accepted only for a configured zone, with a
+        // TSIG key the keyring holds, and is persisted to that zone's file.
+        // The policy is validated before the runtime is built, so a bad line
+        // costs nothing.
+        for (self.config.allow_updates.items[0..self.config.allow_updates.len]) |entry| {
+            const apex = entry.apexText();
+            var served = false;
+            for (self.config.zones.items[0..self.config.zones.len]) |zone| {
+                if (std.ascii.eqlIgnoreCase(zone.nameText(), apex)) served = true;
+            }
+            if (!served) return error.BadConfiguration;
+            if (!self.keyring.containsName(entry.keyText())) return error.BadConfiguration;
+        }
+
         var runtime = if (self.config.forwarder != null or self.config.recursion_allow.len != 0 or self.config.cookies.enabled)
             try auth_runtime.Runtime.fromZonesWithPolicyAndKeyring(self.allocator, &self.zones, self.blocklist, io, policy, &self.keyring)
         else
@@ -349,6 +316,17 @@ pub const ServerContext = struct {
         runtime.answer_policy.report_agent = report_agent;
         runtime.answer_policy.report_monitor = report_monitor;
         runtime.answer_policy.zoneversion = self.config.zoneversion;
+        for (self.config.allow_updates.items[0..self.config.allow_updates.len]) |entry| {
+            const apex = entry.apexText();
+            var zone_path: []const u8 = &.{};
+            for (self.config.zones.items[0..self.config.zones.len]) |zone| {
+                if (std.ascii.eqlIgnoreCase(zone.nameText(), apex)) zone_path = zone.fileText();
+            }
+            runtime.setUpdatePolicy(std.Io.Dir.cwd(), apex, entry.keyText(), zone_path) catch {
+                runtime.deinit();
+                return error.BadConfiguration;
+            };
+        }
         if (self.config.minimal_any_ttl) |ttl| runtime.answer_policy.minimal_any_ttl = ttl;
         if (self.config.minimal_any_ttl_tcp) |ttl| runtime.answer_policy.minimal_any_ttl_tcp = ttl;
         // RFC 7828 section 3.3.2: the option carries the idle timeout the
@@ -478,6 +456,131 @@ fn agentDomainName(text: []const u8) !dns_name.Name {
         break :blk buffer[0 .. text.len + 1];
     };
     return dns_name.Name.fromText(absolute) catch error.BadConfiguration;
+}
+
+/// Loads one zone text into the server context: parse, name check, sign, and
+/// the RFC 8976 ZONEMD checks. Shared by a configured zone file and the
+/// RFC 9432 catalog zone synthesized from the configuration.
+fn loadZoneText(
+    context: *ServerContext,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    zone_text: []const u8,
+    expected_name: []const u8,
+    dnssec_key: ?*signer.Key,
+    now_seconds: u32,
+    chain_policy: ?signer.ChainPolicy,
+) !void {
+    var zone_file = try zone_parser.ZoneFile.parse(zone_text);
+    errdefer zone_file.deinit();
+    if (!zoneNamesEqual(expected_name, zone_file.originText())) {
+        return Error.ZoneNameMismatch;
+    }
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    errdefer zone.deinit();
+    // RFC 4035 section 2.3: signing adds DNSKEY, DS, RRSIG, and NSEC to
+    // the loaded zone, so the signed RRsets are served from here on
+    // without touching the zone file on disk.
+    if (dnssec_key) |key| {
+        signer.signZone(context.allocator, &zone, key, .{
+            .inception = now_seconds,
+            .expiration = now_seconds + signature_validity_seconds,
+            .chain = chain_policy,
+        }) catch |err| switch (err) {
+            // The zone states the parameters of its own chain and the
+            // configuration names other ones: the zone is refused
+            // rather than served as two chains.
+            error.BadChainParameters => {
+                var report: [256]u8 = undefined;
+                const message = std.fmt.bufPrint(&report, "zone {s}: the configuration names NSEC3 parameters the zone's apex NSEC3PARAM contradicts", .{zone.originText()}) catch "zone: the configuration names NSEC3 parameters the zone's apex NSEC3PARAM contradicts";
+                printStartupError(io, message);
+                return Error.BadDnssecKey;
+            },
+            else => return Error.BadDnssecKey,
+        };
+    }
+    // RFC 8976 section 4 steps 1 to 3: a zone that carries an apex
+    // ZONEMD record and is named by a configured trust anchor is
+    // expected to be signed, and its SOA and ZONEMD RRsets must carry
+    // valid signatures chaining up to that anchor. The chain is
+    // checked before the digest, so a zone that is not authentic is
+    // never accepted on the strength of its digest alone.
+    if (zonemd.hasApexRecord(&zone)) {
+        const chained = validate_mod.zoneSignedToAnchor(
+            allocator,
+            &context.anchors,
+            &zone,
+            &.{ RecordType.SOA.code(), RecordType.ZONEMD.code() },
+            now_seconds,
+        ) catch false;
+        if (!chained) {
+            var report: [256]u8 = undefined;
+            const message = std.fmt.bufPrint(&report, "zone {s}: the SOA and ZONEMD RRsets do not carry valid signatures chaining to a configured trust anchor", .{zone.originText()}) catch "zone: the SOA and ZONEMD RRsets are not signed to a configured trust anchor";
+            printStartupError(io, message);
+            return Error.ZonemdSignatureInvalid;
+        }
+    } else {
+        // RFC 8976 section 4 step 2: for a zone where signatures are
+        // expected, the existence of the apex ZONEMD record must be
+        // validated. A zone that publishes no ZONEMD is a different
+        // answer from a zone whose ZONEMD does not match, and the zone
+        // tells the two apart with its own denial records: the absence
+        // is proven only when an NSEC or NSEC3 record of the zone
+        // denies the RRset. An unproven absence leaves absent and
+        // unknown indistinguishable, so the server refuses to start.
+        const absence = validate_mod.zoneZonemdAbsence(
+            allocator,
+            &context.anchors,
+            &zone,
+            now_seconds,
+        ) catch .unknown;
+        if (absence == .unknown) {
+            var report: [256]u8 = undefined;
+            const message = std.fmt.bufPrint(&report, "zone {s}: no apex ZONEMD record, and no NSEC or NSEC3 record of the zone proves that it does not exist", .{zone.originText()}) catch "zone: the absence of the apex ZONEMD record is not proven";
+            printStartupError(io, message);
+            return Error.ZonemdAbsenceUnproven;
+        }
+    }
+    // RFC 8976 section 4: refuse to serve a zone whose apex ZONEMD
+    // record does not match the loaded data, so a corrupted or
+    // tampered zone file fails closed at startup instead of answering
+    // queries. The report names the zone and both digests.
+    var zonemd_report: [zonemd.report_max_len]u8 = undefined;
+    _ = zonemd.verify(&zone, allocator, &zonemd_report) catch {
+        const written = std.mem.indexOfScalar(u8, &zonemd_report, 0) orelse zonemd_report.len;
+        printStartupError(io, zonemd_report[0..written]);
+        return Error.ZonemdMismatch;
+    };
+    try context.zones.append(allocator, zone);
+}
+
+/// The RFC 9432 section 4 catalog zone for the zones this server serves: the
+/// schema-2 version property, one member node per configured zone, and the
+/// SOA and NS that make the zone syntactically valid. Member labels are the
+/// configuration order, so the synthesized zone is stable across restarts.
+fn synthesizeCatalogZoneText(
+    allocator: std.mem.Allocator,
+    apex: []const u8,
+    members: []const parser.Zone,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var line: [512]u8 = undefined;
+    try out.appendSlice(allocator, try std.fmt.bufPrint(
+        &line,
+        "$ORIGIN {s}\n$TTL 3600\n@ IN SOA invalid. hostmaster.invalid. 1 3600 900 1209600 0\n@ IN NS invalid.\nversion IN TXT \"2\"\n",
+        .{apex},
+    ));
+    for (members, 1..) |member, number| {
+        const name = member.nameText();
+        const dotted = name.len != 0 and name[name.len - 1] == '.';
+        try out.appendSlice(allocator, try std.fmt.bufPrint(&line, "m{d}.zones IN PTR {s}{s}\n", .{
+            number,
+            name,
+            if (dotted) "" else ".",
+        }));
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 /// Lowercase an override apex with its trailing dot, for comparison against
@@ -610,6 +713,117 @@ test "server context carries the TCP idle timeout to the listener and the answer
     try std.testing.expect(listener.tcpLimits().idle_timeout == null);
     try std.testing.expectEqual(@as(u32, 5), listener.tcpIdleTimeout().seconds);
     try std.testing.expectEqual(@as(u16, 50), plain_runtime.answer_policy.tcp_keepalive_timeout);
+}
+
+test "server context publishes a catalog zone listing the served zones" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{ .sub_path = "one.zone", .data = "$ORIGIN one.example.\n$TTL 3600\n@ IN SOA ns.one.example. hostmaster.one.example. 1 3600 900 1209600 3600\n@ IN NS ns.one.example.\n" });
+    try dir.dir.writeFile(io, .{ .sub_path = "two.zone", .data = "$ORIGIN two.example.\n$TTL 3600\n@ IN SOA ns.two.example. hostmaster.two.example. 1 3600 900 1209600 3600\n@ IN NS ns.two.example.\n" });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data =
+        \\zone one.example primary one.zone
+        \\zone two.example primary two.zone
+        \\catalog-zone catalog.example.
+        \\
+    });
+
+    var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 3), context.zones.items.len);
+
+    var catalog: ?*const zone_index.Zone = null;
+    for (context.zones.items) |*zone| {
+        if (std.ascii.eqlIgnoreCase(zone.originText(), "catalog.example.")) catalog = zone;
+    }
+    const z = catalog orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), countType(z.*, .TXT));
+    try std.testing.expectEqual(@as(usize, 2), countType(z.*, .PTR));
+    try std.testing.expectEqual(@as(usize, 1), countType(z.*, .SOA));
+    try std.testing.expectEqual(@as(usize, 1), countType(z.*, .NS));
+
+    var runtime = try context.takeRuntime(io);
+    defer runtime.deinit();
+
+    // version.catalog.example. TXT answers "2", and m1.zones.catalog.example.
+    // PTR answers the first configured zone.
+    const version_query = [_]u8{
+        0x22, 0x22, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        7,    'v',  'e',  'r',  's',  'i',  'o',  'n',  7,    'c',  'a',  't',
+        'a',  'l',  'o',  'g',  7,    'e',  'x',  'a',  'm',  'p',  'l',  'e',
+        0,    0x00, 0x10, 0x00, 0x01,
+    };
+    var output: [512]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const version_response = try runtime.answer(&version_query, &output);
+    const parsed_version = try dns_message.Message.parse(arena.allocator(), version_response);
+    try std.testing.expectEqual(@as(u16, 1), parsed_version.header.answer_count);
+    try std.testing.expect(parsed_version.answers.items[0].rrtype.eql(.TXT));
+
+    const member_query = [_]u8{
+        0x22, 0x23, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        2,    'm',  '1',  5,    'z',  'o',  'n',  'e',  's',  7,    'c',  'a',
+        't',  'a',  'l',  'o',  'g',  7,    'e',  'x',  'a',  'm',  'p',  'l',
+        'e',  0,    0x00, 0x0c, 0x00, 0x01,
+    };
+    const member_response = try runtime.answer(&member_query, &output);
+    const parsed_member = try dns_message.Message.parse(arena.allocator(), member_response);
+    try std.testing.expectEqual(@as(u16, 1), parsed_member.header.answer_count);
+    try std.testing.expect(parsed_member.answers.items[0].rrtype.eql(.PTR));
+}
+
+// A configuration that names the catalog apex as one of its own zones cannot
+// be published: the catalog would list itself.
+test "server context refuses a catalog apex that names a served zone" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{ .sub_path = "one.zone", .data = "$ORIGIN one.example.\n$TTL 3600\n@ IN SOA ns.one.example. hostmaster.one.example. 1 3600 900 1209600 3600\n@ IN NS ns.one.example.\n" });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone one.example primary one.zone\ncatalog-zone ONE.example\n" });
+
+    try std.testing.expectError(Error.BadCatalogZone, ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator));
+}
+
+test "allow-update for a zone or key the server does not hold fails the load" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.writeFile(io, .{ .sub_path = "one.zone", .data = "$ORIGIN one.example.\n$TTL 3600\n@ IN SOA ns.one.example. hostmaster.one.example. 1 3600 900 1209600 3600\n@ IN NS ns.one.example.\n" });
+    try dir.dir.writeFile(io, .{
+        .sub_path = "tsig.keys",
+        .data = "key \"update-key.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };\n",
+    });
+    try dir.dir.writeFile(io, .{
+        .sub_path = "config.gdns",
+        .data = "zone one.example primary one.zone\ntsig-key-file tsig.keys\nallow-update one.example update-key.\n",
+    });
+    var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+    defer context.deinit();
+    var runtime = try context.takeRuntime(io);
+    defer runtime.deinit();
+    try std.testing.expectEqual(@as(usize, 1), runtime.update_policies.items.len);
+    try std.testing.expectEqualStrings("one.example", runtime.update_policies.items[0].origin);
+
+    // A zone the server does not serve is a configuration error.
+    try dir.dir.writeFile(io, .{
+        .sub_path = "bad-zone.gdns",
+        .data = "zone one.example primary one.zone\ntsig-key-file tsig.keys\nallow-update other.example. update-key.\n",
+    });
+    var bad_zone = try ServerContext.load(dir.dir, io, "bad-zone.gdns", std.testing.allocator);
+    defer bad_zone.deinit();
+    try std.testing.expectError(error.BadConfiguration, bad_zone.takeRuntime(io));
+
+    // A key the keyring does not hold is a configuration error too.
+    try dir.dir.writeFile(io, .{
+        .sub_path = "bad-key.gdns",
+        .data = "zone one.example primary one.zone\ntsig-key-file tsig.keys\nallow-update one.example missing-key.\n",
+    });
+    var bad_key = try ServerContext.load(dir.dir, io, "bad-key.gdns", std.testing.allocator);
+    defer bad_key.deinit();
+    try std.testing.expectError(error.BadConfiguration, bad_key.takeRuntime(io));
 }
 
 test "server context loads the configured TSIG key file during startup" {

@@ -111,9 +111,13 @@ pub const Message = struct {
         }
 
         try validateSectionCounts(&reader, header);
-        try parseSection(allocator, bytes, &reader, header.answer_count, &message.answers);
-        try parseSection(allocator, bytes, &reader, header.authority_count, &message.authorities);
-        try parseAdditionalSection(allocator, bytes, &reader, header.additional_count, &message);
+        // RFC 2136 section 2.4: in an UPDATE message the answer and authority
+        // sections are the prerequisite and update sections, whose records may
+        // carry no RDATA at all.
+        const rdata_mode: record_mod.ResourceRecord.RdataMode = if (header.opcode == .update) .update else .strict;
+        try parseSection(allocator, bytes, &reader, header.answer_count, &message.answers, rdata_mode);
+        try parseSection(allocator, bytes, &reader, header.authority_count, &message.authorities, rdata_mode);
+        try parseAdditionalSection(allocator, bytes, &reader, header.additional_count, &message, rdata_mode);
 
         // RFC 7873 section 8: BADCOOKIE is the extended code 23, the header's
         // low bits 7 plus an OPT extended-rcode of 1 (RFC 6891 section 6.1.3).
@@ -261,23 +265,23 @@ fn validateSectionCounts(reader: *const Reader, header: header_mod.Header) Error
     }
 }
 
-fn parseSection(allocator: std.mem.Allocator, bytes: []const u8, reader: *Reader, count: u16, section: *RecordSection) !void {
+fn parseSection(allocator: std.mem.Allocator, bytes: []const u8, reader: *Reader, count: u16, section: *RecordSection, mode: record_mod.ResourceRecord.RdataMode) !void {
     section.* = try RecordSection.init(allocator, count);
     var index: u16 = 0;
     while (index < count) : (index += 1) {
-        const parsed_record = record_mod.ResourceRecord.parse(bytes, reader.position()) catch return Error.BadRecord;
+        const parsed_record = record_mod.ResourceRecord.parseWithMode(bytes, reader.position(), mode) catch return Error.BadRecord;
         section.items[index] = parsed_record.record;
         reader.offset = parsed_record.next_offset;
     }
     section.len = @intCast(count);
 }
 
-fn parseAdditionalSection(allocator: std.mem.Allocator, bytes: []const u8, reader: *Reader, count: u16, message: *Message) !void {
+fn parseAdditionalSection(allocator: std.mem.Allocator, bytes: []const u8, reader: *Reader, count: u16, message: *Message, mode: record_mod.ResourceRecord.RdataMode) !void {
     message.additionals = try RecordSection.init(allocator, count);
     var index: u16 = 0;
     while (index < count) : (index += 1) {
         const record_offset = reader.position();
-        const parsed_record = record_mod.ResourceRecord.parse(bytes, reader.position()) catch |err| switch (err) {
+        const parsed_record = record_mod.ResourceRecord.parseWithMode(bytes, reader.position(), mode) catch |err| switch (err) {
             record_mod.Error.MalformedOption => return Error.MalformedEdnsOption,
             record_mod.Error.MalformedEcsOption => return Error.MalformedEcsOption,
             record_mod.Error.OptionsTooLong => return Error.EdnsOptionsTooLong,

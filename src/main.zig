@@ -12,6 +12,7 @@ pub const dns_dnssec = @import("dns/dnssec.zig");
 pub const dns_validate = @import("dns/validate.zig");
 pub const zone_parser = @import("zone/parser.zig");
 pub const zone_index = @import("zone/index.zig");
+pub const zone_update = @import("zone/update.zig");
 pub const zone_journal = @import("zone/journal.zig");
 pub const zone_transfer = @import("zone/transfer.zig");
 pub const auth_response = @import("auth/response.zig");
@@ -77,6 +78,7 @@ test {
     _ = @import("zone/journal.zig");
     _ = zone_parser;
     _ = zone_index;
+    _ = zone_update;
     _ = zone_zonemd;
     _ = zone_signer;
     _ = @import("zone/transfer.zig");

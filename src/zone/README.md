@@ -13,6 +13,16 @@ nothing else. The zone-signing key then carries the Zone Key flag alone
 key files and hands the keys over; `src/config/parser.zig` knows the
 directives.
 
+## The key file
+
+One `<algorithm> <secret>` line per key. `ECDSAP256SHA256`, `ECDSAP384SHA384`,
+and `ED25519` take the raw private scalar or seed in base64. `RSASHA256` and
+`RSASHA512` take a base64 PKCS#1 `RSAPrivateKey` DER, which an operator makes
+with `openssl rsa -traditional -outform DER | base64`; the signature is one
+modular exponentiation and the primes are not needed. RSA/SHA-1 (algorithms 5
+and 7) is not offered because RFC 8624 §3.1 says a signer MUST NOT use it, and
+Ed448 needs a primitive the standard library does not ship.
+
 ## The NSEC3 chain (RFC 9276 §3.1)
 
 The chain is opt-in: the zone's own apex NSEC3PARAM decides it, and the

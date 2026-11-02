@@ -4471,13 +4471,13 @@ fn makeTestRrsig(now_expired: bool) dns_rdata.Unknown {
 }
 
 /// An RRSIG over an A record whose algorithm this build cannot verify with
-/// (8 is RSAMD5, which RFC 4035 section 5.2 leaves unsupported), signed by
-/// the zone the trust anchor speaks for.
+/// (16 is Ed448, which this build does not implement), signed by the zone the
+/// trust anchor speaks for.
 fn makeUnsupportedAlgorithmRrsig() dns_rdata.Unknown {
     var raw = dns_rdata.Unknown{};
     raw.data[0] = 0x00;
     raw.data[1] = 0x01;
-    raw.data[2] = 0x08;
+    raw.data[2] = 0x10;
     raw.data[3] = 0x03;
     std.mem.writeInt(u32, raw.data[4..8], 3600, .big);
     std.mem.writeInt(u32, raw.data[8..12], 2_000_000_000, .big);
@@ -9980,7 +9980,7 @@ test "RFC 8914 section 4.2: an answer the server cannot verify carries the code 
     // 4035 section 5.2 leaves the zone unsigned, and RFC 8914 section 4.2
     // names the code the client is told.
     const anchors = try validate.Anchors.parse(std.testing.allocator,
-        \\example.com. DNSKEY 256 3 8 AwEAAQ==
+        \\example.com. DNSKEY 256 3 16 AwEAAQ==
         \\
     );
     var resolver = try Resolver.init(std.testing.allocator, io, .{
@@ -10017,7 +10017,7 @@ test "the cached copy of an unverifiable answer carries the same code" {
     const thread = try std.Thread.spawn(.{}, serveUnsupportedAlgorithmUpstream, .{&upstream});
 
     const anchors = try validate.Anchors.parse(std.testing.allocator,
-        \\example.com. DNSKEY 256 3 8 AwEAAQ==
+        \\example.com. DNSKEY 256 3 16 AwEAAQ==
         \\
     );
     var resolver = try Resolver.init(std.testing.allocator, io, .{

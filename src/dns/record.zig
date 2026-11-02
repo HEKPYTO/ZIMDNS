@@ -32,7 +32,16 @@ pub const ResourceRecord = struct {
     ttl: u32,
     rdata: RData,
 
+    /// RFC 2136 section 2.4: a prerequisite or delete record carries no RDATA,
+    /// so an opcode-UPDATE message parses an empty RDATA as opaque bytes even
+    /// for a type whose RDATA is otherwise required to be exactly sized.
+    pub const RdataMode = enum { strict, update };
+
     pub fn parse(message: []const u8, offset: usize) !ParseResult {
+        return parseWithMode(message, offset, .strict);
+    }
+
+    pub fn parseWithMode(message: []const u8, offset: usize, mode: RdataMode) !ParseResult {
         const owner_result = Name.parse(message, offset) catch return Error.BadName;
         var reader = Reader.init(message[owner_result.next_offset..]);
         const rrtype_code = reader.readU16() catch return Error.EndOfInput;
@@ -42,12 +51,15 @@ pub const ResourceRecord = struct {
         const rdlength = reader.readU16() catch return Error.EndOfInput;
 
         const rdata_offset = owner_result.next_offset + reader.position();
-        const rdata = RData.parse(RecordType.fromCode(rrtype_code), message, rdata_offset, rdlength) catch |err| switch (err) {
-            rdata_mod.Error.MalformedOption => return Error.MalformedOption,
-            rdata_mod.Error.MalformedEcsOption => return Error.MalformedEcsOption,
-            rdata_mod.Error.OptionsTooLong => return Error.OptionsTooLong,
-            else => return Error.BadRData,
-        };
+        const rdata = if (mode == .update and rdlength == 0)
+            RData{ .Unknown = .{ .borrowed = message[rdata_offset..rdata_offset] } }
+        else
+            RData.parse(RecordType.fromCode(rrtype_code), message, rdata_offset, rdlength) catch |err| switch (err) {
+                rdata_mod.Error.MalformedOption => return Error.MalformedOption,
+                rdata_mod.Error.MalformedEcsOption => return Error.MalformedEcsOption,
+                rdata_mod.Error.OptionsTooLong => return Error.OptionsTooLong,
+                else => return Error.BadRData,
+            };
 
         return .{
             .record = .{

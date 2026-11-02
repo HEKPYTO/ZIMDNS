@@ -94,6 +94,18 @@ pub const Keyring = struct {
     /// The key that carries `name` with `algorithm`. Every key holding the
     /// name is checked, so a request that names an algorithm the first key
     /// of the name does not carry still finds its key.
+    /// Reports whether a key of this name is loaded, whatever its algorithm.
+    /// RFC 2136's `allow-update` names a key, and the update path compares the
+    /// request's TSIG name against it.
+    pub fn containsName(self: *const Keyring, name_text: []const u8) bool {
+        for (self.keys[0..self.len]) |*key| {
+            var buffer: [512]u8 = undefined;
+            const text = key.name.toText(&buffer) catch continue;
+            if (std.ascii.eqlIgnoreCase(text, name_text)) return true;
+        }
+        return false;
+    }
+
     pub fn findAlgorithm(self: *const Keyring, name: Name, algorithm: tsig.Algorithm) ?*const Key {
         for (self.keys[0..self.len]) |*key| {
             if (key.name.eql(&name) and key.algorithm == algorithm) return key;
@@ -243,6 +255,13 @@ fn parseAlgorithm(text: []const u8) Error!tsig.Algorithm {
     if (std.ascii.eqlIgnoreCase(text, "hmac-sha384-192")) return .hmac_sha384_192;
     if (std.ascii.eqlIgnoreCase(text, "hmac-sha512-256")) return .hmac_sha512_256;
     return Error.UnsupportedAlgorithm;
+}
+
+test "a keyring reports the names it holds" {
+    var ring = try Keyring.parse("key \"update-key.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };");
+    defer ring.deinit();
+    try std.testing.expect(ring.containsName("update-key."));
+    try std.testing.expect(!ring.containsName("other."));
 }
 
 test "keyring parses and canonicalizes a SHA-256 key" {

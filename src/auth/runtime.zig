@@ -6,7 +6,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const dns_dnssec = @import("../dns/dnssec.zig");
+const dns_header = @import("../dns/header.zig");
 const dns_message = @import("../dns/message.zig");
+const dns_name_mod = @import("../dns/name.zig");
+const dns_record_mod = @import("../dns/record.zig");
 const dns_rdata = @import("../dns/rdata.zig");
 const dns_types = @import("../dns/types.zig");
 const dns_validate = @import("../dns/validate.zig");
@@ -23,6 +26,35 @@ const keyring_mod = @import("keyring.zig");
 const tsig = @import("../dns/tsig.zig");
 const transfer = @import("../zone/transfer.zig");
 const journal_mod = @import("../zone/journal.zig");
+const zone_update = @import("../zone/update.zig");
+
+/// Scratch memory for one answer. Nothing parsed or built for a response
+/// outlives the encoded bytes, so one arena per thread is reset and reused
+/// instead of mapping and unmapping pages per query. The answer entry points
+/// are not reentrant: none of them calls another.
+threadlocal var answer_scratch_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+
+fn answerScratch() std.mem.Allocator {
+    _ = answer_scratch_arena.reset(.retain_capacity);
+    return answer_scratch_arena.allocator();
+}
+
+/// Frees the calling thread's retained scratch buffers. A thread that answers
+/// one frame and exits has no reuse to gain from them, and thread-local
+/// storage has no destructor, so that thread would leak them; every such
+/// thread calls this before it exits. A long-lived thread never calls it.
+pub fn releaseAnswerScratch() void {
+    answer_scratch_arena.deinit();
+    answer_scratch_arena = .init(std.heap.page_allocator);
+}
+
+test "releaseAnswerScratch frees the retained buffers" {
+    const scratch = answerScratch();
+    _ = try scratch.alloc(u8, 4096);
+    try std.testing.expect(answer_scratch_arena.queryCapacity() >= 4096);
+    releaseAnswerScratch();
+    try std.testing.expectEqual(@as(usize, 0), answer_scratch_arena.queryCapacity());
+}
 
 pub const Error = error{
     BadQuery,
@@ -36,6 +68,16 @@ pub const ReloadSource = struct {
     dir: std.Io.Dir,
     path: []const u8,
     origin: []const u8,
+};
+
+/// One RFC 2136 update policy: the zone apex an operator allowed updates for,
+/// the one TSIG key allowed to write it, and the zone file the accepted change
+/// is persisted to before the response.
+pub const UpdatePolicy = struct {
+    origin: []const u8,
+    key_name: []const u8,
+    dir: std.Io.Dir,
+    path: []const u8,
 };
 
 /// What one zone replacement did. The served zone changes only when the
@@ -135,6 +177,9 @@ pub const Runtime = struct {
     /// The zone file an operator can replace, and the apex it must provide.
     /// Null when no zone file is reloadable.
     reload_source: ?ReloadSource = null,
+    /// RFC 2136 update policies, one per zone the operator allowed updates
+    /// for. Empty unless `allow-update` is configured.
+    update_policies: std.ArrayList(UpdatePolicy) = .empty,
     /// Set by the SIGHUP handler and cleared by the reload that answers it.
     /// The handler only stores the flag; the file is read outside it.
     reload_requested: std.atomic.Value(bool) = .init(false),
@@ -244,6 +289,13 @@ pub const Runtime = struct {
             self.allocator.free(source.origin);
             self.reload_source = null;
         }
+        for (self.update_policies.items) |policy| {
+            self.allocator.free(policy.origin);
+            self.allocator.free(policy.key_name);
+            self.allocator.free(policy.path);
+        }
+        self.update_policies.deinit(self.allocator);
+        self.update_policies = .empty;
         self.blocklist = .{};
         if (self.answer_policy.nsid) |nsid| self.allocator.free(nsid);
         self.answer_policy = .{};
@@ -282,6 +334,36 @@ pub const Runtime = struct {
             self.allocator.free(source.origin);
         }
         self.reload_source = .{ .dir = dir, .path = owned_path, .origin = owned_origin };
+    }
+
+    /// Records an RFC 2136 update policy: the apex, the TSIG key name that may
+    /// write it, and the zone file the change is persisted to.
+    pub fn setUpdatePolicy(self: *Runtime, dir: std.Io.Dir, origin: []const u8, key_name: []const u8, path: []const u8) !void {
+        const owned_origin = try self.allocator.dupe(u8, origin);
+        errdefer self.allocator.free(owned_origin);
+        const owned_key = try self.allocator.dupe(u8, key_name);
+        errdefer self.allocator.free(owned_key);
+        const owned_path = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(owned_path);
+        try self.update_policies.append(self.allocator, .{
+            .origin = owned_origin,
+            .key_name = owned_key,
+            .dir = dir,
+            .path = owned_path,
+        });
+    }
+
+    fn updatePolicyFor(self: *const Runtime, origin: []const u8) ?*const UpdatePolicy {
+        for (self.update_policies.items) |*policy| {
+            if (sameDnsName(policy.origin, origin)) return policy;
+        }
+        return null;
+    }
+
+    fn sameDnsName(left: []const u8, right: []const u8) bool {
+        const a = std.mem.trimEnd(u8, left, ".");
+        const b = std.mem.trimEnd(u8, right, ".");
+        return std.ascii.eqlIgnoreCase(a, b);
     }
 
     /// Asks for the configured zone to be re-read. The signal handler calls
@@ -367,19 +449,25 @@ pub const Runtime = struct {
             reportReload(io, "error: cannot build the zone for {s}: {t}", .{ origin, err });
             return .load_failed;
         };
-        var replaced = false;
-        defer if (!replaced) zone.deinit();
-
         if (!std.ascii.eqlIgnoreCase(zone.originText(), origin)) {
+            zone.deinit();
             reportReload(io, "error: the zone file for {s} provides {s}", .{ origin, zone.originText() });
             return .wrong_zone;
         }
-
         // The new zone is built before the lock is taken, so a reload does
         // not hold up the answers it does not change.
         self.lockExclusive();
         defer self.unlockExclusive();
+        const outcome = self.installZoneLocked(io, origin, &zone);
+        if (outcome != .replaced) zone.deinit();
+        return outcome;
+    }
 
+    /// Installs a zone the caller built, under the exclusive lock: the serial
+    /// transition is compared, a signed zone is signed again, the delta is
+    /// journaled, and only then is the served zone swapped. The caller keeps
+    /// ownership of `zone` unless the outcome is `.replaced`.
+    fn installZoneLocked(self: *Runtime, io: std.Io, origin: []const u8, zone: *zone_index.Zone) ReloadOutcome {
         const target = self.zoneIndexForOrigin(origin) orelse {
             reportReload(io, "error: the server does not serve a zone for {s}", .{origin});
             return .no_zone;
@@ -422,7 +510,7 @@ pub const Runtime = struct {
                     std.time.ns_per_s,
                 ));
                 const window = session.options.fromNow(now_seconds);
-                zone_signer.resignZone(self.allocator, &zone, &session.key, window, &self.zones.items[target]) catch |err| {
+                zone_signer.resignZone(self.allocator, zone, &session.key, window, &self.zones.items[target]) catch |err| {
                     reportReload(io, "error: cannot sign the reloaded zone for {s}: {t}", .{ origin, err });
                     return .sign_failed;
                 };
@@ -445,7 +533,7 @@ pub const Runtime = struct {
         // The difference between the two zones is computed here, where both
         // snapshots exist, so the incremental answer carries the records
         // that changed.
-        const difference = zone_index.difference(self.allocator, &self.zones.items[target], &zone) catch |err| {
+        const difference = zone_index.difference(self.allocator, &self.zones.items[target], zone) catch |err| {
             reportReload(io, "error: cannot compute the difference of the zone for {s}: {t}", .{ origin, err });
             return .load_failed;
         };
@@ -457,8 +545,7 @@ pub const Runtime = struct {
         };
         // Swap only after the new zone is built and the transition recorded.
         self.zones.items[target].deinit();
-        self.zones.items[target] = zone;
-        replaced = true;
+        self.zones.items[target] = zone.*;
         reportReload(io, "reloaded the zone for {s}: serial {d} -> {d}", .{ origin, old_serial, new_serial });
         return .replaced;
     }
@@ -797,7 +884,10 @@ pub const Runtime = struct {
 
     /// Answers one request and counts it, so every transport that reports
     /// metrics counts the same way.
-    fn answerCounted(
+    /// One answer for either transport. Parsing happens before the runtime
+    /// lock is taken: an RFC 2136 UPDATE takes the exclusive lock itself (it
+    /// rewrites the zone), and every other opcode takes it shared.
+    fn dispatchAnswer(
         self: *Runtime,
         allocator: std.mem.Allocator,
         query_bytes: []const u8,
@@ -807,18 +897,33 @@ pub const Runtime = struct {
         over_tcp: bool,
     ) ![]const u8 {
         if (counters) |value| metrics.bump(&value.queries_total);
-        const result = self.answerIncoming(allocator, query_bytes, output, client, counters, over_tcp) catch |err| {
-            if (counters) |value| {
-                if (err == Error.BadQuery) metrics.bump(&value.bad_queries_total);
-                if (err == Error.EncodeFailed) metrics.bump(&value.encode_failures_total);
-            }
+        const parsed = self.parseIncoming(allocator, query_bytes) catch |err| {
+            countAnswerError(counters, err);
+            return err;
+        };
+        if (parsed == .incoming and parsed.incoming.query.header.opcode == .update) {
+            return self.answerUpdate(allocator, output, parsed.incoming) catch |err| {
+                countAnswerError(counters, err);
+                return err;
+            };
+        }
+        self.lockShared();
+        defer self.unlockShared();
+        const result = self.answerParsed(allocator, query_bytes, output, client, counters, over_tcp, parsed) catch |err| {
+            countAnswerError(counters, err);
             return err;
         };
         if (counters) |value| metrics.bump(&value.responses_total);
         return result;
     }
 
-    fn answerIncoming(
+    fn countAnswerError(counters: ?*metrics.Counters, err: anyerror) void {
+        const value = counters orelse return;
+        if (err == Error.BadQuery) metrics.bump(&value.bad_queries_total);
+        if (err == Error.EncodeFailed) metrics.bump(&value.encode_failures_total);
+    }
+
+    fn answerParsed(
         self: *Runtime,
         allocator: std.mem.Allocator,
         query_bytes: []const u8,
@@ -826,8 +931,8 @@ pub const Runtime = struct {
         client: ?*const std.Io.net.IpAddress,
         counters: ?*metrics.Counters,
         over_tcp: bool,
+        parsed: IncomingResult,
     ) ![]const u8 {
-        const parsed = try self.parseIncoming(allocator, query_bytes);
         switch (parsed) {
             .failure => |failure| return self.encodeFailure(allocator, query_bytes, output, failure),
             .incoming => |incoming| {
@@ -836,35 +941,107 @@ pub const Runtime = struct {
                     return self.encodeSignedMessage(try self.buildMessage(incoming.query, over_tcp), output, auth, 0, &.{}, null);
                 }
                 if (client) |address| return self.answerFromUnlocked(query_bytes, output, address, incoming.query, over_tcp);
+                if (try self.localZoneAnswer(incoming.query)) |local| return self.encodeMessage(local, output);
                 return self.encodeMessage(try self.buildMessage(incoming.query, over_tcp), output);
             },
         }
     }
 
-    pub fn answer(self: *const Runtime, query_bytes: []const u8, output: []u8) ![]const u8 {
-        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        defer arena.deinit();
-        self.lockShared();
-        defer self.unlockShared();
-        const parsed = try self.parseIncoming(arena.allocator(), query_bytes);
-        switch (parsed) {
-            .failure => |failure| return self.encodeFailure(arena.allocator(), query_bytes, output, failure),
-            .incoming => |incoming| {
-                if (incoming.auth) |auth| {
-                    return self.encodeSignedMessage(try self.buildMessage(incoming.query, true), output, auth, 0, &.{}, null);
-                }
-                if (try self.localZoneAnswer(incoming.query)) |local| return self.encodeMessage(local, output);
-                return self.encodeMessage(try self.buildMessage(incoming.query, true), output);
-            },
+    /// RFC 2136 section 3: one update transaction. The zone section is checked
+    /// first, then the operator's policy and the request's TSIG, then the
+    /// prerequisite and update sections are applied, the new zone text is
+    /// persisted to the zone file, and only then does the served zone swap.
+    fn answerUpdate(
+        self: *Runtime,
+        allocator: std.mem.Allocator,
+        output: []u8,
+        incoming: Incoming,
+    ) ![]const u8 {
+        const query = incoming.query;
+        // Nothing is enabled: the opcode is not implemented by policy, and the
+        // message body is not inspected.
+        if (self.update_policies.items.len == 0) return self.encodeUpdateReply(query, incoming.auth, .notimp, output);
+        const q = query.question orelse return self.encodeUpdateReply(query, incoming.auth, .formerr, output);
+        if (!q.qtype.eql(.SOA) or !q.qclass.eql(dns_types.Class.IN)) {
+            return self.encodeUpdateReply(query, incoming.auth, .formerr, output);
         }
+        var apex_buffer: [512]u8 = undefined;
+        const apex = q.name.toText(&apex_buffer) catch return self.encodeUpdateReply(query, incoming.auth, .formerr, output);
+        const policy = self.updatePolicyFor(apex) orelse return self.encodeUpdateReply(query, incoming.auth, .notimp, output);
+        const auth = incoming.auth orelse return self.encodeUpdateReply(query, incoming.auth, .refused, output);
+        var key_buffer: [512]u8 = undefined;
+        const key_name = auth.key.name.toText(&key_buffer) catch return self.encodeUpdateReply(query, incoming.auth, .refused, output);
+        if (!std.ascii.eqlIgnoreCase(key_name, policy.key_name)) {
+            return self.encodeUpdateReply(query, incoming.auth, .refused, output);
+        }
+        if (self.zoneIndexForOrigin(apex) == null) {
+            return self.encodeUpdateReply(query, incoming.auth, .notauth, output);
+        }
+
+        // The lock is exclusive from the first read of the zone to the swap:
+        // one update at a time, and no answer sees a half-applied change.
+        self.lockExclusive();
+        defer self.unlockExclusive();
+        const target = self.zoneIndexForOrigin(apex) orelse return self.encodeUpdateReply(query, incoming.auth, .notauth, output);
+        const outcome = zone_update.apply(
+            allocator,
+            &self.zones.items[target],
+            apex,
+            query.answers.items[0..query.answers.len],
+            query.authorities.items[0..query.authorities.len],
+        ) catch return self.encodeUpdateReply(query, incoming.auth, .servfail, output);
+        const text = switch (outcome) {
+            .rcode => |rcode| return self.encodeUpdateReply(query, incoming.auth, rcode, output),
+            .zone_text => |text| text,
+        };
+        defer allocator.free(text);
+        self.persistZoneText(self.io, policy, text) catch return self.encodeUpdateReply(query, incoming.auth, .servfail, output);
+
+        var zone_file = zone_parser.ZoneFile.parse(text) catch return self.encodeUpdateReply(query, incoming.auth, .servfail, output);
+        var zone = zone_index.Zone.fromZoneFile(&zone_file) catch {
+            zone_file.deinit();
+            return self.encodeUpdateReply(query, incoming.auth, .servfail, output);
+        };
+        const installed = self.installZoneLocked(self.io, apex, &zone);
+        if (installed != .replaced) zone.deinit();
+        return switch (installed) {
+            .replaced => self.encodeUpdateReply(query, incoming.auth, .no_error, output),
+            else => self.encodeUpdateReply(query, incoming.auth, .servfail, output),
+        };
+    }
+
+    /// RFC 2136 section 3.5: the change is committed before the response. The
+    /// zone file is rewritten through a temporary file in the same directory
+    /// and renamed, so a crash leaves either the old file or the new one.
+    fn persistZoneText(self: *const Runtime, io: std.Io, policy: *const UpdatePolicy, text: []const u8) !void {
+        _ = self;
+        var temp_buffer: [512]u8 = undefined;
+        const temp_path = std.fmt.bufPrint(&temp_buffer, "{s}.update.tmp", .{policy.path}) catch return error.PathTooLong;
+        try policy.dir.writeFile(io, .{ .sub_path = temp_path, .data = text });
+        try policy.dir.rename(temp_path, policy.dir, policy.path, io);
+    }
+
+    /// RFC 2136 section 3.8: the response echoes the zone section and carries
+    /// the rcode; a signed request gets a signed response.
+    fn encodeUpdateReply(
+        self: *const Runtime,
+        query: dns_message.Message,
+        auth: ?TsigAuth,
+        rcode: dns_header.Rcode,
+        output: []u8,
+    ) ![]const u8 {
+        var message = response.buildNotImplementedResponse(query) catch return Error.EncodeFailed;
+        message.header.rcode = rcode;
+        if (auth) |value| return self.encodeSignedMessage(message, output, value, 0, &.{}, null);
+        return self.encodeMessage(message, output);
+    }
+
+    pub fn answer(self: *const Runtime, query_bytes: []const u8, output: []u8) ![]const u8 {
+        return @constCast(self).dispatchAnswer(answerScratch(), query_bytes, output, null, null, true);
     }
 
     pub fn answerFrom(self: *Runtime, query_bytes: []const u8, output: []u8, client: *const std.Io.net.IpAddress) ![]const u8 {
-        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        defer arena.deinit();
-        self.lockShared();
-        defer self.unlockShared();
-        return self.answerCounted(arena.allocator(), query_bytes, output, client, null, false);
+        return self.dispatchAnswer(answerScratch(), query_bytes, output, client, null, false);
     }
 
     /// Answers a request that arrived on a TCP session. RFC 7828 section 3.3.2
@@ -877,11 +1054,7 @@ pub const Runtime = struct {
         client: *const std.Io.net.IpAddress,
         counters: ?*metrics.Counters,
     ) ![]const u8 {
-        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        defer arena.deinit();
-        self.lockShared();
-        defer self.unlockShared();
-        return self.answerCounted(arena.allocator(), query_bytes, output, client, counters, true);
+        return self.dispatchAnswer(answerScratch(), query_bytes, output, client, counters, true);
     }
 
     pub fn truncateUdpResponse(self: *Runtime, query_bytes: []const u8, response_bytes: []const u8, output: []u8) ![]const u8 {
@@ -1209,39 +1382,11 @@ pub const Runtime = struct {
     }
 
     pub fn answerFromWithMetrics(self: *Runtime, query_bytes: []const u8, output: []u8, client: *const std.Io.net.IpAddress, counters: *metrics.Counters) ![]const u8 {
-        self.lockShared();
-        defer self.unlockShared();
-        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        defer arena.deinit();
-        return self.answerCounted(arena.allocator(), query_bytes, output, client, counters, false);
+        return self.dispatchAnswer(answerScratch(), query_bytes, output, client, counters, false);
     }
 
     pub fn answerWithMetrics(self: *const Runtime, query_bytes: []const u8, output: []u8, counters: *metrics.Counters) ![]const u8 {
-        metrics.bump(&counters.queries_total);
-        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        defer arena.deinit();
-        self.lockShared();
-        defer self.unlockShared();
-        const parsed = self.parseIncoming(arena.allocator(), query_bytes) catch |err| {
-            metrics.bump(&counters.bad_queries_total);
-            return err;
-        };
-        const result = switch (parsed) {
-            .failure => |failure| self.encodeFailure(arena.allocator(), query_bytes, output, failure),
-            .incoming => |incoming| answer: {
-                countInboundBits(counters, incoming.query);
-                break :answer if (incoming.auth) |auth|
-                    self.encodeSignedMessage(try self.buildMessage(incoming.query, true), output, auth, 0, &.{}, null)
-                else
-                    self.encodeMessage(try self.buildMessage(incoming.query, true), output);
-            },
-        } catch |err| {
-            if (err == Error.BadQuery) metrics.bump(&counters.bad_queries_total);
-            if (err == Error.EncodeFailed) metrics.bump(&counters.encode_failures_total);
-            return err;
-        };
-        metrics.bump(&counters.responses_total);
-        return result;
+        return @constCast(self).dispatchAnswer(answerScratch(), query_bytes, output, null, counters, true);
     }
 
     fn encodeMessage(self: *const Runtime, response_message: dns_message.Message, output: []u8) ![]const u8 {
@@ -2766,6 +2911,195 @@ test "authoritative runtime answers unassigned opcodes with local NOTIMP" {
     try std.testing.expect(parsed.header.qr);
     try std.testing.expectEqual(@as(@TypeOf(parsed.header.opcode), .unassigned_3), parsed.header.opcode);
     try std.testing.expectEqual(@as(@TypeOf(parsed.header.rcode), .notimp), parsed.header.rcode);
+}
+
+/// A TSIG-signed RFC 2136 UPDATE: the zone section, one prerequisite set and
+/// the update records, then the TSIG record the request is signed with.
+fn encodeSignedUpdateRequest(
+    allocator: std.mem.Allocator,
+    buffer: []u8,
+    zone: []const u8,
+    prerequisites: []const dns_record_mod.ResourceRecord,
+    updates: []const dns_record_mod.ResourceRecord,
+    time_signed: u64,
+    key: TestKey,
+) ![]const u8 {
+    const dns_name = @import("../dns/name.zig");
+    var request = dns_message.Message{
+        .allocator = allocator,
+        .header = .{
+            .id = 0x7777,
+            .opcode = .update,
+            .question_count = 1,
+            .answer_count = @intCast(prerequisites.len),
+            .authority_count = @intCast(updates.len),
+            .additional_count = 1,
+        },
+        .question = .{
+            .name = try dns_name.Name.fromText(zone),
+            .qtype = dns_types.RecordType.SOA,
+            .qclass = dns_types.Class.IN,
+        },
+        .answers = try dns_message.RecordSection.init(allocator, prerequisites.len),
+        .authorities = try dns_message.RecordSection.init(allocator, updates.len),
+        .additionals = try dns_message.RecordSection.init(allocator, 1),
+    };
+    for (prerequisites) |record| try request.answers.append(record);
+    for (updates) |record| try request.authorities.append(record);
+    var zeros: [64]u8 = @splat(0);
+    const value = try dns_rdata.Tsig.init(
+        try dns_name.Name.fromText(key.algorithm),
+        time_signed,
+        300,
+        zeros[0..32],
+        0x7777,
+        0,
+        &.{},
+    );
+    try request.additionals.append(.{
+        .owner = try dns_name.Name.fromText(key.name),
+        .rrtype = dns_types.RecordType.TSIG,
+        .class = dns_types.Class.ANY,
+        .ttl = 0,
+        .rdata = .{ .TSIG = value },
+    });
+    var writer = dns_writer.Writer.init(buffer);
+    try request.encode(&writer);
+    const final = (try tsig.parseFinalAdditional(writer.written())).?;
+    const signed = try tsig.sign(writer.written(), key.secret, final.owner, final.tsig, null);
+    try tsig.patchMac(buffer[0..writer.len()], final, signed.slice());
+    return writer.written();
+}
+
+test "runtime applies a signed RFC 2136 update and persists the zone" {
+    const now = 1_700_000_000;
+    var keyring = try keyring_mod.Keyring.parse("key \"key.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };");
+    var runtime = try Runtime.fromZoneTextWithKeyring(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
+        \\
+    , &keyring);
+    defer runtime.deinit();
+    runtime.setTsigNow(now);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try runtime.setUpdatePolicy(tmp.dir, "home.arpa.", "key.", "zone.db");
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var request_buffer: [1024]u8 = undefined;
+    var updates = [_]dns_record_mod.ResourceRecord{.{
+        .owner = try dns_name_mod.Name.fromText("www.home.arpa."),
+        .rrtype = dns_types.RecordType.A,
+        .class = dns_types.Class.IN,
+        .ttl = 60,
+        .rdata = .{ .A = .{ 192, 168, 1, 9 } },
+    }};
+    const request = try encodeSignedUpdateRequest(arena.allocator(), &request_buffer, "home.arpa.", &.{}, &updates, now, .{
+        .algorithm = "hmac-sha256.",
+        .secret = "01234567890123456789012345678901",
+    });
+
+    var output: [1024]u8 = undefined;
+    const response_bytes = try runtime.answer(request, &output);
+    const update_response = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@as(@TypeOf(update_response.header.rcode), .no_error), update_response.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), update_response.header.question_count);
+    try std.testing.expect((try tsig.parseFinalAdditional(response_bytes)) != null);
+
+    // The added record answers, and the serial moved.
+    var query_buffer: [256]u8 = undefined;
+    var query = dns_message.Message{
+        .allocator = arena.allocator(),
+        .header = .{ .id = 0x2222, .opcode = .query, .recursion_desired = true, .question_count = 1 },
+        .question = .{
+            .name = try dns_name_mod.Name.fromText("www.home.arpa."),
+            .qtype = dns_types.RecordType.A,
+            .qclass = dns_types.Class.IN,
+        },
+        .answers = try dns_message.RecordSection.init(arena.allocator(), 0),
+        .authorities = try dns_message.RecordSection.init(arena.allocator(), 0),
+        .additionals = try dns_message.RecordSection.init(arena.allocator(), 0),
+    };
+    defer query.deinit();
+    var query_writer = dns_writer.Writer.init(&query_buffer);
+    try query.encode(&query_writer);
+    const answer_bytes = try runtime.answer(query_writer.written(), &output);
+    const answer = try dns_message.Message.parse(arena.allocator(), answer_bytes);
+    try std.testing.expectEqual(@as(u16, 1), answer.header.answer_count);
+    try std.testing.expectEqual(@as(u8, 192), answer.answers.items[0].rdata.A[0]);
+    try std.testing.expectEqual(@as(u8, 9), answer.answers.items[0].rdata.A[3]);
+    try std.testing.expectEqual(@as(u32, 2), runtime.zones.items[0].soaSerial().?);
+
+    // RFC 2136 section 3.5: the change was written before the response.
+    const persisted = try tmp.dir.readFileAlloc(runtime.io, "zone.db", std.testing.allocator, .limited(1 << 20));
+    defer std.testing.allocator.free(persisted);
+    try std.testing.expect(std.mem.indexOf(u8, persisted, "www.home.arpa.") != null);
+}
+
+test "runtime refuses an unsigned or wrongly keyed RFC 2136 update" {
+    const now = 1_700_000_000;
+    var keyring = try keyring_mod.Keyring.parse("key \"key.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };");
+    var runtime = try Runtime.fromZoneTextWithKeyring(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
+        \\
+    , &keyring);
+    defer runtime.deinit();
+    runtime.setTsigNow(now);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try runtime.setUpdatePolicy(tmp.dir, "home.arpa.", "key.", "zone.db");
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var updates = [_]dns_record_mod.ResourceRecord{.{
+        .owner = try dns_name_mod.Name.fromText("www.home.arpa."),
+        .rrtype = dns_types.RecordType.A,
+        .class = dns_types.Class.IN,
+        .ttl = 60,
+        .rdata = .{ .A = .{ 192, 168, 1, 9 } },
+    }};
+    var update_message = dns_message.Message{
+        .allocator = arena.allocator(),
+        .header = .{ .id = 0x7778, .opcode = .update, .question_count = 1, .authority_count = 1 },
+        .question = .{
+            .name = try dns_name_mod.Name.fromText("home.arpa."),
+            .qtype = dns_types.RecordType.SOA,
+            .qclass = dns_types.Class.IN,
+        },
+        .answers = try dns_message.RecordSection.init(arena.allocator(), 0),
+        .authorities = try dns_message.RecordSection.init(arena.allocator(), 1),
+        .additionals = try dns_message.RecordSection.init(arena.allocator(), 0),
+    };
+    defer update_message.deinit();
+    for (updates) |record| try update_message.authorities.append(record);
+    var request_buffer: [1024]u8 = undefined;
+    var writer = dns_writer.Writer.init(&request_buffer);
+    try update_message.encode(&writer);
+    var output: [1024]u8 = undefined;
+    const unsigned = try runtime.answer(writer.written(), &output);
+    const unsigned_response = try dns_message.Message.parse(arena.allocator(), unsigned);
+    try std.testing.expectEqual(@as(@TypeOf(unsigned_response.header.rcode), .refused), unsigned_response.header.rcode);
+
+    var wrong_key_buffer: [1024]u8 = undefined;
+    const wrong_key_request = try encodeSignedUpdateRequest(arena.allocator(), &wrong_key_buffer, "home.arpa.", &.{}, &updates, now, .{
+        .algorithm = "hmac-sha256.",
+        .secret = "abcdefghijklmnopqrstuvwxyz012345",
+        .name = "other.",
+    });
+    // The keyring does not hold "other.", so the request is refused before any
+    // zone change.
+    const wrong = try runtime.answer(wrong_key_request, &output);
+    const wrong_response = try dns_message.Message.parse(arena.allocator(), wrong);
+    try std.testing.expectEqual(@as(@TypeOf(wrong_response.header.rcode), .notauth), wrong_response.header.rcode);
 }
 
 test "authoritative runtime answers RFC 2136 UPDATE with NOTIMP" {
