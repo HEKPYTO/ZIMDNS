@@ -20,8 +20,10 @@ and `ED25519` take the raw private scalar or seed in base64. `RSASHA256` and
 `RSASHA512` take a base64 PKCS#1 `RSAPrivateKey` DER, which an operator makes
 with `openssl rsa -traditional -outform DER | base64`; the signature is one
 modular exponentiation and the primes are not needed. RSA/SHA-1 (algorithms 5
-and 7) is not offered because RFC 8624 §3.1 says a signer MUST NOT use it, and
-Ed448 needs a primitive the standard library does not ship.
+and 7) is not offered because the IANA "DNS Security Algorithm Numbers"
+registry, as revised by RFC 9904, marks it NOT RECOMMENDED under "Implement
+for DNSSEC Signing", and Ed448 needs a primitive the standard library does not
+ship.
 
 ## The catalog zone's shape (RFC 9432)
 

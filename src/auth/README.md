@@ -12,6 +12,10 @@ TSIG: request authentication and the responses that answer it.
 
 - RFC 8945 §5.2: the key, then the MAC, then the time window, then the
   truncation policy.
+- A key file entry may carry an optional `expires YYYYMMDDHHMMSS;` (UTC, 14
+  digits). At or after that second the key is inactive, and a request naming
+  it is answered NOTAUTH with an unsigned BADKEY (17) record, the same answer
+  an unknown key gets.
 - A name may carry several algorithms. Every key holding the name is a
   candidate, the algorithm the request names selects one, and the key that
   authenticated the request signs the reply.

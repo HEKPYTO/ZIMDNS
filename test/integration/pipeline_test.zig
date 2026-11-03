@@ -2430,6 +2430,80 @@ test "forwarder signals anchor key tags on upstream DNSKEY query" {
     try std.testing.expectEqualSlices(u8, &.{ 0x88, 0x8f }, capture.tags[0..capture.tags_len]);
 }
 
+const KeyTagQueryCapture = struct {
+    io: std.Io,
+    udp: *const std.Io.net.Socket,
+    saw_null_query: bool = false,
+    name: [256]u8 = undefined,
+    name_len: usize = 0,
+    ok: bool = false,
+};
+
+/// Serves the three datagrams the DDR-style chain fetch makes: the client's
+/// signed A answer, the RFC 8145 section 5.2 Key Tag query, and the DNSKEY
+/// chain query. Records the NULL query's name.
+fn serveKeyTagQueryCapture(args: *KeyTagQueryCapture) void {
+    var buffer: [resolver.MAX_UPSTREAM_MESSAGE]u8 = undefined;
+    var served: usize = 0;
+    while (served < 3) : (served += 1) {
+        const incoming = args.udp.receiveTimeout(args.io, &buffer, TestTimeout) catch return;
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const parsed = dns_message.Message.parse(arena.allocator(), incoming.data) catch return;
+        var response = makeAResponse(incoming.data, false, false, false);
+        if (parsed.question) |question| {
+            if (question.qtype.code() == 10) {
+                args.saw_null_query = true;
+                var text: [256]u8 = undefined;
+                const name = question.name.toText(&text) catch return;
+                @memcpy(args.name[0..name.len], name);
+                args.name_len = name.len;
+            }
+            // The client's A answer must look signed so the validator fetches
+            // the chain; the chain queries themselves need no signature.
+            if (question.qtype.eql(.A)) appendMockRrsig(&response);
+        }
+        args.udp.send(args.io, &incoming.from, response.bytes[0..response.len]) catch return;
+    }
+    args.ok = true;
+}
+
+test "forwarder sends the RFC 8145 key tag query for an anchor zone" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+    var capture = KeyTagQueryCapture{ .io = io, .udp = &upstream_socket };
+    const capture_thread = try std.Thread.spawn(.{}, serveKeyTagQueryCapture, .{&capture});
+
+    // The mock RRSIG signs with `example.`, so the anchor names that zone.
+    const anchors = try zimdns.dns_validate.Anchors.parse(std.testing.allocator,
+        \\example. DNSKEY 257 3 8 QUJDRA==
+        \\
+    );
+    const policy = resolver.Policy{
+        .forwarder = .{ .address = upstream_socket.address },
+        .anchors = anchors,
+    };
+    var upstream = try Resolver.init(std.testing.allocator, io, policy);
+    defer upstream.deinit();
+
+    var query_buffer: [512]u8 = undefined;
+    const query_bytes = try cli_query.buildQueryPacket(&query_buffer, 0x7012, "www.example.", .A, true);
+    var query_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer query_arena.deinit();
+    const query = try dns_message.Message.parseQuery(query_arena.allocator(), query_bytes);
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 41012);
+    var output: [resolver.MAX_UPSTREAM_MESSAGE]u8 = undefined;
+    _ = try upstream.answer(query_bytes, query, &client, &output);
+    capture_thread.join();
+
+    try std.testing.expect(capture.ok);
+    try std.testing.expect(capture.saw_null_query);
+    // 0x888f is the RFC 4034 Appendix B checksum of the anchor's DNSKEY.
+    try std.testing.expectEqualStrings("_ta-888f.example.", capture.name[0..capture.name_len]);
+}
+
 const DoCaptureArgs = struct {
     io: std.Io,
     udp: *const std.Io.net.Socket,

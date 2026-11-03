@@ -20,7 +20,6 @@ pub const auth_runtime = @import("auth/runtime.zig");
 pub const auth_keyring = @import("auth/keyring.zig");
 pub const listener = @import("platform/listener.zig");
 pub const cli_query = @import("cli/query.zig");
-pub const cli_zonemd = @import("cli/zonemd.zig");
 pub const config_parser = @import("config/parser.zig");
 pub const config_loader = @import("config/loader.zig");
 pub const metrics = @import("metrics.zig");
@@ -141,11 +140,6 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    if (std.mem.eql(u8, command, "zonemd")) {
-        try handleZonemd(args, io, arena, stdout);
-        return;
-    }
-
     try stdout.print("error: command '{s}' is not implemented yet\n\n", .{command});
     try printHelp(stdout);
     try exitUsage(stdout);
@@ -181,7 +175,6 @@ fn printHelp(writer: *std.Io.Writer) !void {
         \\  zimdns query @127.0.0.1 -p 1055 --zoneversion example.com A
         \\  zimdns query @127.0.0.1 -p 1055 --nsid example.com A
         \\  zimdns query @127.0.0.1 -p 1055 --0x20 example.com A
-        \\  zimdns zonemd publish --zone-file examples/zones/home.arpa.zone
         \\
         \\  RFC 6303/6761/7793/8375 locally served zones are on by default and
         \\  are answered ahead of the cache and the forwarder. A configuration
@@ -212,16 +205,6 @@ fn printHelp(writer: *std.Io.Writer) !void {
         \\  draft-vixie-dnsext-dns0x20 and is no RFC requirement, so it is
         \\  off unless the operator asks for it.
         \\
-        \\  zonemd publish computes the RFC 8976 zone digest of a zone file
-        \\  and prints the ZONEMD record in zone text, ready to paste into
-        \\  the zone. The digest is computed over the zone as published: the
-        \\  apex ZONEMD RRset and the RRSIG covering it stay outside it (RFC
-        \\  8976 section 3.3.1.1), and the record carries the zone's SOA
-        \\  serial (section 3.1). '--scheme' and '--hash' take the RFC 8976
-        \\  registry codes: scheme 1 is SIMPLE, hash 1 is SHA384 and hash 2
-        \\  is SHA512. A signed zone needs its ZONEMD RRset signed again
-        \\  after the record is published (section 3.4).
-        \\
         \\  --serve-dot serves DNS over TLS (RFC 7858) with the "dot" ALPN
         \\  token, --serve-doh serves DNS over HTTPS (RFC 8484) with the
         \\  "http/1.1" token, and --serve-xfr serves zone transfers over TLS
@@ -231,16 +214,9 @@ fn printHelp(writer: *std.Io.Writer) !void {
         \\  certificate and key.
         \\
         \\Implemented now:
-        \\  --help, --version, server run, query, zonemd publish
+        \\  --help, --version, server run, query
         \\
     );
-}
-
-test "the help text documents the zonemd publish command" {
-    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
-    try printHelp(&output.writer);
-    try std.testing.expect(std.mem.indexOf(u8, output.written(), "zimdns zonemd publish --zone-file") != null);
 }
 
 fn handleQuery(args: []const []const u8, io: std.Io, allocator: std.mem.Allocator, writer: *std.Io.Writer) !void {
@@ -328,70 +304,6 @@ fn handleQuery(args: []const []const u8, io: std.Io, allocator: std.mem.Allocato
     // wire, so it is printed only when the case was randomized.
     if (use_case_randomization) try cli_query.writeQuestion(response, writer);
     try cli_query.writeResponse(response, writer);
-}
-
-fn handleZonemd(args: []const []const u8, io: std.Io, allocator: std.mem.Allocator, writer: *std.Io.Writer) !void {
-    if (args.len < 3 or !std.mem.eql(u8, args[2], "publish")) {
-        try writer.writeAll("error: expected 'zonemd publish'\n");
-        try exitUsage(writer);
-    }
-
-    var zone_path: ?[]const u8 = null;
-    var scheme: u8 = 1;
-    var hash: u8 = 1;
-
-    var index: usize = 3;
-    while (index < args.len) {
-        const arg = args[index];
-        if (std.mem.eql(u8, arg, "--zone-file")) {
-            index += 1;
-            if (index >= args.len) {
-                try writer.writeAll("error: --zone-file requires a path\n");
-                try exitUsage(writer);
-            }
-            zone_path = args[index];
-        } else if (std.mem.eql(u8, arg, "--scheme")) {
-            index += 1;
-            if (index >= args.len) {
-                try writer.writeAll("error: --scheme requires a code\n");
-                try exitUsage(writer);
-            }
-            scheme = std.fmt.parseInt(u8, args[index], 10) catch {
-                try writer.writeAll("error: invalid scheme code\n");
-                try exitUsage(writer);
-            };
-        } else if (std.mem.eql(u8, arg, "--hash")) {
-            index += 1;
-            if (index >= args.len) {
-                try writer.writeAll("error: --hash requires a code\n");
-                try exitUsage(writer);
-            }
-            hash = std.fmt.parseInt(u8, args[index], 10) catch {
-                try writer.writeAll("error: invalid hash code\n");
-                try exitUsage(writer);
-            };
-        } else {
-            try writer.print("error: unknown zonemd option '{s}'\n", .{arg});
-            try exitUsage(writer);
-        }
-        index += 1;
-    }
-
-    const path = zone_path orelse {
-        try writer.writeAll("error: zonemd publish requires --zone-file\n");
-        try exitUsage(writer);
-    };
-    const zone_text = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024)) catch {
-        try writer.writeAll("error: cannot read the zone file\n");
-        try exitFailure(writer);
-    };
-
-    // The publisher prints its own refusal line; the exit code says the
-    // digest was not published.
-    cli_zonemd.publish(zone_text, scheme, hash, allocator, writer) catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        else => try exitFailure(writer),
-    };
 }
 
 fn parseQueryType(text: []const u8) !@import("dns/types.zig").RecordType {
@@ -935,10 +847,6 @@ fn exitUsage(writer: *std.Io.Writer) !noreturn {
     std.process.exit(2);
 }
 
-fn exitFailure(writer: *std.Io.Writer) !noreturn {
-    try writer.flush();
-    std.process.exit(1);
-}
 test "query parser accepts SSHFP" {
     try std.testing.expectEqual(@import("dns/types.zig").RecordType.SSHFP, try parseQueryType("SSHFP"));
 }

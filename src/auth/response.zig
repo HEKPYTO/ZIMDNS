@@ -1502,15 +1502,16 @@ pub fn negotiateEdnsPayload(advertised: u16) u16 {
     return @min(advertised, DEFAULT_EDNS_UDP_PAYLOAD_SIZE);
 }
 
-/// RFC 9461 and RFC 9462 section 4: the SVCB RRset a resolver publishes at
-/// `_dns.resolver.arpa.` describes the encrypted endpoints it offers. Each
-/// RDATA is the wire form the publisher built; an empty slice is the NODATA
-/// answer for a QTYPE the name does not carry.
-pub fn buildDdrResponse(request: dns_message.Message, rdatas: []const []const u8, ttl: u32) !dns_message.Message {
+/// RFC 9461 and RFC 9462 sections 4 and 5: the SVCB RRset a resolver publishes
+/// at `_dns.resolver.arpa.` and at each known name `_dns.<target>` describes
+/// the encrypted endpoints it offers. Each RDATA is the wire form the publisher
+/// built; an empty slice is the NODATA answer for a QTYPE the name does not
+/// carry.
+pub fn buildDdrResponse(request: dns_message.Message, owner_text: []const u8, rdatas: []const []const u8, ttl: u32) !dns_message.Message {
     const q = request.question orelse return Error.MissingQuestion;
     var response = try buildEmptyResponse(request, q, .no_error);
     errdefer response.deinit();
-    const owner = dns_name.Name.fromText("_dns.resolver.arpa.") catch return Error.BadResponse;
+    const owner = dns_name.Name.fromText(owner_text) catch return Error.BadResponse;
     for (rdatas) |rdata| {
         try response.answers.append(.{
             .owner = owner,

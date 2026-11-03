@@ -62,6 +62,7 @@ pub const RecordType = struct {
     pub const NSEC3 = RecordType{ .value = 50 };
     pub const ZONEMD = RecordType{ .value = 63 };
     pub const NSEC3PARAM = RecordType{ .value = 51 };
+    pub const NULL = RecordType{ .value = 10 };
 
     pub fn fromCode(value: u16) RecordType {
         return .{ .value = value };

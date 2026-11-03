@@ -1,7 +1,6 @@
 # src
 
-The server and the CLI. One binary. The commands are `server run`, `query`, and
-`zonemd publish`.
+The server and the CLI. One binary. The commands are `server run` and `query`.
 
 | Path | Owns |
 |---|---|
@@ -13,7 +12,7 @@ The server and the CLI. One binary. The commands are `server run`, `query`, and
 | `local_zone.zig` | Locally served zones that are not loaded from files. |
 | `golden_fixture.zig` | Shared helpers for the golden test group. |
 | `auth/` | TSIG keys and authenticated request handling. |
-| `cli/` | The `query` and `zonemd` subcommands. |
+| `cli/` | The `query` subcommand. |
 | `config/` | The configuration grammar and its loader. |
 | `dns/` | Wire format: header, question, name, record types, RDATA, reader, writer, TSIG, DNSSEC signing and validation, padding, and the error report. |
 | `platform/` | Sockets, listeners, and deadlines. |

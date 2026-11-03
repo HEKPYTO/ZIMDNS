@@ -46,8 +46,10 @@ const Ed25519 = std.crypto.sign.Ed25519;
 
 /// The signing algorithms this build carries. RFC 5702's RSA/SHA-256 (8) and
 /// RSA/SHA-512 (10) are here; RSA/SHA-1 (5) and RSA/SHA-1-NSEC3 (7) are not,
-/// because RFC 8624 section 3.1 says a signer MUST NOT use them. Ed448 (RFC
-/// 8080 algorithm 16) is absent: the standard library has no primitive for it.
+/// because the IANA "DNS Security Algorithm Numbers" registry, as revised by
+/// RFC 9904, marks them NOT RECOMMENDED under "Implement for DNSSEC Signing".
+/// Ed448 (RFC 8080 algorithm 16) is absent: the standard library has no
+/// primitive for it.
 pub const Algorithm = enum(u8) {
     rsa_sha256 = 8,
     rsa_sha512 = 10,

@@ -45,9 +45,16 @@ pub const Key = struct {
     algorithm: tsig.Algorithm,
     secret: [max_secret_len]u8 = undefined,
     secret_len: u8 = 0,
+    /// Seconds since the Unix epoch, or null for a key that never expires.
+    expires_at: ?u64 = null,
 
     pub fn secretBytes(self: *const Key) []const u8 {
         return self.secret[0..self.secret_len];
+    }
+
+    /// True while the key may authenticate: no expiry, or `now` before it.
+    pub fn activeAt(self: *const Key, now: u64) bool {
+        return if (self.expires_at) |expires_at| now < expires_at else true;
     }
 
     fn clear(self: *Key) void {
@@ -215,6 +222,15 @@ fn parseKey(scanner: *Scanner) Error!Key {
     scanner.skipWhitespace();
     try scanner.expect(';');
     scanner.skipWhitespace();
+    var expires_at: ?u64 = null;
+    if (scanner.index < scanner.text.len and scanner.text[scanner.index] != '}') {
+        try scanner.expectWord("expires");
+        try scanner.requireWhitespace();
+        expires_at = try parseExpires(try scanner.readWord());
+        scanner.skipWhitespace();
+        try scanner.expect(';');
+        scanner.skipWhitespace();
+    }
     try scanner.expect('}');
     scanner.skipWhitespace();
     try scanner.expect(';');
@@ -228,10 +244,47 @@ fn parseKey(scanner: *Scanner) Error!Key {
     if (decoded_len < minimum) return Error.SecretTooShort;
     if (decoded_len > max_secret_len) return Error.SecretTooLong;
 
-    var key = Key{ .name = name, .algorithm = algorithm, .secret_len = @intCast(decoded_len) };
+    var key = Key{ .name = name, .algorithm = algorithm, .secret_len = @intCast(decoded_len), .expires_at = expires_at };
     errdefer key.clear();
     std.base64.standard.Decoder.decode(key.secret[0..decoded_len], encoded_secret) catch return Error.BadSecret;
     return key;
+}
+
+/// Parses `YYYYMMDDHHMMSS` as UTC. The key file's own expiry directive is an
+/// operator extension of this profile, not RFC 8945 section 8, which defines
+/// only shared-secret handling; RFC 2104 section 3 asks for periodic refresh.
+fn parseExpires(text: []const u8) Error!u64 {
+    if (text.len != 14) return Error.BadSyntax;
+    for (text) |byte| {
+        if (!std.ascii.isDigit(byte)) return Error.BadSyntax;
+    }
+    const year = std.fmt.parseInt(u16, text[0..4], 10) catch return Error.BadSyntax;
+    const month = std.fmt.parseInt(u8, text[4..6], 10) catch return Error.BadSyntax;
+    const day = std.fmt.parseInt(u8, text[6..8], 10) catch return Error.BadSyntax;
+    const hour = std.fmt.parseInt(u8, text[8..10], 10) catch return Error.BadSyntax;
+    const minute = std.fmt.parseInt(u8, text[10..12], 10) catch return Error.BadSyntax;
+    const second = std.fmt.parseInt(u8, text[12..14], 10) catch return Error.BadSyntax;
+    if (month < 1 or month > 12) return Error.BadSyntax;
+    const days_in_month = std.time.epoch.getDaysInMonth(year, @fromBackingInt(@intCast(@as(u4, @intCast(month)))));
+    if (day < 1 or day > days_in_month) return Error.BadSyntax;
+    if (hour > 23 or minute > 59 or second > 59) return Error.BadSyntax;
+    const days = daysFromCivil(year, month, day);
+    // The stored field is unsigned seconds since the epoch, so a date before
+    // 1970 cannot be represented and is out of range.
+    if (days < 0) return Error.BadSyntax;
+    return @as(u64, @intCast(days)) * 86_400 + @as(u64, hour) * 3600 + @as(u64, minute) * 60 + second;
+}
+
+/// Days since 1970-01-01 for a civil date, by the 400-year-era algorithm.
+fn daysFromCivil(year: u16, month: u8, day: u8) i64 {
+    const y: i64 = year;
+    const m: i64 = month;
+    const shifted = if (m <= 2) y - 1 else y;
+    const era = @divFloor(shifted, 400);
+    const year_of_era = shifted - era * 400;
+    const day_of_year = @divFloor(153 * (if (m > 2) m - 3 else m + 9) + 2, 5) + @as(i64, day) - 1;
+    const day_of_era = year_of_era * 365 + @divFloor(year_of_era, 4) - @divFloor(year_of_era, 100) + day_of_year;
+    return era * 146_097 + day_of_era - 719_468;
 }
 
 fn validNameText(text: []const u8) bool {
@@ -262,6 +315,62 @@ test "a keyring reports the names it holds" {
     defer ring.deinit();
     try std.testing.expect(ring.containsName("update-key."));
     try std.testing.expect(!ring.containsName("other."));
+}
+
+test "keyring parses an optional UTC expiry" {
+    var expiring = try Keyring.parse("key \"one.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; expires 20300101000000; };");
+    defer expiring.deinit();
+    const expiring_key = expiring.findAlgorithm(try Name.fromText("one."), .hmac_sha256).?;
+    try std.testing.expectEqual(@as(?u64, 1893456000), expiring_key.expires_at);
+
+    var eternal = try Keyring.parse("key \"one.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };");
+    defer eternal.deinit();
+    const eternal_key = eternal.findAlgorithm(try Name.fromText("one."), .hmac_sha256).?;
+    try std.testing.expectEqual(@as(?u64, null), eternal_key.expires_at);
+    try std.testing.expect(eternal_key.activeAt(std.math.maxInt(u64)));
+}
+
+test "keyring parses a leap-day expiry" {
+    var ring = try Keyring.parse("key \"one.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; expires 20240229123456; };");
+    defer ring.deinit();
+    const key = ring.findAlgorithm(try Name.fromText("one."), .hmac_sha256).?;
+    try std.testing.expectEqual(@as(?u64, 1709210096), key.expires_at);
+}
+
+test "keyring activeAt treats the expiry second as inactive" {
+    var ring = try Keyring.parse("key \"one.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; expires 20300101000000; };");
+    defer ring.deinit();
+    const key = ring.findAlgorithm(try Name.fromText("one."), .hmac_sha256).?;
+    try std.testing.expect(key.activeAt(1893455999));
+    try std.testing.expect(!key.activeAt(1893456000));
+    try std.testing.expect(!key.activeAt(1893456001));
+}
+
+test "keyring refuses malformed expiries, duplicates, and trailing statements" {
+    const cases = [_][]const u8{
+        "expires 2030010100000;",
+        "expires 203001010000001;",
+        "expires 20300001000000;",
+        "expires 20301301000000;",
+        "expires 20300132000000;",
+        "expires 20300431000000;",
+        "expires 20230229000000;",
+        "expires 20300101240000;",
+        "expires 20300101006000;",
+        "expires 20300101000060;",
+        "expires 2030010A000000;",
+        "expires 20300101000000; expires 20300101000001;",
+        "expires 20300101000000; ttl 60;",
+    };
+    for (cases) |statement| {
+        const text = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "key \"one.\" {{ algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; {s} }};",
+            .{statement},
+        );
+        defer std.testing.allocator.free(text);
+        try std.testing.expectError(Error.BadSyntax, Keyring.parse(text));
+    }
 }
 
 test "keyring parses and canonicalizes a SHA-256 key" {

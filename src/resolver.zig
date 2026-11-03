@@ -1721,7 +1721,7 @@ pub const Resolver = struct {
         // RFC 6147 section 5.1.2 runs before this: an error RCODE other than
         // NXDOMAIN is treated as an empty answer, so a synthesis that
         // answers the client with a record is not a resolution failure.
-        switch (try synthesizeDns64Answer(self, query, &response, exchange.scope, now)) {
+        switch (try synthesizeDns64Answer(self, query, &response, exchange.scope, transport, now)) {
             .none => {},
             .synthesized => |answer_scope| upstream_scope = answer_scope,
             .bogus => |ede| {
@@ -2035,6 +2035,29 @@ pub const Resolver = struct {
             }
             return;
         }
+        // RFC 8145 section 5.2: originate a Key Tag query on the same channel
+        // as the DNSKEY chain query for an anchor zone. Best effort only.
+        if (qtype.eql(.DNSKEY) and self.policy.anchors.anchorsZone(apex)) {
+            if (self.keyTagQueryName(apex)) |kt_name| {
+                var kt_answer = switch (source) {
+                    .iterate => blk: {
+                        const options: iterate_mod.Options = .{
+                            .cache = &self.delegations,
+                            .now = now,
+                            .dnssec_ok = false,
+                            .qname_minimization = true,
+                        };
+                        break :blk iterate_mod.resolve(self.allocator, .{ .context = self, .send = iterateSend }, self.rootServers(now), .{
+                            .name = kt_name,
+                            .qtype = dns_types.RecordType.NULL,
+                            .qclass = .IN,
+                        }, options) catch null;
+                    },
+                    .forward => self.forwardZoneQuery(kt_name, dns_types.RecordType.NULL) catch null,
+                };
+                if (kt_answer) |*a| a.deinit();
+            }
+        }
         var chain_answer = switch (source) {
             .iterate => blk: {
                 const options: iterate_mod.Options = .{
@@ -2097,6 +2120,9 @@ pub const Resolver = struct {
         if (self.policy.forwarder_tls) return self.queryUpstreamTls(bytes, parsed, null);
         if (self.policy.forwarder_doh) return self.queryUpstreamDoh(bytes, parsed, null);
         return self.queryUdp(upstream, bytes, parsed, null, true);
+    }
+    fn keyTagQueryName(self: *Resolver, apex: dns_name.Name) ?dns_name.Name {
+        return keyTagQueryNameFor(&self.policy.anchors, apex);
     }
 
     /// SERVFAIL plus the RFC 8914 DNSSEC-bogus INFO-CODE the validator
@@ -2926,6 +2952,36 @@ pub const Resolver = struct {
     }
 };
 
+/// RFC 8145 section 5.1: the name of a Key Tag query for `apex`, its exact
+/// anchors' tags as lowercase four-hex-digit values, sorted and joined by
+/// hyphens, under the `_ta-` label. Section 5.2 names only a trust anchor
+/// zone, so an anchor on an ancestor or a descendant does not qualify. The
+/// label is bounded at 63 octets, which fits twelve tags; the rest are
+/// dropped because the list is sorted and only the smallest tags fit. Null
+/// when the zone has no exact anchor or the name would exceed 255 octets.
+fn keyTagQueryNameFor(anchors: *const validate.Anchors, apex: dns_name.Name) ?dns_name.Name {
+    var tags: [validate.max_anchors]u16 = undefined;
+    const count = anchors.zoneKeyTags(apex, &tags);
+    if (count == 0) return null;
+    var name = dns_name.Name{ .wire_len = 0 };
+    @memcpy(name.wire[1..5], "_ta-");
+    var label_len: usize = 4;
+    for (tags[0..@min(count, 12)], 0..) |tag, idx| {
+        if (idx != 0) {
+            name.wire[1 + label_len] = '-';
+            label_len += 1;
+        }
+        _ = std.fmt.bufPrint(name.wire[1 + label_len ..][0..4], "{x:0>4}", .{tag}) catch return null;
+        label_len += 4;
+    }
+    name.wire[0] = @intCast(label_len);
+    const zone_wire = apex.asWire();
+    if (1 + label_len + zone_wire.len > 255) return null;
+    @memcpy(name.wire[1 + label_len ..][0..zone_wire.len], zone_wire);
+    name.wire_len = @intCast(1 + label_len + zone_wire.len);
+    return name;
+}
+
 /// What the DNS64 synthesis did with the answer: nothing was synthesized, a
 /// synthesized AAAA took the answer's place, or the answer the synthesis
 /// rests on did not validate and the client must see that failure instead.
@@ -2948,8 +3004,12 @@ const Dns64Outcome = union(enum) {
 /// that refuses it is asked again with no ADDRESS (RFC 7871 section 7.1.3).
 /// Returns `.none` when nothing is synthesized, which leaves the answer as
 /// the upstream sent it.
-fn synthesizeDns64Answer(self: *Resolver, query: dns_message.Message, response: *dns_message.Message, scope: ?EcsScope, now: i64) !Dns64Outcome {
+fn synthesizeDns64Answer(self: *Resolver, query: dns_message.Message, response: *dns_message.Message, scope: ?EcsScope, transport: UpstreamTransport, now: i64) !Dns64Outcome {
     if (self.policy.nat64_prefixes.len == 0) return .none;
+    // RFC 6147 section 5.3.1 option 2: a PTR query for an address one of the
+    // configured prefixes embeds is answered with a CNAME into IN-ADDR.ARPA
+    // before the AAAA synthesis, which only accepts AAAA, is considered.
+    if (try synthesizeDns64Reverse(self, query, response, scope, transport)) |outcome| return outcome;
     if (!dns64Applies(query, response.*)) return .none;
     // RFC 6147 section 5.1.4: an AAAA record inside the excluded ranges is
     // not real AAAA data. The offending records are dropped, and an answer
@@ -2980,7 +3040,7 @@ fn synthesizeDns64Answer(self: *Resolver, query: dns_message.Message, response: 
     var a_authenticated = false;
     var hops: usize = 0;
     while (true) {
-        var a_query = try buildAQuery(self, query, target, scope);
+        var a_query = try buildDns64Query(self, query, target, scope, .A);
         defer a_query.deinit();
         var a_query_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
         var a_writer = dns_writer.Writer.init(&a_query_buffer);
@@ -3017,6 +3077,74 @@ fn synthesizeDns64Answer(self: *Resolver, query: dns_message.Message, response: 
         target = owner;
         hops += 1;
     }
+}
+
+/// RFC 6147 section 5.3.1 option 2: a DNS64 answers a PTR query whose
+/// IP6.ARPA name is exactly one of its own RFC 6052 embeddings with a
+/// synthesized CNAME into the matching IN-ADDR.ARPA name. The CNAME is
+/// synthesized only when that name carries PTR data and no CNAME of its
+/// own, so the chain points at real data and is not made longer. Returns
+/// null when nothing is synthesized, which leaves the answer as the
+/// upstream sent it.
+fn synthesizeDns64Reverse(self: *Resolver, query: dns_message.Message, response: *dns_message.Message, scope: ?EcsScope, transport: UpstreamTransport) !?Dns64Outcome {
+    // RFC 6147 section 5.5 item 3: a client that set CD does the synthesis
+    // itself, and section 5.1 keeps this server out of classes other than
+    // IN.
+    if (query.header.checking_disabled) return null;
+    const question = query.question orelse return null;
+    if (!question.qtype.eql(.PTR) or !question.qclass.eql(.IN)) return null;
+    const address = parseIp6ArpaName(question.name) orelse return null;
+    // A real CNAME or PTR at the queried name is the answer: the synthesis
+    // never overwrites it.
+    for (response.answers.slice()) |record| {
+        if (record.owner.eql(&question.name)) return null;
+    }
+    const v4 = reverseEmbeddedIpv4(&self.policy, address) orelse return null;
+    var target_text: [64]u8 = undefined;
+    const text = std.fmt.bufPrint(&target_text, "{d}.{d}.{d}.{d}.in-addr.arpa.", .{ v4[3], v4[2], v4[1], v4[0] }) catch return null;
+    const target = dns_name.Name.fromText(text) catch return null;
+    var ptr_query = try buildDns64Query(self, query, target, scope, .PTR);
+    defer ptr_query.deinit();
+    var query_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
+    var writer = dns_writer.Writer.init(&query_buffer);
+    ptr_query.encode(&writer) catch return null;
+    var answer = self.queryUpstream(writer.written(), ptr_query, scope, transport) catch return null;
+    defer answer.response.deinit();
+    const reverse = answer.response;
+    // RFC 6147 section 5.3.1 option 2: the IN-ADDR.ARPA name must have PTR
+    // data and must not be a CNAME itself.
+    var ptr_count: usize = 0;
+    for (reverse.answers.slice()) |record| {
+        if (!record.owner.eql(&target)) continue;
+        if (record.rrtype.eql(.CNAME)) return null;
+        if (record.rrtype.eql(.PTR)) ptr_count += 1;
+    }
+    if (ptr_count == 0) return null;
+
+    response.answers.len = 0;
+    try response.answers.append(.{
+        .owner = question.name,
+        .rrtype = .CNAME,
+        .class = .IN,
+        // RFC 6147 section 5.3.1 gives the synthesized CNAME no TTL rule.
+        .ttl = 600,
+        .rdata = .{ .CNAME = target },
+    });
+    for (reverse.answers.slice()) |record| {
+        if (!record.rrtype.eql(.PTR) or !record.owner.eql(&target)) continue;
+        try response.answers.append(record);
+    }
+    response.header.answer_count = @intCast(response.answers.len);
+    // RFC 6147 section 5.4 takes the authority section from the final query,
+    // but the synthesized answer owns no authority data: the reverse answer's
+    // records borrow its own message, which is freed below, and a positive
+    // answer needs none. So the section is emptied rather than carried.
+    response.authorities.len = 0;
+    response.header.authority_count = 0;
+    response.header.rcode = .no_error;
+    response.header.authoritative = false;
+    response.header.authenticated_data = false;
+    return .{ .synthesized = upstreamScopeInfo(reverse, answer.scope orelse EcsScope{}) };
 }
 
 /// RFC 6147 sections 5.1.1, 5.1.5 and 5.1.6: the answer decides whether the
@@ -3155,6 +3283,42 @@ fn labelBoundary(wire: []const u8, offset: usize) bool {
     return false;
 }
 
+/// RFC 3596 section 2.5: an IP6.ARPA name holds the 32 nibbles of the
+/// address in reverse order, one single-hex-digit label each, under
+/// ip6.arpa. Returns the address, or null when the name is not exactly
+/// that shape.
+fn parseIp6ArpaName(name: dns_name.Name) ?[16]u8 {
+    const wire = name.asWire();
+    var address: [16]u8 = @splat(0);
+    var offset: usize = 0;
+    var nibble: usize = 0;
+    while (nibble < 32) : (nibble += 1) {
+        if (offset + 2 > wire.len or wire[offset] != 1) return null;
+        const digit = hexDigit(wire[offset + 1]) orelse return null;
+        const position = 31 - nibble;
+        if (position % 2 == 0) {
+            address[position / 2] |= digit << 4;
+        } else {
+            address[position / 2] |= digit;
+        }
+        offset += 2;
+    }
+    if (offset + 10 != wire.len) return null;
+    // RFC 4343 section 4.1: a name is case-insensitive, so the suffix is
+    // matched without regard to the case the client wrote it in.
+    if (!std.ascii.eqlIgnoreCase(wire[offset..], &.{ 3, 'i', 'p', '6', 4, 'a', 'r', 'p', 'a', 0 })) return null;
+    return address;
+}
+
+fn hexDigit(byte: u8) ?u8 {
+    return switch (byte) {
+        '0'...'9' => byte - '0',
+        'a'...'f' => byte - 'a' + 10,
+        'A'...'F' => byte - 'A' + 10,
+        else => null,
+    };
+}
+
 /// RFC 6147 section 5.1.2: the query and the response decide whether this
 /// server acts as a DNS64 for them. A client that set CD does the validation
 /// and the synthesis itself (RFC 6147 section 5.5), and NXDOMAIN is the one
@@ -3247,18 +3411,35 @@ fn selectPrefix(policy: *const Policy, address: [4]u8) ?config.Nat64Prefix {
     return chosen;
 }
 
+/// RFC 6147 section 5.3.1: the IPv4 address an IP6.ARPA name denotes under a
+/// configured prefix. Only an exact RFC 6052 embedding counts: the address
+/// is decoded and re-embedded, and the bytes must match, so a non-zero
+/// reserved octet or suffix bit rejects the name. The prefix must also serve
+/// that IPv4 address (RFC 6052 section 3.1).
+fn reverseEmbeddedIpv4(policy: *const Policy, address: [16]u8) ?[4]u8 {
+    for (policy.nat64_prefixes.items[0..policy.nat64_prefixes.len]) |prefix| {
+        const v4 = extractIpv4(prefix, address);
+        const embedded = embedIpv4(prefix, v4);
+        if (!std.mem.eql(u8, &embedded, &address)) continue;
+        if (!prefix.represents(v4) or !prefix.range.containsIpv4(v4)) continue;
+        return v4;
+    }
+    return null;
+}
+
 /// RFC 6147 section 5.1.7: the prefix that builds the synthetic AAAA of an A
 /// record, or null when no configured prefix serves the address.
 fn prefixForRecord(policy: *const Policy, record: dns_record.ResourceRecord) ?config.Nat64Prefix {
     return selectPrefix(policy, record.rdata.A);
 }
 
-/// RFC 6147 section 5.1.6: the A query for the owner that holds the A
-/// records. It carries the question the client asked apart from the type,
+/// RFC 6147 sections 5.1.6 and 5.3.1: the query the synthesis rests on,
+/// built for the owner that holds the records and the type it needs. It
+/// carries the question the client asked apart from the name and the type,
 /// and the client's AD claim does not travel upstream (RFC 4035 section 4.6).
-/// RFC 7871 section 7.1.1: it carries the scope the AAAA query carried, so
-/// both answers are fetched for one scope.
-fn buildAQuery(self: *Resolver, query: dns_message.Message, name: dns_name.Name, scope: ?EcsScope) !dns_message.Message {
+/// RFC 7871 section 7.1.1: it carries the scope the client's query carried,
+/// so both answers are fetched for one scope.
+fn buildDns64Query(self: *Resolver, query: dns_message.Message, name: dns_name.Name, scope: ?EcsScope, qtype: dns_types.RecordType) !dns_message.Message {
     const question = query.question orelse return Error.BadUpstreamResponse;
     var a_query = dns_message.Message{
         .allocator = self.allocator,
@@ -3270,7 +3451,7 @@ fn buildAQuery(self: *Resolver, query: dns_message.Message, name: dns_name.Name,
     };
     errdefer a_query.deinit();
     a_query.question.?.name = name;
-    a_query.question.?.qtype = .A;
+    a_query.question.?.qtype = qtype;
     a_query.header.authenticated_data = false;
     // The query carries no OPT record of its own, so the upstream request is
     // composed the way a client query without EDNS is.
@@ -3363,6 +3544,22 @@ fn embedIpv4(prefix: config.Nat64Prefix, v4: [4]u8) [16]u8 {
     @memcpy(out[0..prefix_len], prefix.bytes[0..prefix_len]);
     @memcpy(out[prefix_len..][0..head], v4[0..head]);
     @memcpy(out[9..][0 .. 4 - head], v4[head..4]);
+    return out;
+}
+
+/// RFC 6052 section 2.2: the IPv4 address an embedded IPv6 address holds.
+/// It is the inverse of `embedIpv4`; the caller re-embeds and compares,
+/// which is what makes the reserved octet and the suffix have to be zero.
+fn extractIpv4(prefix: config.Nat64Prefix, address: [16]u8) [4]u8 {
+    var out: [4]u8 = undefined;
+    if (prefix.length == 96) {
+        @memcpy(out[0..], address[12..16]);
+        return out;
+    }
+    const prefix_len: usize = @as(usize, prefix.length) / 8;
+    const head: usize = (64 - @as(usize, prefix.length)) / 8;
+    @memcpy(out[0..head], address[prefix_len..][0..head]);
+    @memcpy(out[head..], address[9..][0 .. 4 - head]);
     return out;
 }
 
@@ -5405,6 +5602,65 @@ test "RFC 8145: an upstream DNSKEY query carries the anchors' key tags and nothi
         try buildUpstreamQuery(&.{ 0xbe, 0xef }, unanchored, &output, &.{}, null, true, &.{}),
     );
     try std.testing.expect(findOption(plain_upstream, dns_rdata.EDNS_KEY_TAG_OPTION_CODE) == null);
+}
+
+test "RFC 8145 section 5.1: the key tag query name sorts, pads, and deduplicates" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var anchors = try validate.Anchors.parse(arena.allocator(),
+        \\example.com. DS 34959 8 2 aabb
+        \\example.com. DS 999 8 2 aabb
+        \\example.com. DS 43547 8 2 aabb
+        \\example.com. DS 999 8 2 ccdd
+        \\child.example.com. DS 1 8 2 aabb
+        \\
+    );
+    defer anchors.deinit(arena.allocator());
+
+    const name = keyTagQueryNameFor(&anchors, try dns_name.Name.fromText("example.com.")).?;
+    var text: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("_ta-03e7-888f-aa1b.example.com.", try name.toText(&text));
+
+    // Section 5.2 names only a trust anchor zone: an anchor on a child is
+    // not a trust anchor for the parent, and the parent's name alone does
+    // not make the child a trust anchor zone either.
+    try std.testing.expect(keyTagQueryNameFor(&anchors, try dns_name.Name.fromText("sub.example.com.")) == null);
+    const child = keyTagQueryNameFor(&anchors, try dns_name.Name.fromText("child.example.com.")).?;
+    try std.testing.expectEqualStrings("_ta-0001.child.example.com.", try child.toText(&text));
+}
+
+test "RFC 8145 section 5.1: the label holds twelve tags and a long zone sends none" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var text = std.ArrayList(u8).empty;
+    for (1..14) |tag| {
+        var line: [64]u8 = undefined;
+        try text.appendSlice(arena.allocator(), try std.fmt.bufPrint(&line, "cap.test. DS {d} 8 2 aabb\n", .{tag}));
+    }
+    var anchors = try validate.Anchors.parse(arena.allocator(), text.items);
+    defer anchors.deinit(arena.allocator());
+
+    const name = keyTagQueryNameFor(&anchors, try dns_name.Name.fromText("cap.test.")).?;
+    var wire: [256]u8 = undefined;
+    const label = try name.toText(&wire);
+    // Twelve tags fill the 63-octet label exactly; the thirteenth is dropped
+    // because the list is sorted and the label cannot grow.
+    try std.testing.expectEqualStrings("_ta-0001-0002-0003-0004-0005-0006-0007-0008-0009-000a-000b-000c.cap.test.", label);
+    try std.testing.expect(std.mem.indexOf(u8, label, "000d") == null);
+
+    // A valid zone name that leaves no room for the label is refused rather
+    // than truncated: this 251-octet wire name plus a one-tag label exceeds
+    // the 255-octet name ceiling, and the anchor makes the exact-owner check
+    // pass so the length guard is the thing under test.
+    const long_zone = try dns_name.Name.fromText(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd.",
+    );
+    var long_text: [256]u8 = undefined;
+    var long_line: [320]u8 = undefined;
+    const long_anchor_text = try std.fmt.bufPrint(&long_line, "{s} DS 1 8 2 aabb\n", .{try long_zone.toText(&long_text)});
+    var long_anchors = try validate.Anchors.parse(arena.allocator(), long_anchor_text);
+    defer long_anchors.deinit(arena.allocator());
+    try std.testing.expect(keyTagQueryNameFor(&long_anchors, long_zone) == null);
 }
 
 test "cache separates CD and EDNS DO variants" {
@@ -9279,9 +9535,9 @@ test "RFC 6147 section 5.5: a validated synthesis carries the AD bit" {
     // the negative AAAA answer and the A answer validated, so the AD bit
     // tells the client that the synthesized answer is authentic.
     try std.testing.expect(response.header.authenticated_data);
-    // The upstream saw the AAAA query, the DNSKEY query that validated its
-    // chain, and the A query that followed them.
-    try std.testing.expectEqual(@as(usize, 3), upstream.requests);
+    // The upstream saw the AAAA query, the RFC 8145 Key Tag query and the
+    // DNSKEY query that validated its chain, and the A query that followed.
+    try std.testing.expectEqual(@as(usize, 4), upstream.requests);
 }
 
 test "RFC 6147 section 5.5: a client without the DO bit gets no AD bit" {
@@ -9337,9 +9593,9 @@ test "RFC 6147 section 5.5: a client without the DO bit gets no AD bit" {
     // RFC 6147 section 5.5 item 1: with CD clear and DO clear the vDNS64
     // must not set the AD bit in any response.
     try std.testing.expect(!response.header.authenticated_data);
-    // The upstream saw the AAAA query, the DNSKEY query that validated its
-    // chain, and the A query that followed them.
-    try std.testing.expectEqual(@as(usize, 3), upstream.requests);
+    // The upstream saw the AAAA query, the RFC 8145 Key Tag query and the
+    // DNSKEY query that validated its chain, and the A query that followed.
+    try std.testing.expectEqual(@as(usize, 4), upstream.requests);
 }
 
 test "RFC 6147 section 5.5: a client that set CD gets no synthesis" {
@@ -9449,6 +9705,273 @@ test "RFC 6147 section 5.5: the negative answer is validated without the client'
     try expectEde(response, EDE_RRSIGS_MISSING, "rrsigs missing");
     // The upstream saw the AAAA query and no A query behind it.
     try std.testing.expectEqual(@as(usize, 1), upstream.requests);
+}
+
+test "RFC 6147 section 5.3.1: a DNS64 PTR query is answered with a CNAME into IN-ADDR.ARPA" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    // The Well-Known Prefix embedding of 93.184.216.34.
+    var name_buffer: [128]u8 = undefined;
+    const ip6_name = try dns64TestIp6ArpaName(.{
+        0x00, 0x64, 0xff, 0x9b, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x5d, 0xb8, 0xd8, 0x22,
+    }, &name_buffer);
+    const in_addr_name = "34.216.184.93.in-addr.arpa.";
+    const ptr_records = [_]dns_record.ResourceRecord{dns64TestPtrRecord(in_addr_name, "host.example.")};
+    const entries = [_]Dns64AliasEntry{
+        .{ .name = ip6_name, .qtype = .PTR, .answers = &[_]dns_record.ResourceRecord{} },
+        .{ .name = in_addr_name, .qtype = .PTR, .answers = &ptr_records },
+    };
+    var upstream = Dns64AliasUpstream{
+        .io = io,
+        .udp = &upstream_socket,
+        .entries = &entries,
+    };
+    const thread = try std.Thread.spawn(.{}, serveDns64AliasUpstream, .{&upstream});
+
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = upstream_socket.address },
+        .nat64_prefixes = .init(&.{try config.Nat64Prefix.parse("64:ff9b::/96")}),
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2960, ip6_name, false);
+    defer query.deinit();
+    query.question.?.qtype = .PTR;
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42860);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    thread.join();
+
+    const response = try dns_message.Message.parse(arena.allocator(), bytes);
+    try std.testing.expectEqual(dns_header.Rcode.no_error, response.header.rcode);
+    try std.testing.expectEqual(@as(u16, 2), response.header.answer_count);
+    try std.testing.expectEqual(@as(u16, 0), response.header.authority_count);
+    // RFC 6147 section 5.3.1 option 2: the CNAME maps the IP6.ARPA name to
+    // the IN-ADDR.ARPA name, and the PTR data follows it.
+    try std.testing.expect(response.answers.items[0].rrtype.eql(.CNAME));
+    var text_buffer: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(ip6_name, try response.answers.items[0].owner.toText(&text_buffer));
+    var target_buffer: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(in_addr_name, try response.answers.items[0].rdata.CNAME.toText(&target_buffer));
+    try std.testing.expectEqual(@as(u32, 600), response.answers.items[0].ttl);
+    try std.testing.expect(response.answers.items[1].rrtype.eql(.PTR));
+    try std.testing.expectEqualStrings(in_addr_name, try response.answers.items[1].owner.toText(&target_buffer));
+    try std.testing.expectEqualStrings("host.example.", try response.answers.items[1].rdata.PTR.toText(&target_buffer));
+    // The synthesized CNAME comes from no zone and is unsigned.
+    try std.testing.expect(!response.header.authoritative);
+    try std.testing.expect(!response.header.authenticated_data);
+    // The upstream saw the IP6.ARPA query and then the IN-ADDR.ARPA query.
+    try std.testing.expectEqual(@as(usize, 2), upstream.requests);
+    try std.testing.expectEqualStrings(ip6_name, upstream.seen[0][0..upstream.seen_len[0]]);
+    try std.testing.expectEqualStrings(in_addr_name, upstream.seen[1][0..upstream.seen_len[1]]);
+}
+
+test "RFC 6147 section 5.3.1: a reverse target without PTR data is not synthesized" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    var name_buffer: [128]u8 = undefined;
+    const ip6_name = try dns64TestIp6ArpaName(.{
+        0x00, 0x64, 0xff, 0x9b, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x5d, 0xb8, 0xd8, 0x22,
+    }, &name_buffer);
+    const entries = [_]Dns64AliasEntry{
+        .{ .name = ip6_name, .qtype = .PTR, .answers = &[_]dns_record.ResourceRecord{} },
+        .{ .name = "34.216.184.93.in-addr.arpa.", .qtype = .PTR, .answers = &[_]dns_record.ResourceRecord{} },
+    };
+    var upstream = Dns64AliasUpstream{
+        .io = io,
+        .udp = &upstream_socket,
+        .entries = &entries,
+    };
+    const thread = try std.Thread.spawn(.{}, serveDns64AliasUpstream, .{&upstream});
+
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = upstream_socket.address },
+        .nat64_prefixes = .init(&.{try config.Nat64Prefix.parse("64:ff9b::/96")}),
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2961, ip6_name, false);
+    defer query.deinit();
+    query.question.?.qtype = .PTR;
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42861);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    thread.join();
+
+    const response = try dns_message.Message.parse(arena.allocator(), bytes);
+    try std.testing.expectEqual(dns_header.Rcode.no_error, response.header.rcode);
+    try std.testing.expectEqual(@as(u16, 0), response.header.answer_count);
+    // The IN-ADDR.ARPA query was asked, and its empty answer stayed empty.
+    try std.testing.expectEqual(@as(usize, 2), upstream.requests);
+}
+
+test "RFC 6147 section 5.3.1: a reverse target with a CNAME is not synthesized" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    var name_buffer: [128]u8 = undefined;
+    const ip6_name = try dns64TestIp6ArpaName(.{
+        0x00, 0x64, 0xff, 0x9b, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x5d, 0xb8, 0xd8, 0x22,
+    }, &name_buffer);
+    const in_addr_name = "34.216.184.93.in-addr.arpa.";
+    const cname_records = [_]dns_record.ResourceRecord{dns64TestCnameRecord(in_addr_name, "alias.example.")};
+    const entries = [_]Dns64AliasEntry{
+        .{ .name = ip6_name, .qtype = .PTR, .answers = &[_]dns_record.ResourceRecord{} },
+        .{ .name = in_addr_name, .qtype = .PTR, .answers = &cname_records },
+    };
+    var upstream = Dns64AliasUpstream{
+        .io = io,
+        .udp = &upstream_socket,
+        .entries = &entries,
+    };
+    const thread = try std.Thread.spawn(.{}, serveDns64AliasUpstream, .{&upstream});
+
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = upstream_socket.address },
+        .nat64_prefixes = .init(&.{try config.Nat64Prefix.parse("64:ff9b::/96")}),
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2962, ip6_name, false);
+    defer query.deinit();
+    query.question.?.qtype = .PTR;
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42862);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    thread.join();
+
+    const response = try dns_message.Message.parse(arena.allocator(), bytes);
+    try std.testing.expectEqual(@as(u16, 0), response.header.answer_count);
+    try std.testing.expectEqual(@as(usize, 2), upstream.requests);
+}
+
+test "RFC 6147 section 5.3.1: an address outside every prefix asks no IN-ADDR.ARPA question" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    var name_buffer: [128]u8 = undefined;
+    const ip6_name = try dns64TestIp6ArpaName(.{
+        0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+    }, &name_buffer);
+    const entries = [_]Dns64AliasEntry{
+        .{ .name = ip6_name, .qtype = .PTR, .answers = &[_]dns_record.ResourceRecord{} },
+    };
+    var upstream = Dns64AliasUpstream{
+        .io = io,
+        .udp = &upstream_socket,
+        .entries = &entries,
+        .max_requests = 1,
+    };
+    const thread = try std.Thread.spawn(.{}, serveDns64AliasUpstream, .{&upstream});
+
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = upstream_socket.address },
+        .nat64_prefixes = .init(&.{try config.Nat64Prefix.parse("64:ff9b::/96")}),
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2963, ip6_name, false);
+    defer query.deinit();
+    query.question.?.qtype = .PTR;
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42863);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    thread.join();
+
+    const response = try dns_message.Message.parse(arena.allocator(), bytes);
+    try std.testing.expectEqual(@as(u16, 0), response.header.answer_count);
+    // The name is outside every configured prefix, so no reverse query
+    // followed the client's own query.
+    try std.testing.expectEqual(@as(usize, 1), upstream.requests);
+}
+
+test "RFC 6147 section 5.3.1: non-zero suffix bits are not an exact embedding and are not synthesized" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    // The /64 embedding of 93.184.216.34, with one suffix bit set.
+    var name_buffer: [128]u8 = undefined;
+    const ip6_name = try dns64TestIp6ArpaName(.{
+        0x20, 0x01, 0x0d, 0xb8, 0x00, 0x64, 0x00, 0x00,
+        0x00, 0x5d, 0xb8, 0xd8, 0x22, 0x01, 0x00, 0x00,
+    }, &name_buffer);
+    const entries = [_]Dns64AliasEntry{
+        .{ .name = ip6_name, .qtype = .PTR, .answers = &[_]dns_record.ResourceRecord{} },
+    };
+    var upstream = Dns64AliasUpstream{
+        .io = io,
+        .udp = &upstream_socket,
+        .entries = &entries,
+        .max_requests = 1,
+    };
+    const thread = try std.Thread.spawn(.{}, serveDns64AliasUpstream, .{&upstream});
+
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = upstream_socket.address },
+        .nat64_prefixes = .init(&.{try config.Nat64Prefix.parse("2001:db8:64::/64")}),
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2964, ip6_name, false);
+    defer query.deinit();
+    query.question.?.qtype = .PTR;
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42864);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    thread.join();
+
+    const response = try dns_message.Message.parse(arena.allocator(), bytes);
+    try std.testing.expectEqual(@as(u16, 0), response.header.answer_count);
+    try std.testing.expectEqual(@as(usize, 1), upstream.requests);
+}
+
+test "RFC 3596 section 2.5: an IP6.ARPA name decodes in either case" {
+    var buffer: [128]u8 = undefined;
+    const text = try dns64TestIp6ArpaName(.{
+        0x00, 0x64, 0xff, 0x9b, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x5d, 0xb8, 0xd8, 0x22,
+    }, &buffer);
+    var upper: [128]u8 = undefined;
+    for (text, 0..) |byte, index| upper[index] = std.ascii.toUpper(byte);
+    const lower_address = parseIp6ArpaName(try dns_name.Name.fromTextPreservingCase(text)).?;
+    const upper_address = parseIp6ArpaName(try dns_name.Name.fromTextPreservingCase(upper[0..text.len])).?;
+    try std.testing.expectEqualSlices(u8, &lower_address, &upper_address);
 }
 
 /// The fake upstream a DNS64 test forwards to. It answers the AAAA query and
@@ -9602,6 +10125,9 @@ const Dns64AliasUpstream = struct {
     entries: []const Dns64AliasEntry,
     /// The SOA the AAAA answer carries in its authority section.
     soa: []const dns_record.ResourceRecord = &.{},
+    /// The question names the fake saw, in the order it saw them.
+    seen: [2][256]u8 = undefined,
+    seen_len: [2]usize = .{ 0, 0 },
     /// The number of queries the fake answers before it stops.
     max_requests: usize = 2,
     requests: usize = 0,
@@ -9618,6 +10144,7 @@ fn serveDns64AliasUpstream(args: *Dns64AliasUpstream) void {
     var index: usize = 0;
     while (index < args.max_requests) : (index += 1) {
         const incoming = args.udp.receiveTimeout(args.io, &request_buffer, Dns64Timeout) catch return;
+        const slot = args.requests;
         args.requests += 1;
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
@@ -9625,6 +10152,10 @@ fn serveDns64AliasUpstream(args: *Dns64AliasUpstream) void {
         const question = query.question orelse return;
         var name_buffer: [256]u8 = undefined;
         const name_text = question.name.toText(&name_buffer) catch return;
+        if (slot < args.seen.len and name_text.len <= args.seen[slot].len) {
+            @memcpy(args.seen[slot][0..name_text.len], name_text);
+            args.seen_len[slot] = name_text.len;
+        }
         var answers: []const dns_record.ResourceRecord = &.{};
         for (args.entries) |entry| {
             if (!entry.qtype.eql(question.qtype)) continue;
@@ -9686,6 +10217,32 @@ fn dns64TestCnameRecord(owner_text: []const u8, target_text: []const u8) dns_rec
         .ttl = 300,
         .rdata = .{ .CNAME = dns_name.Name.fromText(target_text) catch unreachable },
     };
+}
+
+fn dns64TestPtrRecord(owner_text: []const u8, target_text: []const u8) dns_record.ResourceRecord {
+    return .{
+        .owner = dns_name.Name.fromText(owner_text) catch unreachable,
+        .rrtype = .PTR,
+        .class = .IN,
+        .ttl = 300,
+        .rdata = .{ .PTR = dns_name.Name.fromText(target_text) catch unreachable },
+    };
+}
+
+/// RFC 3596 section 2.5: the IP6.ARPA name of an address, built from the
+/// address so a test reads as the address it asks for.
+fn dns64TestIp6ArpaName(address: [16]u8, buffer: []u8) ![]const u8 {
+    var len: usize = 0;
+    var nibble: usize = 0;
+    while (nibble < 32) : (nibble += 1) {
+        const position = 31 - nibble;
+        const byte = address[position / 2];
+        const digit = if (position % 2 == 0) byte >> 4 else byte & 0x0f;
+        len += (try std.fmt.bufPrint(buffer[len..], "{x}.", .{digit})).len;
+    }
+    const suffix = "ip6.arpa.";
+    len += (try std.fmt.bufPrint(buffer[len..], "{s}", .{suffix})).len;
+    return buffer[0..len];
 }
 
 fn dns64TestDnameRecord(owner_text: []const u8, target_text: []const u8) dns_record.ResourceRecord {

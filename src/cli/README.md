@@ -5,7 +5,6 @@ The command line.
 | File | Owns |
 |---|---|
 | `query.zig` | The `query` command: send one question to a server and print the answer. |
-| `zonemd.zig` | The `zonemd publish` command: compute a zone's RFC 8976 digest and print the record. |
 
 ## Rules
 

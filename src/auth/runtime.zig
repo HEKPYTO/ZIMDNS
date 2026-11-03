@@ -51,6 +51,19 @@ pub fn releaseAnswerScratch() void {
     answer_scratch_arena = .init(std.heap.page_allocator);
 }
 
+/// RFC 9462 section 5: the known name is exactly `_dns.<target>`, and case
+/// folding is the only difference RFC 1035 section 2.3.3 allows. Comparing the
+/// whole wire name keeps the match at label boundaries, so `_dns.xfoo.example.`
+/// is not the known name of `foo.example.`.
+fn isKnownResolverName(name: *const dns_name_mod.Name, target: *const dns_name_mod.Name) bool {
+    const wire = name.asWire();
+    const target_wire = target.asWire();
+    if (wire.len != target_wire.len + 5) return false;
+    if (wire[0] != 4) return false;
+    if (!std.ascii.eqlIgnoreCase(wire[1..5], "_dns")) return false;
+    return std.ascii.eqlIgnoreCase(wire[5..], target_wire);
+}
+
 test "releaseAnswerScratch frees the retained buffers" {
     const scratch = answerScratch();
     _ = try scratch.alloc(u8, 4096);
@@ -233,6 +246,9 @@ pub const Runtime = struct {
     /// `_dns.resolver.arpa.` for RFC 9462 discovery. Empty unless `ddr` is
     /// configured; every slice is owned.
     ddr_rdatas: std.ArrayList([]const u8) = .empty,
+    /// The TargetName of each `ddr_rdatas` entry, in the same order: RFC 9462
+    /// section 5 also publishes the binding at the known name `_dns.<target>`.
+    ddr_targets: std.ArrayList(dns_name_mod.Name) = .empty,
     /// Set by the SIGHUP handler and cleared by the reload that answers it.
     /// The handler only stores the flag; the file is read outside it.
     reload_requested: std.atomic.Value(bool) = .init(false),
@@ -356,6 +372,8 @@ pub const Runtime = struct {
         for (self.ddr_rdatas.items) |rdata| self.allocator.free(rdata);
         self.ddr_rdatas.deinit(self.allocator);
         self.ddr_rdatas = .empty;
+        self.ddr_targets.deinit(self.allocator);
+        self.ddr_targets = .empty;
         if (self.catalog_consumer) |*consumer| {
             self.allocator.free(consumer.apex);
             for (consumer.members.items) |member| {
@@ -434,10 +452,12 @@ pub const Runtime = struct {
         });
     }
 
-    /// Registers one RFC 9461 SVCB record for `_dns.resolver.arpa.`. The
-    /// presentation form is parsed and its wire RDATA kept, so a query costs
-    /// no re-parse.
+    /// Registers one RFC 9461 SVCB record for `_dns.resolver.arpa.` and its
+    /// RFC 9462 section 5 known name `_dns.<target>`. The presentation form is
+    /// parsed and its wire RDATA kept, so a query costs no re-parse; the target
+    /// is kept inline so a known-name query needs no allocator.
     pub fn addDdrRecord(self: *Runtime, target: []const u8, alpn: []const u8, port: u16, dohpath: ?[]const u8) !void {
+        const target_name = dns_name_mod.Name.fromText(target) catch return error.BadConfiguration;
         var text_buffer: [512]u8 = undefined;
         const text = if (dohpath) |path|
             try std.fmt.bufPrint(&text_buffer, "1 {s} alpn={s} port={d} dohpath={s}", .{ target, alpn, port, path })
@@ -450,6 +470,10 @@ pub const Runtime = struct {
         const owned = try self.allocator.dupe(u8, writer.written());
         errdefer self.allocator.free(owned);
         try self.ddr_rdatas.append(self.allocator, owned);
+        // The two lists are one record; a failed second append must not leave
+        // them different lengths.
+        errdefer _ = self.ddr_rdatas.pop();
+        try self.ddr_targets.append(self.allocator, target_name);
     }
 
     /// Records the RFC 9432 catalog this server is provisioned from. The
@@ -1079,6 +1103,7 @@ pub const Runtime = struct {
             return .{ .incoming = .{ .query = query } };
         };
 
+        const now = self.currentTsigTime();
         const algorithm = tsig.algorithmForName(&final_record.tsig.algorithm) catch {
             return .{ .failure = .{ .code = .badkey, .final = final_record } };
         };
@@ -1088,6 +1113,12 @@ pub const Runtime = struct {
         const key = self.keyring.findAlgorithm(final_record.owner, algorithm) orelse {
             return .{ .failure = .{ .code = .badkey, .final = final_record } };
         };
+        // An operator-configured expiry makes the key unusable, and RFC 8945
+        // section 5.2.1 answers an unusable key as an unknown one: NOTAUTH
+        // with BADKEY and no MAC (section 5.3.2).
+        if (!key.activeAt(now)) {
+            return .{ .failure = .{ .code = .badkey, .final = final_record } };
+        }
         if (final_record.tsig.error_code != 0) {
             return .{ .failure = .{ .code = .formerr, .final = final_record } };
         }
@@ -1101,7 +1132,6 @@ pub const Runtime = struct {
             else => return .{ .failure = .{ .code = .formerr, .final = final_record } },
         };
 
-        const now = self.currentTsigTime();
         const signed_time = final_record.tsig.time_signed;
         const delta = if (now >= signed_time) now - signed_time else signed_time - now;
         if (delta > final_record.tsig.fudge) {
@@ -1748,6 +1778,30 @@ pub const Runtime = struct {
         var qname_text_buffer: [256]u8 = undefined;
         const qname_text = q.name.toText(&qname_text_buffer) catch return Error.BadQuery;
 
+        // RFC 9462 sections 4 and 5: `_dns.resolver.arpa.` and each known name
+        // `_dns.<target>` are special-use names this resolver publishes for
+        // itself, so they are answered before any zone the name falls in. A
+        // QTYPE the published name does not carry is NODATA rather than a
+        // forward, and a known name this server was not configured for falls
+        // through without being claimed. Only class IN asks for these records.
+        if (q.qclass.eql(dns_types.Class.IN) and self.ddr_rdatas.items.len != 0 and std.ascii.eqlIgnoreCase(qname_text, "_dns.resolver.arpa.")) {
+            const answers: []const []const u8 = if (q.qtype.eql(.SVCB) or q.qtype.eql(.ANY)) self.ddr_rdatas.items else &.{};
+            return self.encodeMessage(try response.buildDdrResponse(query, "_dns.resolver.arpa.", answers, self.ddr_ttl), output);
+        }
+        if (q.qclass.eql(dns_types.Class.IN)) {
+            for (self.ddr_targets.items) |target| {
+                if (!isKnownResolverName(&q.name, &target)) continue;
+                var answers: std.ArrayList([]const u8) = .empty;
+                defer answers.deinit(query.allocator);
+                if (q.qtype.eql(.SVCB) or q.qtype.eql(.ANY)) {
+                    for (self.ddr_targets.items, self.ddr_rdatas.items) |candidate, rdata| {
+                        if (candidate.eql(&target)) try answers.append(query.allocator, rdata);
+                    }
+                }
+                return self.encodeMessage(try response.buildDdrResponse(query, qname_text, answers.items, self.ddr_ttl), output);
+            }
+        }
+
         if (self.selectZone(qname_text) != null) {
             if (self.resolver) |*resolver| {
                 const server_cookie = resolver.validateCookie(query, client) catch |err| switch (err) {
@@ -1762,14 +1816,6 @@ pub const Runtime = struct {
             return self.encodeMessage(try self.buildMessage(query, over_tcp, client), output);
         }
         if (try self.localZoneAnswer(query)) |local| return self.encodeMessage(local, output);
-        // RFC 9462 section 4: a client asks its resolver for the designated
-        // resolver's SVCB records at `_dns.resolver.arpa.`. The name is
-        // special-use, so it is answered here rather than forwarded; a QTYPE
-        // the name does not carry is NODATA.
-        if (self.ddr_rdatas.items.len != 0 and std.ascii.eqlIgnoreCase(qname_text, "_dns.resolver.arpa.")) {
-            const answers: []const []const u8 = if (q.qtype.eql(.SVCB) or q.qtype.eql(.ANY)) self.ddr_rdatas.items else &.{};
-            return self.encodeMessage(try response.buildDdrResponse(query, answers, self.ddr_ttl), output);
-        }
         if (self.blocklist.blocks(qname_text)) return self.encodeMessage(try response.buildBlockedResponse(query), output);
         if (!q.qclass.eql(@import("../dns/types.zig").Class.IN)) {
             return self.encodeMessage(try response.buildRefusedResponse(query), output);
@@ -2449,6 +2495,42 @@ test "runtime maps TSIG key and MAC failures before query dispatch" {
     try std.testing.expectEqual(@as(@TypeOf(parsed.header.rcode), .notauth), parsed.header.rcode);
     try std.testing.expectEqual(@as(u16, 1), parsed.header.additional_count);
     try std.testing.expectEqual(@as(u16, 16), parsed.additionals.items[0].rdata.TSIG.error_code);
+    try std.testing.expectEqual(@as(u16, 0x1234), parsed.additionals.items[0].rdata.TSIG.original_id);
+    try std.testing.expectEqual(@as(usize, 0), parsed.additionals.items[0].rdata.TSIG.macBytes().len);
+}
+
+test "runtime answers an expired TSIG key with unsigned BADKEY" {
+    const valid_now = 1_700_000_000;
+    const expired_now = 1_893_456_000;
+    var keyring = try keyring_mod.Keyring.parse("key \"key.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; expires 20300101000000; };");
+    var runtime = try Runtime.fromZoneTextWithKeyring(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
+        \\
+    , &keyring);
+    defer runtime.deinit();
+
+    runtime.setTsigNow(valid_now);
+    const before = try makeSignedQuery(valid_now, 32);
+    var output: [1024]u8 = undefined;
+    var response_bytes = try runtime.answer(before.packet[0..before.len], &output);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@as(@TypeOf(parsed.header.rcode), .no_error), parsed.header.rcode);
+
+    // The request's time_signed is the same expired instant, so only the
+    // key's expiry, not the time window, is under test.
+    runtime.setTsigNow(expired_now);
+    const after = try makeSignedQuery(expired_now, 32);
+    response_bytes = try runtime.answer(after.packet[0..after.len], &output);
+    parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@as(@TypeOf(parsed.header.rcode), .notauth), parsed.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.additional_count);
+    try std.testing.expectEqual(@as(u16, 17), parsed.additionals.items[0].rdata.TSIG.error_code);
     try std.testing.expectEqual(@as(u16, 0x1234), parsed.additionals.items[0].rdata.TSIG.original_id);
     try std.testing.expectEqual(@as(usize, 0), parsed.additionals.items[0].rdata.TSIG.macBytes().len);
 }
@@ -3501,6 +3583,27 @@ fn encodeSignedUpdateRequest(
     return writer.written();
 }
 
+/// Builds one OPCODE 0, RD-set query so a DDR test can name any target without
+/// hand-writing its wire form.
+fn encodeDdrQuery(allocator: std.mem.Allocator, buffer: []u8, name: []const u8, qtype: dns_types.RecordType) ![]const u8 {
+    var message = dns_message.Message{
+        .allocator = allocator,
+        .header = .{ .id = 0x4444, .opcode = .query, .recursion_desired = true, .question_count = 1 },
+        .question = .{
+            .name = try dns_name_mod.Name.fromText(name),
+            .qtype = qtype,
+            .qclass = dns_types.Class.IN,
+        },
+        .answers = try dns_message.RecordSection.init(allocator, 0),
+        .authorities = try dns_message.RecordSection.init(allocator, 0),
+        .additionals = try dns_message.RecordSection.init(allocator, 0),
+    };
+    defer message.deinit();
+    var writer = dns_writer.Writer.init(buffer);
+    try message.encode(&writer);
+    return writer.written();
+}
+
 test "the resolver publishes RFC 9461 SVCB records at _dns.resolver.arpa" {
     var keyring = try keyring_mod.Keyring.parse("key \"key.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };");
     var runtime = try Runtime.fromZoneTextWithKeyring(
@@ -3545,6 +3648,83 @@ test "the resolver publishes RFC 9461 SVCB records at _dns.resolver.arpa" {
     const a_answer = try dns_message.Message.parse(arena.allocator(), a_response);
     try std.testing.expectEqual(@as(@TypeOf(a_answer.header.rcode), .no_error), a_answer.header.rcode);
     try std.testing.expectEqual(@as(u16, 0), a_answer.header.answer_count);
+}
+
+test "RFC 9462 section 5 known names answer with their own target's records" {
+    var runtime = try Runtime.fromZoneText(
+        \\$ORIGIN one.example.
+        \\$TTL 3600
+        \\@ IN SOA ns.one.example. hostmaster.one.example. 1 3600 900 1209600 3600
+        \\@ IN NS ns.one.example.
+        \\
+    );
+    defer runtime.deinit();
+    try runtime.addDdrRecord("one.example.", "dot", 853, null);
+    try runtime.addDdrRecord("two.example.", "h2", 443, "/two{?dns}");
+    try runtime.addDdrRecord("one.example.", "h2", 443, "/one{?dns}");
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const client = try std.Io.net.IpAddress.parse("192.0.2.1", 5555);
+    var query_buffer: [512]u8 = undefined;
+    var output: [1024]u8 = undefined;
+    var text_buffer: [256]u8 = undefined;
+
+    // `one.example.` is a served zone, so NOERROR with two answers proves the
+    // known name is answered before the zone path sees `_dns.one.example.`.
+    const one_name = try dns_name_mod.Name.fromText("_dns.one.example.");
+    const one_query = try encodeDdrQuery(arena.allocator(), &query_buffer, "_dns.one.example.", .SVCB);
+    const one = try dns_message.Message.parse(arena.allocator(), try runtime.answerFrom(one_query, &output, &client));
+    try std.testing.expectEqual(@as(u16, 2), one.header.answer_count);
+    for (one.answers.items) |record| {
+        try std.testing.expect(record.rrtype.eql(.SVCB));
+        try std.testing.expect(record.owner.eql(&one_name));
+        const target = try record.rdata.SVCB.target.toText(&text_buffer);
+        try std.testing.expectEqualStrings("one.example.", target);
+    }
+
+    // The other target answers at its own name, and the match folds case.
+    const two_name = try dns_name_mod.Name.fromText("_dns.two.example.");
+    const two_query = try encodeDdrQuery(arena.allocator(), &query_buffer, "_DNS.TWO.EXAMPLE.", .SVCB);
+    const two = try dns_message.Message.parse(arena.allocator(), try runtime.answerFrom(two_query, &output, &client));
+    try std.testing.expectEqual(@as(u16, 1), two.header.answer_count);
+    try std.testing.expect(two.answers.items[0].owner.eql(&two_name));
+    const two_target = try two.answers.items[0].rdata.SVCB.target.toText(&text_buffer);
+    try std.testing.expectEqualStrings("two.example.", two_target);
+
+    // A QTYPE the known name does not carry is NODATA, not a forward. The zone
+    // would answer NXDOMAIN for the same query name, so NOERROR proves the DDR
+    // path answered it.
+    const a_query = try encodeDdrQuery(arena.allocator(), &query_buffer, "_dns.one.example.", .A);
+    const a = try dns_message.Message.parse(arena.allocator(), try runtime.answerFrom(a_query, &output, &client));
+    try std.testing.expectEqual(@as(@TypeOf(a.header.rcode), .no_error), a.header.rcode);
+    try std.testing.expectEqual(@as(u16, 0), a.header.answer_count);
+}
+
+test "RFC 9462 section 5 does not claim a known name this server was not configured for" {
+    var runtime = try Runtime.fromZoneText(
+        \\$ORIGIN one.example.
+        \\$TTL 3600
+        \\@ IN SOA ns.one.example. hostmaster.one.example. 1 3600 900 1209600 3600
+        \\@ IN NS ns.one.example.
+        \\
+    );
+    defer runtime.deinit();
+    try runtime.addDdrRecord("one.example.", "dot", 853, null);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const client = try std.Io.net.IpAddress.parse("192.0.2.1", 5555);
+    var query_buffer: [512]u8 = undefined;
+    var output: [1024]u8 = undefined;
+
+    // No resolver is configured, so the fall-through answer is the server's
+    // not-authoritative refusal, never a DDR NODATA.
+    const query = try encodeDdrQuery(arena.allocator(), &query_buffer, "_dns.unknown.example.", .SVCB);
+    const answer = try dns_message.Message.parse(arena.allocator(), try runtime.answerFrom(query, &output, &client));
+    try std.testing.expectEqual(@as(@TypeOf(answer.header.rcode), .refused), answer.header.rcode);
+    try std.testing.expectEqual(@as(u16, 0), answer.header.answer_count);
+    try std.testing.expect(!answer.header.authoritative);
 }
 
 test "a signed update sends an RFC 1996 NOTIFY to the configured secondary" {

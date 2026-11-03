@@ -18,9 +18,10 @@
 /// configured anchor (RFC 8976 section 4 step 3).
 /// What this module does NOT do: iterative resolution, chasing a delegation
 /// chain across several zones, the RFC 5011 anchor rollover beyond the REVOKE
-/// bit, NSEC3 generation, RSA/SHA-1 (5 and 7, which RFC 8624 section 3.1
-/// says a validator SHOULD NOT use), and Ed448, for which the standard
-/// library carries no primitive.
+/// bit, NSEC3 generation, RSA/SHA-1 (5 and 7, a MUST in the IANA "DNS
+/// Security Algorithm Numbers" registry's "Implement for DNSSEC Validation"
+/// column as revised by RFC 9904; not implementing it is a recorded
+/// deviation), and Ed448, for which the standard library carries no primitive.
 /// Ownership: `validate` runs on one arena and frees it before returning.
 /// `Anchors` owns its parsed RDATA until `deinit`.
 /// Errors: a malformed anchor file or opaque RDATA is a typed error. A failed
@@ -174,6 +175,43 @@ pub const Anchors = struct {
             if (anchor.owner.eql(&name)) return true;
         }
         return false;
+    }
+    /// RFC 8145 section 5.2: writes the key tags of anchors whose owner is
+    /// EXACTLY `zone` (not a descendant, not an ancestor) into `out`, sorted
+    /// ascending and deduplicated; returns the count. DS anchors use their
+    /// RDATA key tag; DNSKEY anchors use dnssec.keyTag.
+    pub fn zoneKeyTags(self: *const Anchors, zone: Name, out: []u16) usize {
+        var tags: [max_anchors]u16 = undefined;
+        var n: usize = 0;
+        for (self.items[0..self.len]) |anchor| {
+            if (!anchor.owner.eql(&zone)) continue;
+            const tag = if (anchor.rrtype.eql(.DS))
+                std.mem.readInt(u16, anchor.rdata[0..2], .big)
+            else
+                dnssec.keyTag(anchor.rdata);
+            var dup = false;
+            for (tags[0..n]) |t| {
+                if (t == tag) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) continue;
+            tags[n] = tag;
+            n += 1;
+        }
+        var i: usize = 1;
+        while (i < n) : (i += 1) {
+            const key = tags[i];
+            var j: usize = i;
+            while (j > 0 and tags[j - 1] > key) : (j -= 1) tags[j] = tags[j - 1];
+            tags[j] = key;
+        }
+        // The written count, so a caller with a short buffer never reads
+        // slots this method did not fill.
+        const m = @min(n, out.len);
+        @memcpy(out[0..m], tags[0..m]);
+        return m;
     }
 
     /// Writes the 16-bit Key Tag of every anchor that speaks for `name` into
@@ -504,9 +542,12 @@ fn verifyEd25519(key: []const u8, signature: []const u8, data: []const u8) Error
 /// (RFC 6605), and 15 (RFC 8080). A DNSKEY RRset of any other algorithm is
 /// the case RFC 8914 section 4.2 names; a DS RRset of them is the case
 /// RFC 4035 section 5.2 names. Either way the zone has no supported
-/// authentication path. RSA/SHA-1 (5 and 7) is not here: RFC 8624 section 3.1
-/// says a signer MUST NOT use it and a validator SHOULD NOT, and this build
-/// treats it as unsupported rather than insecure-by-silence.
+/// authentication path. RSA/SHA-1 (5 and 7) is not here: the IANA "DNS
+/// Security Algorithm Numbers" registry, as revised by RFC 9904, marks it MUST
+/// under "Implement for DNSSEC Validation" and NOT RECOMMENDED under
+/// "Implement for DNSSEC Signing"; this build deliberately does not implement
+/// that validation MUST and records the deviation, treating the algorithms as
+/// unsupported rather than insecure-by-silence.
 fn algorithmSupported(number: u8) bool {
     return switch (number) {
         8, 10, 13, 14, 15 => true,
@@ -2790,6 +2831,30 @@ fn dsAnchor(allocator: std.mem.Allocator, owner_text: []const u8, dnskey_rdata: 
     return anchors;
 }
 
+/// A DS for `dnskey_rdata` with digest type 1 (SHA-1), the RFC 3658 digest
+/// that RFC 9904's "Implement for DNSSEC Validation" column makes a MUST.
+fn dsAnchorSha1(allocator: std.mem.Allocator, owner_text: []const u8, dnskey_rdata: []const u8, corrupt: bool) !Anchors {
+    var hasher = std.crypto.hash.Sha1.init(.{});
+    hasher.update((try Name.fromText(owner_text)).asWire());
+    hasher.update(dnskey_rdata);
+    var digest: [std.crypto.hash.Sha1.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    if (corrupt) digest[0] ^= 0xff;
+    var rdata: [4 + std.crypto.hash.Sha1.digest_length]u8 = undefined;
+    std.mem.writeInt(u16, rdata[0..2], dnssec.keyTag(dnskey_rdata), .big);
+    rdata[2] = dnskey_rdata[3];
+    rdata[3] = 1;
+    @memcpy(rdata[4..], &digest);
+    var anchors = Anchors{};
+    anchors.items[0] = .{
+        .owner = try Name.fromText(owner_text),
+        .rrtype = .DS,
+        .rdata = try allocator.dupe(u8, &rdata),
+    };
+    anchors.len = 1;
+    return anchors;
+}
+
 /// A DS for `dnskey_rdata` whose digest type this build cannot compute
 /// (RFC 6840 section 5.2 names an unknown digest type a downgrade signal).
 fn dsAnchorWithDigestType(allocator: std.mem.Allocator, owner_text: []const u8, dnskey_rdata: []const u8, digest_type: u8) !Anchors {
@@ -3248,6 +3313,27 @@ test "a DS whose digest does not match the DNSKEY leaves the answer insecure" {
     try expectStatus(.insecure, try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds));
 }
 
+test "RFC 9904: a SHA-1 DS anchor authenticates the zone and a corrupted SHA-1 digest does not" {
+    var signed = try signZoneText(std.testing.allocator, child_zone_text, p256_secret);
+    defer signed.deinit(std.testing.allocator);
+
+    var pair = try exchange(std.testing.allocator, &signed.zone, "www.example.com.", .A, .no_error, "www.example.com.", null);
+    defer pair.query.deinit();
+    defer pair.response.deinit();
+
+    // RFC 3658's SHA-1 DS digest is a MUST under RFC 9904's "Implement for
+    // DNSSEC Validation" column, so the anchor must establish a secure chain.
+    var anchors = try dsAnchorSha1(std.testing.allocator, "example.com.", signed.dnskey, false);
+    defer anchors.deinit(std.testing.allocator);
+    try expectStatus(.secure, try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds));
+
+    // The same anchor with one digest octet changed matches no DNSKEY, which
+    // RFC 4035 section 5.2 leaves insecure, as the SHA-256 case above does.
+    var corrupted = try dsAnchorSha1(std.testing.allocator, "example.com.", signed.dnskey, true);
+    defer corrupted.deinit(std.testing.allocator);
+    try expectStatus(.insecure, try validate(std.testing.allocator, &corrupted, pair.query, pair.response, &.{}, now_seconds));
+}
+
 test "a DS anchor whose child publishes no DNSKEY is bogus with the DNSKEY Missing EDE (RFC 8914 4.10)" {
     var signed = try signZoneText(std.testing.allocator, child_zone_text, p256_secret);
     defer signed.deinit(std.testing.allocator);
@@ -3272,23 +3358,28 @@ test "a DNSKEY RRset with only an unsupported algorithm leaves the answer insecu
     var signed = try signZoneText(std.testing.allocator, child_zone_text, p256_secret);
     defer signed.deinit(std.testing.allocator);
 
-    // The zone publishes one DNSKEY, whose algorithm this build cannot
-    // verify with, and the DS at the parent names it.
-    const key = dnskeyRdata(256, 16);
-    var anchors = try dsAnchor(std.testing.allocator, "example.com.", &key, false);
-    defer anchors.deinit(std.testing.allocator);
-
     var pair = try exchange(std.testing.allocator, &signed.zone, "www.example.com.", .A, .no_error, "www.example.com.", null);
     defer pair.query.deinit();
     defer pair.response.deinit();
-    try setApexDnskey(&pair.response, &key);
 
-    // RFC 4035 section 5.2: an unsupported algorithm leaves the zone with no
-    // authentication path, so the answer is insecure and the client still
-    // gets it -- not a SERVFAIL.
-    const result = try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds);
-    try expectStatus(.insecure, result);
-    try std.testing.expectEqual(dnssec.EDE_UNSUPPORTED_DNSKEY_ALGORITHM, result.ede);
+    // The zone publishes one DNSKEY, whose algorithm this build cannot verify
+    // with, and the DS at the parent names it. Algorithms 5 and 7 (RSA/SHA-1)
+    // are the RFC 9904 validation MUST this build deliberately does not meet;
+    // 16 (Ed448) is RECOMMENDED for validation and absent. All three are
+    // recorded deviations, so each is insecure rather than silently trusted.
+    for ([_]u8{ 5, 7, 16 }) |algorithm| {
+        const key = dnskeyRdata(256, algorithm);
+        var anchors = try dsAnchor(std.testing.allocator, "example.com.", &key, false);
+        defer anchors.deinit(std.testing.allocator);
+        try setApexDnskey(&pair.response, &key);
+
+        // RFC 4035 section 5.2: an unsupported algorithm leaves the zone with
+        // no authentication path, so the answer is insecure and the client
+        // still gets it -- not a SERVFAIL.
+        const result = try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds);
+        try expectStatus(.insecure, result);
+        try std.testing.expectEqual(dnssec.EDE_UNSUPPORTED_DNSKEY_ALGORITHM, result.ede);
+    }
 }
 
 test "a DS whose digest type this build cannot compute leaves the answer insecure with the Unsupported DS Digest Type EDE (RFC 8914 4.3)" {
@@ -4632,6 +4723,31 @@ test "RFC 5155 section 8.6: a DS NODATA needs the Opt-Out bit or it is bogus" {
 }
 
 // ------------------------------------------------------------ anchor file
+
+test "RFC 8145 section 5.2: zoneKeyTags keeps exact owners, sorted and deduplicated" {
+    var anchors = try Anchors.parse(std.testing.allocator,
+        \\example.com. DS 34959 8 2 aabb
+        \\example.com. DS 999 8 2 aabb
+        \\example.com. DS 999 8 2 ccdd
+        \\sub.example.com. DS 1 8 2 aabb
+        \\
+    );
+    defer anchors.deinit(std.testing.allocator);
+
+    var tags: [max_anchors]u16 = undefined;
+    const count = anchors.zoneKeyTags(try Name.fromText("example.com."), &tags);
+    // The child's anchor does not speak for the zone, and the duplicate tag
+    // is one value: a Key Tag query names keys, not anchor records.
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqual(@as(u16, 999), tags[0]);
+    try std.testing.expectEqual(@as(u16, 34959), tags[1]);
+    try std.testing.expectEqual(@as(usize, 0), anchors.zoneKeyTags(try Name.fromText("test."), &tags));
+
+    // The return value is the number of slots written: a caller with a
+    // shorter buffer can copy exactly that many.
+    var one: [1]u16 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), anchors.zoneKeyTags(try Name.fromText("example.com."), &one));
+}
 
 test "RFC 1035 2.3.2: a trust anchor covers a name that arrived in upper case" {
     var anchors = try Anchors.parse(std.testing.allocator,
