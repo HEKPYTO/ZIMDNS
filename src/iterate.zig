@@ -266,9 +266,13 @@ fn resolveFrom(
                 }
             }
             // RFC 1034 section 4.3.2 step 3: the answer section ends the
-            // resolution. NXDOMAIN ends it too, and an empty answer with an
-            // SOA in the authority section is the NODATA denial.
-            if (rcode == .nxdomain or answered(&response, hop) or hasSoa(&response)) {
+            // resolution. RFC 9156 section 3 keeps a minimized hop's answer
+            // from ending it: the answer names the minimized name, and the
+            // client asked about a name below it, so the walk asks the next
+            // label instead. NXDOMAIN still ends it, and a NODATA answer to
+            // the full question is the denial of section 5.4.
+            const asked_full = hop.name.eql(&question.name);
+            if (rcode == .nxdomain or (asked_full and (answered(&response, question) or hasSoa(&response)))) {
                 if (options.zone_out) |out| out.* = zone;
                 return response;
             }
@@ -373,6 +377,11 @@ fn referral(
     targets: *[MAX_SERVERS]Name,
     glue: *[MAX_SERVERS]std.Io.net.IpAddress,
 ) ?Referral {
+    // RFC 1034 section 4.3.2: a referral carries no answer. A server can be
+    // authoritative for both a zone and its child, so a minimized hop for the
+    // child can come back with an answer in the answer section and the
+    // child's NS RRset beside it; that is an answer, not a delegation.
+    if (message.answers.len != 0) return null;
     var child: ?Name = null;
     for (message.authorities.slice()) |record| {
         if (!record.rrtype.eql(.NS)) continue;
@@ -578,6 +587,10 @@ const TestScript = struct {
     /// An answer a server that is not authoritative for the name gives: it
     /// cannot advance a minimized walk (RFC 9156 section 3 step 6c).
     lame: bool = false,
+    /// An NS RRset for the asked name in the authority section, the shape a
+    /// server authoritative for both a zone and its child gives when it
+    /// answers the child's minimized hop.
+    authority_ns: ?[]const u8 = null,
     kind: Kind,
 
     const Kind = union(enum) {
@@ -627,6 +640,10 @@ const FakeSender = struct {
             .additionals = try dns_message.RecordSection.init(allocator, 1),
         };
         errdefer message.deinit();
+        if (script.authority_ns) |ns_text| {
+            try message.authorities.append(.{ .owner = question.name, .rrtype = .NS, .class = .IN, .ttl = 3600, .rdata = .{ .NS = try Name.fromText(ns_text) } });
+            message.header.authority_count += 1;
+        }
         switch (script.kind) {
             .referral => |next| {
                 const child = try Name.fromText(next.child);
@@ -1052,6 +1069,40 @@ test "RFC 9156 section 3 step 6c: an authoritative minimized answer continues wi
     }, .{ .qname_minimization = true });
     defer answer.deinit();
 
+    try std.testing.expectEqual([4]u8{ 192, 0, 2, 7 }, answer.answers.slice()[0].rdata.A);
+    for (used) |entry| try std.testing.expect(entry);
+}
+
+test "RFC 9156 section 3 step 6c: a minimized answer beside the name's own NS is not a referral" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    // A server authoritative for both `example.com` and its parent answers the
+    // minimized `example.com. A` hop with an answer and puts the name's own NS
+    // RRset in the authority section. That NS RRset is not a referral to a
+    // child, so the walk must ask the next label instead of returning the
+    // minimized name's A record as the client's answer.
+    const scripts = [_]TestScript{
+        .{ .server = .{ 198, 41, 0, 4 }, .qname = "com.", .qtype = .A, .kind = .{ .referral = .{ .child = "com.", .ns = "a.gtld-servers.net.", .glue = .{ 203, 0, 113, 1 } } } },
+        // The same server answers for `com` and `example.com`: its answer to
+        // the minimized `example.com. A` hop is authoritative and carries the
+        // name's own NS RRset beside it.
+        .{ .server = .{ 203, 0, 113, 1 }, .qname = "example.com.", .qtype = .A, .kind = .{ .address = .{ 192, 0, 2, 99 } }, .authority_ns = "ns.example.com." },
+        .{ .server = .{ 203, 0, 113, 1 }, .qname = "www.example.com.", .qtype = .A, .kind = .{ .address = .{ 192, 0, 2, 7 } } },
+    };
+    var used = std.mem.zeroes([scripts.len]bool);
+    var fake = FakeSender{ .scripts = &scripts, .used = &used };
+    const hints = [_]std.Io.net.IpAddress{hint(.{ 198, 41, 0, 4 })};
+
+    var answer = try resolve(allocator, .{ .context = &fake, .send = FakeSender.send }, &hints, .{
+        .name = try Name.fromText("www.example.com."),
+        .qtype = .A,
+        .qclass = .IN,
+    }, .{ .qname_minimization = true });
+    defer answer.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), answer.answers.len);
     try std.testing.expectEqual([4]u8{ 192, 0, 2, 7 }, answer.answers.slice()[0].rdata.A);
     for (used) |entry| try std.testing.expect(entry);
 }

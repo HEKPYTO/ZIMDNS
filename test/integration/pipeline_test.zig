@@ -3355,51 +3355,74 @@ const SignedUpstreamArgs = struct {
 };
 
 /// Serves the A RRset and its RRSIG out of an already-signed zone, exactly as
-/// an upstream recursive server would for a DO=1 query.
+/// an upstream recursive server would for a DO=1 query, and answers the
+/// signer's DNSKEY query the validator makes to learn the zone's ZSKs.
 fn serveSignedUpstream(args: *SignedUpstreamArgs) void {
     var request_buffer: [resolver.MAX_UPSTREAM_MESSAGE]u8 = undefined;
-    const incoming = args.udp.receiveTimeout(args.io, &request_buffer, TestTimeout) catch return;
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const parsed = dns_message.Message.parseQuery(arena.allocator(), incoming.data) catch return;
+    var served: usize = 0;
+    while (served < 8) : (served += 1) {
+        const incoming = args.udp.receiveTimeout(args.io, &request_buffer, TestTimeout) catch return;
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const parsed = dns_message.Message.parseQuery(arena.allocator(), incoming.data) catch return;
+        const question = parsed.question orelse return;
+        const dnskey_query = question.qtype.eql(.DNSKEY);
 
-    var message = dns_message.Message{
-        .allocator = arena.allocator(),
-        .header = .{
-            .id = parsed.header.id,
-            .qr = true,
-            .recursion_desired = true,
-            .recursion_available = true,
-            .question_count = 1,
-        },
-        .question = parsed.question,
-        .answers = dns_message.RecordSection.init(arena.allocator(), 0) catch return,
-        .authorities = dns_message.RecordSection.init(arena.allocator(), 0) catch return,
-        .additionals = dns_message.RecordSection.init(arena.allocator(), 0) catch return,
-        .edns = null,
-    };
-    for (args.zone.records.items[0..args.zone.records.len]) |*record| {
-        const is_answer = record.rrtype.eql(.A) or record.rrtype.eql(.RRSIG);
-        if (!is_answer) continue;
-        const owner_is_www = std.ascii.eqlIgnoreCase(record.ownerText(), "www.signed.example.");
-        if (!owner_is_www) continue;
-        var wire = dns_record.ResourceRecord{
-            .owner = dns_name.Name.fromText(record.ownerText()) catch return,
-            .rrtype = record.rrtype,
-            .class = .IN,
-            .ttl = record.ttl,
-            .rdata = zimdns.zone_parser.parseRData(record.rrtype, record.rdataText()) catch return,
+        var message = dns_message.Message{
+            .allocator = arena.allocator(),
+            .header = .{
+                .id = parsed.header.id,
+                .qr = true,
+                .recursion_desired = true,
+                .recursion_available = true,
+                .question_count = 1,
+            },
+            .question = parsed.question,
+            .answers = dns_message.RecordSection.init(arena.allocator(), 0) catch return,
+            .authorities = dns_message.RecordSection.init(arena.allocator(), 0) catch return,
+            .additionals = dns_message.RecordSection.init(arena.allocator(), 0) catch return,
+            .edns = null,
         };
-        if (args.tamper and wire.rrtype.eql(.A)) wire.rdata.A[3] ^= 0xff;
-        message.answers.append(wire) catch return;
-    }
-    message.header.answer_count = @intCast(message.answers.len);
+        for (args.zone.records.items[0..args.zone.records.len]) |*record| {
+            const is_answer = record.rrtype.eql(.A) or record.rrtype.eql(.RRSIG);
+            if (!is_answer) continue;
+            const owner_is_www = std.ascii.eqlIgnoreCase(record.ownerText(), "www.signed.example.");
+            if (!owner_is_www) continue;
+            var wire = dns_record.ResourceRecord{
+                .owner = dns_name.Name.fromText(record.ownerText()) catch return,
+                .rrtype = record.rrtype,
+                .class = .IN,
+                .ttl = record.ttl,
+                .rdata = zimdns.zone_parser.parseRData(record.rrtype, record.rdataText()) catch return,
+            };
+            if (args.tamper and wire.rrtype.eql(.A)) wire.rdata.A[3] ^= 0xff;
+            message.answers.append(wire) catch return;
+        }
+        if (dnskey_query) {
+            message.answers.len = 0;
+            for (args.zone.records.items[0..args.zone.records.len]) |*record| {
+                const is_dnskey_data = record.rrtype.eql(.DNSKEY) or record.rrtype.eql(.RRSIG);
+                if (!is_dnskey_data) continue;
+                const owner_is_apex = std.ascii.eqlIgnoreCase(record.ownerText(), "signed.example.");
+                if (!owner_is_apex) continue;
+                const wire = dns_record.ResourceRecord{
+                    .owner = dns_name.Name.fromText(record.ownerText()) catch return,
+                    .rrtype = record.rrtype,
+                    .class = .IN,
+                    .ttl = record.ttl,
+                    .rdata = zimdns.zone_parser.parseRData(record.rrtype, record.rdataText()) catch return,
+                };
+                message.answers.append(wire) catch return;
+            }
+        }
+        message.header.answer_count = @intCast(message.answers.len);
 
-    var buffer: [4096]u8 = undefined;
-    var writer = dns_writer.Writer.init(&buffer);
-    message.encode(&writer) catch return;
-    args.udp.send(args.io, &incoming.from, writer.written()) catch return;
-    args.ok = true;
+        var buffer: [4096]u8 = undefined;
+        var writer = dns_writer.Writer.init(&buffer);
+        message.encode(&writer) catch return;
+        args.udp.send(args.io, &incoming.from, writer.written()) catch return;
+        args.ok = true;
+    }
 }
 
 /// A forwarder policy carrying one DNSKEY anchor. The resolver takes ownership

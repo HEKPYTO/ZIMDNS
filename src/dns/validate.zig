@@ -67,11 +67,13 @@ pub const Status = enum {
 
 pub const Result = struct {
     status: Status,
-    /// RFC 8914 INFO-CODE to relay, or 0. A bogus status carries the code of
-    /// the failure; an insecure status carries the code that says why the
-    /// answer could not be signed-verified, and rides on the answer the
-    /// client still gets (RFC 4035 section 5.2).
     ede: u16 = 0,
+    /// Verified denial proof record indices (flat into response.answers ++ response.authorities).
+    /// Only non-empty on a `.secure` result; empty on `.insecure`.
+    verified: [max_proofs]u16 = undefined,
+    verified_count: usize = 0,
+    wildcard_rrsig: u16 = 0,
+    has_wildcard_rrsig: bool = false,
 };
 
 /// Bounds on one answer's validation work. RFC 4035 section 5.4 requires a
@@ -254,6 +256,8 @@ const Rrsig = struct {
     owner: Name,
     raw: []const u8,
     covered: u16,
+    record_index: u16 = 0,
+    verified: bool = false,
     algorithm: u8,
     labels: u8,
     orig_ttl: u32,
@@ -806,6 +810,10 @@ const Rrset = struct {
     owner: Name,
     rrtype: u16,
     records: std.ArrayList(*const dns_record.ResourceRecord) = .empty,
+    /// False for a chain record the resolver fetched (the `extra` section):
+    /// it is key material the validator authenticates on demand, and its own
+    /// verdict is not part of the answer's.
+    counted: bool = true,
 };
 
 /// An NSEC denial proof plus the two facts RFC 6840 needs about the RRSIG that
@@ -820,6 +828,7 @@ const Nsec = struct {
     /// signature to be verified. A record the response carries beside the
     /// proof is not judged.
     used: bool = false,
+    record_index: u16 = 0,
 };
 
 /// An NSEC3 denial proof. `owner_labels` is the label count of the name the
@@ -841,6 +850,7 @@ const Nsec3 = struct {
     /// signature to be verified. A record the response carries beside the
     /// proof is not judged.
     used: bool = false,
+    record_index: u16 = 0,
 };
 
 /// A proven closest encloser: the name itself, plus the NSEC3 that matched it.
@@ -868,6 +878,10 @@ const Validator = struct {
     nsecs: std.ArrayList(Nsec) = .empty,
     nsec3s: std.ArrayList(Nsec3) = .empty,
     chains: std.ArrayList(KeySet) = .empty,
+    /// The zone whose parent published an authenticated DS but whose DNSKEY
+    /// RRset held no key that digest matches. RFC 8914 section 4.10 names
+    /// this state DNSKEY Missing, and RFC 4035 section 5.2 makes it bogus.
+    missing_dnskey: ?Name = null,
     seen: usize = 0,
     secure: usize = 0,
     insecure: usize = 0,
@@ -896,7 +910,7 @@ const Validator = struct {
 
     // ------------------------------------------------------------ indexing
 
-    fn addRecord(self: *Validator, record: *const dns_record.ResourceRecord) Error!void {
+    fn addRecord(self: *Validator, record: *const dns_record.ResourceRecord, from_extra: bool, position: u16) Error!void {
         self.seen += 1;
         if (self.seen > max_records) return Error.TooManyRecords;
         const raw = switch (record.rdata) {
@@ -911,16 +925,19 @@ const Validator = struct {
             // must themselves be authenticated, so a proof is collected as an
             // RRset as well, and the denial path checks the signature over
             // it with the signer's trusted key set.
-            if (record.rrtype.eql(.NSEC)) try self.addNsec(record, bytes);
-            if (record.rrtype.eql(.NSEC3)) try self.addNsec3(record, bytes);
+            if (record.rrtype.eql(.NSEC)) try self.addNsec(record, bytes, position);
+            if (record.rrtype.eql(.NSEC3)) try self.addNsec3(record, bytes, position);
         }
         for (self.rrsets.items) |*rrset| {
             if (rrset.rrtype != record.rrtype.code() or !rrset.owner.eql(&record.owner)) continue;
+            // A response record that joins a set the chain created makes the
+            // set part of the answer, so it is counted again.
+            if (!from_extra) rrset.counted = true;
             try rrset.records.append(self.allocator, record);
             return;
         }
         if (self.rrsets.items.len >= max_rrsets) return Error.TooManyRecords;
-        var rrset = Rrset{ .owner = record.owner, .rrtype = record.rrtype.code() };
+        var rrset = Rrset{ .owner = record.owner, .rrtype = record.rrtype.code(), .counted = !from_extra };
         try rrset.records.append(self.allocator, record);
         try self.rrsets.append(self.allocator, rrset);
     }
@@ -932,20 +949,22 @@ const Validator = struct {
     /// order the records arrived in, and an attacker chooses that order: an
     /// NSEC placed ahead of its RRSIG would have been dropped as unsigned,
     /// turning a real denial into a validation failure.
-    fn addSignature(self: *Validator, record: *const dns_record.ResourceRecord) Error!void {
+    fn addSignature(self: *Validator, record: *const dns_record.ResourceRecord, record_index: u16) Error!void {
         if (!record.rrtype.eql(.RRSIG)) return;
         if (self.rrsigs.items.len >= max_records) return Error.TooManyRecords;
         const bytes = switch (record.rdata) {
             .Unknown => |*unknown| unknown.bytes(),
             else => return Error.MalformedRrsig,
         };
-        try self.rrsigs.append(self.allocator, try Rrsig.at(bytes, record.owner));
+        var rrsig = try Rrsig.at(bytes, record.owner);
+        rrsig.record_index = record_index;
+        try self.rrsigs.append(self.allocator, rrsig);
     }
 
     /// An NSEC with no covering RRSIG proves nothing (RFC 4035 section 5.4:
     /// the proof RRsets must themselves be authenticated), so it is dropped
     /// rather than collected.
-    fn addNsec(self: *Validator, record: *const dns_record.ResourceRecord, raw: []const u8) Error!void {
+    fn addNsec(self: *Validator, record: *const dns_record.ResourceRecord, raw: []const u8, record_index: u16) Error!void {
         if (self.nsecs.items.len >= max_proofs) return Error.TooManyRecords;
         const rrsig = self.coveringRrsig(record.owner, RecordType.NSEC.code()) orelse return;
         const next = Name.parse(raw, 0) catch return Error.MalformedRdata;
@@ -955,10 +974,11 @@ const Validator = struct {
             .bitmap = raw[next.next_offset..],
             .signer = rrsig.signer,
             .labels = rrsig.labels,
+            .record_index = record_index,
         });
     }
 
-    fn addNsec3(self: *Validator, record: *const dns_record.ResourceRecord, raw: []const u8) Error!void {
+    fn addNsec3(self: *Validator, record: *const dns_record.ResourceRecord, raw: []const u8, record_index: u16) Error!void {
         if (self.nsec3s.items.len >= max_proofs) return Error.TooManyRecords;
         const rdata = parseNsec3Rdata(raw) orelse return Error.MalformedRdata;
         const rrsig = self.coveringRrsig(record.owner, RecordType.NSEC3.code()) orelse return;
@@ -977,12 +997,13 @@ const Validator = struct {
             .bitmap = rdata.bitmap,
             .signer = rrsig.signer,
             .owner_labels = rrsig.labels,
+            .record_index = record_index,
         });
     }
 
     fn coveringRrsig(self: *Validator, owner: Name, covered: u16) ?Rrsig {
-        for (self.rrsigs.items) |rrsig| {
-            if (rrsig.covered == covered and rrsig.owner.eql(&owner)) return rrsig;
+        for (self.rrsigs.items) |*rrsig| {
+            if (rrsig.covered == covered and rrsig.owner.eql(&owner)) return rrsig.*;
         }
         return null;
     }
@@ -1253,8 +1274,12 @@ const Validator = struct {
                     }
                 }
             }
-            if (keys.items.len == 0) continue;
+            if (keys.items.len == 0) {
+                self.missing_dnskey = signer;
+                continue;
+            }
             try self.confirmDsMatchedKeys(keys, signer);
+            if (keys.items.len == 0) self.missing_dnskey = signer;
             return;
         }
     }
@@ -1325,6 +1350,12 @@ const Validator = struct {
                 if (self.dsAnchorFor(rrsig.signer) and !self.hasDnskey(rrsig.signer)) {
                     return self.fail(dnssec.EDE_DNSKEY_MISSING);
                 }
+                // The same state reached from the parent's authenticated DS
+                // rather than a configured anchor: the delegation names a
+                // digest, and the child publishes no key it matches.
+                if (self.missing_dnskey) |zone| {
+                    if (zone.eql(&rrsig.signer)) return self.fail(dnssec.EDE_DNSKEY_MISSING);
+                }
                 continue;
             }
             has_keys = true;
@@ -1344,6 +1375,9 @@ const Validator = struct {
             const data = try signedData(self.allocator, rrset.records.items, rrsig);
             for (keys) |key| {
                 verifyWithKey(key, rrsig, data) catch continue;
+                for (self.rrsigs.items) |*rr| {
+                    if (rr.record_index == rrsig.record_index) rr.verified = true;
+                }
                 return .secure;
             }
         }
@@ -1352,6 +1386,12 @@ const Validator = struct {
             // does not sign it and the child has not been reached, so its
             // absence of a signature says nothing about the trust domain.
             if (rrset.rrtype == RecordType.NS.code()) return .insecure;
+            // A merged alias answer carries RRsets from more than one zone.
+            // An unsigned RRset outside every zone that signed something in
+            // this answer is an unsigned delegation the alias walked into,
+            // not a stripped signature; the AD bit is still withheld by the
+            // aggregate verdict.
+            if (!self.insideAnySigner(&rrset.owner)) return .insecure;
             // Any other RRset in a zone the operator anchored must carry a
             // signature; its absence is bogus, not merely unsigned.
             if (self.anchors.covers(rrset.owner)) return self.fail(dnssec.EDE_RRSIGS_MISSING);
@@ -1783,6 +1823,16 @@ const Validator = struct {
     fn anchored(self: *Validator, signer: Name) Error!bool {
         return (try self.keySet(signer)).len != 0;
     }
+
+    /// True when one of the answer's signatures was made by a zone that
+    /// contains `owner`, which is the evidence that `owner` sits inside a
+    /// signed zone rather than in a separate, unsigned delegation.
+    fn insideAnySigner(self: *const Validator, owner: *const Name) bool {
+        for (self.rrsigs.items) |rrsig| {
+            if (isSuffix(rrsig.signer, owner.*)) return true;
+        }
+        return false;
+    }
 };
 
 /// RFC 5155 section 3, Flags: the Opt-Out bit on an NSEC3 RR.
@@ -1842,11 +1892,23 @@ pub fn validate(
         response.authorities.slice(),
         extra,
     };
+    var sig_flat: usize = 0;
     for (sections) |section| {
-        for (section) |*record| try self.addSignature(record);
+        for (section) |*record| {
+            try self.addSignature(record, @intCast(sig_flat));
+            sig_flat += 1;
+        }
     }
-    for (sections) |section| {
-        for (section) |*record| try self.addRecord(record);
+    var flat: usize = 0;
+    for (sections, 0..) |section, index| {
+        // The last section is `extra`, the chain RRsets the resolver fetched
+        // to build keys; they take part in the chain and not in the answer's
+        // verdict.
+        const from_extra = index == sections.len - 1;
+        for (section) |*record| {
+            try self.addRecord(record, from_extra, @intCast(flat));
+            flat += 1;
+        }
     }
 
     // No signature arrived at all. A name inside the trust domain must be
@@ -1859,6 +1921,7 @@ pub fn validate(
     }
 
     for (self.rrsets.items) |*rrset| {
+        if (!rrset.counted) continue;
         // The NSEC and NSEC3 proof records are checked with the denial proof
         // they belong to (RFC 4035 section 5.4), not on their own.
         if (rrset.rrtype == RecordType.NSEC.code()) continue;
@@ -1893,12 +1956,106 @@ pub fn validate(
         self.count(outcome);
     }
 
+    var wildcard_rrsig: u16 = 0;
+    var wildcard_labels: u8 = 0;
+    var has_wildcard_rrsig: bool = false;
+    if (query.question) |q| {
+        for (self.rrsigs.items) |rrsig| {
+            if (!rrsig.verified) continue;
+            if (!rrsig.owner.eql(&q.name)) continue;
+            if (rrsig.labels >= labelCount(q.name.asWire())) continue;
+            var matched = false;
+            for (response.answers.slice()) |rec| {
+                if (rec.owner.eql(&q.name) and rec.rrtype.code() == rrsig.covered) {
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) continue;
+            wildcard_rrsig = rrsig.record_index;
+            wildcard_labels = rrsig.labels;
+            has_wildcard_rrsig = true;
+            break;
+        }
+    }
+    if (has_wildcard_rrsig) {
+        const qname = question.name;
+        const wildcard_name = dnssec.wildcardFromLabels(qname, wildcard_labels) orelse {
+            _ = self.fail(dnssec.EDE_DNSSEC_BOGUS);
+            return .{ .status = .bogus, .ede = self.ede, .wildcard_rrsig = wildcard_rrsig, .has_wildcard_rrsig = has_wildcard_rrsig };
+        };
+        const encloser = parentName(wildcard_name) orelse {
+            _ = self.fail(dnssec.EDE_DNSSEC_BOGUS);
+            return .{ .status = .bogus, .ede = self.ede, .wildcard_rrsig = wildcard_rrsig, .has_wildcard_rrsig = has_wildcard_rrsig };
+        };
+        const encloser_labels = labelCount(encloser.asWire());
+        var next_closer = qname;
+        while (labelCount(next_closer.asWire()) > @as(u8, encloser_labels) + 1) {
+            next_closer = parentName(next_closer) orelse break;
+        }
+        if (self.nsec3s.items.len != 0) {
+            if (!self.nsec3ParamsConsistent()) {
+                _ = self.fail(dnssec.EDE_DNSSEC_BOGUS);
+                return .{ .status = .bogus, .ede = self.ede, .wildcard_rrsig = wildcard_rrsig, .has_wildcard_rrsig = has_wildcard_rrsig };
+            }
+            if (self.nsec3s.items[0].iterations > max_nsec3_iterations) {
+                self.noteInsecure(dnssec.EDE_UNSUPPORTED_NSEC3_ITERATIONS);
+                return .{ .status = .insecure, .ede = self.insecure_ede };
+            }
+            const target_hash = self.hash(next_closer);
+            var covered = false;
+            for (self.nsec3s.items) |*proof| {
+                if (!nsec3Covers(proof.owner_hash, proof.next_hash, target_hash)) continue;
+                if (proof.flags & nsec3_opt_out != 0) {
+                    self.count(.insecure);
+                    return .{ .status = .insecure, .ede = self.insecure_ede };
+                }
+                proof.used = true;
+                covered = true;
+            }
+            if (!covered) {
+                _ = self.fail(dnssec.EDE_DNSSEC_BOGUS);
+                return .{ .status = .bogus, .ede = self.ede, .wildcard_rrsig = wildcard_rrsig, .has_wildcard_rrsig = has_wildcard_rrsig };
+            }
+        } else if (self.nsecs.items.len != 0) {
+            if (try self.nsecCoversName(next_closer) != .covered) {
+                _ = self.fail(dnssec.EDE_DNSSEC_BOGUS);
+                return .{ .status = .bogus, .ede = self.ede, .wildcard_rrsig = wildcard_rrsig, .has_wildcard_rrsig = has_wildcard_rrsig };
+            }
+        } else {
+            _ = self.fail(dnssec.EDE_DNSSEC_BOGUS);
+            return .{ .status = .bogus, .ede = self.ede, .wildcard_rrsig = wildcard_rrsig, .has_wildcard_rrsig = has_wildcard_rrsig };
+        }
+        const proofs = try self.checkProofs();
+        if (proofs == .bogus) {
+            _ = self.fail(dnssec.EDE_DNSSEC_BOGUS);
+            return .{ .status = .bogus, .ede = self.ede, .wildcard_rrsig = wildcard_rrsig, .has_wildcard_rrsig = has_wildcard_rrsig };
+        }
+        if (proofs == .insecure) self.count(.insecure);
+    }
+    var verified: [max_proofs]u16 = undefined;
+    var verified_count: usize = 0;
+    for (self.nsecs.items) |*proof| {
+        if (proof.used) {
+            if (verified_count == verified.len) break;
+            verified[verified_count] = proof.record_index;
+            verified_count += 1;
+        }
+    }
+    for (self.nsec3s.items) |*proof| {
+        if (proof.used) {
+            if (verified_count == verified.len) break;
+            verified[verified_count] = proof.record_index;
+            verified_count += 1;
+        }
+    }
+
     if (self.ede != 0) return .{ .status = .bogus, .ede = self.ede };
-    if (self.secure == 0) return .{ .status = .insecure, .ede = self.insecure_ede };
+    if (self.secure == 0) return .{ .status = .insecure, .ede = self.insecure_ede, .verified = undefined, .verified_count = 0, .wildcard_rrsig = wildcard_rrsig, .has_wildcard_rrsig = has_wildcard_rrsig };
     // AD covers every RRset in the answer, so one unanchored RRset in the mix
     // is enough to withhold it.
-    if (self.insecure != 0) return .{ .status = .insecure, .ede = self.insecure_ede };
-    return .{ .status = .secure };
+    if (self.insecure != 0) return .{ .status = .insecure, .ede = self.insecure_ede, .verified = undefined, .verified_count = 0, .wildcard_rrsig = wildcard_rrsig, .has_wildcard_rrsig = has_wildcard_rrsig };
+    return .{ .status = .secure, .verified = verified, .verified_count = verified_count, .wildcard_rrsig = wildcard_rrsig, .has_wildcard_rrsig = has_wildcard_rrsig };
 }
 
 /// RFC 8976 section 4 step 3: the RRsets named by `types` must carry valid
@@ -1924,9 +2081,9 @@ pub fn zoneSignedToAnchor(
     const records = try apexRecords(scratch, zone, apex);
     for (records) |record| {
         if (record.rrtype.eql(.RRSIG)) {
-            try validator.addSignature(record);
+            try validator.addSignature(record, 0);
         } else {
-            try validator.addRecord(record);
+            try validator.addRecord(record, false, 0);
         }
     }
     for (types) |rrtype| {
@@ -2107,8 +2264,8 @@ pub fn zoneZonemdAbsence(
 
     // The signatures are indexed first: a proof is read only once the
     // signature that covers it is known.
-    for (signatures.items) |*record| try validator.addSignature(record);
-    for (proofs.items) |*proof| try validator.addRecord(&proof.record);
+    for (signatures.items) |*record| try validator.addSignature(record, 0);
+    for (proofs.items) |*proof| try validator.addRecord(&proof.record, false, 0);
 
     // RFC 4035 section 5.4: the proof is worthless without a signature over
     // it that verifies, so the absence is proven only by an authenticated
@@ -3501,6 +3658,45 @@ test "RFC 4035 section 5.4: an extra NSEC the validator cannot authenticate does
     const result = try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds);
     try expectStatus(.secure, result);
     try std.testing.expectEqual(@as(u16, 0), result.ede);
+}
+
+test "RFC 4035 section 5.4: the verified proof index is the used NSEC only" {
+    var signed = try signZoneText(std.testing.allocator, child_zone_text, ed25519_secret);
+    defer signed.deinit(std.testing.allocator);
+    var anchors = try dnskeyAnchor(std.testing.allocator, "example.com.", signed.dnskey);
+    defer anchors.deinit(std.testing.allocator);
+
+    var pair = try exchange(std.testing.allocator, &signed.zone, "www.example.com.", .MX, .no_error, "nothing.example.com.", &.{"www.example.com."});
+    defer pair.query.deinit();
+    defer pair.response.deinit();
+
+    // Compute the flat position of the used NSEC before appending extras.
+    var used_position: u16 = 0;
+    var found: bool = false;
+    var i: u16 = 0;
+    for (pair.response.answers.slice()) |rec| {
+        if (!found and rec.rrtype.eql(.NSEC)) {
+            used_position = i;
+            found = true;
+        }
+        i += 1;
+    }
+    if (!found) {
+        for (pair.response.authorities.slice()) |rec| {
+            if (!found and rec.rrtype.eql(.NSEC)) {
+                used_position = i;
+                found = true;
+            }
+            i += 1;
+        }
+    }
+
+    try appendExtraNsec(&pair.response.authorities, "extra.example.com.");
+
+    const result = try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds);
+    try expectStatus(.secure, result);
+    try std.testing.expectEqual(@as(u16, 1), result.verified_count);
+    try std.testing.expectEqual(used_position, result.verified[0]);
 }
 
 // ------------------------------------- RFC 4034 section 6.2 rule 3 folding
