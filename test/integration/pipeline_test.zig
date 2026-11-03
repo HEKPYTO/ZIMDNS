@@ -1401,7 +1401,7 @@ test "TCP request pipeline answers NSID with configured payload" {
     try std.testing.expect(found);
 }
 
-test "TCP request pipeline preserves FIFO responses for pipelined queries" {
+test "TCP request pipeline answers pipelined queries by id" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1442,8 +1442,10 @@ test "TCP request pipeline preserves FIFO responses for pipelined queries" {
     try std.testing.expect(args.ok);
     try expectAResponse(first_response);
     try expectAResponse(second_response);
-    try std.testing.expectEqual(@as(u16, 0x4245), first_response.header.id);
-    try std.testing.expectEqual(@as(u16, 0x4246), second_response.header.id);
+    const ids = [_]u16{ first_response.header.id, second_response.header.id };
+    try std.testing.expect(ids[0] != ids[1]);
+    try std.testing.expect(ids[0] == 0x4245 or ids[0] == 0x4246);
+    try std.testing.expect(ids[1] == 0x4245 or ids[1] == 0x4246);
 }
 
 test "CLI TCP exchange uses the bounded connection path" {

@@ -1572,7 +1572,7 @@ pub const Resolver = struct {
                     if (wantsDnssecProofs(query)) response.header.authenticated_data = true;
                     // Harvest runs before the client copy is stripped, so it
                     // still sees the full proofs.
-                    self.harvestNsecProofs(response, result.verified[0..result.verified_count], if (result.has_wildcard_rrsig) result.wildcard_rrsig else null, now);
+                    self.harvestValidatedProofs(response, result, now);
                 },
                 // RFC 4035 section 5.5: a response that fails validation MUST
                 // not be returned, and the client gets SERVFAIL carrying the
@@ -2058,9 +2058,24 @@ pub const Resolver = struct {
     // 5.1 and 5.2).
     fn harvestNsecProofs(self: *Resolver, response: dns_message.Message, verified: []const u16, rrsig_index: ?u16, now: i64) void {
         if (!response.header.authenticated_data) return;
-        harvestSectionNsec(&self.dnssec_aggressive, response.answers.slice(), 0, verified, now);
-        harvestSectionNsec(&self.dnssec_aggressive, response.authorities.slice(), @intCast(response.answers.slice().len), verified, now);
+        harvestSectionNsec(&self.dnssec_aggressive, response.answers.slice(), 0, response.answers.slice(), response.authorities.slice(), verified, &.{}, null, now);
+        harvestSectionNsec(&self.dnssec_aggressive, response.authorities.slice(), @intCast(response.answers.slice().len), response.answers.slice(), response.authorities.slice(), verified, &.{}, null, now);
         if (rrsig_index) |idx| harvestWildcard(&self.dnssec_aggressive, response, idx, now);
+    }
+
+    /// The validated harvest: the cache keeps the signature the validator
+    /// accepted over each proof and over the SOA, not the first one that
+    /// covers it (RFC 4035 section 5.4).
+    fn harvestValidatedProofs(self: *Resolver, response: dns_message.Message, result: validate.Result, now: i64) void {
+        if (!response.header.authenticated_data) return;
+        const answers = response.answers.slice();
+        const authorities = response.authorities.slice();
+        const verified = result.verified[0..result.verified_count];
+        const verified_sig = result.verified_sig[0..result.verified_count];
+        const soa_rrsig = flatRecord(answers, authorities, result.soa_rrsig);
+        harvestSectionNsec(&self.dnssec_aggressive, answers, 0, answers, authorities, verified, verified_sig, soa_rrsig, now);
+        harvestSectionNsec(&self.dnssec_aggressive, authorities, @intCast(answers.len), answers, authorities, verified, verified_sig, soa_rrsig, now);
+        if (result.has_wildcard_rrsig) harvestWildcard(&self.dnssec_aggressive, response, result.wildcard_rrsig, now);
     }
 
     /// RFC 4035 section 5.5: the SOA a denial carries must carry the
@@ -3503,14 +3518,25 @@ fn harvestWildcard(cache: *dnssec.AggressiveCache, response: dns_message.Message
     cache.insertWildcard(wildcard, wildcard_zone, records[0..count], rrsig_record, now, ttl);
 }
 
-fn harvestSectionNsec(cache: *dnssec.AggressiveCache, records: []const dns_record.ResourceRecord, base: u16, verified: []const u16, now: i64) void {
+fn harvestSectionNsec(
+    cache: *dnssec.AggressiveCache,
+    records: []const dns_record.ResourceRecord,
+    base: u16,
+    answers: []const dns_record.ResourceRecord,
+    authorities: []const dns_record.ResourceRecord,
+    verified: []const u16,
+    verified_sig: []const ?u16,
+    verified_soa_rrsig: ?dns_record.ResourceRecord,
+    now: i64,
+) void {
     // RFC 2308 section 3: the SOA of the zone rides with the proof that
     // arrived with it, so a denial the proof gives can carry it.
     const soa = sectionSoa(records);
     // RFC 4035 section 5.5: an answer that carries the SOA must carry the
     // signature that covers it, or a validating client sees an unsigned
-    // RRset in a signed zone.
-    const soa_rrsig = if (soa) |record| coveringRrsig(records, record.owner, .SOA) else null;
+    // RRset in a signed zone. The validator's accepted signature wins over
+    // the first covering one.
+    const soa_rrsig = verified_soa_rrsig orelse if (soa) |record| coveringRrsig(records, record.owner, .SOA) else null;
     for (records, 0..) |*record, local_index| {
         const pos = base + @as(u16, @intCast(local_index));
         var is_verified = false;
@@ -3536,7 +3562,7 @@ fn harvestSectionNsec(cache: *dnssec.AggressiveCache, records: []const dns_recor
             const next = dns_name.Name.parse(raw, 0) catch continue;
             cache.insertNsec(record.owner, next.name, raw[next.next_offset..], now, record.ttl, soa, .{
                 .record = record.*,
-                .rrsig = coveringRrsig(records, record.owner, .NSEC),
+                .rrsig = pairedRrsig(answers, authorities, verified, verified_sig, pos) orelse coveringRrsig(records, record.owner, .NSEC),
                 .soa_rrsig = soa_rrsig,
             });
             continue;
@@ -3555,10 +3581,39 @@ fn harvestSectionNsec(cache: *dnssec.AggressiveCache, records: []const dns_recor
         @memcpy(&next_hash, rdata.next_hash);
         cache.insertNsec3(record.owner, owner_hash, next_hash, rdata.flags & 1 != 0, rdata.iterations, rdata.salt, rdata.bitmap, now, record.ttl, soa, .{
             .record = record.*,
-            .rrsig = coveringRrsig(records, record.owner, .NSEC3),
+            .rrsig = pairedRrsig(answers, authorities, verified, verified_sig, pos) orelse coveringRrsig(records, record.owner, .NSEC3),
             .soa_rrsig = soa_rrsig,
         });
     }
+}
+
+/// The record a validator record index names, across the Answer and
+/// Authority sections (the two sections the harvest walks).
+fn flatRecord(
+    answers: []const dns_record.ResourceRecord,
+    authorities: []const dns_record.ResourceRecord,
+    index: ?u16,
+) ?dns_record.ResourceRecord {
+    const position: usize = index orelse return null;
+    if (position < answers.len) return answers[position];
+    const local = position - answers.len;
+    if (local < authorities.len) return authorities[local];
+    return null;
+}
+
+/// The RRSIG the validator accepted over the proof at flat position `pos`.
+fn pairedRrsig(
+    answers: []const dns_record.ResourceRecord,
+    authorities: []const dns_record.ResourceRecord,
+    verified: []const u16,
+    verified_sig: []const ?u16,
+    pos: u16,
+) ?dns_record.ResourceRecord {
+    if (verified_sig.len != verified.len) return null;
+    for (verified, verified_sig) |proof, sig| {
+        if (proof == pos) return flatRecord(answers, authorities, sig);
+    }
+    return null;
 }
 
 /// The RRSIG that covers the record at `owner` in the same section. RFC 4035
@@ -5681,6 +5736,54 @@ test "wildcard rrsig comes from verified proof" {
     try std.testing.expectEqual(dnssec.EDE_DNSSEC_BOGUS, unproven_result.ede);
 }
 
+test "a foreign NSEC cannot break a valid wildcard proof" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var key = try zone_signer.parseKey("ed25519 DSSF3o0s0f+ElWzj9E/Osxw8hLpk55chkmx0LYN5WiY=\n");
+    defer key.deinit();
+    var anchors = validate.Anchors{};
+    anchors.items[0] = .{
+        .owner = try dns_name.Name.fromText("example.com."),
+        .rrtype = .DNSKEY,
+        .rdata = try key.dnskeyRdata(allocator),
+    };
+    anchors.len = 1;
+    defer anchors.deinit(allocator);
+    var query = try makeTestQuery(allocator, 0x2714, "nx.example.com.", false);
+    defer query.deinit();
+
+    var response = try makeSignedTestWildcardResponse(allocator, "nx.example.com.");
+    defer response.deinit();
+    const bitmap = [_]u8{ 0x00, 0x06, 0x40, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    const foreign = try makeTestNsecRecord("aaa.evil.", "www.example.com.", &bitmap, 3600);
+    try response.authorities.append(foreign);
+    try response.authorities.append(try makeTestSignedRrsig(allocator, foreign, "evil.", &key));
+    response.header.authority_count += 2;
+
+    const with_foreign = try validate.validate(allocator, &anchors, query, response, &.{}, 1_500_000_000);
+    try std.testing.expectEqual(validate.Status.secure, with_foreign.status);
+
+    var bare = try makeSignedTestWildcardResponse(allocator, "nx.example.com.");
+    defer bare.deinit();
+    var kept: usize = 0;
+    for (bare.authorities.items) |record| {
+        if (record.rrtype.eql(.NSEC)) continue;
+        if (record.rrtype.eql(.RRSIG)) continue;
+        bare.authorities.items[kept] = record;
+        kept += 1;
+    }
+    bare.authorities.len = kept;
+    const foreign_b = try makeTestNsecRecord("aaa.evil.", "www.example.com.", &bitmap, 3600);
+    try bare.authorities.append(foreign_b);
+    try bare.authorities.append(try makeTestSignedRrsig(allocator, foreign_b, "evil.", &key));
+    bare.header.authority_count = @intCast(bare.authorities.len);
+
+    const without_genuine = try validate.validate(allocator, &anchors, query, bare, &.{}, 1_500_000_000);
+    try std.testing.expectEqual(validate.Status.bogus, without_genuine.status);
+}
+
 test "wildcard proof seeds the aggressive cache" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var resolver = try Resolver.init(std.testing.allocator, io, .{
@@ -5713,7 +5816,7 @@ test "wildcard proof seeds the aggressive cache" {
     const result = try validate.validate(allocator, &anchors, query, response, &.{}, @intCast(validate_now));
     try std.testing.expectEqual(validate.Status.secure, result.status);
 
-    resolver.harvestNsecProofs(response, result.verified[0..result.verified_count], if (result.has_wildcard_rrsig) result.wildcard_rrsig else null, cache_now);
+    resolver.harvestValidatedProofs(response, result, cache_now);
 
     var other = try makeTestQuery(allocator, 0x2713, "other.example.com.", true);
     defer other.deinit();
@@ -6483,7 +6586,7 @@ test "a proof whose RDATA kept a compression pointer is refused as malformed" {
         .rdata = .{ .Unknown = rdata },
     };
     try std.testing.expect(dnssec.proofMalformed(record));
-    harvestSectionNsec(&cache, &.{record}, 0, &.{0}, now);
+    harvestSectionNsec(&cache, &.{record}, 0, &.{record}, &.{}, &.{0}, &.{}, null, now);
     // The malformed proof is refused: it is not cached, so it denies
     // nothing and it is not carried in a cut answer.
     try std.testing.expect((try cache.deny(try dns_name.Name.fromText("www.example."), .A, now)) == null);
@@ -6778,7 +6881,7 @@ fn harvestTestProofs(cache: *dnssec.AggressiveCache, now: i64, with_rrsig: bool)
         try makeTestRrsigRecord("example.", "example.", 3600),
         try makeTestRrsigRecord("mail.example.", "example.", 3600),
     };
-    harvestSectionNsec(cache, if (with_rrsig) &records else records[0..3], 0, &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31 }, now);
+    harvestSectionNsec(cache, if (with_rrsig) &records else records[0..3], 0, if (with_rrsig) &records else records[0..3], &.{}, &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31 }, &.{}, null, now);
 }
 
 test "RFC 8020 section 2: a cut answer carries the NSEC proof and its RRSIG" {
@@ -11652,4 +11755,26 @@ test "RFC 7873 section 5.3: a server cookie is learned only when the client cook
     // The learned pair expires after the RFC 7873 section 5.2.1 hour, and the
     // query falls back to the client cookie alone.
     try std.testing.expectEqualSlices(u8, &client_cookie, try resolver.outgoingCookie(server, now + Resolver.server_cookie_ttl + 1));
+}
+
+test "RFC 4035 section 5.4: the harvest keeps the verified proof signature" {
+    var cache = dnssec.AggressiveCache{};
+    const now: i64 = 1_500_000_000;
+    const bitmap = [_]u8{ 0x00, 0x02, 0x40, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    const soa = try makeTestSoa(3600, 3600);
+    var soa_sig = try makeTestRrsigRecord("example.", "example.", 3600);
+    std.mem.writeInt(u16, soa_sig.rdata.Unknown.data[0..2], dns_types.RecordType.SOA.code(), .big);
+    const nsec = try makeTestNsecRecord("example.", "mail.example.", &bitmap, 3600);
+    var first = try makeTestRrsigRecord("example.", "example.", 3600);
+    var second = try makeTestRrsigRecord("example.", "example.", 3600);
+    // Two signatures cover the same proof RRset; only the second one is the
+    // one the validator accepted.
+    first.rdata.Unknown.data[30] = 0xAA;
+    second.rdata.Unknown.data[30] = 0xBB;
+    const authorities = [_]dns_record.ResourceRecord{ soa, soa_sig, nsec, first, second };
+    harvestSectionNsec(&cache, &authorities, 0, &.{}, &authorities, &.{2}, &.{4}, soa_sig, now);
+    try std.testing.expect(cache.entries[0].valid);
+    try std.testing.expect(std.mem.endsWith(u8, cache.entries[0].proof_rrsig.bytes(), second.rdata.Unknown.bytes()));
+    const cached_soa_sig = cache.entries[0].soa_rrsig orelse return error.MissingSoaSignature;
+    try std.testing.expect(std.mem.eql(u8, soa_sig.rdata.Unknown.bytes(), cached_soa_sig.rdata.Unknown.bytes()));
 }

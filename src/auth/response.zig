@@ -493,7 +493,9 @@ pub fn buildResponseWithPolicy(
             if (!any_answer) appendCoveringRrsigs(&response, zone, .ANY, lookup.answer_owner) catch {};
             // The minimal ANY answer is an answer, not a denial: it carries
             // its own signatures and no denial proof.
-            if (!any_answer and (lookup.kind == .nodata or lookup.kind == .nxdomain)) {
+            if (!any_answer and lookup.kind == .answer and answerWasWildcardExpanded(response.answers.items, q.name)) {
+                appendWildcardExpansionProof(&response, zone, qname_text) catch {};
+            } else if (!any_answer and (lookup.kind == .nodata or lookup.kind == .nxdomain)) {
                 const proved = appendDenialProofs(&response, zone, qname_text, q.qtype, lookup.kind) catch false;
                 if (!proved) refuseUnprovenDenial(&response);
             } else if (lookup.kind == .referral) {
@@ -877,6 +879,59 @@ fn zoneCarriesDnssec(zone: *const zone_index.Zone) bool {
         if (record.rrtype.eql(.NSEC) or record.rrtype.eql(.NSEC3) or record.rrtype.eql(.RRSIG)) return true;
     }
     return false;
+}
+
+/// RFC 4035 section 3.1.3.3: a wildcard RRSIG rides on an answer under the
+/// expanded owner, and its Labels field counts one less than the QNAME, which
+/// is how the response knows the answer came from a wildcard.
+fn answerWasWildcardExpanded(answers: []const dns_record.ResourceRecord, qname: dns_name.Name) bool {
+    var text_buffer: [256]u8 = undefined;
+    const qname_text = qname.toText(&text_buffer) catch return false;
+    const qname_labels = labelCount(qname_text);
+    for (answers) |record| {
+        if (!record.rrtype.eql(.RRSIG)) continue;
+        if (!record.owner.eql(&qname)) continue;
+        const raw = switch (record.rdata) {
+            .Unknown => |unknown| unknown.bytes(),
+            else => continue,
+        };
+        const labels = @import("../dns/dnssec.zig").rrsigLabels(raw) orelse continue;
+        if (labels < qname_labels) return true;
+    }
+    return false;
+}
+
+fn appendWildcardExpansionProof(response: *dns_message.Message, zone: *const zone_index.Zone, qname_text: []const u8) !void {
+    const dnssec = @import("../dns/dnssec.zig");
+    const qname = dns_name.Name.fromText(qname_text) catch return;
+    var chain = try nsec3Chain(response.allocator, zone);
+    defer chain.deinit(response.allocator);
+    if (chain.entries != null) {
+        const digest = nsec3HashOf(&chain, qname);
+        if (nsec3Cover(&chain, digest)) |ci| {
+            if (!try appendNsec3(response, zone, &chain, ci)) return;
+        }
+        try appendApexNsec3Param(response, zone);
+        return;
+    }
+    var index: usize = 0;
+    while (index < zone.records.len) : (index += 1) {
+        const candidate = zone.records.items[index];
+        if (!candidate.rrtype.eql(.NSEC)) continue;
+        const rr = toResourceRecord(candidate, null) catch continue;
+        const raw = switch (rr.rdata) {
+            .Unknown => |*u| u.bytes(),
+            else => continue,
+        };
+        const owner = dns_name.Name.fromText(candidate.ownerText()) catch continue;
+        const next = dns_name.Name.parse(raw, 0) catch continue;
+        if (!dnssec.nsecCovers(owner, next.name, qname)) continue;
+        try response.authorities.append(rr);
+        if (rrsigOver(zone, candidate.ownerText(), dns_types.RecordType.NSEC.code())) |sig| {
+            try response.authorities.append(sig);
+        }
+        return;
+    }
 }
 
 fn appendDenialProofs(
@@ -6322,4 +6377,39 @@ test "RFC 9567 section 8.2: a monitored answer keeps no denial proof" {
     for (monitored.answers.slice()) |record| {
         try std.testing.expect(!record.rrtype.eql(.RRSIG));
     }
+}
+
+test "RFC 4035 section 3.1.3.3: a signed wildcard answer carries its expansion proof" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var zone_file = try zone_parser.ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+        \\@ IN NS ns.example.
+        \\ns IN A 192.0.2.1
+        \\* IN A 192.0.2.9
+        \\
+    );
+    defer zone_file.deinit();
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+    var key = try zone_signer.parseKey("ed25519 DSSF3o0s0f+ElWzj9E/Osxw8hLpk55chkmx0LYN5WiY=\n");
+    defer key.deinit();
+    try zone_signer.signZone(arena.allocator(), &zone, &key, .{ .inception = 1_000_000_000, .expiration = 2_000_000_000 });
+
+    const query = try testDoQuery(arena.allocator(), 0x4a10, "w.example.", .A, true);
+    var answer = try buildResponse(query, &zone);
+    defer answer.deinit();
+
+    var anchors = dns_validate.Anchors{};
+    anchors.items[0] = .{
+        .owner = try dns_name.Name.fromText("example."),
+        .rrtype = .DNSKEY,
+        .rdata = try key.dnskeyRdata(arena.allocator()),
+    };
+    anchors.len = 1;
+    defer anchors.deinit(arena.allocator());
+    const verdict = try dns_validate.validate(arena.allocator(), &anchors, query, answer, &.{}, 1_500_000_000);
+    try std.testing.expectEqual(dns_validate.Status.secure, verdict.status);
 }

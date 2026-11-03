@@ -72,6 +72,8 @@ pub const Result = struct {
     /// Only non-empty on a `.secure` result; empty on `.insecure`.
     verified: [max_proofs]u16 = undefined,
     verified_count: usize = 0,
+    verified_sig: [max_proofs]?u16 = undefined,
+    soa_rrsig: ?u16 = null,
     wildcard_rrsig: u16 = 0,
     has_wildcard_rrsig: bool = false,
 };
@@ -1420,9 +1422,11 @@ const Validator = struct {
     /// before the proof may support an answer. A proof whose signature does
     /// not verify makes the response bad (section 5.5); a proof this build
     /// cannot authenticate leaves the answer insecure (the state of section
-    /// 4.3). A record
-    /// the response carries beside the proof is not part of it and is not
-    /// judged.
+    /// 4.3). A record the response carries beside the proof is not part of
+    /// it and is not judged; the one exception is a wildcard-expanded answer,
+    /// which also authenticates the closest encloser's own record when it
+    /// carries it, because the aggressive cache uses that record to
+    /// synthesize (RFC 8198 section 5.3).
     fn checkProofs(self: *Validator) Error!Outcome {
         var authenticated = true;
         for (self.nsecs.items) |*proof| {
@@ -1958,6 +1962,7 @@ pub fn validate(
 
     var wildcard_rrsig: u16 = 0;
     var wildcard_labels: u8 = 0;
+    var wildcard_signer: Name = Name.root();
     var has_wildcard_rrsig: bool = false;
     if (query.question) |q| {
         for (self.rrsigs.items) |rrsig| {
@@ -1974,11 +1979,15 @@ pub fn validate(
             if (!matched) continue;
             wildcard_rrsig = rrsig.record_index;
             wildcard_labels = rrsig.labels;
+            wildcard_signer = rrsig.signer;
             has_wildcard_rrsig = true;
             break;
         }
     }
     if (has_wildcard_rrsig) {
+        // RFC 4035 sections 5.3.1 and 5.3.4: the RRSIG Labels field fixes the
+        // wildcard's own name and its parent, the closest encloser. An answer
+        // cannot instead choose a shallower encloser whose proof it carries.
         const qname = question.name;
         const wildcard_name = dnssec.wildcardFromLabels(qname, wildcard_labels) orelse {
             _ = self.fail(dnssec.EDE_DNSSEC_BOGUS);
@@ -1989,9 +1998,16 @@ pub fn validate(
             return .{ .status = .bogus, .ede = self.ede, .wildcard_rrsig = wildcard_rrsig, .has_wildcard_rrsig = has_wildcard_rrsig };
         };
         const encloser_labels = labelCount(encloser.asWire());
+        // RFC 4035 section 5.3.1: the next closer name is one label below
+        // the closest encloser toward the QNAME; proving it does not exist
+        // is what makes the wildcard apply.
         var next_closer = qname;
         while (labelCount(next_closer.asWire()) > @as(u8, encloser_labels) + 1) {
             next_closer = parentName(next_closer) orelse break;
+        }
+        if (labelCount(next_closer.asWire()) != @as(u8, encloser_labels) + 1) {
+            _ = self.fail(dnssec.EDE_DNSSEC_BOGUS);
+            return .{ .status = .bogus, .ede = self.ede, .wildcard_rrsig = wildcard_rrsig, .has_wildcard_rrsig = has_wildcard_rrsig };
         }
         if (self.nsec3s.items.len != 0) {
             if (!self.nsec3ParamsConsistent()) {
@@ -1999,16 +2015,66 @@ pub fn validate(
                 return .{ .status = .bogus, .ede = self.ede, .wildcard_rrsig = wildcard_rrsig, .has_wildcard_rrsig = has_wildcard_rrsig };
             }
             if (self.nsec3s.items[0].iterations > max_nsec3_iterations) {
+                // RFC 9276 section 3.2: the signature over an NSEC3 is still
+                // checked before the answer may be called insecure, and a
+                // bogus RRset elsewhere in the answer still makes it bogus.
+                for (self.nsec3s.items) |*proof| proof.used = true;
+                const proofs = try self.checkProofs();
+                if (proofs == .bogus) {
+                    _ = self.fail(dnssec.EDE_DNSSEC_BOGUS);
+                    return .{ .status = .bogus, .ede = self.ede, .wildcard_rrsig = wildcard_rrsig, .has_wildcard_rrsig = has_wildcard_rrsig };
+                }
+                if (self.ede != 0) return .{ .status = .bogus, .ede = self.ede, .wildcard_rrsig = wildcard_rrsig, .has_wildcard_rrsig = has_wildcard_rrsig };
                 self.noteInsecure(dnssec.EDE_UNSUPPORTED_NSEC3_ITERATIONS);
+                self.count(.insecure);
                 return .{ .status = .insecure, .ede = self.insecure_ede };
             }
             const target_hash = self.hash(next_closer);
             var covered = false;
+            var opt_out = false;
             for (self.nsec3s.items) |*proof| {
+                if (!proof.signer.eql(&wildcard_signer)) continue;
                 if (!nsec3Covers(proof.owner_hash, proof.next_hash, target_hash)) continue;
-                if (proof.flags & nsec3_opt_out != 0) {
-                    self.count(.insecure);
-                    return .{ .status = .insecure, .ede = self.insecure_ede };
+                proof.used = true;
+                covered = true;
+                if (proof.flags & nsec3_opt_out != 0) opt_out = true;
+            }
+            if (!covered) {
+                _ = self.fail(dnssec.EDE_DNSSEC_BOGUS);
+                return .{ .status = .bogus, .ede = self.ede, .wildcard_rrsig = wildcard_rrsig, .has_wildcard_rrsig = has_wildcard_rrsig };
+            }
+            // RFC 5155 section 8.8: the closest encloser's own NSEC3 is not
+            // required for the verdict, but the aggressive cache uses it when
+            // the answer carries it, so it is authenticated with the proof.
+            const encloser_hash = self.hash(encloser);
+            for (self.nsec3s.items) |*proof| {
+                if (proof.signer.eql(&wildcard_signer) and std.mem.eql(u8, &proof.owner_hash, &encloser_hash)) proof.used = true;
+            }
+            const proofs = try self.checkProofs();
+            if (proofs == .bogus) {
+                _ = self.fail(dnssec.EDE_DNSSEC_BOGUS);
+                return .{ .status = .bogus, .ede = self.ede, .wildcard_rrsig = wildcard_rrsig, .has_wildcard_rrsig = has_wildcard_rrsig };
+            }
+            if (self.ede != 0) return .{ .status = .bogus, .ede = self.ede, .wildcard_rrsig = wildcard_rrsig, .has_wildcard_rrsig = has_wildcard_rrsig };
+            // RFC 5155 section 9.2: an Opt-Out cover does not authenticate a
+            // signed wildcard expansion, and RFC 9276 section 3.2 keeps an
+            // unauthenticated NSEC3 chain from yielding AD.
+            if (opt_out or proofs == .insecure) self.count(.insecure);
+        } else if (self.nsecs.items.len != 0) {
+            // RFC 4035 sections 3.1.3.3 and 5.4: one NSEC covering the next
+            // closer name proves the QNAME does not exist; an NSEC at the
+            // closest encloser is not required.
+            // RFC 4035 sections 5.3.1 and 5.4: only an NSEC signed by the
+            // zone that signed the wildcard proves the expansion. A foreign
+            // covering NSEC is ignored rather than fatal, because otherwise
+            // an injected record could force SERVFAIL on a valid answer.
+            var covered = false;
+            for (self.nsecs.items) |*proof| {
+                if (!proof.signer.eql(&wildcard_signer)) continue;
+                if (!dnssec.nsecCovers(proof.owner, proof.next, next_closer)) continue;
+                if (isAncestorDelegation(proof.bitmap, labelsCount(proof.owner.asWire()), labelsCount(proof.signer.asWire()))) {
+                    _ = self.fail(dnssec.EDE_DNSSEC_BOGUS);
+                    return .{ .status = .bogus, .ede = self.ede, .wildcard_rrsig = wildcard_rrsig, .has_wildcard_rrsig = has_wildcard_rrsig };
                 }
                 proof.used = true;
                 covered = true;
@@ -2017,28 +2083,48 @@ pub fn validate(
                 _ = self.fail(dnssec.EDE_DNSSEC_BOGUS);
                 return .{ .status = .bogus, .ede = self.ede, .wildcard_rrsig = wildcard_rrsig, .has_wildcard_rrsig = has_wildcard_rrsig };
             }
-        } else if (self.nsecs.items.len != 0) {
-            if (try self.nsecCoversName(next_closer) != .covered) {
+            // RFC 8198 section 5.3: the encloser's own record, when present
+            // and from the wildcard's zone, is authenticated for the cache.
+            for (self.nsecs.items) |*proof| {
+                if (proof.signer.eql(&wildcard_signer) and proof.owner.eql(&encloser)) proof.used = true;
+            }
+            const proofs = try self.checkProofs();
+            if (proofs == .bogus) {
                 _ = self.fail(dnssec.EDE_DNSSEC_BOGUS);
                 return .{ .status = .bogus, .ede = self.ede, .wildcard_rrsig = wildcard_rrsig, .has_wildcard_rrsig = has_wildcard_rrsig };
             }
+            if (self.ede != 0) return .{ .status = .bogus, .ede = self.ede, .wildcard_rrsig = wildcard_rrsig, .has_wildcard_rrsig = has_wildcard_rrsig };
+            if (proofs == .insecure) self.count(.insecure);
         } else {
             _ = self.fail(dnssec.EDE_DNSSEC_BOGUS);
             return .{ .status = .bogus, .ede = self.ede, .wildcard_rrsig = wildcard_rrsig, .has_wildcard_rrsig = has_wildcard_rrsig };
         }
-        const proofs = try self.checkProofs();
-        if (proofs == .bogus) {
-            _ = self.fail(dnssec.EDE_DNSSEC_BOGUS);
-            return .{ .status = .bogus, .ede = self.ede, .wildcard_rrsig = wildcard_rrsig, .has_wildcard_rrsig = has_wildcard_rrsig };
-        }
-        if (proofs == .insecure) self.count(.insecure);
     }
+
     var verified: [max_proofs]u16 = undefined;
+    var verified_sig: [max_proofs]?u16 = undefined;
     var verified_count: usize = 0;
+    // SOA authority record index detection.
+    var soa_owner: ?Name = null;
+    for (response.authorities.slice()) |rr| {
+        if (rr.rrtype.code() == 6) {
+            soa_owner = rr.owner;
+            break;
+        }
+    }
+    const findSig = struct {
+        fn call(v: *const Validator, owner: Name, covered: u16) ?u16 {
+            for (v.rrsigs.items) |r| {
+                if (r.verified and r.owner.eql(&owner) and r.covered == covered) return r.record_index;
+            }
+            return null;
+        }
+    }.call;
     for (self.nsecs.items) |*proof| {
         if (proof.used) {
             if (verified_count == verified.len) break;
             verified[verified_count] = proof.record_index;
+            verified_sig[verified_count] = findSig(&self, proof.owner, RecordType.NSEC.code());
             verified_count += 1;
         }
     }
@@ -2046,16 +2132,21 @@ pub fn validate(
         if (proof.used) {
             if (verified_count == verified.len) break;
             verified[verified_count] = proof.record_index;
+            verified_sig[verified_count] = findSig(&self, proof.owner, RecordType.NSEC3.code());
             verified_count += 1;
         }
     }
+    var soa_rrsig: ?u16 = null;
+    if (soa_owner) |so| {
+        soa_rrsig = findSig(&self, so, RecordType.SOA.code());
+    }
 
     if (self.ede != 0) return .{ .status = .bogus, .ede = self.ede };
-    if (self.secure == 0) return .{ .status = .insecure, .ede = self.insecure_ede, .verified = undefined, .verified_count = 0, .wildcard_rrsig = wildcard_rrsig, .has_wildcard_rrsig = has_wildcard_rrsig };
+    if (self.secure == 0) return .{ .status = .insecure, .ede = self.insecure_ede, .verified = undefined, .verified_count = 0, .verified_sig = undefined, .soa_rrsig = null, .wildcard_rrsig = wildcard_rrsig, .has_wildcard_rrsig = has_wildcard_rrsig };
     // AD covers every RRset in the answer, so one unanchored RRset in the mix
     // is enough to withhold it.
-    if (self.insecure != 0) return .{ .status = .insecure, .ede = self.insecure_ede, .verified = undefined, .verified_count = 0, .wildcard_rrsig = wildcard_rrsig, .has_wildcard_rrsig = has_wildcard_rrsig };
-    return .{ .status = .secure, .verified = verified, .verified_count = verified_count, .wildcard_rrsig = wildcard_rrsig, .has_wildcard_rrsig = has_wildcard_rrsig };
+    if (self.insecure != 0) return .{ .status = .insecure, .ede = self.insecure_ede, .verified = undefined, .verified_count = 0, .verified_sig = undefined, .soa_rrsig = null, .wildcard_rrsig = wildcard_rrsig, .has_wildcard_rrsig = has_wildcard_rrsig };
+    return .{ .status = .secure, .verified = verified, .verified_count = verified_count, .verified_sig = verified_sig, .soa_rrsig = soa_rrsig, .wildcard_rrsig = wildcard_rrsig, .has_wildcard_rrsig = has_wildcard_rrsig };
 }
 
 /// RFC 8976 section 4 step 3: the RRsets named by `types` must carry valid
@@ -5075,4 +5166,293 @@ test "RFC 4035 section 5.2: a KSK anchor trusts the ZSK that signed the parent's
     const result = try validate(allocator, &anchors, query, response, &extra, now_seconds);
     try expectStatus(.secure, result);
     try std.testing.expectEqual(@as(u16, 0), result.ede);
+}
+
+test "RFC 5155 section 8.8: an NSEC3 cover proves a wildcard expansion" {
+    var key = try zone_signer.parseKey(ed25519_secret);
+    defer key.deinit();
+    const dnskey_rdata = try key.dnskeyRdata(std.testing.allocator);
+    defer std.testing.allocator.free(dnskey_rdata);
+    var anchors = try dnskeyAnchor(std.testing.allocator, "example.", dnskey_rdata);
+    defer anchors.deinit(std.testing.allocator);
+
+    const qname = try Name.fromText("w.example.");
+    const question = dns_question.Question{ .name = qname, .qtype = .A, .qclass = .IN };
+    var query = try emptyMessage(std.testing.allocator, .{ .id = 0x1234, .recursion_desired = true, .question_count = 1 }, question);
+    defer query.deinit();
+    var response = try emptyMessage(std.testing.allocator, .{
+        .id = 0x1234,
+        .qr = true,
+        .recursion_desired = true,
+        .recursion_available = true,
+        .question_count = 1,
+    }, question);
+    defer response.deinit();
+
+    const answer = dns_record.ResourceRecord{
+        .owner = qname,
+        .rrtype = .A,
+        .class = .IN,
+        .ttl = 300,
+        .rdata = .{ .A = .{ 192, 0, 2, 1 } },
+    };
+    try response.answers.append(answer);
+    var rdata_buffer: [dns_rdata.max_unknown_len]u8 = undefined;
+    var rdata_writer = dns_writer.Writer.init(&rdata_buffer);
+    try answer.rdata.encode(&rdata_writer);
+    const rrsig_rdata = try zone_signer.signRrset(
+        std.testing.allocator,
+        try Name.fromText("*.example."),
+        try Name.fromText("example."),
+        RecordType.A.code(),
+        &.{rdata_writer.written()},
+        answer.ttl,
+        &key,
+        window,
+    );
+    defer std.testing.allocator.free(rrsig_rdata);
+    var signature = dns_rdata.Unknown{};
+    @memcpy(signature.data[0..rrsig_rdata.len], rrsig_rdata);
+    signature.len = @intCast(rrsig_rdata.len);
+    try response.answers.append(.{
+        .owner = qname,
+        .rrtype = .RRSIG,
+        .class = .IN,
+        .ttl = answer.ttl,
+        .rdata = .{ .Unknown = signature },
+    });
+    response.header.answer_count = 2;
+
+    const covering_bitmap = typeBitmap(&.{ .RRSIG, .NSEC3 });
+    const zero_hash = "00000000000000000000000000000000";
+    const max_hash = "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv";
+    const nsec3_pair = try signedNsec3(std.testing.allocator, &key, zero_hash, nsec3Rdata(max_hash, 0, &covering_bitmap, 0), 3600);
+    try response.authorities.append(nsec3_pair[0]);
+    try response.authorities.append(nsec3_pair[1]);
+    response.header.authority_count = 2;
+
+    var parsed_query = try roundTrip(std.testing.allocator, query);
+    defer parsed_query.deinit();
+    var parsed_response = try roundTrip(std.testing.allocator, response);
+    defer parsed_response.deinit();
+
+    const result = try validate(std.testing.allocator, &anchors, parsed_query, parsed_response, &.{}, now_seconds);
+    try expectStatus(.secure, result);
+}
+
+test "RFC 5155 section 8.8: opt-out NSEC3 cover leaves a wildcard expansion insecure" {
+    var key = try zone_signer.parseKey(ed25519_secret);
+    defer key.deinit();
+    const dnskey_rdata = try key.dnskeyRdata(std.testing.allocator);
+    defer std.testing.allocator.free(dnskey_rdata);
+    var anchors = try dnskeyAnchor(std.testing.allocator, "example.", dnskey_rdata);
+    defer anchors.deinit(std.testing.allocator);
+
+    const qname = try Name.fromText("w.example.");
+    const question = dns_question.Question{ .name = qname, .qtype = .A, .qclass = .IN };
+    var query = try emptyMessage(std.testing.allocator, .{ .id = 0x1234, .recursion_desired = true, .question_count = 1 }, question);
+    defer query.deinit();
+    var response = try emptyMessage(std.testing.allocator, .{
+        .id = 0x1234,
+        .qr = true,
+        .recursion_desired = true,
+        .recursion_available = true,
+        .question_count = 1,
+    }, question);
+    defer response.deinit();
+
+    const answer = dns_record.ResourceRecord{
+        .owner = qname,
+        .rrtype = .A,
+        .class = .IN,
+        .ttl = 300,
+        .rdata = .{ .A = .{ 192, 0, 2, 1 } },
+    };
+    try response.answers.append(answer);
+    var rdata_buffer: [dns_rdata.max_unknown_len]u8 = undefined;
+    var rdata_writer = dns_writer.Writer.init(&rdata_buffer);
+    try answer.rdata.encode(&rdata_writer);
+    const rrsig_rdata = try zone_signer.signRrset(
+        std.testing.allocator,
+        try Name.fromText("*.example."),
+        try Name.fromText("example."),
+        RecordType.A.code(),
+        &.{rdata_writer.written()},
+        answer.ttl,
+        &key,
+        window,
+    );
+    defer std.testing.allocator.free(rrsig_rdata);
+    var signature = dns_rdata.Unknown{};
+    @memcpy(signature.data[0..rrsig_rdata.len], rrsig_rdata);
+    signature.len = @intCast(rrsig_rdata.len);
+    try response.answers.append(.{
+        .owner = qname,
+        .rrtype = .RRSIG,
+        .class = .IN,
+        .ttl = answer.ttl,
+        .rdata = .{ .Unknown = signature },
+    });
+    response.header.answer_count = 2;
+
+    const covering_bitmap = typeBitmap(&.{ .RRSIG, .NSEC3 });
+    const zero_hash = "00000000000000000000000000000000";
+    const max_hash = "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv";
+    const nsec3_pair = try signedNsec3(std.testing.allocator, &key, zero_hash, nsec3Rdata(max_hash, 1, &covering_bitmap, 0), 3600);
+    try response.authorities.append(nsec3_pair[0]);
+    try response.authorities.append(nsec3_pair[1]);
+    response.header.authority_count = 2;
+
+    var parsed_query = try roundTrip(std.testing.allocator, query);
+    defer parsed_query.deinit();
+    var parsed_response = try roundTrip(std.testing.allocator, response);
+    defer parsed_response.deinit();
+
+    const result = try validate(std.testing.allocator, &anchors, parsed_query, parsed_response, &.{}, now_seconds);
+    try expectStatus(.insecure, result);
+}
+
+test "RFC 5155 section 8.8: an NSEC3 cover with a high iteration count is insecure" {
+    var key = try zone_signer.parseKey(ed25519_secret);
+    defer key.deinit();
+    const dnskey_rdata = try key.dnskeyRdata(std.testing.allocator);
+    defer std.testing.allocator.free(dnskey_rdata);
+    var anchors = try dnskeyAnchor(std.testing.allocator, "example.", dnskey_rdata);
+    defer anchors.deinit(std.testing.allocator);
+
+    const qname = try Name.fromText("w.example.");
+    const question = dns_question.Question{ .name = qname, .qtype = .A, .qclass = .IN };
+    var query = try emptyMessage(std.testing.allocator, .{ .id = 0x1234, .recursion_desired = true, .question_count = 1 }, question);
+    defer query.deinit();
+    var response = try emptyMessage(std.testing.allocator, .{
+        .id = 0x1234,
+        .qr = true,
+        .recursion_desired = true,
+        .recursion_available = true,
+        .question_count = 1,
+    }, question);
+    defer response.deinit();
+
+    const answer = dns_record.ResourceRecord{
+        .owner = qname,
+        .rrtype = .A,
+        .class = .IN,
+        .ttl = 300,
+        .rdata = .{ .A = .{ 192, 0, 2, 1 } },
+    };
+    try response.answers.append(answer);
+    var rdata_buffer: [dns_rdata.max_unknown_len]u8 = undefined;
+    var rdata_writer = dns_writer.Writer.init(&rdata_buffer);
+    try answer.rdata.encode(&rdata_writer);
+    const rrsig_rdata = try zone_signer.signRrset(
+        std.testing.allocator,
+        try Name.fromText("*.example."),
+        try Name.fromText("example."),
+        RecordType.A.code(),
+        &.{rdata_writer.written()},
+        answer.ttl,
+        &key,
+        window,
+    );
+    defer std.testing.allocator.free(rrsig_rdata);
+    var signature = dns_rdata.Unknown{};
+    @memcpy(signature.data[0..rrsig_rdata.len], rrsig_rdata);
+    signature.len = @intCast(rrsig_rdata.len);
+    try response.answers.append(.{
+        .owner = qname,
+        .rrtype = .RRSIG,
+        .class = .IN,
+        .ttl = answer.ttl,
+        .rdata = .{ .Unknown = signature },
+    });
+    response.header.answer_count = 2;
+
+    const covering_bitmap = typeBitmap(&.{ .RRSIG, .NSEC3 });
+    const zero_hash = "00000000000000000000000000000000";
+    const max_hash = "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv";
+    const nsec3_pair = try signedNsec3(std.testing.allocator, &key, zero_hash, nsec3Rdata(max_hash, 0, &covering_bitmap, 65535), 3600);
+    try response.authorities.append(nsec3_pair[0]);
+    try response.authorities.append(nsec3_pair[1]);
+    response.header.authority_count = 2;
+
+    var parsed_query = try roundTrip(std.testing.allocator, query);
+    defer parsed_query.deinit();
+    var parsed_response = try roundTrip(std.testing.allocator, response);
+    defer parsed_response.deinit();
+
+    const result = try validate(std.testing.allocator, &anchors, parsed_query, parsed_response, &.{}, now_seconds);
+    try expectStatus(.insecure, result);
+}
+
+test "RFC 5155 section 8.8: a broken NSEC3 cover signature over a high iteration count is bogus" {
+    var key = try zone_signer.parseKey(ed25519_secret);
+    defer key.deinit();
+    const dnskey_rdata = try key.dnskeyRdata(std.testing.allocator);
+    defer std.testing.allocator.free(dnskey_rdata);
+    var anchors = try dnskeyAnchor(std.testing.allocator, "example.", dnskey_rdata);
+    defer anchors.deinit(std.testing.allocator);
+
+    const qname = try Name.fromText("w.example.");
+    const question = dns_question.Question{ .name = qname, .qtype = .A, .qclass = .IN };
+    var query = try emptyMessage(std.testing.allocator, .{ .id = 0x1234, .recursion_desired = true, .question_count = 1 }, question);
+    defer query.deinit();
+    var response = try emptyMessage(std.testing.allocator, .{
+        .id = 0x1234,
+        .qr = true,
+        .recursion_desired = true,
+        .recursion_available = true,
+        .question_count = 1,
+    }, question);
+    defer response.deinit();
+
+    const answer = dns_record.ResourceRecord{
+        .owner = qname,
+        .rrtype = .A,
+        .class = .IN,
+        .ttl = 300,
+        .rdata = .{ .A = .{ 192, 0, 2, 1 } },
+    };
+    try response.answers.append(answer);
+    var rdata_buffer: [dns_rdata.max_unknown_len]u8 = undefined;
+    var rdata_writer = dns_writer.Writer.init(&rdata_buffer);
+    try answer.rdata.encode(&rdata_writer);
+    const rrsig_rdata = try zone_signer.signRrset(
+        std.testing.allocator,
+        try Name.fromText("*.example."),
+        try Name.fromText("example."),
+        RecordType.A.code(),
+        &.{rdata_writer.written()},
+        answer.ttl,
+        &key,
+        window,
+    );
+    defer std.testing.allocator.free(rrsig_rdata);
+    var signature = dns_rdata.Unknown{};
+    @memcpy(signature.data[0..rrsig_rdata.len], rrsig_rdata);
+    signature.len = @intCast(rrsig_rdata.len);
+    try response.answers.append(.{
+        .owner = qname,
+        .rrtype = .RRSIG,
+        .class = .IN,
+        .ttl = answer.ttl,
+        .rdata = .{ .Unknown = signature },
+    });
+    response.header.answer_count = 2;
+
+    const covering_bitmap = typeBitmap(&.{ .RRSIG, .NSEC3 });
+    const zero_hash = "00000000000000000000000000000000";
+    const max_hash = "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv";
+    var nsec3_pair = try signedNsec3(std.testing.allocator, &key, zero_hash, nsec3Rdata(max_hash, 0, &covering_bitmap, 65535), 3600);
+    nsec3_pair[1].rdata.Unknown.data[10] ^= 1;
+    try response.authorities.append(nsec3_pair[0]);
+    try response.authorities.append(nsec3_pair[1]);
+    response.header.authority_count = 2;
+
+    var parsed_query = try roundTrip(std.testing.allocator, query);
+    defer parsed_query.deinit();
+    var parsed_response = try roundTrip(std.testing.allocator, response);
+    defer parsed_response.deinit();
+
+    const result = try validate(std.testing.allocator, &anchors, parsed_query, parsed_response, &.{}, now_seconds);
+    try expectStatus(.bogus, result);
 }
