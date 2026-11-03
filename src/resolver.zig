@@ -23,6 +23,8 @@ const iterate_mod = @import("iterate.zig");
 const zone = @import("zone/index.zig");
 const zone_signer = @import("zone/signer.zig");
 const tcp_deadline = @import("platform/tcp_deadline.zig");
+const tls_client = @import("transport/tls_client.zig");
+const doh_client = @import("transport/doh_client.zig");
 
 pub const MAX_CACHE_ENTRIES = 64;
 /// RFC 9520 section 3.2: the resolution-failure cache is bounded too, so a
@@ -168,6 +170,18 @@ pub const Policy = struct {
     /// forwarded unchanged.
     max_cacheable_prefix: ?u8 = null,
 
+    /// RFC 7858 section 3.1: the forwarder speaks DNS over TLS, and this is
+    /// the name its certificate must match. The bytes live in the policy so
+    /// they outlive the config text; the Resolver reads them through this
+    /// buffer, never through a slice into the config.
+    forwarder_tls: bool = false,
+    /// RFC 8484 section 4.1: the forwarder speaks DNS over HTTPS.
+    forwarder_doh: bool = false,
+    forwarder_tls_name: [253]u8 = undefined,
+    forwarder_tls_name_len: usize = 0,
+    forwarder_doh_path: [256]u8 = undefined,
+    forwarder_doh_path_len: usize = 0,
+
     /// RFC 4035 section 5.2 trust anchors. Empty unless `trust-anchor-file`
     /// named one, so a forwarder with no configured anchor validates nothing
     /// and never sets AD. Owned here because the Policy is copied into the
@@ -186,6 +200,20 @@ pub const Policy = struct {
         if (value.forwarder) |forwarder| {
             const address = std.Io.net.IpAddress.parse(forwarder.addressText(), forwarder.port) catch return error.BadAddress;
             policy.forwarder = .{ .address = address };
+            if (forwarder.transport != .udp) {
+                const name = forwarder.tlsNameText();
+                if (name.len == 0 or name.len > policy.forwarder_tls_name.len) return error.BadDirective;
+                @memcpy(policy.forwarder_tls_name[0..name.len], name);
+                policy.forwarder_tls_name_len = name.len;
+                policy.forwarder_tls = forwarder.transport == .tls;
+                policy.forwarder_doh = forwarder.transport == .doh;
+                if (policy.forwarder_doh) {
+                    const path = forwarder.dohPathText();
+                    if (path.len == 0 or path.len > policy.forwarder_doh_path.len) return error.BadDirective;
+                    @memcpy(policy.forwarder_doh_path[0..path.len], path);
+                    policy.forwarder_doh_path_len = path.len;
+                }
+            }
         }
         if (value.cookies.enabled) {
             policy.cookies = CookiePolicy.init(value.cookies.currentText(), value.cookies.previousText());
@@ -1252,6 +1280,25 @@ pub const Resolver = struct {
     chain_entries: [max_chain_entries]ChainEntry = undefined,
     chain_len: usize = 0,
     cache: Cache,
+    /// RFC 7858 section 3.1: the DoT client the forwarder uses, created on the
+    /// first TLS query so a plain-UDP deployment never loads a trust store.
+    tls_client_state: tls_client.Client = undefined,
+    tls_ready: bool = false,
+    /// RFC 8484 section 4.1: the DoH client, created on the first DoH query.
+    doh_client_state: doh_client.Client = undefined,
+    doh_ready: bool = false,
+    /// RFC 7873 section 5.1: the 8-octet client cookie this resolver sends to
+    /// every server, so a server can key the state it keeps on one value.
+    client_cookie: [8]u8 = @splat(0),
+    /// False until the first outgoing query draws the client cookie, which
+    /// keeps the fallible draw out of `init`'s error set.
+    client_cookie_ready: bool = false,
+    /// RFC 7873 section 5.2.1: the server cookie each server handed back,
+    /// reused for at most an hour. A ring: when the table is full the oldest
+    /// slot is replaced.
+    server_cookies: [max_server_cookies]ServerCookie = undefined,
+    server_cookie_count: usize = 0,
+    server_cookie_next: usize = 0,
     /// RFC 8198 aggressive cache of NSEC and NSEC3 proofs. Fed from the
     /// proofs an upstream answer carries on the forward path and consulted
     /// before forwarding when the client set DO without CD. No
@@ -1275,6 +1322,8 @@ pub const Resolver = struct {
         self.cache.deinit();
         self.policy.cookies.deinit();
         self.policy.anchors.deinit(self.allocator);
+        if (self.tls_ready) self.tls_client_state.deinit();
+        if (self.doh_ready) self.doh_client_state.deinit();
         for (self.chain_entries[0..self.chain_len]) |entry| self.allocator.free(entry.records);
     }
 
@@ -1681,7 +1730,7 @@ pub const Resolver = struct {
             // it runs that check. A forwarded answer does not name its zone,
             // and a DS probe of the wrong name would fail an unsigned
             // domain, so it stays honestly insecure.
-            if (self.upstream == null) return self.unsignedVerdict(self.iterate_zone, now, .iterate);
+            if (self.upstream == null) return self.unsignedVerdict(self.iterate_zone, now);
             // A forwarded answer does not name the zone that should have
             // signed it. An anchor that names an ancestor below the root is
             // a zone that must sign its answers, so an unsigned one lost its
@@ -1712,6 +1761,15 @@ pub const Resolver = struct {
 
     const ChainSource = enum { iterate, forward };
 
+    /// True when a configured DS anchor names `name` itself.
+    fn dsAnchorFor(self: *const Resolver, name: dns_name.Name) bool {
+        for (self.policy.anchors.items[0..self.policy.anchors.len]) |anchor| {
+            if (!anchor.rrtype.eql(.DS) or !anchor.owner.eql(&name)) continue;
+            return true;
+        }
+        return false;
+    }
+
     /// True when a configured DNSKEY anchor names `name` itself.
     fn dnskeyAnchorFor(self: *const Resolver, name: dns_name.Name) bool {
         for (self.policy.anchors.items[0..self.policy.anchors.len]) |anchor| {
@@ -1736,7 +1794,7 @@ pub const Resolver = struct {
     /// the unsigned answer is a stripped signature; a signed denial of the DS
     /// means the delegation is insecure; a DS answer that cannot be validated
     /// keeps the failure closed.
-    fn unsignedVerdict(self: *Resolver, apex: dns_name.Name, now: u32, source: ChainSource) !validate.Result {
+    fn unsignedVerdict(self: *Resolver, apex: dns_name.Name, now: u32) !validate.Result {
         var ds_query = dns_message.Message{
             .allocator = self.allocator,
             .header = .{ .id = 0, .question_count = 1 },
@@ -1746,21 +1804,16 @@ pub const Resolver = struct {
             .additionals = dns_message.RecordSection.init(self.allocator, 0) catch return .{ .status = .bogus, .ede = dnssec.EDE_DNSSEC_BOGUS },
         };
         defer ds_query.deinit();
-        var ds_response = switch (source) {
-            .iterate => blk: {
-                const options: iterate_mod.Options = .{ .now = @intCast(now), .dnssec_ok = true, .qname_minimization = true };
-                break :blk iterate_mod.resolve(self.allocator, .{ .context = self, .send = iterateSend }, self.root_hints[0..self.hint_count], .{
-                    .name = apex,
-                    .qtype = .DS,
-                    .qclass = .IN,
-                }, options) catch return .{ .status = .bogus, .ede = dnssec.EDE_DNSSEC_BOGUS };
-            },
-            .forward => self.forwardZoneQuery(apex, .DS) catch return .{ .status = .bogus, .ede = dnssec.EDE_DNSSEC_BOGUS },
-        };
+        const options: iterate_mod.Options = .{ .now = @intCast(now), .dnssec_ok = true, .qname_minimization = true };
+        var ds_response = iterate_mod.resolve(self.allocator, .{ .context = self, .send = iterateSend }, self.root_hints[0..self.hint_count], .{
+            .name = apex,
+            .qtype = .DS,
+            .qclass = .IN,
+        }, options) catch return .{ .status = .bogus, .ede = dnssec.EDE_DNSSEC_BOGUS };
         defer ds_response.deinit();
         var extra: std.ArrayList(dns_record.ResourceRecord) = .empty;
         defer extra.deinit(self.allocator);
-        try self.fetchChain(ds_response, @intCast(now), &extra, source);
+        try self.fetchChain(ds_response, @intCast(now), &extra, .iterate);
         const result = validate.validate(self.allocator, &self.policy.anchors, ds_query, ds_response, extra.items, now) catch return .{ .status = .bogus, .ede = dnssec.EDE_DNSSEC_BOGUS };
         switch (result.status) {
             // The DS RRset is present and authenticated, so the zone is
@@ -1830,6 +1883,11 @@ pub const Resolver = struct {
             var steps: usize = 0;
             while (steps < max_chain_zones) : (steps += 1) {
                 try self.fetchZoneRecords(ancestor, .DNSKEY, now, extra, source);
+                // An anchor that names this zone is the trust root for it: the
+                // DS a parent would publish is redundant, and every RRset above
+                // the anchor is outside the chain the validator can reach, so
+                // fetching it would only add insecure RRsets that withhold AD.
+                if (self.dnskeyAnchorFor(ancestor) or self.dsAnchorFor(ancestor)) break;
                 try self.fetchZoneRecords(ancestor, .DS, now, extra, source);
                 ancestor = parentOf(ancestor) orelse break;
             }
@@ -1906,6 +1964,11 @@ pub const Resolver = struct {
         const bytes = writer.written();
         var parsed = dns_message.Message.parse(self.allocator, bytes) catch return Error.BadUpstreamResponse;
         defer parsed.deinit();
+        // RFC 7858 section 3.1 and RFC 8484 section 4.1: an encrypted
+        // forwarder has no cleartext path, so the chain query travels the same
+        // channel as the answer.
+        if (self.policy.forwarder_tls) return self.queryUpstreamTls(bytes, parsed, null);
+        if (self.policy.forwarder_doh) return self.queryUpstreamDoh(bytes, parsed, null);
         return self.queryUdp(upstream, bytes, parsed, null, true);
     }
 
@@ -2238,6 +2301,15 @@ pub const Resolver = struct {
         // address is easy to forge. A platform that cannot waits no longer
         // than the ordinary path.
         const upstream = self.upstream orelse return .{ .response = try self.iterate(query), .scope = scope };
+        // RFC 7858 section 3.1 and RFC 8484 section 4.1: an encrypted
+        // forwarder carries every upstream query over its channel; there is
+        // no cleartext fallback.
+        if (self.policy.forwarder_tls) {
+            return .{ .response = try self.queryUpstreamTls(query_bytes, query, scope), .scope = scope };
+        }
+        if (self.policy.forwarder_doh) {
+            return .{ .response = try self.queryUpstreamDoh(query_bytes, query, scope), .scope = scope };
+        }
         if (transport == .tcp) {
             if (comptime UPSTREAM_TCP_DEADLINES_SUPPORTED) {
                 return .{ .response = try self.queryUpstreamTcp(query_bytes, query, scope), .scope = scope };
@@ -2257,13 +2329,102 @@ pub const Resolver = struct {
     /// RFC 9567 section 6.1: the error report travels over TCP. The query
     /// carries a randomized ID, exactly as the UDP path does before it
     /// sends, so a forged answer cannot name the query.
+    /// RFC 7858 section 3.1: one forwarding exchange over DNS over TLS. The
+    /// certificate name and the SNI are the operator's configured name, and
+    /// the response passes the same identity checks as a plain upstream
+    /// answer before it is relayed.
+    fn queryUpstreamTls(self: *Resolver, query_bytes: []const u8, query: dns_message.Message, scope: ?EcsScope) !dns_message.Message {
+        const upstream = self.upstream orelse return Error.NoForwarder;
+        if (!self.policy.forwarder_tls or self.policy.forwarder_tls_name_len == 0) return Error.NoForwarder;
+        const host = self.policy.forwarder_tls_name[0..self.policy.forwarder_tls_name_len];
+        var query_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
+        if (query_bytes.len < 2 or query_bytes.len > query_buffer.len) return Error.UpstreamFailure;
+        var randomized_id: [2]u8 = undefined;
+        self.io.randomSecure(&randomized_id) catch return Error.UpstreamFailure;
+        const now: u32 = @intCast(@divTrunc(std.Io.Clock.real.now(self.io).nanoseconds, std.time.ns_per_s));
+        const upstream_query = try buildUpstreamQuery(query_bytes, query, &query_buffer, &self.policy.anchors, scope, true, try self.outgoingCookie(upstream, now));
+        @memcpy(query_buffer[0..2], &randomized_id);
+        const expected_id = std.mem.readInt(u16, &randomized_id, .big);
+
+        if (!self.tls_ready) {
+            try self.tls_client_state.init(self.allocator, self.io);
+            self.tls_ready = true;
+        }
+        var stream = try self.dialTcp(upstream);
+        defer stream.close(self.io);
+        setTcpIoTimeout(stream);
+        var response_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
+        const response_bytes = self.tls_client_state.exchange(stream, host, query_buffer[0..upstream_query.len], &response_buffer) catch |err| switch (err) {
+            tls_client.Error.FrameTooLarge, tls_client.Error.HandshakeFailed => return Error.UpstreamFailure,
+            tls_client.Error.BadFrame => return Error.BadUpstreamResponse,
+            // RFC 7858 section 3.1: without a verified certificate for the
+            // configured name there is no DoT channel, and this build never
+            // falls back to cleartext.
+            else => return Error.UpstreamFailure,
+        };
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const response = dns_message.Message.parse(arena.allocator(), response_bytes) catch return Error.BadUpstreamResponse;
+        if (!validUpstreamResponse(response, query, expected_id, scope)) return Error.BadUpstreamResponse;
+        self.learnServerCookie(upstream, response, now);
+        return cloneMessage(self.allocator, response);
+    }
+
+    /// RFC 8484 section 4.1: one forwarding exchange over DNS over HTTPS
+    /// (POST, `application/dns-message`). The answer passes the same identity
+    /// checks as a plain upstream answer before it is relayed.
+    fn queryUpstreamDoh(self: *Resolver, query_bytes: []const u8, query: dns_message.Message, scope: ?EcsScope) !dns_message.Message {
+        const upstream = self.upstream orelse return Error.NoForwarder;
+        if (!self.policy.forwarder_doh or self.policy.forwarder_tls_name_len == 0 or self.policy.forwarder_doh_path_len == 0) return Error.NoForwarder;
+        const host = self.policy.forwarder_tls_name[0..self.policy.forwarder_tls_name_len];
+        const path = self.policy.forwarder_doh_path[0..self.policy.forwarder_doh_path_len];
+        var query_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
+        if (query_bytes.len < 2 or query_bytes.len > query_buffer.len) return Error.UpstreamFailure;
+        var randomized_id: [2]u8 = undefined;
+        self.io.randomSecure(&randomized_id) catch return Error.UpstreamFailure;
+        const now: u32 = @intCast(@divTrunc(std.Io.Clock.real.now(self.io).nanoseconds, std.time.ns_per_s));
+        const upstream_query = try buildUpstreamQuery(query_bytes, query, &query_buffer, &self.policy.anchors, scope, true, try self.outgoingCookie(upstream, now));
+        @memcpy(query_buffer[0..2], &randomized_id);
+        const expected_id = std.mem.readInt(u16, &randomized_id, .big);
+
+        if (!self.doh_ready) {
+            try self.doh_client_state.init(self.allocator, self.io);
+            self.doh_ready = true;
+        }
+        var stream = try self.dialTcp(upstream);
+        defer stream.close(self.io);
+        setTcpIoTimeout(stream);
+        var response_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
+        const body = self.doh_client_state.post(stream, host, path, query_buffer[0..upstream_query.len], &response_buffer) catch |err| switch (err) {
+            doh_client.Error.BadStatus,
+            doh_client.Error.BadHeaders,
+            doh_client.Error.BadContentType,
+            doh_client.Error.BadContentLength,
+            doh_client.Error.BadChunk,
+            doh_client.Error.ResponseTooLarge,
+            doh_client.Error.TruncatedBody,
+            => return Error.BadUpstreamResponse,
+            else => return Error.UpstreamFailure,
+        };
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const response = dns_message.Message.parse(arena.allocator(), body) catch return Error.BadUpstreamResponse;
+        if (!validUpstreamResponse(response, query, expected_id, scope)) return Error.BadUpstreamResponse;
+        if (findOption(response, COOKIE_OPTION_CODE)) |option| {
+            if (option.len >= self.client_cookie.len and !std.mem.eql(u8, option[0..8], &self.client_cookie)) return Error.BadUpstreamResponse;
+        }
+        self.learnServerCookie(upstream, response, now);
+        return cloneMessage(self.allocator, response);
+    }
+
     fn queryUpstreamTcp(self: *Resolver, query_bytes: []const u8, query: dns_message.Message, scope: ?EcsScope) !dns_message.Message {
         const upstream = self.upstream orelse return Error.NoForwarder;
         var query_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
         if (query_bytes.len < 2 or query_bytes.len > query_buffer.len) return Error.UpstreamFailure;
         var randomized_id: [2]u8 = undefined;
         self.io.randomSecure(&randomized_id) catch return Error.UpstreamFailure;
-        const upstream_query = try buildUpstreamQuery(query_bytes, query, &query_buffer, &self.policy.anchors, scope, true);
+        const now: u32 = @intCast(@divTrunc(std.Io.Clock.real.now(self.io).nanoseconds, std.time.ns_per_s));
+        const upstream_query = try buildUpstreamQuery(query_bytes, query, &query_buffer, &self.policy.anchors, scope, true, try self.outgoingCookie(upstream, now));
         @memcpy(query_buffer[0..2], &randomized_id);
         const expected_id = std.mem.readInt(u16, &randomized_id, .big);
         return self.queryTcp(upstream, query_buffer[0..upstream_query.len], query, expected_id, scope);
@@ -2276,28 +2437,124 @@ pub const Resolver = struct {
         // OS-assigned ephemeral source port differs per attempt, widening the
         // Q-ID space with the per-attempt randomized ID below.
         var response_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
+        const now: u32 = @intCast(@divTrunc(std.Io.Clock.real.now(self.io).nanoseconds, std.time.ns_per_s));
         var attempt: usize = 0;
         while (attempt < UDP_ATTEMPTS) : (attempt += 1) {
             var socket = try self.bindSourceSocket(upstream);
             defer socket.close(self.io);
             var randomized_id: [2]u8 = undefined;
             self.io.randomSecure(&randomized_id) catch return Error.UpstreamFailure;
-            const upstream_query = try buildUpstreamQuery(query_bytes, query, &query_buffer, &self.policy.anchors, scope, dnssec_ok);
+            const cookie = try self.outgoingCookie(upstream, now);
+            const upstream_query = try buildUpstreamQuery(query_bytes, query, &query_buffer, &self.policy.anchors, scope, dnssec_ok, cookie);
             @memcpy(query_buffer[0..2], &randomized_id);
             const expected_id = std.mem.readInt(u16, &randomized_id, .big);
 
             socket.send(self.io, &upstream, query_buffer[0..upstream_query.len]) catch continue;
+            // RFC 7873 section 5.3: a BADCOOKIE answer names the Server
+            // Cookie to retry with, so the query is resent once with it
+            // instead of failing the hop.
+            var retried_bad_cookie = false;
             while (true) {
                 const incoming = socket.receiveTimeout(self.io, &response_buffer, UDP_TIMEOUT) catch break;
                 if (!incoming.from.eql(&upstream)) continue;
-                switch (classifyUpstreamPacket(self.allocator, query, expected_id, incoming.data, scope)) {
+                switch (classifyUpstreamPacket(self.allocator, query, expected_id, incoming.data, scope, self.client_cookie)) {
                     .ignore => continue,
                     .truncated => return self.queryTcpAfterTruncation(upstream, query_buffer[0..upstream_query.len], query, expected_id, UPSTREAM_TCP_DEADLINES_SUPPORTED, scope),
-                    .ready => |message| return message,
+                    .ready => |message| {
+                        var received = message;
+                        // RFC 7873 section 5.3: one retry with the returned
+                        // server cookie. A second BADCOOKIE means the server
+                        // would not accept even that cookie, so the hop fails
+                        // instead of relaying the error as an answer.
+                        if (received.header.rcode == .badcookie and retried_bad_cookie) {
+                            received.deinit();
+                            return Error.UpstreamFailure;
+                        }
+                        if (received.header.rcode == .badcookie and !retried_bad_cookie) {
+                            self.learnServerCookie(upstream, received, now);
+                            received.deinit();
+                            retried_bad_cookie = true;
+                            const retry_cookie = try self.outgoingCookie(upstream, now);
+                            const retry_query = try buildUpstreamQuery(query_bytes, query, &query_buffer, &self.policy.anchors, scope, dnssec_ok, retry_cookie);
+                            @memcpy(query_buffer[0..2], &randomized_id);
+                            socket.send(self.io, &upstream, query_buffer[0..retry_query.len]) catch break;
+                            continue;
+                        }
+                        self.learnServerCookie(upstream, received, now);
+                        return received;
+                    },
                 }
             }
         }
         return Error.UpstreamFailure;
+    }
+
+    /// Servers whose server cookies are kept; a forwarder plus the root and
+    /// TLD hints fit many times over.
+    const max_server_cookies: usize = 32;
+    /// RFC 7873 section 5.2.1: a server cookie is used for at most one hour.
+    const server_cookie_ttl: u32 = 60 * 60;
+
+    const ServerCookie = struct {
+        address: std.Io.net.IpAddress,
+        /// The 8-octet client cookie followed by the server cookie, whose
+        /// length RFC 7873 section 4 bounds at 8 to 32 octets.
+        value: [40]u8,
+        len: usize,
+        expires: u32,
+    };
+
+    /// RFC 7873 section 5.2: the Cookie option to send to `server`. A known
+    /// server cookie travels with the client cookie; without one only the
+    /// client cookie is sent, which asks the server for one.
+    fn outgoingCookie(self: *Resolver, server: std.Io.net.IpAddress, now: u32) ![]const u8 {
+        if (!self.client_cookie_ready) {
+            // RFC 7873 section 5.1: one unpredictable client cookie for every
+            // server, so a server can key its state on one value.
+            self.io.randomSecure(&self.client_cookie) catch return Error.UpstreamFailure;
+            self.client_cookie_ready = true;
+        }
+        var index: usize = 0;
+        while (index < self.server_cookie_count) : (index += 1) {
+            const entry = &self.server_cookies[index];
+            if (entry.expires <= now) continue;
+            if (!entry.address.eql(&server)) continue;
+            return entry.value[0..entry.len];
+        }
+        return self.client_cookie[0..self.client_cookie.len];
+    }
+
+    /// RFC 7873 section 5.3: a response carrying a Server Cookie binds it to
+    /// this server for the next hour, and the next query uses it.
+    fn learnServerCookie(self: *Resolver, server: std.Io.net.IpAddress, response: dns_message.Message, now: u32) void {
+        const option = findOption(response, COOKIE_OPTION_CODE) orelse return;
+        // RFC 7873 section 4: a valid Cookie option is 8 to 40 octets, and a
+        // server cookie is at least 8 of them. RFC 7873 section 5.2.3: the
+        // first 8 octets must be this client's cookie, or the answer is not
+        // from the server the query went to.
+        if (option.len < 16 or option.len > 40) return;
+        if (!std.mem.eql(u8, option[0..8], &self.client_cookie)) return;
+        var value: [40]u8 = @splat(0);
+        // RFC 7873 section 5.1: the client cookie is this resolver's, so the
+        // stored pair starts with it whatever the server echoed back.
+        @memcpy(value[0..8], &self.client_cookie);
+        @memcpy(value[8..option.len], option[8..option.len]);
+        const expires = now +| server_cookie_ttl;
+        var index: usize = 0;
+        while (index < self.server_cookie_count) : (index += 1) {
+            const entry = &self.server_cookies[index];
+            if (!entry.address.eql(&server)) continue;
+            entry.* = .{ .address = server, .value = value, .len = option.len, .expires = expires };
+            return;
+        }
+        const slot: usize = if (self.server_cookie_count < self.server_cookies.len) blk: {
+            self.server_cookie_count += 1;
+            break :blk self.server_cookie_count - 1;
+        } else blk: {
+            self.server_cookie_next = (self.server_cookie_next + 1) % self.server_cookies.len;
+            break :blk self.server_cookie_next;
+        };
+        self.server_cookies[slot] = .{ .address = server, .value = value, .len = option.len, .expires = expires };
     }
 
     /// RFC 5452 section 9.2: the source port of an outgoing query is an
@@ -2356,10 +2613,10 @@ pub const Resolver = struct {
         return self.queryTcp(upstream, query_bytes, query, expected_id, scope);
     }
 
-    fn queryTcp(self: *Resolver, upstream: std.Io.net.IpAddress, query_bytes: []const u8, query: dns_message.Message, expected_id: u16, scope: ?EcsScope) !dns_message.Message {
-        // The upstream address is the delegation server or the configured
-        // forwarder; the caller resolved it.
-        var stream = if (comptime UPSTREAM_TCP_DEADLINES_SUPPORTED)
+    /// One TCP connection to an upstream, honoring the RFC 5452 section 9.2
+    /// source-port denylist on the platforms whose connector cannot.
+    fn dialTcp(self: *Resolver, upstream: std.Io.net.IpAddress) !std.Io.net.Stream {
+        const stream = if (comptime UPSTREAM_TCP_DEADLINES_SUPPORTED)
             connectTcpWithTimeoutAvoiding(self.io, &upstream, .{
                 .mode = .stream,
                 .protocol = .tcp,
@@ -2371,12 +2628,22 @@ pub const Resolver = struct {
                 .protocol = .tcp,
                 .timeout = TCP_TIMEOUT,
             }) catch return Error.UpstreamFailure;
-        defer stream.close(self.io);
         if (comptime !UPSTREAM_TCP_DEADLINES_SUPPORTED) {
             // The plain connector binds its own source port, so a denied
             // port is refused here instead of carrying a query.
-            if (portDenied(self.policy.deny_ports[0..self.policy.deny_ports_len], localPort(stream.socket))) return Error.UpstreamFailure;
+            if (portDenied(self.policy.deny_ports[0..self.policy.deny_ports_len], localPort(stream.socket))) {
+                stream.close(self.io);
+                return Error.UpstreamFailure;
+            }
         }
+        return stream;
+    }
+
+    fn queryTcp(self: *Resolver, upstream: std.Io.net.IpAddress, query_bytes: []const u8, query: dns_message.Message, expected_id: u16, scope: ?EcsScope) !dns_message.Message {
+        // The upstream address is the delegation server or the configured
+        // forwarder; the caller resolved it.
+        var stream = try self.dialTcp(upstream);
+        defer stream.close(self.io);
         const frame_deadline = tcp_deadline.deadlineFromTimeout(self.io, TCP_TIMEOUT) orelse return Error.UpstreamFailure;
         setTcpIoTimeout(stream);
 
@@ -2396,6 +2663,13 @@ pub const Resolver = struct {
         defer arena.deinit();
         const response = dns_message.Message.parse(arena.allocator(), response_bytes[0..response_len]) catch return Error.BadUpstreamResponse;
         if (!validUpstreamResponse(response, query, expected_id, scope)) return Error.BadUpstreamResponse;
+        // RFC 7873 section 5.2.3: the same client-cookie echo check the UDP
+        // path makes, and the server cookie the answer binds to this server.
+        if (findOption(response, COOKIE_OPTION_CODE)) |option| {
+            if (option.len >= self.client_cookie.len and !std.mem.eql(u8, option[0..8], &self.client_cookie)) return Error.BadUpstreamResponse;
+        }
+        const now: u32 = @intCast(@divTrunc(std.Io.Clock.real.now(self.io).nanoseconds, std.time.ns_per_s));
+        self.learnServerCookie(upstream, response, now);
         return cloneMessage(self.allocator, response);
     }
 };
@@ -2848,11 +3122,17 @@ const UpstreamPacket = union(enum) {
 
 /// Parses and validates one UDP datagram with a scratch arena owned by this
 /// call, so the receive loop holds no deferred cleanups across iterations.
-fn classifyUpstreamPacket(allocator: std.mem.Allocator, query: dns_message.Message, expected_id: u16, data: []const u8, scope: ?EcsScope) UpstreamPacket {
+fn classifyUpstreamPacket(allocator: std.mem.Allocator, query: dns_message.Message, expected_id: u16, data: []const u8, scope: ?EcsScope, client_cookie: [8]u8) UpstreamPacket {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const response = dns_message.Message.parse(arena.allocator(), data) catch return .ignore;
     if (!validUpstreamResponse(response, query, expected_id, scope)) return .ignore;
+    // RFC 7873 section 5.2.3: a response whose Cookie option does not start
+    // with this client's cookie did not come from the server the query went
+    // to, so it is dropped like any other mismatched answer.
+    if (findOption(response, COOKIE_OPTION_CODE)) |option| {
+        if (option.len >= client_cookie.len and !std.mem.eql(u8, option[0..client_cookie.len], &client_cookie)) return .ignore;
+    }
     if (response.header.truncated) return .truncated;
     return .{ .ready = cloneMessage(allocator, response) catch return .ignore };
 }
@@ -2861,14 +3141,24 @@ fn classifyUpstreamPacket(allocator: std.mem.Allocator, query: dns_message.Messa
 /// classic 512-octet payload, the DO bit set, and no option data. RFC 3225
 /// section 3 wants the DO bit on every recursive request, so a client query
 /// that carried no OPT still gets one upstream.
-fn writeDoOptRecord(buffer: []u8, dnssec_ok: bool) void {
+fn writeDoOptRecord(buffer: []u8, dnssec_ok: bool, cookie: []const u8) usize {
     buffer[0] = 0;
     std.mem.writeInt(u16, buffer[1..3], 41, .big);
     // RFC 6891 section 6.2.5: the sender's own payload size. 1232 is the
     // DNS Flag Day 2020 recommendation and fits every ordinary referral.
     std.mem.writeInt(u16, buffer[3..5], dns_message.DEFAULT_EDNS_UDP_PAYLOAD_SIZE, .big);
     std.mem.writeInt(u32, buffer[5..9], if (dnssec_ok) 0x00008000 else 0, .big);
-    std.mem.writeInt(u16, buffer[9..11], 0, .big);
+    // RFC 7873 section 5.1: the Cookie option (code 10) rides in the OPT.
+    if (cookie.len == 0) {
+        std.mem.writeInt(u16, buffer[9..11], 0, .big);
+        return opt_record_len;
+    }
+    const rdata_len: usize = 4 + cookie.len;
+    std.mem.writeInt(u16, buffer[9..11], @intCast(rdata_len), .big);
+    std.mem.writeInt(u16, buffer[11..13], COOKIE_OPTION_CODE, .big);
+    std.mem.writeInt(u16, buffer[13..15], @intCast(cookie.len), .big);
+    @memcpy(buffer[15..][0..cookie.len], cookie);
+    return opt_record_len + rdata_len;
 }
 
 fn buildUpstreamQuery(
@@ -2878,6 +3168,7 @@ fn buildUpstreamQuery(
     anchors: *const validate.Anchors,
     scope: ?EcsScope,
     dnssec_ok: bool,
+    cookie: []const u8,
 ) ![]const u8 {
     if (query.edns == null) {
         // RFC 3225 section 3: a recursive DNSSEC-aware server MUST set the DO
@@ -2886,7 +3177,7 @@ fn buildUpstreamQuery(
         // (RFC 8198) proofs from. A client that sent no OPT gets one OPT
         // record with DO=1 appended to the forwarded bytes, so the question
         // keeps the client's own octets and its QNAME case survives the hop.
-        if (original.len < dns_header_len or original.len + opt_record_len > output.len) return Error.UpstreamFailure;
+        if (original.len < dns_header_len or original.len + opt_record_len + 4 + cookie.len > output.len) return Error.UpstreamFailure;
         @memcpy(output[0..original.len], original);
         // RFC 4035 section 4.6: a security-aware resolver MUST clear the AD
         // bit when composing a query message, so a client's claim that an
@@ -2898,8 +3189,8 @@ fn buildUpstreamQuery(
         const additional_count = std.mem.readInt(u16, output[10..12], .big);
         if (additional_count == std.math.maxInt(u16)) return Error.UpstreamFailure;
         std.mem.writeInt(u16, output[10..12], additional_count + 1, .big);
-        writeDoOptRecord(output[original.len..][0..opt_record_len], dnssec_ok);
-        return output[0 .. original.len + opt_record_len];
+        const written = writeDoOptRecord(output[original.len..][0 .. opt_record_len + 4 + cookie.len], dnssec_ok, cookie);
+        return output[0 .. original.len + written];
     }
 
     var sanitized = dns_message.Message{
@@ -2930,6 +3221,9 @@ fn buildUpstreamQuery(
         var ecs_buffer: [4 + 16]u8 = undefined;
         try appendOption(&sanitized, dns_rdata.EDNS_ECS_OPTION_CODE, ecsPayload(value, 0, &ecs_buffer));
     }
+    // RFC 7873 section 5.1: the Cookie option goes on every upstream query,
+    // after the ECS option the client's own prefix produced.
+    if (cookie.len != 0) try appendOption(&sanitized, COOKIE_OPTION_CODE, cookie);
     appendKeyTags(&sanitized, query, anchors);
     var writer = dns_writer.Writer.init(output);
     sanitized.encode(&writer) catch return Error.UpstreamFailure;
@@ -4120,7 +4414,7 @@ test "resolver forwards the client subnet option upstream" {
     try appendOption(&query, dns_rdata.EDNS_ECS_OPTION_CODE, &ecs);
 
     var output: [512]u8 = undefined;
-    const encoded = try buildUpstreamQuery(&.{ 0xde, 0xad }, query, &output, &.{}, ecsScope(query), true);
+    const encoded = try buildUpstreamQuery(&.{ 0xde, 0xad }, query, &output, &.{}, ecsScope(query), true, &.{});
 
     var parsed_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer parsed_arena.deinit();
@@ -4399,7 +4693,7 @@ test "a client without the client subnet option keeps today's behavior" {
     defer plain.deinit();
 
     var output: [512]u8 = undefined;
-    const encoded = try buildUpstreamQuery(&.{ 0xde, 0xad }, plain, &output, &.{}, null, true);
+    const encoded = try buildUpstreamQuery(&.{ 0xde, 0xad }, plain, &output, &.{}, null, true, &.{});
     var parsed_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer parsed_arena.deinit();
     const upstream = try dns_message.Message.parse(parsed_arena.allocator(), encoded);
@@ -4468,7 +4762,7 @@ test "buildUpstreamQuery strips the other client EDNS options but preserves payl
     try appendOption(&query, dns_rdata.EDNS_EXPIRE_OPTION_CODE, &.{});
 
     var output: [512]u8 = undefined;
-    const encoded = try buildUpstreamQuery(&.{ 0xde, 0xad }, query, &output, &.{}, ecsScope(query), true);
+    const encoded = try buildUpstreamQuery(&.{ 0xde, 0xad }, query, &output, &.{}, ecsScope(query), true, &.{});
 
     var parsed_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer parsed_arena.deinit();
@@ -4499,7 +4793,7 @@ test "RFC 3225: buildUpstreamQuery sets DO=1 when the client cleared DO" {
     query.additionals.items[0].ttl = 0;
 
     var output: [512]u8 = undefined;
-    const encoded = try buildUpstreamQuery(&.{ 0xde, 0xad }, query, &output, &.{}, null, true);
+    const encoded = try buildUpstreamQuery(&.{ 0xde, 0xad }, query, &output, &.{}, null, true, &.{});
 
     var parsed_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer parsed_arena.deinit();
@@ -4519,7 +4813,7 @@ test "RFC 4343 4.1: the upstream query keeps the case the client sent" {
     )).name;
 
     var output: [512]u8 = undefined;
-    const encoded = try buildUpstreamQuery(&.{ 0xde, 0xad }, query, &output, &.{}, null, true);
+    const encoded = try buildUpstreamQuery(&.{ 0xde, 0xad }, query, &output, &.{}, null, true, &.{});
 
     var parsed_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer parsed_arena.deinit();
@@ -4540,7 +4834,7 @@ test "RFC 4035 section 4.6: buildUpstreamQuery clears the client's AD bit" {
     const original = try encodeTestMessage(plain, &original_bytes);
 
     var output: [512]u8 = undefined;
-    const composed = try buildUpstreamQuery(original, plain, &output, &.{}, null, true);
+    const composed = try buildUpstreamQuery(original, plain, &output, &.{}, null, true, &.{});
 
     // The client's own octets head the upstream query with the AD bit
     // cleared, and one OPT record with DO=1 follows them (RFC 3225 section 3):
@@ -4568,7 +4862,7 @@ test "RFC 4035 section 4.6: buildUpstreamQuery clears the client's AD bit" {
     dnssec_query.additionals.items[0].ttl = 0x8000;
 
     var edns_output: [512]u8 = undefined;
-    const composed_edns = try buildUpstreamQuery(&.{ 0xde, 0xad }, dnssec_query, &edns_output, &.{}, null, true);
+    const composed_edns = try buildUpstreamQuery(&.{ 0xde, 0xad }, dnssec_query, &edns_output, &.{}, null, true, &.{});
     var parsed_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer parsed_arena.deinit();
     const upstream = try dns_message.Message.parse(parsed_arena.allocator(), composed_edns);
@@ -4588,7 +4882,7 @@ test "RFC 3225 section 3: a client query without EDNS still asks the upstream wi
     const original = try encodeTestMessage(plain, &original_bytes);
 
     var output: [512]u8 = undefined;
-    const composed = try buildUpstreamQuery(original, plain, &output, &.{}, null, true);
+    const composed = try buildUpstreamQuery(original, plain, &output, &.{}, null, true, &.{});
 
     // The question the client sent is the question that goes upstream: only
     // the header's ARCOUNT grows, to carry the record appended to it. The
@@ -4674,7 +4968,7 @@ test "RFC 8145: an upstream DNSKEY query carries the anchors' key tags and nothi
     dnskey_query.question.?.qtype = .DNSKEY;
     const dnskey_upstream = try dns_message.Message.parse(
         parsed_arena.allocator(),
-        try buildUpstreamQuery(&.{ 0xde, 0xad }, dnskey_query, &output, &anchors, null, true),
+        try buildUpstreamQuery(&.{ 0xde, 0xad }, dnskey_query, &output, &anchors, null, true, &.{}),
     );
     // 34959 is the RFC 4034 Appendix B checksum of the DNSKEY RDATA
     // 01 01 03 08 41 42 43 44 that `257 3 8 QUJDRA==` encodes.
@@ -4688,7 +4982,7 @@ test "RFC 8145: an upstream DNSKEY query carries the anchors' key tags and nothi
     ds_query.question.?.qtype = .DNSKEY;
     const ds_upstream = try dns_message.Message.parse(
         parsed_arena.allocator(),
-        try buildUpstreamQuery(&.{ 0xbe, 0xef }, ds_query, &output, &anchors, null, true),
+        try buildUpstreamQuery(&.{ 0xbe, 0xef }, ds_query, &output, &anchors, null, true, &.{}),
     );
     try std.testing.expectEqualSlices(u8, &.{ 0xec, 0x45 }, findOption(ds_upstream, dns_rdata.EDNS_KEY_TAG_OPTION_CODE).?);
 
@@ -4698,7 +4992,7 @@ test "RFC 8145: an upstream DNSKEY query carries the anchors' key tags and nothi
     defer a_query.deinit();
     const a_upstream = try dns_message.Message.parse(
         parsed_arena.allocator(),
-        try buildUpstreamQuery(&.{ 0xbe, 0xef }, a_query, &output, &anchors, null, true),
+        try buildUpstreamQuery(&.{ 0xbe, 0xef }, a_query, &output, &anchors, null, true, &.{}),
     );
     try std.testing.expect(findOption(a_upstream, dns_rdata.EDNS_KEY_TAG_OPTION_CODE) == null);
     try std.testing.expectEqual(@as(usize, 0), a_upstream.additionals.items[0].rdata.OPT.bytes().len);
@@ -4710,7 +5004,7 @@ test "RFC 8145: an upstream DNSKEY query carries the anchors' key tags and nothi
     unanchored.question.?.qtype = .DNSKEY;
     const plain_upstream = try dns_message.Message.parse(
         parsed_arena.allocator(),
-        try buildUpstreamQuery(&.{ 0xbe, 0xef }, unanchored, &output, &.{}, null, true),
+        try buildUpstreamQuery(&.{ 0xbe, 0xef }, unanchored, &output, &.{}, null, true, &.{}),
     );
     try std.testing.expect(findOption(plain_upstream, dns_rdata.EDNS_KEY_TAG_OPTION_CODE) == null);
 }
@@ -6909,8 +7203,9 @@ test "upstream packet classification isolates validation and truncation" {
     defer arena.deinit();
     var query = try makeTestQuery(arena.allocator(), 0x2606, "example.com.", false);
     defer query.deinit();
+    const client_cookie = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
 
-    try std.testing.expect(classifyUpstreamPacket(arena.allocator(), query, 0x2606, &.{ 1, 2, 3 }, null) == .ignore);
+    try std.testing.expect(classifyUpstreamPacket(arena.allocator(), query, 0x2606, &.{ 1, 2, 3 }, null, client_cookie) == .ignore);
 
     var truncated = try makePositiveResponse(arena.allocator(), 60);
     defer truncated.deinit();
@@ -6918,14 +7213,14 @@ test "upstream packet classification isolates validation and truncation" {
     truncated.header.truncated = true;
     var wire: [2048]u8 = undefined;
     const truncated_bytes = try encodeTestMessage(truncated, &wire);
-    try std.testing.expect(classifyUpstreamPacket(arena.allocator(), query, 0x9999, truncated_bytes, null) == .ignore);
-    try std.testing.expect(classifyUpstreamPacket(arena.allocator(), query, query.header.id, truncated_bytes, null) == .truncated);
+    try std.testing.expect(classifyUpstreamPacket(arena.allocator(), query, 0x9999, truncated_bytes, null, client_cookie) == .ignore);
+    try std.testing.expect(classifyUpstreamPacket(arena.allocator(), query, query.header.id, truncated_bytes, null, client_cookie) == .truncated);
 
     var good = try makePositiveResponse(arena.allocator(), 60);
     defer good.deinit();
     good.header.id = query.header.id;
     const good_bytes = try encodeTestMessage(good, &wire);
-    var ready = classifyUpstreamPacket(std.testing.allocator, query, query.header.id, good_bytes, null);
+    var ready = classifyUpstreamPacket(std.testing.allocator, query, query.header.id, good_bytes, null, client_cookie);
     switch (ready) {
         .ready => |*message| {
             defer message.deinit();
@@ -9334,7 +9629,7 @@ test "RFC 1035 section 4.1.1: the upstream query never carries the reserved Z bi
     try std.testing.expectEqual(@as(u8, 0x40), raw[3] & 0x40);
 
     var output: [512]u8 = undefined;
-    const composed = try buildUpstreamQuery(raw[0..original.len], query, &output, &.{}, null, true);
+    const composed = try buildUpstreamQuery(raw[0..original.len], query, &output, &.{}, null, true, &.{});
     // RFC 1035 section 4.1.1: the Z bit must be zero in all queries.
     try std.testing.expectEqual(@as(u8, 0), composed[3] & 0x40);
 }
@@ -10941,4 +11236,185 @@ test "a forwarded unsigned answer stays insecure under a root anchor" {
     try std.testing.expect(!response.header.authenticated_data);
     // The unsigned answer needs no chain, so the forwarder saw one query.
     try std.testing.expectEqual(@as(usize, 1), upstream.requests);
+}
+
+test "RFC 7873 section 5.1: an upstream query carries the Cookie option" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+
+    var query = try makeTestQuery(scratch, 0x3300, "example.com.", true);
+    defer query.deinit();
+    const client_cookie = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    var output: [2048]u8 = undefined;
+    const encoded = try buildUpstreamQuery(&.{ 0xde, 0xad }, query, &output, &.{}, null, true, &client_cookie);
+    const parsed = try dns_message.Message.parse(scratch, encoded);
+    const carried = findOption(parsed, COOKIE_OPTION_CODE) orelse return error.TestExpectedCookie;
+    try std.testing.expectEqualSlices(u8, &client_cookie, carried);
+}
+
+test "RFC 7873 section 5.3: BADCOOKIE is retried with the server cookie" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    var upstream = BadCookieUpstream{ .io = io, .udp = &upstream_socket };
+    const thread = try std.Thread.spawn(.{}, serveBadCookieUpstream, .{&upstream});
+
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = upstream_socket.address },
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var query = try makeTestQuery(scratch, 0x3301, "example.com.", true);
+    defer query.deinit();
+    query.edns.?.dnssec_ok = true;
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42747);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    thread.join();
+
+    const response = try dns_message.Message.parse(scratch, bytes);
+    try std.testing.expectEqual(dns_header.Rcode.no_error, response.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+    // The BADCOOKIE answer names the server cookie, and the retry carries it.
+    try std.testing.expectEqual(@as(usize, 2), upstream.requests);
+    try std.testing.expect(upstream.saw_full_cookie);
+}
+
+const BadCookieUpstream = struct {
+    io: std.Io,
+    udp: *const std.Io.net.Socket,
+    requests: usize = 0,
+    saw_full_cookie: bool = false,
+    max_requests: usize = 4,
+};
+
+fn serveBadCookieUpstream(args: *BadCookieUpstream) void {
+    var buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
+    var index: usize = 0;
+    while (index < args.max_requests) : (index += 1) {
+        const incoming = args.udp.receiveTimeout(args.io, &buffer, Dns64Timeout) catch return;
+        args.requests += 1;
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const query = dns_message.Message.parseQuery(scratch, incoming.data) catch return;
+        const carried = findOption(query, COOKIE_OPTION_CODE) orelse return;
+        if (carried.len > 8) args.saw_full_cookie = true;
+        const has_server_cookie = carried.len > 8;
+
+        var response = makeTestQuery(scratch, query.header.id, "example.com.", true) catch return;
+        response.header.qr = true;
+        response.header.recursion_available = true;
+        response.header.rcode = if (has_server_cookie) .no_error else .yxrrset;
+        // RFC 6891 section 6.1.3: the extended RCODE lives in the OPT TTL's
+        // high byte, so BADCOOKIE (23) is header 7 plus extended 1.
+        if (response.additionals.items.len != 0) {
+            response.additionals.items[0].ttl = if (has_server_cookie) 0 else 0x01000000;
+        }
+        if (has_server_cookie) {
+            response.answers.append(.{
+                .owner = dns_name.Name.fromText("example.com.") catch return,
+                .rrtype = .A,
+                .class = .IN,
+                .ttl = 60,
+                .rdata = .{ .A = .{ 192, 0, 2, 1 } },
+            }) catch return;
+            response.header.answer_count = 1;
+        }
+        var cookie: [24]u8 = undefined;
+        @memcpy(cookie[0..8], carried[0..8]);
+        @memcpy(cookie[8..], &server_cookie_value);
+        setCookieOption(&response, &cookie) catch return;
+        var output: [2048]u8 = undefined;
+        const encoded = encodeTestMessage(response, &output) catch return;
+        _ = args.udp.send(args.io, &incoming.from, encoded) catch return;
+    }
+}
+
+const server_cookie_value = [_]u8{
+    0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7,
+    0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf,
+};
+
+test "RFC 7858 section 3.1: a TLS forwarder never falls back to cleartext" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    // A UDP socket on the port the TLS forwarder names: if the resolver ever
+    // fell back to plain DNS the query would arrive here.
+    var udp_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var udp_socket = try std.Io.net.IpAddress.bind(&udp_address, io, .{ .mode = .dgram, .protocol = .udp });
+    defer udp_socket.close(io);
+    const port = udp_socket.address.ip4.port;
+
+    var policy: Policy = .{ .forwarder = .{ .address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } } } };
+    policy.forwarder_tls = true;
+    policy.forwarder_tls_name[0..9].* = "localhost".*;
+    policy.forwarder_tls_name_len = 9;
+    var resolver = try Resolver.init(std.testing.allocator, io, policy);
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var query = try makeTestQuery(scratch, 0x3302, "example.com.", true);
+    defer query.deinit();
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42748);
+    // The TCP connect fails, so the answer is a failure and no UDP datagram
+    // was ever sent.
+    try std.testing.expectError(Error.UpstreamFailure, resolver.answer(encoded, query, &client, &output));
+    var probe: [512]u8 = undefined;
+    try std.testing.expectError(error.Timeout, udp_socket.receiveTimeout(io, &probe, .{ .duration = .{
+        .raw = .fromMilliseconds(200),
+        .clock = .awake,
+    } }));
+}
+
+test "RFC 7873 section 5.3: a server cookie is learned only when the client cookie echoes" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var resolver = try Resolver.init(std.testing.allocator, io, .{});
+    defer resolver.deinit();
+    const client_cookie = [_]u8{ 4, 5, 6, 7, 8, 9, 10, 11 };
+    resolver.client_cookie = client_cookie;
+    resolver.client_cookie_ready = true;
+    const server = try std.Io.net.IpAddress.parse("192.0.2.53", 53);
+    const now: u32 = 1_000;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+
+    var good = try makeTestQuery(scratch, 0x3303, "example.com.", true);
+    defer good.deinit();
+    var cookie: [24]u8 = undefined;
+    @memcpy(cookie[0..8], &client_cookie);
+    @memcpy(cookie[8..], &server_cookie_value);
+    try setCookieOption(&good, &cookie);
+    resolver.learnServerCookie(server, good, now);
+    try std.testing.expectEqualSlices(u8, &cookie, try resolver.outgoingCookie(server, now));
+
+    // A different client cookie is not this client's answer, so nothing is
+    // stored and the old server cookie stays.
+    var forged = try makeTestQuery(scratch, 0x3304, "example.com.", true);
+    defer forged.deinit();
+    var forged_cookie: [24]u8 = undefined;
+    @memcpy(forged_cookie[0..8], &[_]u8{ 9, 9, 9, 9, 9, 9, 9, 9 });
+    const forged_server: [16]u8 = @splat(0xee);
+    @memcpy(forged_cookie[8..], &forged_server);
+    try setCookieOption(&forged, &forged_cookie);
+    resolver.learnServerCookie(server, forged, now);
+    try std.testing.expectEqualSlices(u8, &cookie, try resolver.outgoingCookie(server, now));
+
+    // The learned pair expires after the RFC 7873 section 5.2.1 hour, and the
+    // query falls back to the client cookie alone.
+    try std.testing.expectEqualSlices(u8, &client_cookie, try resolver.outgoingCookie(server, now + Resolver.server_cookie_ttl + 1));
 }

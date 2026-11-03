@@ -2701,12 +2701,22 @@ const opt_record_len: usize = 11;
 /// True when the query ends in an empty OPT record (root owner, type 41,
 /// RDLENGTH 0): the client's EDNS record. A real server answers the question
 /// and never echoes that record into its own answer section.
-fn endsWithEmptyOpt(query: []const u8) bool {
-    if (query.len < 12 + opt_record_len) return false;
-    const tail = query[query.len - opt_record_len ..];
-    return tail[0] == 0 and
-        std.mem.readInt(u16, tail[1..3], .big) == 41 and
-        std.mem.readInt(u16, tail[9..11], .big) == 0;
+/// The byte length of the OPT record that ends `query`, options and all.
+/// The forwarder always appends one (RFC 6891), and its RDATA may carry the
+/// Cookie option, so the record is located from its root owner and its own
+/// RDATA length rather than assumed to be the bare eleven-octet form.
+fn trailingOptLen(query: []const u8) ?usize {
+    if (query.len < 12 + opt_record_len) return null;
+    var start = query.len - opt_record_len;
+    while (true) {
+        if (query[start] == 0 and std.mem.readInt(u16, query[start + 1 ..][0..2], .big) == 41) {
+            const rdata_len = std.mem.readInt(u16, query[start + 9 ..][0..2], .big);
+            const total = opt_record_len + rdata_len;
+            if (start + total == query.len) return total;
+        }
+        if (start == 0) return null;
+        start -= 1;
+    }
 }
 
 fn serveUpstream(args: *UpstreamArgs) void {
@@ -2837,11 +2847,11 @@ fn makeAResponse(query: []const u8, truncated: bool, wrong_id: bool, wrong_quest
     // record into its own answer section. The forwarder asks upstream with an
     // OPT (RFC 3225 section 3), so the mock drops that trailing record and
     // the record count that carried it.
-    const dropped = endsWithEmptyOpt(query);
-    const echoed = if (dropped) query[0 .. query.len - opt_record_len] else query;
+    const opt_len = trailingOptLen(query);
+    const echoed = if (opt_len) |len| query[0 .. query.len - len] else query;
     @memcpy(response.bytes[0..echoed.len], echoed);
     response.len = echoed.len;
-    if (dropped) {
+    if (opt_len != null) {
         const additional_count = std.mem.readInt(u16, response.bytes[10..12], .big);
         std.mem.writeInt(u16, response.bytes[10..12], additional_count -| 1, .big);
     }
@@ -2897,11 +2907,11 @@ fn makeNxDomainResponse(query: []const u8) ResponseBytes {
     var response = ResponseBytes{};
     // The client's OPT record is not echoed into the answer, as in
     // makeAResponse.
-    const dropped = endsWithEmptyOpt(query);
-    const echoed = if (dropped) query[0 .. query.len - opt_record_len] else query;
+    const opt_len = trailingOptLen(query);
+    const echoed = if (opt_len) |len| query[0 .. query.len - len] else query;
     @memcpy(response.bytes[0..echoed.len], echoed);
     response.len = echoed.len;
-    if (dropped) {
+    if (opt_len != null) {
         const additional_count = std.mem.readInt(u16, response.bytes[10..12], .big);
         std.mem.writeInt(u16, response.bytes[10..12], additional_count -| 1, .big);
     }

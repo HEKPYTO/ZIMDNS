@@ -425,22 +425,28 @@ fn resolveServerAddresses(
     options: Options,
     depth: usize,
 ) anyerror!usize {
+    // RFC 1034 section 4.3.2 asks for the name server's address and names no
+    // family. A and AAAA are both asked: an IPv6-only name server below a
+    // glue-less delegation is unreachable by A alone, and the transport
+    // reaches it, so the A answer is tried first and AAAA when it is empty.
     for (targets) |target| {
-        var answer = resolveAt(allocator, sender, hints, .{ .name = target, .qtype = .A, .qclass = .IN }, options, depth) catch continue;
-        defer answer.deinit();
-        var count: usize = 0;
-        for (answer.answers.slice()) |record| {
-            if (count == servers.len) break;
-            if (!record.owner.eql(&target)) continue;
-            const octets = switch (record.rdata) {
-                .A => |value| value,
-                else => continue,
-            };
-            const address: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = octets, .port = 53 } };
-            servers[count] = address;
-            count += 1;
+        for ([_]RecordType{ .A, .AAAA }) |qtype| {
+            var answer = resolveAt(allocator, sender, hints, .{ .name = target, .qtype = qtype, .qclass = .IN }, options, depth) catch continue;
+            defer answer.deinit();
+            var count: usize = 0;
+            for (answer.answers.slice()) |record| {
+                if (count == servers.len) break;
+                if (!record.owner.eql(&target)) continue;
+                const address: std.Io.net.IpAddress = switch (record.rdata) {
+                    .A => |value| .{ .ip4 = .{ .bytes = value, .port = 53 } },
+                    .AAAA => |value| .{ .ip6 = .{ .bytes = value, .port = 53 } },
+                    else => continue,
+                };
+                servers[count] = address;
+                count += 1;
+            }
+            if (count != 0) return count;
         }
-        if (count != 0) return count;
     }
     return 0;
 }
@@ -564,7 +570,9 @@ fn isDescendant(name: *const Name, ancestor: *const Name) bool {
 }
 
 const TestScript = struct {
-    server: [4]u8,
+    server: [4]u8 = .{ 0, 0, 0, 0 },
+    /// An IPv6 server the script answers from; used when `server` is zero.
+    server_v6: ?[16]u8 = null,
     qname: []const u8,
     qtype: RecordType,
     /// An answer a server that is not authoritative for the name gives: it
@@ -575,6 +583,10 @@ const TestScript = struct {
     const Kind = union(enum) {
         referral: struct { child: []const u8, ns: []const u8, glue: ?[4]u8 },
         address: [4]u8,
+        address_v6: [16]u8,
+        /// An empty NOERROR answer: the name exists with no record of the
+        /// type asked for, as a name server target with only an AAAA does.
+        nodata,
         cname: []const u8,
         nxdomain,
         servfail,
@@ -591,13 +603,13 @@ const FakeSender = struct {
         var query = try dns_message.Message.parse(allocator, query_bytes);
         defer query.deinit();
         const question = query.question orelse return Error.MalformedResponse;
-        const server_bytes = switch (server) {
-            .ip4 => |address| address.bytes,
-            else => return Error.NoReachableServer,
-        };
         for (self.scripts, 0..) |script, index| {
             if (self.used[index]) continue;
-            if (!std.mem.eql(u8, &script.server, &server_bytes)) continue;
+            const same_server = switch (server) {
+                .ip4 => |address| std.mem.eql(u8, &script.server, &address.bytes),
+                .ip6 => |address| if (script.server_v6) |bytes| std.mem.eql(u8, &bytes, &address.bytes) else false,
+            };
+            if (!same_server) continue;
             if (!question.name.eql(&(dns_name.Name.fromText(script.qname) catch unreachable))) continue;
             if (!question.qtype.eql(script.qtype)) continue;
             self.used[index] = true;
@@ -630,6 +642,14 @@ const FakeSender = struct {
                 try message.answers.append(.{ .owner = question.name, .rrtype = .A, .class = .IN, .ttl = 300, .rdata = .{ .A = octets } });
                 message.header.answer_count = 1;
                 message.header.authoritative = !script.lame;
+            },
+            .address_v6 => |octets| {
+                try message.answers.append(.{ .owner = question.name, .rrtype = .AAAA, .class = .IN, .ttl = 300, .rdata = .{ .AAAA = octets } });
+                message.header.answer_count = 1;
+                message.header.authoritative = !script.lame;
+            },
+            .nodata => {
+                message.header.authoritative = true;
             },
             .cname => |target| {
                 try message.answers.append(.{ .owner = question.name, .rrtype = .CNAME, .class = .IN, .ttl = 300, .rdata = .{ .CNAME = try Name.fromText(target) } });
@@ -1034,4 +1054,39 @@ test "RFC 9156 section 3 step 6c: an authoritative minimized answer continues wi
 
     try std.testing.expectEqual([4]u8{ 192, 0, 2, 7 }, answer.answers.slice()[0].rdata.A);
     for (used) |entry| try std.testing.expect(entry);
+}
+
+test "RFC 1034 section 4.3.2: a glue-less name server with only an AAAA address is reached" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var ns_v6: [16]u8 = @splat(0);
+    ns_v6[0] = 0x20;
+    ns_v6[1] = 0x01;
+    ns_v6[2] = 0x0d;
+    ns_v6[3] = 0xb8;
+    ns_v6[15] = 0x53;
+    const scripts = [_]TestScript{
+        // The root refers to `example.` with no glue, so the name server's
+        // own address must be resolved.
+        .{ .server = .{ 203, 0, 113, 5 }, .qname = "www.example.", .qtype = .A, .kind = .{ .referral = .{ .child = "example.", .ns = "ns.example.", .glue = null } } },
+        // Its only address is an AAAA, and the A lookup comes back empty.
+        .{ .server = .{ 203, 0, 113, 5 }, .qname = "ns.example.", .qtype = .A, .kind = .nodata },
+        .{ .server = .{ 203, 0, 113, 5 }, .qname = "ns.example.", .qtype = .AAAA, .kind = .{ .address_v6 = ns_v6 } },
+        // The delegated server answers over IPv6.
+        .{ .server_v6 = ns_v6, .qname = "www.example.", .qtype = .A, .kind = .{ .address = .{ 192, 0, 2, 7 } } },
+    };
+    var used: [scripts.len]bool = @splat(false);
+    var fake = FakeSender{ .scripts = &scripts, .used = &used };
+    const hints = [_]std.Io.net.IpAddress{hint(.{ 203, 0, 113, 5 })};
+    var answer = try resolve(allocator, .{ .context = &fake, .send = FakeSender.send }, &hints, .{
+        .name = try Name.fromText("www.example."),
+        .qtype = .A,
+        .qclass = .IN,
+    }, .{ .now = 1000 });
+    defer answer.deinit();
+    try std.testing.expectEqual(@as(u16, 1), answer.header.answer_count);
+    try std.testing.expectEqualSlices(u8, &.{ 192, 0, 2, 7 }, &answer.answers.items[0].rdata.A);
+    for (used) |item| try std.testing.expect(item);
 }

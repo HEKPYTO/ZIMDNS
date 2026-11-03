@@ -21,6 +21,11 @@ zone home.arpa primary examples/zones/home.arpa.zone
 # before recursion is enabled, on the UDP and the TCP ingress alike.
 # recursion allow 127.0.0.0/8
 # forwarder 127.0.0.1:5353
+# The TLS form names the server certificate and SNI value; the port is the
+# operator's, so a DoT forwarder names 853 explicitly.
+# forwarder 9.9.9.9:853 tls dns.quad9.net
+# The DoH form names the certificate and SNI value and its POST target.
+# forwarder 1.1.1.1:443 doh cloudflare-dns.com /dns-query
 # cookies validate current-secret previous-secret
 #
 # The source ports the forwarder may not use for its outgoing queries.

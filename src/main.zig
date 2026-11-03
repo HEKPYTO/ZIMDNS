@@ -26,6 +26,8 @@ pub const config_loader = @import("config/loader.zig");
 pub const metrics = @import("metrics.zig");
 pub const transport_tls = @import("transport/tls.zig");
 pub const transport_tls_server = @import("transport/tls_server.zig");
+pub const transport_tls_client = @import("transport/tls_client.zig");
+pub const transport_doh_client = @import("transport/doh_client.zig");
 pub const transport_dot = @import("transport/dot.zig");
 pub const transport_doh = @import("transport/doh.zig");
 /// The pinned TLS dependency, exported so the CLI guard can drive a DoH
@@ -88,6 +90,8 @@ test {
     _ = listener;
     _ = transport_tls;
     _ = transport_tls_server;
+    _ = transport_tls_client;
+    _ = transport_doh_client;
     _ = transport_dot;
     _ = transport_doh;
     _ = transfer_axfr;

@@ -11,6 +11,22 @@ token is refused with the RFC 7301 no_application_protocol alert, and the
 identity is loaded before the port is bound, so a broken certificate or key
 refuses the run and leaves no port open.
 
+The resolver also *speaks* DoT as a client: a `forwarder <address>:853 tls
+<name>` configuration sends every upstream query, including the DS and DNSKEY
+chain fetches it needs to validate an answer, over one TLS connection
+(`tls_client.zig`). The handshake offers the `dot` ALPN token and accepts a
+server that negotiates none, refuses a server that selects a different token,
+verifies the certificate against the platform trust store and the operator's
+configured name, and never falls back to a cleartext exchange.
+
+A `forwarder <address>:443 doh <name> <path>` configuration speaks DoH as a
+client (`doh_client.zig`): one RFC 8484 §4.1 POST per query with
+`application/dns-message` on the request and required on the answer, a
+content-length or chunked response body, and no cleartext fallback. It speaks
+HTTP/1.1 with the `http/1.1` ALPN token, the same disclosed deviation the
+serving side carries; a provider whose endpoint requires HTTP/2 answers with a
+non-200 status and the hop fails closed.
+
 DoH (RFC 8484) is served too: `--serve-doh` terminates a TLS 1.3 handshake
 with the `http/1.1` ALPN token and then maps the RFC 8484 section 4.1 GET
 and POST requests to DNS wire bytes, answering with `application/dns-message`.

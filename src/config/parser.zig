@@ -210,9 +210,26 @@ pub const Nat64Prefix = struct {
 pub const Forwarder = struct {
     address: Text = .{},
     port: u16,
+    /// RFC 7858 section 3.1: the forwarder speaks DNS over TLS instead of
+    /// plain UDP when the directive names a TLS server name.
+    transport: ForwardTransport = .udp,
+    /// The name the server certificate must match and the SNI value sent.
+    tls_name: Text = .{},
+    /// RFC 8484 section 4.1: the POST target of a DoH forwarder.
+    doh_path: Text = .{},
+
+    pub const ForwardTransport = enum { udp, tls, doh };
 
     pub fn addressText(self: *const Forwarder) []const u8 {
         return self.address.text();
+    }
+
+    pub fn tlsNameText(self: *const Forwarder) []const u8 {
+        return self.tls_name.text();
+    }
+
+    pub fn dohPathText(self: *const Forwarder) []const u8 {
+        return self.doh_path.text();
     }
 };
 
@@ -657,12 +674,61 @@ pub const Config = struct {
 
     fn parseForwarder(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
         const endpoint = tokens.next() orelse return Error.BadDirective;
-        try requireNoTrailingTokens(tokens);
         const parsed = try parseEndpoint(endpoint);
         var forwarder = Forwarder{ .port = parsed.port };
         try forwarder.address.set(parsed.address);
+        // RFC 7858 section 3.1: `forwarder <address>:<port> tls <name>` sends
+        // the forwarder's queries over TLS, and the name is both the SNI and
+        // the name the certificate must match.
+        if (tokens.next()) |token| {
+            // RFC 7858 section 3.1 for `tls`, RFC 8484 section 4.1 for `doh`:
+            // both name the certificate and SNI value, and a DoH forwarder
+            // may name its POST target.
+            const transport: Forwarder.ForwardTransport = if (std.mem.eql(u8, token, "tls"))
+                .tls
+            else if (std.mem.eql(u8, token, "doh"))
+                .doh
+            else
+                return Error.BadDirective;
+            const name = tokens.next() orelse return Error.BadDirective;
+            const is_literal = blk: {
+                _ = std.Io.net.IpAddress.parse(name, 1) catch break :blk false;
+                break :blk true;
+            };
+            if (is_literal) return Error.BadAddress;
+            try validateHostName(name);
+            try forwarder.tls_name.set(name);
+            forwarder.transport = transport;
+            if (transport == .doh) {
+                const path = tokens.next() orelse return Error.BadDirective;
+                if (path.len == 0 or path[0] != '/') return Error.BadDirective;
+                try forwarder.doh_path.set(path);
+            }
+        }
+        try requireNoTrailingTokens(tokens);
         if (self.forwarder != null) return Error.BadDirective;
         self.forwarder = forwarder;
+    }
+
+    /// RFC 7858 section 3.1 leaves the certificate name to the operator; the
+    /// value must be a DNS name so it can serve as SNI and as the verified
+    /// host, never an address literal (a certificate for an address is not
+    /// what a DoT service presents).
+    fn validateHostName(name: []const u8) !void {
+        if (name.len == 0 or name.len > 253) return Error.BadAddress;
+        var label_len: usize = 0;
+        for (name) |byte| {
+            if (byte == '.') {
+                if (label_len == 0 or label_len > 63) return Error.BadAddress;
+                label_len = 0;
+                continue;
+            }
+            const allowed = (byte >= 'a' and byte <= 'z') or (byte >= 'A' and byte <= 'Z') or
+                (byte >= '0' and byte <= '9') or byte == '-' or byte == '_';
+            if (!allowed) return Error.BadAddress;
+            label_len += 1;
+        }
+        if (label_len == 0 or label_len > 63) return Error.BadAddress;
     }
 
     fn parseCookies(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
@@ -1768,4 +1834,35 @@ test "config parser takes one signed chain and refuses every other shape" {
         "dnssec-chain nsec\ndnssec-chain nsec3 0 -\n",
     ));
     try std.testing.expectError(error.UnknownDirective, Config.parse("dnssec-chain-kind nsec\n"));
+}
+
+test "forwarder names a TLS server and its certificate name" {
+    const config = try Config.parse(
+        \\forwarder 1.1.1.1:853 tls cloudflare-dns.com
+    );
+    const forwarder = config.forwarder orelse return error.TestExpectedForwarder;
+    try std.testing.expectEqual(Forwarder.ForwardTransport.tls, forwarder.transport);
+    try std.testing.expectEqualStrings("cloudflare-dns.com", forwarder.tlsNameText());
+    try std.testing.expectEqual(@as(u16, 853), forwarder.port);
+}
+
+test "a TLS forwarder without a certificate name is refused" {
+    try std.testing.expectError(Error.BadDirective, Config.parse("forwarder 1.1.1.1:853 tls\n"));
+    try std.testing.expectError(Error.BadDirective, Config.parse("forwarder 1.1.1.1:853 quic dns.example\n"));
+    try std.testing.expectError(Error.BadAddress, Config.parse("forwarder 1.1.1.1:853 tls 1.1.1.1\n"));
+}
+
+test "forwarder names a DoH server, its certificate name, and its path" {
+    const config = try Config.parse(
+        \\forwarder 9.9.9.9:443 doh dns.quad9.net /dns-query
+    );
+    const forwarder = config.forwarder orelse return error.TestExpectedForwarder;
+    try std.testing.expectEqual(Forwarder.ForwardTransport.doh, forwarder.transport);
+    try std.testing.expectEqualStrings("dns.quad9.net", forwarder.tlsNameText());
+    try std.testing.expectEqualStrings("/dns-query", forwarder.dohPathText());
+}
+
+test "a DoH forwarder needs a path that starts at the root" {
+    try std.testing.expectError(Error.BadDirective, Config.parse("forwarder 9.9.9.9:443 doh dns.quad9.net\n"));
+    try std.testing.expectError(Error.BadDirective, Config.parse("forwarder 9.9.9.9:443 doh dns.quad9.net dns-query\n"));
 }
