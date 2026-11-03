@@ -424,6 +424,42 @@ const EcsScope = struct {
         const len = (@as(usize, self.prefix) + 7) / 8;
         return std.mem.eql(u8, self.address[0..len], other.address[0..len]);
     }
+
+    /// RFC 7871 section 7.3.2: the network an answer covers contains the
+    /// network the client asked from when every bit of the answer's scope
+    /// is the same. A scope of 0 covers every client, and a client that
+    /// disclosed fewer bits than the answer's scope cannot be placed inside
+    /// it. Family 0 means the message carried no option at all.
+    fn covers(self: EcsScope, other: EcsScope) bool {
+        if (self.prefix == 0) return true;
+        if (self.family == 0 or self.family != other.family) return false;
+        if (other.prefix < self.prefix) return false;
+        const whole = @as(usize, self.prefix) / 8;
+        if (!std.mem.eql(u8, self.address[0..whole], other.address[0..whole])) return false;
+        const remainder = self.prefix % 8;
+        if (remainder == 0) return true;
+        const mask: u8 = @as(u8, 0xFF) << @intCast(8 - remainder);
+        return (self.address[whole] & mask) == (other.address[whole] & mask);
+    }
+
+    /// The same network cut to `scope_prefix` bits, the network the upstream
+    /// said the answer covers (RFC 7871 section 7.3.1).
+    fn scoped(self: EcsScope, scope_prefix: u8) EcsScope {
+        var out = self;
+        // A scope can only narrow the network the client asked from, never
+        // widen it: an upstream cannot invent address bits.
+        out.prefix = @min(scope_prefix, self.prefix);
+        const whole = @as(usize, scope_prefix) / 8;
+        const remainder = scope_prefix % 8;
+        if (remainder == 0) {
+            @memset(out.address[whole..], 0);
+        } else {
+            const mask: u8 = @as(u8, 0xFF) << @intCast(8 - remainder);
+            out.address[whole] &= mask;
+            @memset(out.address[whole + 1 ..], 0);
+        }
+        return out;
+    }
 };
 
 const CacheKey = struct {
@@ -468,6 +504,31 @@ const CacheKey = struct {
             self.checking_disabled == other.checking_disabled and self.dnssec_ok == other.dnssec_ok and
             self.ecs.eql(other.ecs) and
             std.ascii.eqlIgnoreCase(self.name[0..self.name_len], other.name[0..other.name_len]);
+    }
+
+    /// RFC 7871 section 7.3.1: the key an answer is cached under is the
+    /// network the upstream said the answer covers, not the network the
+    /// client asked from. A scope of 0 makes the answer usable by every
+    /// client, so the key carries no client address at all.
+    fn withScope(self: CacheKey, scope_prefix: u8) CacheKey {
+        var key = self;
+        if (key.ecs.family == 0) return key;
+        if (scope_prefix == 0) {
+            key.ecs = .{};
+            return key;
+        }
+        key.ecs = key.ecs.scoped(scope_prefix);
+        return key;
+    }
+
+    /// True when `self` is a cached answer `query` may be served from: the
+    /// same question, and a scope that covers the client's network. The
+    /// caller picks the longest covering scope (RFC 7871 section 7.3.2).
+    fn matches(self: *const CacheKey, query: *const CacheKey) bool {
+        return self.qtype == query.qtype and self.qclass == query.qclass and
+            self.checking_disabled == query.checking_disabled and self.dnssec_ok == query.dnssec_ok and
+            self.ecs.covers(query.ecs) and
+            std.ascii.eqlIgnoreCase(self.name[0..self.name_len], query.name[0..query.name_len]);
     }
 
     /// True when two keys ask the same question. The CD and DO flags are
@@ -549,12 +610,31 @@ fn trimmedScope(scope: EcsScope, max_prefix: ?u8) EcsScope {
 /// the scope of 0. A scope the resolver cannot use, one wider than the
 /// prefix the query asked for, is reported as 0: a client is never told the
 /// answer covers a scope the resolver did not learn from the upstream.
-fn upstreamEcsScope(response: dns_message.Message, scope: EcsScope) u8 {
+const UpstreamScope = struct {
+    /// The SCOPE PREFIX-LENGTH the client is told. RFC 7871 section 7.3: a
+    /// scope the resolver cannot use is reported as 0.
+    report: u8,
+    /// The scope the answer is cached under, or null when the reported scope
+    /// cannot be used: the entry stays confined to the network the query
+    /// asked from instead of widening to every client.
+    store: ?u8,
+};
+
+fn upstreamScopeInfo(response: dns_message.Message, scope: EcsScope) UpstreamScope {
+    // RFC 7871 section 7.3: an answer that carries no option is treated as
+    // scope 0, and the upstream ignored the address it was sent.
+    if (findOption(response, dns_rdata.EDNS_ECS_OPTION_CODE) == null) return .{ .report = 0, .store = 0 };
     const reported = ecsScopePrefix(response);
-    if (reported == 0) return 0;
-    if (scope.family == 0) return 0;
-    if (reported > scope.prefix) return 0;
-    return reported;
+    if (reported == 0) return .{ .report = 0, .store = 0 };
+    // A scope wider than the query asked for, or an option for a query that
+    // carried none, is unusable: report 0 and keep the entry within the
+    // scope the query was sent with.
+    if (scope.family == 0 or reported > scope.prefix) return .{ .report = 0, .store = null };
+    return .{ .report = reported, .store = reported };
+}
+
+fn upstreamEcsScope(response: dns_message.Message, scope: EcsScope) u8 {
+    return upstreamScopeInfo(response, scope).report;
 }
 
 /// RFC 7871 section 7.2.2: a client that sent the option gets one in the
@@ -766,11 +846,11 @@ const Cache = struct {
 
     /// The scope is the one the upstream answered with (RFC 7871 section 6),
     /// which the cached copy reports to every client it serves.
-    fn put(self: *Cache, key: CacheKey, message: *dns_message.Message, now: i64, ecs_scope: u8, ede: u16) !void {
+    fn put(self: *Cache, key: CacheKey, message: *dns_message.Message, now: i64, store_scope: ?u8, report_scope: u8, ede: u16) !void {
         if (message.header.truncated or (message.header.rcode != .no_error and message.header.rcode != .nxdomain)) return;
         const ttl_info = cacheTtl(message, key.qtype) orelse return;
         if (ttl_info.ttl == 0) return;
-        try self.store(key, message, now, ttl_info, ecs_scope, ede);
+        try self.store(key, message, now, ttl_info, store_scope, report_scope, ede);
     }
 
     /// Stores a denial this server synthesized (RFC 8198). Its TTL is the
@@ -782,10 +862,16 @@ const Cache = struct {
             .ttl = ttl,
             .negative = true,
             .nxdomain = message.header.rcode == .nxdomain,
-        }, 0, 0);
+        }, null, 0, 0);
     }
 
-    fn store(self: *Cache, key: CacheKey, message: *dns_message.Message, now: i64, ttl_info: TtlInfo, ecs_scope: u8, ede: u16) !void {
+    fn store(self: *Cache, key: CacheKey, message: *dns_message.Message, now: i64, ttl_info: TtlInfo, store_scope: ?u8, report_scope: u8, ede: u16) !void {
+        // RFC 7871 section 7.3.1: the entry is stored for the network the
+        // upstream said the answer covers, so every client inside that
+        // network is served from it, not only the one that asked. An
+        // unusable scope keeps the entry confined to the query's own
+        // network (store_scope null), never widened.
+        const cached_key = if (store_scope) |scope_prefix| key.withScope(scope_prefix) else key;
         var raw: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
         stripOptions(message);
         var writer = dns_writer.Writer.init(&raw);
@@ -802,7 +888,7 @@ const Cache = struct {
             }
             const elapsed = @max(@as(i64, 0), now - self.entries[index].stored_at);
             if (elapsed >= @as(i64, self.entries[index].ttl) and expired == null) expired = index;
-            if (self.entries[index].key.eql(&key)) {
+            if (self.entries[index].key.eql(&cached_key)) {
                 slot = index;
                 break;
             }
@@ -830,12 +916,12 @@ const Cache = struct {
         const stored = try self.allocator.dupe(u8, writer.written());
         self.entries[slot] = .{
             .response = stored,
-            .key = key,
+            .key = cached_key,
             .stored_at = now,
             .ttl = ttl_info.ttl,
             .negative = ttl_info.negative,
             .nxdomain = ttl_info.nxdomain,
-            .ecs_scope = ecs_scope,
+            .ecs_scope = report_scope,
             .ede = ede,
         };
     }
@@ -843,21 +929,33 @@ const Cache = struct {
     fn lookup(self: *Cache, key: *const CacheKey, query: dns_message.Message, now: i64, output: []u8, allow_stale: bool) !?LookupResult {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        var index: usize = 0;
-        while (index < self.len) : (index += 1) {
-            const entry = &self.entries[index];
-            if (entry.response == null) continue;
-            if (!entry.key.eql(key)) continue;
+        // RFC 7871 section 7.3.2: the answer with the longest scope that
+        // covers the client's network is the one that answers. An entry
+        // whose scope is 0 covers every client.
+        var attempts: usize = 0;
+        while (attempts <= self.len) : (attempts += 1) {
+            var best: ?usize = null;
+            var index: usize = 0;
+            while (index < self.len) : (index += 1) {
+                const candidate = &self.entries[index];
+                if (candidate.response == null) continue;
+                if (!candidate.key.matches(key)) continue;
+                if (best == null or candidate.key.ecs.prefix > self.entries[best.?].key.ecs.prefix) best = index;
+            }
+            const chosen = best orelse break;
+            const entry = &self.entries[chosen];
             const elapsed = @max(@as(i64, 0), now - entry.stored_at);
             const fresh = elapsed < @as(i64, entry.ttl);
             const stale = !fresh and elapsed <= @as(i64, entry.ttl) + STALE_WINDOW_SECONDS;
             if (!fresh and (!allow_stale or !stale)) {
                 // RFC 9520 section 4: an expired entry is still served when
                 // resolution fails, so a fresh lookup keeps it for the stale
-                // window instead of evicting it.
+                // window instead of evicting it. An entry past the window is
+                // gone, and a narrower answer may still cover the client.
                 if (!stale) {
                     self.allocator.free(entry.response.?);
                     entry.* = .{};
+                    continue;
                 }
                 break;
             }
@@ -901,14 +999,16 @@ const Cache = struct {
             if (entry.key.qclass != key.qclass) continue;
             if (entry.key.checking_disabled != key.checking_disabled) continue;
             if (entry.key.dnssec_ok != key.dnssec_ok) continue;
-            // RFC 7871 section 7.3.1: a denial is tied to the network it was
-            // fetched for, so a cut never crosses into another scope.
-            if (!entry.key.ecs.eql(key.ecs)) continue;
+            // RFC 7871 section 7.3.2: a denial covers the network it was
+            // fetched for, and a scope-0 denial covers every client.
+            if (!entry.key.ecs.covers(key.ecs)) continue;
             const elapsed = @max(@as(i64, 0), now - entry.stored_at);
             if (elapsed >= @as(i64, entry.ttl)) continue;
             if (!isDescendant(key.name[0..key.name_len], entry.key.name[0..entry.key.name_len])) continue;
-            // The closest enclosing denial is the one that names the answer.
-            if (cut == null or entry.key.name_len > cut.?.key.name_len) cut = entry;
+            // The closest enclosing denial is the one that names the answer;
+            // among the same name, the longest scope wins (RFC 7871 7.3.2).
+            if (cut == null or entry.key.name_len > cut.?.key.name_len or
+                (entry.key.name_len == cut.?.key.name_len and entry.key.ecs.prefix > cut.?.key.ecs.prefix)) cut = entry;
         }
         const entry = cut orelse return null;
         const elapsed = @max(@as(i64, 0), now - entry.stored_at);
@@ -959,7 +1059,8 @@ fn storeUpstreamAnswer(
     query: dns_message.Message,
     response: *dns_message.Message,
     now: i64,
-    ecs_scope: u8,
+    store_scope: ?u8,
+    report_scope: u8,
     ede: u16,
 ) void {
     if (response.header.rcode == .nxdomain) {
@@ -967,13 +1068,13 @@ fn storeUpstreamAnswer(
             const answers = response.answers.len;
             response.answers.len = 0;
             response.header.answer_count = 0;
-            cache.put(key.withName(denied), response, now, ecs_scope, ede) catch {};
+            cache.put(key.withName(denied), response, now, store_scope, report_scope, ede) catch {};
             response.answers.len = answers;
             response.header.answer_count = @intCast(answers);
             return;
         }
     }
-    cache.put(key, response, now, ecs_scope, ede) catch {};
+    cache.put(key, response, now, store_scope, report_scope, ede) catch {};
 }
 
 /// True when `name` sits strictly below `ancestor` in the DNS tree. Both
@@ -1269,6 +1370,12 @@ pub const Resolver = struct {
     /// narrows `hint_count` to one loopback server.
     root_hints: [iterate_mod.root_hint_text.len]std.Io.net.IpAddress = undefined,
     hint_count: usize = iterate_mod.root_hint_text.len,
+    /// RFC 9609 section 2: the root servers a priming query learned, with the
+    /// addresses the root published for them, reused until the root NS TTL
+    /// runs out; the built-in hints answer when the priming query fails.
+    root_servers: [iterate_mod.root_hint_text.len]std.Io.net.IpAddress = undefined,
+    root_server_count: usize = 0,
+    root_servers_expires_at: i64 = 0,
     /// Delegations the iterative path has learned, reused until their NS TTL
     /// runs out. Read and written under this resolver's lock.
     delegations: iterate_mod.DelegationCache = .{},
@@ -1516,6 +1623,11 @@ pub const Resolver = struct {
         // cleared first: a forwarder that does not validate must never relay
         // another server's claim of authenticity.
         response.header.authenticated_data = false;
+        // RFC 2181 section 7: an answer from a recursive resolver is not
+        // authoritative for the queried name, so the upstream's AA bit does
+        // not ride to the client. The server's own zones are answered before
+        // this path.
+        response.header.authoritative = false;
         response.header.id = query.header.id;
         response.header.recursion_desired = query.header.recursion_desired;
         response.header.recursion_available = true;
@@ -1525,7 +1637,7 @@ pub const Resolver = struct {
         // upstream reported, so it is read before the options are stripped.
         // The scope of the query that fetched it bounds it, so an answer
         // fetched without an ADDRESS never reports a scope of its own.
-        var upstream_scope = upstreamEcsScope(response, exchange.scope orelse EcsScope{});
+        var upstream_scope = upstreamScopeInfo(response, exchange.scope orelse EcsScope{});
         // RFC 9567 section 5: the agent domain the upstream named and the
         // error it reported are read before the options are stripped from
         // the answer.
@@ -1645,13 +1757,13 @@ pub const Resolver = struct {
         // ADDRESS, so it is served to the /0 queries only.
         var answer_key = key;
         answer_key.ecs = exchange.scope orelse EcsScope{};
-        storeUpstreamAnswer(&self.cache, answer_key, query, &response, now, upstream_scope, insecure_ede);
+        storeUpstreamAnswer(&self.cache, answer_key, query, &response, now, upstream_scope.store, upstream_scope.report, insecure_ede);
         // RFC 3225 section 3: a query with the DO bit clear must not be answered
         // with DNSSEC security RRs. The cached copy keeps them, so the removal
         // happens on the way out only.
         stripProofsForClient(&response, query);
         if (query.edns) |edns| try appendOpt(&response, edns);
-        try appendEcsScope(&response, key.ecs, upstream_scope);
+        try appendEcsScope(&response, key.ecs, upstream_scope.report);
         // RFC 8914 section 2: the code rides on the answer itself, so the
         // client learns that the answer is not signed verified.
         if (insecure_ede != 0) try appendEde(&response, insecure_ede);
@@ -1704,7 +1816,17 @@ pub const Resolver = struct {
     /// length. Null when the client sent no option.
     fn upstreamScope(self: *const Resolver, query: dns_message.Message) ?EcsScope {
         const scope = ecsScope(query) orelse return null;
-        return trimmedScope(scope, self.policy.max_cacheable_prefix);
+        // RFC 7871 section 11.1: a recursive resolver is strongly encouraged
+        // to conceal part of the client's address. This profile forwards at
+        // most 24 bits of IPv4 and 56 bits of IPv6, the lengths the section
+        // recommends; a client that disclosed fewer bits keeps its prefix.
+        const limited = trimmedScope(scope, self.policy.max_cacheable_prefix);
+        const privacy: u8 = switch (limited.family) {
+            1 => 24,
+            2 => 56,
+            else => return limited,
+        };
+        return limited.scoped(privacy);
     }
 
     /// True when this response is one this server validates itself: a
@@ -1802,7 +1924,7 @@ pub const Resolver = struct {
         };
         defer ds_query.deinit();
         const options: iterate_mod.Options = .{ .now = @intCast(now), .dnssec_ok = true, .qname_minimization = true };
-        var ds_response = iterate_mod.resolve(self.allocator, .{ .context = self, .send = iterateSend }, self.root_hints[0..self.hint_count], .{
+        var ds_response = iterate_mod.resolve(self.allocator, .{ .context = self, .send = iterateSend }, self.rootServers(@intCast(now)), .{
             .name = apex,
             .qtype = .DS,
             .qclass = .IN,
@@ -1921,7 +2043,7 @@ pub const Resolver = struct {
                     .dnssec_ok = true,
                     .qname_minimization = true,
                 };
-                break :blk iterate_mod.resolve(self.allocator, .{ .context = self, .send = iterateSend }, self.root_hints[0..self.hint_count], .{
+                break :blk iterate_mod.resolve(self.allocator, .{ .context = self, .send = iterateSend }, self.rootServers(now), .{
                     .name = apex,
                     .qtype = qtype,
                     .qclass = .IN,
@@ -2600,12 +2722,122 @@ pub const Resolver = struct {
             .zone_out = &answer_zone,
             .qname_minimization = true,
         };
-        const resolved = iterate_mod.resolve(self.allocator, .{ .context = self, .send = iterateSend }, self.root_hints[0..self.hint_count], question, options) catch |err| switch (err) {
+        const resolved = iterate_mod.resolve(self.allocator, .{ .context = self, .send = iterateSend }, self.rootServers(now), question, options) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return Error.UpstreamFailure,
         };
         self.iterate_zone = answer_zone;
         return resolved;
+    }
+
+    /// RFC 9609 section 2: the addresses an iterative walk starts from. The
+    /// primed root servers answer while the root NS TTL holds; otherwise one
+    /// priming query refreshes them, and the built-in hints answer when it
+    /// fails. A test seam that narrows the hints skips priming, so a fake
+    /// root answers the walk directly.
+    fn rootServers(self: *Resolver, now: i64) []const std.Io.net.IpAddress {
+        if (self.hint_count != iterate_mod.root_hint_text.len) return self.root_hints[0..self.hint_count];
+        if (self.root_server_count == 0 or now >= self.root_servers_expires_at) self.primeRootServers(now);
+        if (self.root_server_count != 0) return self.root_servers[0..self.root_server_count];
+        return self.root_hints[0..self.hint_count];
+    }
+
+    /// The priming query of RFC 9609 section 2: the root NS RRset with the
+    /// root's own addresses in the additional section, asked of the first
+    /// hint that answers. Only the addresses the NS RRset names are kept, so
+    /// an off-bailiwick record cannot enter the list.
+    fn primeRootServers(self: *Resolver, now: i64) void {
+        self.root_server_count = 0;
+        const root = dns_name.Name.root();
+        var query = dns_message.Message{
+            .allocator = self.allocator,
+            .header = .{ .id = 0, .question_count = 1 },
+            .question = .{ .name = root, .qtype = .NS, .qclass = .IN },
+            .answers = dns_message.RecordSection.init(self.allocator, 0) catch return,
+            .authorities = dns_message.RecordSection.init(self.allocator, 0) catch return,
+            .additionals = dns_message.RecordSection.init(self.allocator, 0) catch return,
+        };
+        defer query.deinit();
+        var id_bytes: [2]u8 = undefined;
+        self.io.randomSecure(&id_bytes) catch return;
+        query.header.id = std.mem.readInt(u16, &id_bytes, .big);
+        // RFC 9609 section 3: the priming query carries EDNS0 with room for
+        // the full priming response.
+        query.edns = .{
+            .udp_payload_size = dns_message.DEFAULT_EDNS_UDP_PAYLOAD_SIZE,
+            .extended_rcode = 0,
+            .version = dns_message.EDNS_VERSION,
+            .dnssec_ok = false,
+        };
+        query.additionals.append(.{
+            .owner = root,
+            .rrtype = .OPT,
+            .class = dns_types.Class.fromCode(dns_message.DEFAULT_EDNS_UDP_PAYLOAD_SIZE),
+            .ttl = 0,
+            .rdata = .{ .OPT = .{} },
+        }) catch return;
+        query.header.additional_count = 1;
+        var bytes: [512]u8 = undefined;
+        var writer = dns_writer.Writer.init(&bytes);
+        query.encode(&writer) catch return;
+        // RFC 9609 section 3.2: the priming target is chosen at random from
+        // the configured addresses; each later hint is the next one on the
+        // ring, so an unanswered query moves to a different server.
+        var random_index: [1]u8 = undefined;
+        self.io.randomSecure(&random_index) catch return;
+        var step: usize = 0;
+        while (step < self.hint_count) : (step += 1) {
+            const hint = self.root_hints[(random_index[0] +% step) % self.hint_count];
+            var primed = iterateSend(self, self.allocator, hint, writer.written(), false) catch continue;
+            defer primed.deinit();
+            if (self.adoptRootServers(primed, now)) return;
+        }
+    }
+
+    /// The root servers a priming answer names, with the addresses the answer
+    /// carries for them (RFC 9609 section 2). Addresses whose owner the NS
+    /// RRset does not name are ignored, so an injected additional record
+    /// cannot add a server. Returns false when the answer names no server
+    /// with an address.
+    fn adoptRootServers(self: *Resolver, primed: dns_message.Message, now: i64) bool {
+        const root = dns_name.Name.root();
+        var ttl: u32 = std.math.maxInt(u32);
+        var names: [iterate_mod.MAX_SERVERS]dns_name.Name = undefined;
+        var name_count: usize = 0;
+        for (primed.answers.slice()) |record| {
+            if (!record.owner.eql(&root) or !record.rrtype.eql(.NS)) continue;
+            if (record.rdata != .NS) continue;
+            if (name_count == names.len) break;
+            names[name_count] = record.rdata.NS;
+            name_count += 1;
+            ttl = @min(ttl, record.ttl);
+        }
+        if (name_count == 0) return false;
+        var count: usize = 0;
+        for (primed.additionals.slice()) |record| {
+            if (count == self.root_servers.len) break;
+            var listed = false;
+            for (names[0..name_count]) |name| {
+                if (record.owner.eql(&name)) {
+                    listed = true;
+                    break;
+                }
+            }
+            if (!listed) continue;
+            const address: std.Io.net.IpAddress = switch (record.rdata) {
+                .A => |octets| .{ .ip4 = .{ .bytes = octets, .port = 53 } },
+                .AAAA => |octets| .{ .ip6 = .{ .port = 53, .bytes = octets } },
+                else => continue,
+            };
+            self.root_servers[count] = address;
+            count += 1;
+            ttl = @min(ttl, record.ttl);
+        }
+        if (count == 0) return false;
+        self.root_server_count = count;
+        if (ttl == std.math.maxInt(u32)) ttl = 3600;
+        self.root_servers_expires_at = now + @as(i64, ttl);
+        return true;
     }
 
     fn iterateSend(context: *anyopaque, allocator: std.mem.Allocator, server: std.Io.net.IpAddress, query_bytes: []const u8, dnssec_ok: bool) anyerror!dns_message.Message {
@@ -2700,7 +2932,7 @@ pub const Resolver = struct {
 const Dns64Outcome = union(enum) {
     none,
     /// The scope the A answer covered: the scope the synthesis rests on.
-    synthesized: u8,
+    synthesized: UpstreamScope,
     /// RFC 8914 INFO-CODE of the validation failure.
     bogus: u16,
 };
@@ -2778,7 +3010,7 @@ fn synthesizeDns64Answer(self: *Resolver, query: dns_message.Message, response: 
             // RFC 7871 section 7.3.1: the records the client gets come from
             // the A answer, so the answer reports the scope of that answer:
             // the /0 scope of a retry that carried no ADDRESS.
-            return .{ .synthesized = upstreamEcsScope(a_response, a_answer.scope orelse EcsScope{}) };
+            return .{ .synthesized = upstreamScopeInfo(a_response, a_answer.scope orelse EcsScope{}) };
         }
         // No A records at the owner: the chain goes on, if it goes on at all.
         if (owner.eql(&target) or hops >= zone.MaxAliasHops) return .none;
@@ -3823,7 +4055,7 @@ test "cache ages positive and negative responses and emits stale EDE" {
 
     var positive = try makePositiveResponse(arena.allocator(), 60);
     defer positive.deinit();
-    try cache.put(key, &positive, 1000, 0, 0);
+    try cache.put(key, &positive, 1000, 0, 0, 0);
     var output: [2048]u8 = undefined;
     const fresh = (try cache.lookup(&key, query, 1030, &output, false)).?;
     const fresh_message = try dns_message.Message.parse(arena.allocator(), fresh.bytes);
@@ -3841,7 +4073,7 @@ test "cache ages positive and negative responses and emits stale EDE" {
     var negative = try makeNegativeResponse(arena.allocator(), 60, 30);
     defer negative.deinit();
     const negative_key = try CacheKey.fromQuestion(negative);
-    try cache.put(negative_key, &negative, 2000, 0, 0);
+    try cache.put(negative_key, &negative, 2000, 0, 0, 0);
     var negative_query = try makeTestQuery(arena.allocator(), 0x2201, "missing.example.", true);
     defer negative_query.deinit();
     const negative_stale = (try cache.lookup(&negative_key, negative_query, 2100, &output, true)).?;
@@ -3853,7 +4085,7 @@ test "cache ages positive and negative responses and emits stale EDE" {
     var nodata = try makeNegativeResponse(arena.allocator(), 60, 30);
     defer nodata.deinit();
     nodata.header.rcode = .no_error;
-    try cache.put(negative_key, &nodata, 3000, 0, 0);
+    try cache.put(negative_key, &nodata, 3000, 0, 0, 0);
     const nodata_stale = (try cache.lookup(&negative_key, negative_query, 3100, &output, true)).?;
     const nodata_message = try dns_message.Message.parse(arena.allocator(), nodata_stale.bytes);
     try expectEde(nodata_message, EDE_STALE_ANSWER, "stale answer");
@@ -3872,13 +4104,13 @@ test "the answer cache excludes failures truncation and upstream option data" {
     var failure = try makePositiveResponse(arena.allocator(), 60);
     defer failure.deinit();
     failure.header.rcode = .servfail;
-    try cache.put(key, &failure, 1000, 0, 0);
+    try cache.put(key, &failure, 1000, 0, 0, 0);
     try std.testing.expect((try cache.lookup(&key, query, 1001, &output, true)) == null);
 
     var truncated = try makePositiveResponse(arena.allocator(), 60);
     defer truncated.deinit();
     truncated.header.truncated = true;
-    try cache.put(key, &truncated, 1000, 0, 0);
+    try cache.put(key, &truncated, 1000, 0, 0, 0);
     try std.testing.expect((try cache.lookup(&key, query, 1001, &output, true)) == null);
 
     var with_opt = try makePositiveResponse(arena.allocator(), 60);
@@ -3892,7 +4124,7 @@ test "the answer cache excludes failures truncation and upstream option data" {
         .rdata = .{ .OPT = .{} },
     });
     with_opt.header.additional_count = 1;
-    try cache.put(key, &with_opt, 1000, 0, 0);
+    try cache.put(key, &with_opt, 1000, 0, 0, 0);
     const hit = (try cache.lookup(&key, query, 1001, &output, false)).?;
     const hit_message = try dns_message.Message.parse(arena.allocator(), hit.bytes);
     try std.testing.expect(hit_message.edns == null);
@@ -3932,7 +4164,7 @@ test "cache reuses an expired slot instead of evicting a live entry" {
         });
         responses[index].header.answer_count = 1;
         keys[index] = try CacheKey.fromQuestion(queries[index]);
-        try cache.put(keys[index], &responses[index], 1000, 0, 0);
+        try cache.put(keys[index], &responses[index], 1000, 0, 0, 0);
     }
     try std.testing.expectEqual(MAX_CACHE_ENTRIES, cache.len);
 
@@ -3954,7 +4186,7 @@ test "cache reuses an expired slot instead of evicting a live entry" {
     });
     newcomer_response.header.answer_count = 1;
     const newcomer_key = try CacheKey.fromQuestion(newcomer);
-    try cache.put(newcomer_key, &newcomer_response, 1061, 0, 0);
+    try cache.put(newcomer_key, &newcomer_response, 1061, 0, 0, 0);
     try std.testing.expectEqual(MAX_CACHE_ENTRIES, cache.len);
 
     const survivor = (try cache.lookup(&keys[0], queries[0], 1062, &output, false)).?;
@@ -3975,7 +4207,7 @@ test "RFC 8020 section 2: a cached NXDOMAIN cuts the names below it" {
     var denial = try makeNxdomainResponse(arena.allocator(), "a.example.", 60, 30);
     defer denial.deinit();
     const denied_key = try CacheKey.fromQuestion(denied);
-    try cache.put(denied_key, &denial, 1000, 0, 0);
+    try cache.put(denied_key, &denial, 1000, 0, 0, 0);
 
     // A direct child of the denied name is cut.
     var child = try makeTestQuery(arena.allocator(), 0x2801, "b.a.example.", false);
@@ -4023,14 +4255,14 @@ test "RFC 8020 section 2: a cached answer below a cut name still wins" {
     var denial = try makeNxdomainResponse(arena.allocator(), "a.example.", 60, 30);
     defer denial.deinit();
     const denied_key = try CacheKey.fromQuestion(denied);
-    try cache.put(denied_key, &denial, 1000, 0, 0);
+    try cache.put(denied_key, &denial, 1000, 0, 0, 0);
 
     var positive_query = try makeTestQuery(arena.allocator(), 0x2811, "b.a.example.", false);
     defer positive_query.deinit();
     var positive = try makePositiveResponseFor(arena.allocator(), "b.a.example.", 120);
     defer positive.deinit();
     const positive_key = try CacheKey.fromQuestion(positive_query);
-    try cache.put(positive_key, &positive, 1000, 0, 0);
+    try cache.put(positive_key, &positive, 1000, 0, 0, 0);
 
     const hit = (try cache.lookup(&positive_key, positive_query, 1000, &output, false)).?;
     const message = try dns_message.Message.parse(arena.allocator(), hit.bytes);
@@ -4051,7 +4283,7 @@ test "RFC 8020 section 2: the cut expires with the cached entry" {
     var denial = try makeNxdomainResponse(arena.allocator(), "a.example.", 60, 30);
     defer denial.deinit();
     const denied_key = try CacheKey.fromQuestion(denied);
-    try cache.put(denied_key, &denial, 1000, 0, 0);
+    try cache.put(denied_key, &denial, 1000, 0, 0, 0);
 
     var child = try makeTestQuery(arena.allocator(), 0x2821, "b.a.example.", false);
     defer child.deinit();
@@ -4075,7 +4307,7 @@ test "RFC 2308 section 5: the negative TTL is the smaller of the SOA TTL and the
     var denial = try makeNxdomainResponse(arena.allocator(), "a.example.", 60, 30);
     defer denial.deinit();
     const denied_key = try CacheKey.fromQuestion(denied);
-    try cache.put(denied_key, &denial, 1000, 0, 0);
+    try cache.put(denied_key, &denial, 1000, 0, 0, 0);
 
     const exact = (try cache.lookup(&denied_key, denied, 1000, &output, false)).?;
     const exact_message = try dns_message.Message.parse(arena.allocator(), exact.bytes);
@@ -4097,7 +4329,7 @@ test "RFC 2308 section 5: the negative TTL is the smaller of the SOA TTL and the
     var short_denial = try makeNxdomainResponse(arena.allocator(), "c.example.", 20, 300);
     defer short_denial.deinit();
     const short_key = try CacheKey.fromQuestion(short);
-    try cache.put(short_key, &short_denial, 1000, 0, 0);
+    try cache.put(short_key, &short_denial, 1000, 0, 0, 0);
     const short_hit = (try cache.lookup(&short_key, short, 1000, &output, false)).?;
     const short_message = try dns_message.Message.parse(arena.allocator(), short_hit.bytes);
     try std.testing.expectEqual(@as(u32, 20), short_message.authorities.items[0].ttl);
@@ -4115,7 +4347,7 @@ test "RFC 9520 section 4: a lookup past the TTL keeps the entry for the stale pa
     const key = try CacheKey.fromQuestion(query);
     var positive = try makePositiveResponse(arena.allocator(), 60);
     defer positive.deinit();
-    try cache.put(key, &positive, 1000, 0, 0);
+    try cache.put(key, &positive, 1000, 0, 0, 0);
 
     // The fresh lookup that finds an expired entry must not evict it: the
     // failure path still needs it.
@@ -4149,7 +4381,7 @@ test "RFC 2308 section 2.2: a CNAME with NODATA is cached by the SOA, not the ch
         .rdata = .{ .CNAME = try dns_name.Name.fromText("target.example.com.") },
     });
     nodata.header.answer_count = 1;
-    try cache.put(key, &nodata, 1000, 0, 0);
+    try cache.put(key, &nodata, 1000, 0, 0, 0);
     try std.testing.expect((try cache.lookup(&key, query, 1031, &output, false)) == null);
 }
 
@@ -4165,7 +4397,7 @@ test "RFC 2308 section 5: an upstream negative TTL is capped at three hours" {
     const key = try CacheKey.fromQuestion(query);
     var denial = try makeNxdomainResponse(arena.allocator(), "long.example.com.", 604800, 604800);
     defer denial.deinit();
-    try cache.put(key, &denial, 1000, 0, 0);
+    try cache.put(key, &denial, 1000, 0, 0, 0);
     const fresh = (try cache.lookup(&key, query, 1000 + MAX_NEGATIVE_TTL - 1, &output, false)).?;
     try std.testing.expect(!fresh.stale);
     try std.testing.expect((try cache.lookup(&key, query, 1000 + MAX_NEGATIVE_TTL, &output, false)) == null);
@@ -4187,7 +4419,7 @@ test "RFC 8020 section 2: a descendant of a cached NXDOMAIN is answered without 
     var denial = try makeNxdomainResponse(arena.allocator(), "a.example.", 60, 30);
     defer denial.deinit();
     const denied_key = try CacheKey.fromQuestion(denied);
-    try resolver.cache.put(denied_key, &denial, now, 0, 0);
+    try resolver.cache.put(denied_key, &denial, now, 0, 0, 0);
 
     var query = try makeTestQuery(arena.allocator(), 0x2841, "b.a.example.", false);
     defer query.deinit();
@@ -4703,7 +4935,7 @@ test "a cached answer reports the scope the upstream answered with" {
     defer response.deinit();
     var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
     defer cache.deinit();
-    try cache.put(try CacheKey.fromQuestion(scoped), &response, 4000, 20, 0);
+    try cache.put(try CacheKey.fromQuestion(scoped), &response, 4000, 20, 20, 0);
 
     var output: [2048]u8 = undefined;
     const key = try CacheKey.fromQuestion(scoped);
@@ -4719,15 +4951,15 @@ test "a cached answer reports the scope the upstream answered with" {
     try std.testing.expectEqualSlices(u8, &.{ 192, 0, 2 }, ecs[4..]);
 }
 
-test "the answer cache keeps the client subnet scopes apart" {
+test "RFC 7871 section 7.3.1: a scope-0 answer is served to every client" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var scoped = try makeTestQuery(arena.allocator(), 0x2604, "example.com.", true);
     defer scoped.deinit();
-    try appendOption(&scoped, dns_rdata.EDNS_ECS_OPTION_CODE, &.{ 0, 1, 24, 0, 192, 0, 2 });
+    try appendOption(&scoped, dns_rdata.EDNS_ECS_OPTION_CODE, &.{ 0, 1, 24, 192, 0, 2 });
     var other = try makeTestQuery(arena.allocator(), 0x2604, "example.com.", true);
     defer other.deinit();
-    try appendOption(&other, dns_rdata.EDNS_ECS_OPTION_CODE, &.{ 0, 1, 16, 0, 192, 0 });
+    try appendOption(&other, dns_rdata.EDNS_ECS_OPTION_CODE, &.{ 0, 1, 16, 198, 51 });
     var plain = try makeTestQuery(arena.allocator(), 0x2604, "example.com.", true);
     defer plain.deinit();
 
@@ -4735,17 +4967,121 @@ test "the answer cache keeps the client subnet scopes apart" {
     defer response.deinit();
     var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
     defer cache.deinit();
-    try cache.put(try CacheKey.fromQuestion(scoped), &response, 4000, 0, 0);
+    // The upstream answered with SCOPE PREFIX-LENGTH 0: the answer holds for
+    // every client, not only for the one whose address was sent.
+    try cache.put(try CacheKey.fromQuestion(scoped), &response, 4000, 0, 0, 0);
 
     var output: [2048]u8 = undefined;
     const scoped_key = try CacheKey.fromQuestion(scoped);
     try std.testing.expect((try cache.lookup(&scoped_key, scoped, 4001, &output, false)) != null);
-    // Another scope and a client that sent no option at all are answered by
-    // the upstream, never by the answer fetched for this scope.
+    const other_key = try CacheKey.fromQuestion(other);
+    try std.testing.expect((try cache.lookup(&other_key, other, 4001, &output, false)) != null);
+    const plain_key = try CacheKey.fromQuestion(plain);
+    try std.testing.expect((try cache.lookup(&plain_key, plain, 4001, &output, false)) != null);
+}
+
+test "RFC 7871 section 7.3.2: the longest covering scope answers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var wide = try makeTestQuery(arena.allocator(), 0x2606, "example.com.", true);
+    defer wide.deinit();
+    try appendOption(&wide, dns_rdata.EDNS_ECS_OPTION_CODE, &.{ 0, 1, 16, 0, 198, 51 });
+    var narrow = try makeTestQuery(arena.allocator(), 0x2606, "example.com.", true);
+    defer narrow.deinit();
+    try appendOption(&narrow, dns_rdata.EDNS_ECS_OPTION_CODE, &.{ 0, 1, 24, 0, 198, 51, 100 });
+    var client = try makeTestQuery(arena.allocator(), 0x2606, "example.com.", true);
+    defer client.deinit();
+    try appendOption(&client, dns_rdata.EDNS_ECS_OPTION_CODE, &.{ 0, 1, 24, 0, 198, 51, 100 });
+
+    var wide_response = try makePositiveResponse(arena.allocator(), 60);
+    defer wide_response.deinit();
+    var narrow_response = try makePositiveResponse(arena.allocator(), 120);
+    defer narrow_response.deinit();
+    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    defer cache.deinit();
+    // The upstream answered the /16 query with scope 16, and the /24 query
+    // with scope 24: a client inside both networks takes the /24 answer.
+    try cache.put(try CacheKey.fromQuestion(wide), &wide_response, 4000, 16, 16, 0);
+    try cache.put(try CacheKey.fromQuestion(narrow), &narrow_response, 4000, 24, 24, 0);
+
+    var output: [2048]u8 = undefined;
+    const client_key = try CacheKey.fromQuestion(client);
+    const chosen = (try cache.lookup(&client_key, client, 4001, &output, false)).?;
+    const chosen_message = try dns_message.Message.parse(arena.allocator(), chosen.bytes);
+    try std.testing.expectEqual(@as(u32, 119), chosen_message.answers.items[0].ttl);
+}
+
+test "RFC 7871 section 7.3: an unusable upstream scope is reported as 0 and confined to the query scope" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var scoped = try makeTestQuery(arena.allocator(), 0x2608, "example.com.", true);
+    defer scoped.deinit();
+    try appendOption(&scoped, dns_rdata.EDNS_ECS_OPTION_CODE, &.{ 0, 1, 24, 0, 198, 51, 100 });
+    const key = try CacheKey.fromQuestion(scoped);
+    const asked = key.ecs;
+    try std.testing.expectEqual(@as(u8, 24), asked.prefix);
+
+    // The upstream answers a /24 query with SCOPE PREFIX-LENGTH 32: a scope
+    // the resolver did not ask for is unusable. It must be reported as 0 to
+    // the client and the entry must stay confined to the /24 that asked,
+    // never widened to every client.
+    var response = try makeTestQuery(arena.allocator(), 0x2608, "example.com.", true);
+    defer response.deinit();
+    response.header.qr = true;
+    try response.answers.append(.{
+        .owner = try dns_name.Name.fromText("example.com."),
+        .rrtype = .A,
+        .class = .IN,
+        .ttl = 60,
+        .rdata = .{ .A = .{ 192, 0, 2, 1 } },
+    });
+    response.header.answer_count = 1;
+    try appendOption(&response, dns_rdata.EDNS_ECS_OPTION_CODE, &.{ 0, 1, 24, 32, 198, 51, 100 });
+    const info = upstreamScopeInfo(response, asked);
+    try std.testing.expectEqual(@as(u8, 0), info.report);
+    try std.testing.expect(info.store == null);
+
+    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    defer cache.deinit();
+    try cache.put(key, &response, 4000, info.store, info.report, 0);
+
+    var same = try makeTestQuery(arena.allocator(), 0x2608, "example.com.", true);
+    defer same.deinit();
+    try appendOption(&same, dns_rdata.EDNS_ECS_OPTION_CODE, &.{ 0, 1, 24, 0, 198, 51, 100 });
+    var other = try makeTestQuery(arena.allocator(), 0x2608, "example.com.", true);
+    defer other.deinit();
+    try appendOption(&other, dns_rdata.EDNS_ECS_OPTION_CODE, &.{ 0, 1, 24, 0, 203, 0, 113 });
+    var plain = try makeTestQuery(arena.allocator(), 0x2608, "example.com.", true);
+    defer plain.deinit();
+
+    var output: [2048]u8 = undefined;
+    const same_key = try CacheKey.fromQuestion(same);
+    try std.testing.expect((try cache.lookup(&same_key, same, 4001, &output, false)) != null);
     const other_key = try CacheKey.fromQuestion(other);
     try std.testing.expect((try cache.lookup(&other_key, other, 4001, &output, false)) == null);
     const plain_key = try CacheKey.fromQuestion(plain);
     try std.testing.expect((try cache.lookup(&plain_key, plain, 4001, &output, false)) == null);
+}
+
+test "RFC 7871 section 7.3.2: a client that disclosed fewer bits than the scope is asked upstream" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var narrow = try makeTestQuery(arena.allocator(), 0x2607, "example.com.", true);
+    defer narrow.deinit();
+    try appendOption(&narrow, dns_rdata.EDNS_ECS_OPTION_CODE, &.{ 0, 1, 24, 0, 198, 51, 100 });
+    var client = try makeTestQuery(arena.allocator(), 0x2607, "example.com.", true);
+    defer client.deinit();
+    try appendOption(&client, dns_rdata.EDNS_ECS_OPTION_CODE, &.{ 0, 1, 16, 0, 198, 51 });
+
+    var response = try makePositiveResponse(arena.allocator(), 60);
+    defer response.deinit();
+    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    defer cache.deinit();
+    try cache.put(try CacheKey.fromQuestion(narrow), &response, 4000, 24, 24, 0);
+
+    var output: [2048]u8 = undefined;
+    const client_key = try CacheKey.fromQuestion(client);
+    try std.testing.expect((try cache.lookup(&client_key, client, 4001, &output, false)) == null);
 }
 
 test "a client without the client subnet option keeps today's behavior" {
@@ -4765,7 +5101,7 @@ test "a client without the client subnet option keeps today's behavior" {
     defer response.deinit();
     var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
     defer cache.deinit();
-    try cache.put(try CacheKey.fromQuestion(plain), &response, 4000, 0, 0);
+    try cache.put(try CacheKey.fromQuestion(plain), &response, 4000, 0, 0, 0);
 
     var cache_output: [2048]u8 = undefined;
     const plain_key = try CacheKey.fromQuestion(plain);
@@ -5088,7 +5424,7 @@ test "cache separates CD and EDNS DO variants" {
     defer response.deinit();
     var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
     defer cache.deinit();
-    try cache.put(try CacheKey.fromQuestion(base), &response, 4000, 0, 0);
+    try cache.put(try CacheKey.fromQuestion(base), &response, 4000, 0, 0, 0);
 
     var output: [2048]u8 = undefined;
     const cd_key = try CacheKey.fromQuestion(cd);
@@ -9730,7 +10066,7 @@ test "RFC 9520 section 3.2: the failure cache keeps the answer cache's own bound
     var response = try makePositiveResponse(arena.allocator(), 60);
     defer response.deinit();
     const key = try CacheKey.fromQuestion(query);
-    try cache.put(key, &response, 1000, 0, 0);
+    try cache.put(key, &response, 1000, 0, 0, 0);
 
     // A full table of failures leaves the answer cache alone.
     var name_buffer: [32]u8 = undefined;
@@ -9984,7 +10320,7 @@ test "RFC 1035 section 2.3.3: the NXDOMAIN cut ignores the case of the ancestor"
     var denial = try makeNxdomainResponse(arena.allocator(), "a.example.", 60, 30);
     defer denial.deinit();
     const denied_key = try CacheKey.fromQuestion(denied);
-    try cache.put(denied_key, &denial, 1000, 0, 0);
+    try cache.put(denied_key, &denial, 1000, 0, 0, 0);
 
     // The descendant spells the ancestor in another case, which names the
     // same node: the cut applies.
@@ -11777,4 +12113,100 @@ test "RFC 4035 section 5.4: the harvest keeps the verified proof signature" {
     try std.testing.expect(std.mem.endsWith(u8, cache.entries[0].proof_rrsig.bytes(), second.rdata.Unknown.bytes()));
     const cached_soa_sig = cache.entries[0].soa_rrsig orelse return error.MissingSoaSignature;
     try std.testing.expect(std.mem.eql(u8, soa_sig.rdata.Unknown.bytes(), cached_soa_sig.rdata.Unknown.bytes()));
+}
+
+test "RFC 7871 section 11.1: the upstream scope is masked to the recommended lengths" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = try std.Io.net.IpAddress.parse("127.0.0.1", 9) },
+    });
+    defer resolver.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var v4 = try makeTestQuery(arena.allocator(), 0x2609, "example.com.", true);
+    defer v4.deinit();
+    try appendOption(&v4, dns_rdata.EDNS_ECS_OPTION_CODE, &.{ 0, 1, 32, 0, 198, 51, 100, 7 });
+    const masked4 = resolver.upstreamScope(v4).?;
+    try std.testing.expectEqual(@as(u8, 24), masked4.prefix);
+    try std.testing.expectEqualSlices(u8, &.{ 198, 51, 100, 0 }, masked4.address[0..4]);
+
+    var v6 = try makeTestQuery(arena.allocator(), 0x2609, "example.com.", true);
+    defer v6.deinit();
+    try appendOption(&v6, dns_rdata.EDNS_ECS_OPTION_CODE, &.{
+        0,    2,    128,  0,
+        0x20, 0x01, 0x0d, 0xb8,
+        0x00, 0x01, 0x00, 0x02,
+        0x00, 0x03, 0x00, 0x04,
+        0x00, 0x05, 0x00, 0x06,
+    });
+    const masked6 = resolver.upstreamScope(v6).?;
+    try std.testing.expectEqual(@as(u8, 56), masked6.prefix);
+
+    var narrow = try makeTestQuery(arena.allocator(), 0x2609, "example.com.", true);
+    defer narrow.deinit();
+    try appendOption(&narrow, dns_rdata.EDNS_ECS_OPTION_CODE, &.{ 0, 1, 16, 0, 198, 51 });
+    try std.testing.expectEqual(@as(u8, 16), resolver.upstreamScope(narrow).?.prefix);
+}
+
+test "RFC 9609 section 2: a priming answer fills the root server list" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var resolver = try Resolver.init(std.testing.allocator, io, .{});
+    defer resolver.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var primed = try makeTestQuery(arena.allocator(), 0x2700, ".", true);
+    defer primed.deinit();
+    primed.header.qr = true;
+    const root = try dns_name.Name.fromText(".");
+    const a_root = try dns_name.Name.fromText("a.root-servers.test.");
+    const b_root = try dns_name.Name.fromText("b.root-servers.test.");
+    try primed.answers.append(.{
+        .owner = root,
+        .rrtype = .NS,
+        .class = .IN,
+        .ttl = 1200,
+        .rdata = .{ .NS = a_root },
+    });
+    try primed.answers.append(.{
+        .owner = root,
+        .rrtype = .NS,
+        .class = .IN,
+        .ttl = 1200,
+        .rdata = .{ .NS = b_root },
+    });
+    primed.header.answer_count = 2;
+    // The root publishes the addresses of its servers beside the NS RRset.
+    try primed.additionals.append(.{
+        .owner = a_root,
+        .rrtype = .A,
+        .class = .IN,
+        .ttl = 600,
+        .rdata = .{ .A = .{ 198, 41, 0, 4 } },
+    });
+    try primed.additionals.append(.{
+        .owner = b_root,
+        .rrtype = .AAAA,
+        .class = .IN,
+        .ttl = 600,
+        .rdata = .{ .AAAA = .{ 0x20, 0x01, 0x05, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x42 } },
+    });
+    // An address the NS RRset does not name is not a root server.
+    try primed.additionals.append(.{
+        .owner = try dns_name.Name.fromText("evil.test."),
+        .rrtype = .A,
+        .class = .IN,
+        .ttl = 600,
+        .rdata = .{ .A = .{ 203, 0, 113, 9 } },
+    });
+    primed.header.additional_count = 3;
+
+    try std.testing.expect(resolver.adoptRootServers(primed, 1000));
+    try std.testing.expectEqual(@as(usize, 2), resolver.root_server_count);
+    try std.testing.expectEqual([4]u8{ 198, 41, 0, 4 }, resolver.root_servers[0].ip4.bytes);
+    try std.testing.expectEqual(@as(u16, 53), resolver.root_servers[0].ip4.port);
+    try std.testing.expectEqual(@as(u8, 0x42), resolver.root_servers[1].ip6.bytes[15]);
+    // The shortest TTL of the answer bounds the life of the list.
+    try std.testing.expectEqual(@as(i64, 1600), resolver.root_servers_expires_at);
 }
