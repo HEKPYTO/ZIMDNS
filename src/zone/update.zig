@@ -10,6 +10,7 @@ const dns_rdata = @import("../dns/rdata.zig");
 const dns_record = @import("../dns/record.zig");
 const RecordType = @import("../dns/types.zig").RecordType;
 const dns_writer = @import("../dns/writer.zig");
+const dnssec = @import("../dns/dnssec.zig");
 const parser = @import("parser.zig");
 const Zone = @import("index.zig").Zone;
 const zonemd = @import("zonemd.zig");
@@ -108,7 +109,11 @@ pub fn apply(
             if (!std.ascii.eqlIgnoreCase(record.ownerText(), entry.name)) continue;
             zone_members += 1;
             const bytes = zoneRdataBytes(record, encode_buffer) orelse return .{ .rcode = .formerr };
-            if (!containsMember(entry.members.items, bytes)) return .{ .rcode = .nxrrset };
+            // RFC 2136 section 1.1 with RFC 4034 section 6.2: names inside
+            // RDATA compare case-insensitively, every other octet exactly.
+            const canonical = try dnssec.canonicalRdata(arena, entry.rrtype.code(), bytes);
+            const matched = try containsMember(arena, entry.members.items, entry.rrtype.code(), canonical);
+            if (!matched) return .{ .rcode = .nxrrset };
         }
         if (zone_members != entry.members.items.len) return .{ .rcode = .nxrrset };
     }
@@ -446,8 +451,11 @@ fn zoneRdataBytes(record: parser.ZoneRecord, buffer: []u8) ?[]const u8 {
     return writer.written();
 }
 
-fn containsMember(members: []const []const u8, bytes: []const u8) bool {
-    for (members) |member| if (std.mem.eql(u8, member, bytes)) return true;
+fn containsMember(allocator: std.mem.Allocator, members: []const []const u8, rrtype: u16, bytes: []const u8) Error!bool {
+    for (members) |member| {
+        const canonical = try dnssec.canonicalRdata(allocator, rrtype, member);
+        if (std.mem.eql(u8, canonical, bytes)) return true;
+    }
     return false;
 }
 
@@ -728,6 +736,27 @@ test "a value-dependent prerequisite must match the RRset exactly" {
         makeRecord("www.example.com.", .A, CLASS_IN, 0, .{ .A = .{ 192, 0, 2, 11 } }),
     };
     const refused = try apply(std.testing.allocator, &zone, "example.com.", &wrong, &updates);
+    try std.testing.expectEqual(header.Rcode.nxrrset, zoneRcode(refused));
+}
+
+test "RFC 2136 section 1.1: a prerequisite name compares case-insensitively" {
+    var zone = try buildZone(test_zone_text);
+    defer zone.deinit();
+    // The zone publishes `example.com. NS ns1.example.com.`. The
+    // prerequisite states the same target in another case: RFC 2136
+    // section 1.1 makes the domain names in RDATA case-insensitive, so the
+    // RRset matches member for member.
+    var matching = [_]dns_record.ResourceRecord{
+        makeRecord("example.com.", .NS, CLASS_IN, 0, .{ .NS = makeName("NS1.Example.COM.") }),
+    };
+    var updates = [_]dns_record.ResourceRecord{aRecord("www.example.com.", .{ 192, 0, 2, 31 }, 60)};
+    const accepted = try apply(std.testing.allocator, &zone, "example.com.", &matching, &updates);
+    std.testing.allocator.free(zoneText(accepted));
+
+    var different = [_]dns_record.ResourceRecord{
+        makeRecord("example.com.", .NS, CLASS_IN, 0, .{ .NS = makeName("ns2.example.com.") }),
+    };
+    const refused = try apply(std.testing.allocator, &zone, "example.com.", &different, &updates);
     try std.testing.expectEqual(header.Rcode.nxrrset, zoneRcode(refused));
 }
 

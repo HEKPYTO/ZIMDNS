@@ -79,7 +79,11 @@ trust-anchor store (`Anchors.parse`). The child-side half of the RFC 6781
 §4.1.2 key-signing key rollover landed with it (`dnssec-new-ksk-file`; see
 `src/zone/README.md`), and with it the revoke phase of §4.1.2.1
 (`dnssec-new-ksk-file <path> revoked`), which publishes the key being
-removed with the RFC 5011 §3 REVOKE bit set. Still deferred: iterative
-recursion, root priming, RFC 5011 automated rollover, the parent-side half
-of a key-signing key rollover, and the zone-signing key rollover tooling.
+removed with the RFC 5011 §3 REVOKE bit set. Iterative
+recursion from the built-in root hints now lives in `src/iterate.zig` and
+runs when `recursion allow` is configured without a `forwarder`; its hops
+ask no DNSSEC proofs, so chained validation over that path is still open.
+Also deferred: root priming, RFC 5011 automated rollover, the parent-side
+half of a key-signing key rollover, and the zone-signing key rollover
+tooling.
 Matrix rows 77/91/96 describe the shipped split.

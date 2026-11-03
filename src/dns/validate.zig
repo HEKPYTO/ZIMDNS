@@ -307,6 +307,14 @@ fn labelsCount(wire: []const u8) u8 {
 }
 
 /// Parent name with the leftmost label stripped; null at the root.
+/// True when `ancestor` is a strict ancestor of `name`.
+fn isStrictAncestor(ancestor: *const Name, name: *const Name) bool {
+    const parent = ancestor.asWire();
+    const child = name.asWire();
+    if (parent.len >= child.len) return false;
+    return std.mem.eql(u8, child[child.len - parent.len ..], parent);
+}
+
 fn parentName(name: Name) ?Name {
     const wire = name.asWire();
     if (wire.len < 2) return null;
@@ -1010,6 +1018,12 @@ const Validator = struct {
             try keys.append(self.allocator, anchor.rdata);
         }
         if (keys.items.len == 0) try self.keysFromDs(&keys, signer);
+        if (keys.items.len == 0) try self.keysFromParentDs(&keys, signer);
+        // RFC 4035 section 5.2: the anchor key authenticates the apex DNSKEY
+        // RRset, and every zone key in that authenticated set is then
+        // trusted. A KSK anchor and a ZSK signature are the normal pairing,
+        // so the DNSKEY RRset, when the caller supplied it, adds its keys.
+        if (keys.items.len != 0) try self.adoptZoneKeys(&keys, signer);
         if (keys.items.len == 0) {
             // No chain to the zone: the reason the answer is insecure is
             // worth reporting (RFC 8914 sections 4.2, 4.3, 4.6 and 4.12).
@@ -1124,6 +1138,38 @@ const Validator = struct {
             }
         }
         if (keys.items.len == 0) return;
+        try self.confirmDsMatchedKeys(keys, signer);
+    }
+
+    /// Adds the zone keys of an apex DNSKEY RRset that one of `keys` signed.
+    fn adoptZoneKeys(self: *Validator, keys: *std.ArrayList([]const u8), signer: Name) Error!void {
+        var rrset: ?*const Rrset = null;
+        for (self.rrsets.items) |*candidate| {
+            if (candidate.rrtype == RecordType.DNSKEY.code() and candidate.owner.eql(&signer)) {
+                rrset = candidate;
+                break;
+            }
+        }
+        const apex = rrset orelse return;
+        var authenticated = false;
+        for (self.rrsigs.items) |rrsig| {
+            if (rrsig.covered != RecordType.DNSKEY.code() or !rrsig.owner.eql(&signer)) continue;
+            const data = try signedData(self.allocator, apex.records.items, rrsig);
+            for (keys.items) |key| {
+                verifyWithKey(key, rrsig, data) catch continue;
+                authenticated = true;
+                break;
+            }
+            if (authenticated) break;
+        }
+        if (!authenticated) return;
+        try self.addZoneKeys(keys, apex);
+    }
+
+    /// The DS that reached this zone is authenticated: the matched DNSKEY
+    /// must have signed the apex DNSKEY RRset itself, and a revoked key
+    /// leaves the trusted set (RFC 5011 section 2.1).
+    fn confirmDsMatchedKeys(self: *Validator, keys: *std.ArrayList([]const u8), signer: Name) Error!void {
         // The matched DNSKEY must have signed the apex DNSKEY RRset itself.
         var rrset: ?*const Rrset = null;
         for (self.rrsets.items) |*candidate| {
@@ -1161,6 +1207,56 @@ const Validator = struct {
         }
         keys.items.len = kept;
         try self.addZoneKeys(keys, apex);
+    }
+
+    /// RFC 4035 section 5.2: a zone that no configured anchor names is
+    /// reached through the DS RRset its parent publishes. The parent signs
+    /// that DS RRset with its own key, so the walk continues at the parent
+    /// until an anchor speaks for a zone. Every record the walk needs is in
+    /// the signed material the caller supplied: the DS RRset with its RRSIG,
+    /// and the child's DNSKEY RRset.
+    fn keysFromParentDs(self: *Validator, keys: *std.ArrayList([]const u8), signer: Name) Error!void {
+        var ds: ?*const Rrset = null;
+        for (self.rrsets.items) |*candidate| {
+            if (candidate.rrtype != RecordType.DS.code()) continue;
+            if (!candidate.owner.eql(&signer)) continue;
+            ds = candidate;
+            break;
+        }
+        const ds_set = ds orelse return;
+        for (self.rrsigs.items) |rrsig| {
+            if (rrsig.covered != RecordType.DS.code()) continue;
+            if (!rrsig.owner.eql(&signer)) continue;
+            // The DS is signed by the parent zone. A signer that is not a
+            // strict ancestor would leave the tree the DS names.
+            if (!isStrictAncestor(&rrsig.signer, &signer)) continue;
+            const parent_keys = try self.keySet(rrsig.signer);
+            if (parent_keys.len == 0) continue;
+            const data = try signedData(self.allocator, ds_set.records.items, rrsig);
+            var parent_verified = false;
+            for (parent_keys) |key| {
+                verifyWithKey(key, rrsig, data) catch continue;
+                parent_verified = true;
+                break;
+            }
+            if (!parent_verified) continue;
+            for (self.rrsets.items) |*candidate| {
+                if (candidate.rrtype != RecordType.DNSKEY.code() or !candidate.owner.eql(&signer)) continue;
+                for (candidate.records.items) |record| {
+                    const raw = try encodeRdata(self.allocator, record.rrtype.code(), record.rdata);
+                    if (!dnskeyZoneKeyBit(raw)) continue;
+                    if (!algorithmSupported(raw[3])) continue;
+                    for (ds_set.records.items) |ds_record| {
+                        const ds_raw = try encodeRdata(self.allocator, ds_record.rrtype.code(), ds_record.rdata);
+                        if (!dsMatches(ds_raw, signer, raw)) continue;
+                        try keys.append(self.allocator, raw);
+                    }
+                }
+            }
+            if (keys.items.len == 0) continue;
+            try self.confirmDsMatchedKeys(keys, signer);
+            return;
+        }
     }
 
     /// Whether the key signed the apex DNSKEY RRset it belongs to, which is
@@ -1448,18 +1544,38 @@ const Validator = struct {
         }
         if (!deniesWildcard(proof.labels, proof.owner)) return self.fail(dnssec.EDE_DNSSEC_BOGUS);
         const wildcard = wildcardName(proof.owner) catch return self.fail(dnssec.EDE_DNSSEC_BOGUS);
-        for ([_]Name{ next_closer, wildcard }) |target| {
-            for (self.nsecs.items) |*candidate| {
-                if (!dnssec.nsecCovers(candidate.owner, candidate.next, target)) continue;
-                // The NSEC that covers the name is part of the proof.
-                candidate.used = true;
-                // An ancestor delegation proves nothing below the cut, and a
-                // DNAME redirects the subtree it would have denied.
-                if (isAncestorDelegation(candidate.bitmap, labelsCount(candidate.owner.asWire()), labelsCount(candidate.signer.asWire()))) return self.fail(dnssec.EDE_DNSSEC_BOGUS);
-                if (deniesSubdomain(candidate.bitmap, candidate.owner, target)) return self.fail(dnssec.EDE_DNSSEC_BOGUS);
+        // RFC 4035 section 5.4: the proof is complete only when an NSEC
+        // covers the next closer name and another covers the wildcard at
+        // the closest encloser. A response that carries only the encloser's
+        // own NSEC proves neither.
+        if (try self.nsecCoversName(next_closer) != .covered) return self.fail(dnssec.EDE_DNSSEC_BOGUS);
+        if (try self.nsecCoversName(wildcard) != .covered) return self.fail(dnssec.EDE_DNSSEC_BOGUS);
+        return if (try self.anchored(proof.signer)) .secure else .insecure;
+    }
+
+    const Covers = enum { covered, uncovered, bogus };
+
+    /// Whether some NSEC in the response covers `target`; the NSEC used is
+    /// marked as part of the proof. A covering delegation or DNAME makes the
+    /// denial bogus, not merely incomplete.
+    fn nsecCoversName(self: *Validator, target: Name) Error!Covers {
+        var covered = false;
+        for (self.nsecs.items) |*candidate| {
+            if (!dnssec.nsecCovers(candidate.owner, candidate.next, target)) continue;
+            candidate.used = true;
+            covered = true;
+            // An ancestor delegation proves nothing below the cut, and a
+            // DNAME redirects the subtree it would have denied.
+            if (isAncestorDelegation(candidate.bitmap, labelsCount(candidate.owner.asWire()), labelsCount(candidate.signer.asWire()))) {
+                _ = self.fail(dnssec.EDE_DNSSEC_BOGUS);
+                return .bogus;
+            }
+            if (deniesSubdomain(candidate.bitmap, candidate.owner, target)) {
+                _ = self.fail(dnssec.EDE_DNSSEC_BOGUS);
+                return .bogus;
             }
         }
-        return if (try self.anchored(proof.signer)) .secure else .insecure;
+        return if (covered) .covered else .uncovered;
     }
 
     // ----------------------------------------------------------- NSEC3
@@ -3784,6 +3900,30 @@ test "RFC 4035 section 3.1.3.4: the NSEC at the wildcard owner name proves the N
     try std.testing.expectEqual(@as(u16, 0), result.ede);
 }
 
+test "RFC 4035 section 5.4: an NXDOMAIN proven only by the encloser's NSEC is bogus" {
+    var key = try zone_signer.parseKey(ed25519_secret);
+    defer key.deinit();
+    const dnskey_rdata = try key.dnskeyRdata(std.testing.allocator);
+    defer std.testing.allocator.free(dnskey_rdata);
+    var anchors = try dnskeyAnchor(std.testing.allocator, "example.com.", dnskey_rdata);
+    defer anchors.deinit(std.testing.allocator);
+
+    // The answer carries the apex NSEC and nothing else. It names the
+    // closest encloser, but no NSEC covers nx.example.com. or
+    // *.example.com., so the name's absence is not proved.
+    const bitmap = typeBitmap(&.{ .SOA, .NS, .RRSIG, .NSEC });
+    const owners = [_][]const u8{"example.com."};
+    const nexts = [_][]const u8{"mail.example.com."};
+    const bitmaps = [_][]const u8{&bitmap};
+    var pair = try nsecExchange(std.testing.allocator, &key, "nx.example.com.", .A, .nxdomain, &owners, &nexts, &bitmaps);
+    defer pair.query.deinit();
+    defer pair.response.deinit();
+
+    const result = try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds);
+    try expectStatus(.bogus, result);
+    try std.testing.expectEqual(dnssec.EDE_DNSSEC_BOGUS, result.ede);
+}
+
 test "RFC 4035 section 3.1.3.4: an NSEC that does not cover the query proves nothing" {
     var key = try zone_signer.parseKey(ed25519_secret);
     defer key.deinit();
@@ -4591,4 +4731,152 @@ test "RFC 8976 section 4 step 2: a zone no anchor names needs no proof of the ab
         ZonemdAbsence.not_expected,
         try zoneZonemdAbsence(allocator, &anchors, &signed.zone, now_seconds),
     );
+}
+
+fn rrsigRecord(owner: Name, rrsig: []const u8, ttl: u32) dns_record.ResourceRecord {
+    var raw = dns_rdata.Unknown{};
+    @memcpy(raw.data[0..rrsig.len], rrsig);
+    raw.len = @intCast(rrsig.len);
+    return .{ .owner = owner, .rrtype = .RRSIG, .class = .IN, .ttl = ttl, .rdata = .{ .Unknown = raw } };
+}
+
+fn unknownFrom(bytes: []const u8) dns_rdata.Unknown {
+    var raw = dns_rdata.Unknown{};
+    @memcpy(raw.data[0..bytes.len], bytes);
+    raw.len = @intCast(bytes.len);
+    return raw;
+}
+
+test "RFC 4035 section 5.2: a zone reached through its parent's signed DS validates secure" {
+    const allocator = std.testing.allocator;
+    var root_key = try zone_signer.parseKey(ed25519_secret);
+    defer root_key.deinit();
+    var child_key = try zone_signer.parseKey(p256_secret);
+    defer child_key.deinit();
+
+    const root_dnskey = try root_key.dnskeyRdata(allocator);
+    defer allocator.free(root_dnskey);
+    const child_dnskey = try child_key.dnskeyRdata(allocator);
+    defer allocator.free(child_dnskey);
+
+    const child_owner = try Name.fromText("example.com.");
+    const root_name = try Name.fromText(".");
+
+    // The DS the parent publishes for the child: key tag, algorithm, digest
+    // type 2, and the SHA-256 of the child owner's wire form and DNSKEY.
+    var ds_raw: [4 + std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.mem.writeInt(u16, ds_raw[0..2], dnssec.keyTag(child_dnskey), .big);
+    ds_raw[2] = child_dnskey[3];
+    ds_raw[3] = 2;
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(child_owner.asWire());
+    hasher.update(child_dnskey);
+    hasher.final(ds_raw[4..]);
+
+    const ds_rrsig = try zone_signer.signRrset(allocator, child_owner, root_name, RecordType.DS.code(), &.{ds_raw[0..]}, 3600, &root_key, window);
+    defer allocator.free(ds_rrsig);
+    const key_rrsig = try zone_signer.signRrset(allocator, child_owner, child_owner, RecordType.DNSKEY.code(), &.{child_dnskey}, 3600, &child_key, window);
+    defer allocator.free(key_rrsig);
+
+    const answer_address = [4]u8{ 192, 0, 2, 1 };
+    const www = try Name.fromText("www.example.com.");
+    const a_rrsig = try zone_signer.signRrset(allocator, www, child_owner, RecordType.A.code(), &.{answer_address[0..]}, 3600, &child_key, window);
+    defer allocator.free(a_rrsig);
+
+    const question = dns_question.Question{ .name = www, .qtype = .A, .qclass = .IN };
+    var query = try emptyMessage(allocator, .{ .id = 0x1234, .recursion_desired = true, .question_count = 1 }, question);
+    defer query.deinit();
+    var response = try emptyMessage(allocator, .{ .id = 0x1234, .qr = true, .question_count = 1, .answer_count = 2 }, question);
+    defer response.deinit();
+    try response.answers.append(.{ .owner = www, .rrtype = .A, .class = .IN, .ttl = 3600, .rdata = .{ .A = answer_address } });
+    try response.answers.append(rrsigRecord(www, a_rrsig, 3600));
+
+    // The chain the iterative resolver fetched: the parent's DS RRset and the
+    // child's DNSKEY RRset, each with the signature that covers it.
+    const extra = [_]dns_record.ResourceRecord{
+        .{ .owner = child_owner, .rrtype = .DS, .class = .IN, .ttl = 3600, .rdata = .{ .Unknown = unknownFrom(ds_raw[0..]) } },
+        rrsigRecord(child_owner, ds_rrsig, 3600),
+        .{ .owner = child_owner, .rrtype = .DNSKEY, .class = .IN, .ttl = 3600, .rdata = .{ .Unknown = unknownFrom(child_dnskey) } },
+        rrsigRecord(child_owner, key_rrsig, 3600),
+    };
+
+    // The operator configured only the root key. The child's key is reached
+    // from the root through the DS the root signed.
+    var anchors = try dnskeyAnchor(allocator, ".", root_dnskey);
+    defer anchors.deinit(allocator);
+
+    const result = try validate(allocator, &anchors, query, response, &extra, now_seconds);
+    try expectStatus(.secure, result);
+    try std.testing.expectEqual(@as(u16, 0), result.ede);
+}
+
+test "RFC 4035 section 5.2: a KSK anchor trusts the ZSK that signed the parent's DS" {
+    const allocator = std.testing.allocator;
+    // The operator anchors the root KSK. The root signs its children's DS
+    // RRsets with the ZSK, which the anchored DNSKEY RRset authenticates.
+    var root_ksk = try zone_signer.parseKey(ed25519_secret);
+    defer root_ksk.deinit();
+    var root_zsk = try zone_signer.parseKey(p256_secret);
+    defer root_zsk.deinit();
+    var child_key = try zone_signer.parseKey("ed25519 AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=\n");
+    defer child_key.deinit();
+
+    const root_ksk_dnskey = try root_ksk.dnskeyRdata(allocator);
+    defer allocator.free(root_ksk_dnskey);
+    const root_zsk_dnskey = try root_zsk.dnskeyRdata(allocator);
+    defer allocator.free(root_zsk_dnskey);
+    const child_dnskey = try child_key.dnskeyRdata(allocator);
+    defer allocator.free(child_dnskey);
+
+    const child_owner = try Name.fromText("example.com.");
+    const root_name = try Name.fromText(".");
+
+    // The root DNSKEY RRset, signed by the KSK, is what makes the ZSK a
+    // trusted zone key.
+    const root_rrsig = try zone_signer.signRrset(allocator, root_name, root_name, RecordType.DNSKEY.code(), &.{ root_ksk_dnskey, root_zsk_dnskey }, 3600, &root_ksk, window);
+    defer allocator.free(root_rrsig);
+
+    // The DS the root publishes for the child is signed by the root ZSK.
+    var ds_raw: [4 + std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.mem.writeInt(u16, ds_raw[0..2], dnssec.keyTag(child_dnskey), .big);
+    ds_raw[2] = child_dnskey[3];
+    ds_raw[3] = 2;
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(child_owner.asWire());
+    hasher.update(child_dnskey);
+    hasher.final(ds_raw[4..]);
+    const ds_rrsig = try zone_signer.signRrset(allocator, child_owner, root_name, RecordType.DS.code(), &.{ds_raw[0..]}, 3600, &root_zsk, window);
+    defer allocator.free(ds_rrsig);
+    const child_rrsig = try zone_signer.signRrset(allocator, child_owner, child_owner, RecordType.DNSKEY.code(), &.{child_dnskey}, 3600, &child_key, window);
+    defer allocator.free(child_rrsig);
+
+    const answer_address = [4]u8{ 192, 0, 2, 1 };
+    const www = try Name.fromText("www.example.com.");
+    const a_rrsig = try zone_signer.signRrset(allocator, www, child_owner, RecordType.A.code(), &.{answer_address[0..]}, 3600, &child_key, window);
+    defer allocator.free(a_rrsig);
+
+    const question = dns_question.Question{ .name = www, .qtype = .A, .qclass = .IN };
+    var query = try emptyMessage(allocator, .{ .id = 0x1234, .recursion_desired = true, .question_count = 1 }, question);
+    defer query.deinit();
+    var response = try emptyMessage(allocator, .{ .id = 0x1234, .qr = true, .question_count = 1 }, question);
+    defer response.deinit();
+    try response.answers.append(.{ .owner = www, .rrtype = .A, .class = .IN, .ttl = 3600, .rdata = .{ .A = answer_address } });
+    try response.answers.append(rrsigRecord(www, a_rrsig, 3600));
+
+    const extra = [_]dns_record.ResourceRecord{
+        .{ .owner = root_name, .rrtype = .DNSKEY, .class = .IN, .ttl = 3600, .rdata = .{ .Unknown = unknownFrom(root_ksk_dnskey) } },
+        .{ .owner = root_name, .rrtype = .DNSKEY, .class = .IN, .ttl = 3600, .rdata = .{ .Unknown = unknownFrom(root_zsk_dnskey) } },
+        rrsigRecord(root_name, root_rrsig, 3600),
+        .{ .owner = child_owner, .rrtype = .DS, .class = .IN, .ttl = 3600, .rdata = .{ .Unknown = unknownFrom(ds_raw[0..]) } },
+        rrsigRecord(child_owner, ds_rrsig, 3600),
+        .{ .owner = child_owner, .rrtype = .DNSKEY, .class = .IN, .ttl = 3600, .rdata = .{ .Unknown = unknownFrom(child_dnskey) } },
+        rrsigRecord(child_owner, child_rrsig, 3600),
+    };
+
+    var anchors = try dnskeyAnchor(allocator, ".", root_ksk_dnskey);
+    defer anchors.deinit(allocator);
+
+    const result = try validate(allocator, &anchors, query, response, &extra, now_seconds);
+    try expectStatus(.secure, result);
+    try std.testing.expectEqual(@as(u16, 0), result.ede);
 }

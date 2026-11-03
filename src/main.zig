@@ -98,6 +98,7 @@ test {
     _ = metrics;
     _ = blocklist;
     _ = resolver;
+    _ = @import("iterate.zig");
     _ = local_zone;
 }
 

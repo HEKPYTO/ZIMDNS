@@ -6,7 +6,8 @@ The server and the CLI. One binary. The commands are `server run`, `query`, and
 | Path | Owns |
 |---|---|
 | `main.zig` | Argument parsing and process wiring. |
-| `resolver.zig` | Upstream lookups, caching, DNS64 synthesis, and the reporting resolver. |
+| `resolver.zig` | Upstream lookups, caching, DNS64 synthesis, the reporting resolver, and the iterative answer path. |
+| `iterate.zig` | Iterative resolution from the root hints: referrals, glue hints, alias chains, and their bounds. |
 | `metrics.zig` | Counters exported by the server. |
 | `blocklist.zig` | Blocked-name policy: exact domain names, matched after normalization. |
 | `local_zone.zig` | Locally served zones that are not loaded from files. |

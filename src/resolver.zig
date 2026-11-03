@@ -1,5 +1,7 @@
 /// Contract: Performs one bounded, UDP-first forwarding exchange and owns its
-/// in-memory cache and cookie policy. No iterative recursion or upstream pool.
+/// in-memory cache and cookie policy. Two upstream kinds: a configured
+/// forwarder, or iterative resolution from the root hints when `recursion
+/// allow` is set without one.
 /// Locally generated EDE options carry an INFO-CODE plus purpose text; error
 /// responses preserve the query CD/DO policy. Cookie replay tracking is opt-in
 /// and ring-bounded. deinit zeroizes cookie secrets.
@@ -17,6 +19,7 @@ const dns_types = @import("dns/types.zig");
 const dns_writer = @import("dns/writer.zig");
 const dnssec = @import("dns/dnssec.zig");
 const validate = @import("dns/validate.zig");
+const iterate_mod = @import("iterate.zig");
 const zone = @import("zone/index.zig");
 const zone_signer = @import("zone/signer.zig");
 const tcp_deadline = @import("platform/tcp_deadline.zig");
@@ -990,16 +993,6 @@ fn dropOutOfDomainAuthorities(message: *dns_message.Message, query_name: []const
         const record = message.authorities.items[read_index];
         if (!inDomainOf(record.owner.asWire(), query_name) and
             !isOwnAuthorityData(record, referral, denial, query_name)) continue;
-        if (!inDomainOf(record.owner.asWire(), query_name)) {
-            var kept_buffer: [128]u8 = undefined;
-            std.debug.print("KEEP owner={s} type={d} qlen={d} referral={} denial={}\n", .{
-                record.owner.toText(&kept_buffer) catch "?",
-                record.rrtype.code(),
-                query_name.len,
-                referral,
-                denial,
-            });
-        }
         message.authorities.items[write_index] = record;
         write_index += 1;
     }
@@ -1244,6 +1237,16 @@ pub const Resolver = struct {
     mutex: std.Io.Mutex = .init,
     policy: Policy,
     upstream: ?std.Io.net.IpAddress,
+    /// The root hint addresses the iterative path starts from; the test seam
+    /// narrows `hint_count` to one loopback server.
+    root_hints: [iterate_mod.root_hint_text.len]std.Io.net.IpAddress = undefined,
+    hint_count: usize = iterate_mod.root_hint_text.len,
+    /// Delegations the iterative path has learned, reused until their NS TTL
+    /// runs out. Read and written under this resolver's lock.
+    delegations: iterate_mod.DelegationCache = .{},
+    /// The zone the last iterative answer came from, which fixes the zone cut
+    /// a validation decision needs. Read and written under the resolver lock.
+    iterate_zone: dns_name.Name = dns_name.Name.root(),
     cache: Cache,
     /// RFC 8198 aggressive cache of NSEC and NSEC3 proofs. Fed from the
     /// proofs an upstream answer carries on the forward path and consulted
@@ -1253,13 +1256,15 @@ pub const Resolver = struct {
     dnssec_aggressive: dnssec.AggressiveCache = .{},
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, policy: Policy) !Resolver {
-        return .{
+        var resolver = Resolver{
             .allocator = allocator,
             .io = io,
             .policy = policy,
             .upstream = if (policy.forwarder) |forwarder| forwarder.address else null,
             .cache = Cache.init(allocator, policy.failure_cache_seconds),
         };
+        _ = iterate_mod.rootHints(&resolver.root_hints);
+        return resolver;
     }
 
     pub fn deinit(self: *Resolver) void {
@@ -1325,7 +1330,7 @@ pub const Resolver = struct {
             return hit.bytes;
         }
 
-        if (self.upstream == null) return Error.NoForwarder;
+        if (self.upstream == null and self.policy.recursion_allow_len == 0) return Error.NoForwarder;
         // RFC 8198 section 3: a cached NSEC proof answers denial queries
         // without an upstream round trip. Only when the client asked for
         // DNSSEC proofs (DO) and did not disable checking (CD).
@@ -1567,6 +1572,34 @@ pub const Resolver = struct {
         return writer.written();
     }
 
+    /// The signer name of an RRSIG record, which is the zone whose key made the
+    /// signature. RRSIG RDATA is opaque to this build, so the name is parsed
+    /// where the type's fixed 18-octet header leaves it (RFC 4034 section 3.1).
+    fn rrsigSigner(record: dns_record.ResourceRecord) ?dns_name.Name {
+        if (!record.rrtype.eql(.RRSIG)) return null;
+        return switch (record.rdata) {
+            .Unknown => |value| blk: {
+                var copy = value;
+                const parsed = dns_name.Name.parse(copy.bytes(), 18) catch break :blk null;
+                break :blk parsed.name;
+            },
+            else => null,
+        };
+    }
+
+    /// The name one label shorter, or null at the root.
+    fn parentOf(name: dns_name.Name) ?dns_name.Name {
+        const wire = name.asWire();
+        if (wire.len < 2) return null;
+        const len = wire[0];
+        if (len == 0 or len > 63 or 1 + @as(usize, len) >= wire.len) return null;
+        const rest = wire[1 + @as(usize, len) ..];
+        var out = dns_name.Name{};
+        @memcpy(out.wire[0..rest.len], rest);
+        out.wire_len = @intCast(rest.len);
+        return out;
+    }
+
     /// RFC 7871 section 7.1.1: the scope the query is sent upstream with,
     /// the client's scope trimmed to the server's maximum cacheable prefix
     /// length. Null when the client sent no option.
@@ -1586,11 +1619,148 @@ pub const Resolver = struct {
         return self.policy.anchors.len != 0 and !query.header.checking_disabled;
     }
 
-    fn checkDnssec(self: *Resolver, query: dns_message.Message, response: dns_message.Message, now: u32) validate.Error!validate.Result {
-        // `extra` is empty: the forward path answers from the response alone,
-        // so a DS-only anchor has no child DNSKEY RRset to match and the
-        // answer is honestly insecure rather than secure.
-        return validate.validate(self.allocator, &self.policy.anchors, query, response, &.{}, now);
+    fn checkDnssec(self: *Resolver, query: dns_message.Message, response: dns_message.Message, now: u32) !validate.Result {
+        if (self.upstream == null and !hasRrsig(response)) {
+            // RFC 4035 section 5.2: an unsigned answer is relayed as insecure
+            // when the parent's signed DS denial proves an insecure
+            // delegation; a zone that publishes a DS must have signed it.
+            return self.unsignedVerdict(self.iterate_zone, now);
+        }
+        if (self.upstream != null) {
+            // `extra` is empty: the forward path answers from the response
+            // alone, so a DS-only anchor has no child DNSKEY RRset to match
+            // and the answer is honestly insecure rather than secure.
+            return validate.validate(self.allocator, &self.policy.anchors, query, response, &.{}, now);
+        }
+        // The iterative path fetched the answer, not a validating upstream,
+        // so the chain from the anchor to the answer zone is this server's
+        // work: the DS each parent publishes and the DNSKEY each zone
+        // publishes, for every zone on the way to the anchor.
+        var extra: std.ArrayList(dns_record.ResourceRecord) = .empty;
+        defer extra.deinit(self.allocator);
+        try self.fetchChain(response, @intCast(now), &extra);
+        return validate.validate(self.allocator, &self.policy.anchors, query, response, extra.items, now);
+    }
+
+    /// RFC 4035 section 5.2: decide an unsigned answer by the parent's DS
+    /// RRset for the zone. A signed DS record means the zone is signed, so
+    /// the unsigned answer is a stripped signature; a signed denial of the DS
+    /// means the delegation is insecure; a DS answer that cannot be validated
+    /// keeps the failure closed.
+    fn unsignedVerdict(self: *Resolver, apex: dns_name.Name, now: u32) !validate.Result {
+        var ds_query = dns_message.Message{
+            .allocator = self.allocator,
+            .header = .{ .id = 0, .question_count = 1 },
+            .question = .{ .name = apex, .qtype = .DS, .qclass = .IN },
+            .answers = dns_message.RecordSection.init(self.allocator, 0) catch return .{ .status = .bogus, .ede = dnssec.EDE_DNSSEC_BOGUS },
+            .authorities = dns_message.RecordSection.init(self.allocator, 0) catch return .{ .status = .bogus, .ede = dnssec.EDE_DNSSEC_BOGUS },
+            .additionals = dns_message.RecordSection.init(self.allocator, 0) catch return .{ .status = .bogus, .ede = dnssec.EDE_DNSSEC_BOGUS },
+        };
+        defer ds_query.deinit();
+        const options: iterate_mod.Options = .{ .now = @intCast(now), .dnssec_ok = true };
+        var ds_response = iterate_mod.resolve(self.allocator, .{ .context = self, .send = iterateSend }, self.root_hints[0..self.hint_count], .{
+            .name = apex,
+            .qtype = .DS,
+            .qclass = .IN,
+        }, options) catch return .{ .status = .bogus, .ede = dnssec.EDE_DNSSEC_BOGUS };
+        defer ds_response.deinit();
+        var extra: std.ArrayList(dns_record.ResourceRecord) = .empty;
+        defer extra.deinit(self.allocator);
+        try self.fetchChain(ds_response, @intCast(now), &extra);
+        const result = validate.validate(self.allocator, &self.policy.anchors, ds_query, ds_response, extra.items, now) catch return .{ .status = .bogus, .ede = dnssec.EDE_DNSSEC_BOGUS };
+        switch (result.status) {
+            // The DS RRset is present and authenticated, so the zone is
+            // signed: the unsigned answer is a stripped signature.
+            .secure => {
+                for (ds_response.answers.slice()) |record| {
+                    if (record.rrtype.eql(.DS)) return .{ .status = .bogus, .ede = dnssec.EDE_RRSIGS_MISSING };
+                }
+                return .{ .status = .insecure, .ede = result.ede };
+            },
+            // RFC 4035 section 5.2: the parent's signed denial of the DS is
+            // itself an insecure outcome (the delegation carries no chain),
+            // and it carries no EDE. An insecure answer with an EDE is a
+            // chain this build could not authenticate, so it stays closed.
+            .insecure => {
+                if (result.ede == 0) return .{ .status = .insecure, .ede = 0 };
+                return .{ .status = .bogus, .ede = result.ede };
+            },
+            .bogus => return .{ .status = .bogus, .ede = result.ede },
+        }
+    }
+
+    fn hasRrsig(response: dns_message.Message) bool {
+        for ([_][]const dns_record.ResourceRecord{ response.answers.slice(), response.authorities.slice() }) |section| {
+            for (section) |record| {
+                if (record.rrtype.eql(.RRSIG)) return true;
+            }
+        }
+        return false;
+    }
+
+    /// AT most this many RRSIG signers are chained; a normal answer names one.
+    const max_chain_signers: usize = 4;
+    /// The chain walk stops after this many ancestor zones, which covers
+    /// every real delegation depth.
+    const max_chain_zones: usize = 8;
+    /// The chain records handed to the validator, bounded.
+    const max_chain_records: usize = 96;
+
+    /// Fetches the DS and DNSKEY RRsets (with their RRSIGs) for every zone
+    /// from each RRSIG signer up to the root, so the validator can walk the
+    /// chain itself. Best effort: a zone that does not answer leaves its
+    /// part of the chain absent and the answer insecure, never bogus.
+    fn fetchChain(self: *Resolver, response: dns_message.Message, now: i64, extra: *std.ArrayList(dns_record.ResourceRecord)) !void {
+        var signers: [max_chain_signers]dns_name.Name = undefined;
+        var signer_count: usize = 0;
+        for ([_][]const dns_record.ResourceRecord{ response.answers.slice(), response.authorities.slice() }) |section| {
+            for (section) |record| {
+                const signer = rrsigSigner(record) orelse continue;
+                var seen = false;
+                for (signers[0..signer_count]) |*existing| {
+                    if (existing.eql(&signer)) seen = true;
+                }
+                if (seen) continue;
+                if (signer_count == signers.len) break;
+                signers[signer_count] = signer;
+                signer_count += 1;
+            }
+        }
+        for (signers[0..signer_count]) |signer| {
+            var ancestor = signer;
+            var steps: usize = 0;
+            while (steps < max_chain_zones) : (steps += 1) {
+                try self.fetchZoneRecords(ancestor, .DNSKEY, now, extra);
+                try self.fetchZoneRecords(ancestor, .DS, now, extra);
+                ancestor = parentOf(ancestor) orelse break;
+            }
+        }
+    }
+
+    fn fetchZoneRecords(self: *Resolver, apex: dns_name.Name, qtype: dns_types.RecordType, now: i64, extra: *std.ArrayList(dns_record.ResourceRecord)) !void {
+        // RFC 4035 section 5.2: the DS for a zone lives in the parent, so the
+        // query must reach the parent's servers. A cached delegation for the
+        // zone would start the walk inside the child, which cannot answer
+        // for its own DS, so the DS query starts from the root.
+        const root = dns_name.Name.root();
+        if (qtype.eql(.DS) and apex.eql(&root)) return;
+        const options: iterate_mod.Options = .{
+            .cache = if (qtype.eql(.DS)) null else &self.delegations,
+            .now = now,
+            .dnssec_ok = true,
+        };
+        var chain_answer = iterate_mod.resolve(self.allocator, .{ .context = self, .send = iterateSend }, self.root_hints[0..self.hint_count], .{
+            .name = apex,
+            .qtype = qtype,
+            .qclass = .IN,
+        }, options) catch return;
+        defer chain_answer.deinit();
+        for ([_][]const dns_record.ResourceRecord{ chain_answer.answers.slice(), chain_answer.authorities.slice() }) |section| {
+            for (section) |record| {
+                if (extra.items.len == max_chain_records) return;
+                try extra.append(self.allocator, record);
+            }
+        }
     }
 
     /// SERVFAIL plus the RFC 8914 DNSSEC-bogus INFO-CODE the validator
@@ -1921,12 +2091,13 @@ pub const Resolver = struct {
         // platform can reach the upstream over TCP, because a UDP source
         // address is easy to forge. A platform that cannot waits no longer
         // than the ordinary path.
+        const upstream = self.upstream orelse return .{ .response = try self.iterate(query), .scope = scope };
         if (transport == .tcp) {
             if (comptime UPSTREAM_TCP_DEADLINES_SUPPORTED) {
                 return .{ .response = try self.queryUpstreamTcp(query_bytes, query, scope), .scope = scope };
             }
         }
-        var response = try self.queryUdp(query_bytes, query, scope);
+        var response = try self.queryUdp(upstream, query_bytes, query, scope, true);
         const sent = scope orelse return .{ .response = response, .scope = scope };
         if (sent.prefix == 0 or response.header.rcode != .refused) return .{ .response = response, .scope = scope };
         // RFC 7871 section 6: an option whose SOURCE PREFIX-LENGTH is 0
@@ -1934,25 +2105,25 @@ pub const Resolver = struct {
         var without_address = sent;
         without_address.prefix = 0;
         response.deinit();
-        return .{ .response = try self.queryUdp(query_bytes, query, without_address), .scope = without_address };
+        return .{ .response = try self.queryUdp(upstream, query_bytes, query, without_address, true), .scope = without_address };
     }
 
     /// RFC 9567 section 6.1: the error report travels over TCP. The query
     /// carries a randomized ID, exactly as the UDP path does before it
     /// sends, so a forged answer cannot name the query.
     fn queryUpstreamTcp(self: *Resolver, query_bytes: []const u8, query: dns_message.Message, scope: ?EcsScope) !dns_message.Message {
+        const upstream = self.upstream orelse return Error.NoForwarder;
         var query_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
         if (query_bytes.len < 2 or query_bytes.len > query_buffer.len) return Error.UpstreamFailure;
         var randomized_id: [2]u8 = undefined;
         self.io.randomSecure(&randomized_id) catch return Error.UpstreamFailure;
-        const upstream_query = try buildUpstreamQuery(query_bytes, query, &query_buffer, &self.policy.anchors, scope);
+        const upstream_query = try buildUpstreamQuery(query_bytes, query, &query_buffer, &self.policy.anchors, scope, true);
         @memcpy(query_buffer[0..2], &randomized_id);
         const expected_id = std.mem.readInt(u16, &randomized_id, .big);
-        return self.queryTcp(query_buffer[0..upstream_query.len], query, expected_id, scope);
+        return self.queryTcp(upstream, query_buffer[0..upstream_query.len], query, expected_id, scope);
     }
 
-    fn queryUdp(self: *Resolver, query_bytes: []const u8, query: dns_message.Message, scope: ?EcsScope) !dns_message.Message {
-        const upstream = self.upstream orelse return Error.NoForwarder;
+    fn queryUdp(self: *Resolver, upstream: std.Io.net.IpAddress, query_bytes: []const u8, query: dns_message.Message, scope: ?EcsScope, dnssec_ok: bool) !dns_message.Message {
         var query_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
         if (query_bytes.len < 2 or query_bytes.len > query_buffer.len) return Error.UpstreamFailure;
         // RFC 5452 §9.2: each attempt binds its own socket so the
@@ -1965,7 +2136,7 @@ pub const Resolver = struct {
             defer socket.close(self.io);
             var randomized_id: [2]u8 = undefined;
             self.io.randomSecure(&randomized_id) catch return Error.UpstreamFailure;
-            const upstream_query = try buildUpstreamQuery(query_bytes, query, &query_buffer, &self.policy.anchors, scope);
+            const upstream_query = try buildUpstreamQuery(query_bytes, query, &query_buffer, &self.policy.anchors, scope, dnssec_ok);
             @memcpy(query_buffer[0..2], &randomized_id);
             const expected_id = std.mem.readInt(u16, &randomized_id, .big);
 
@@ -1975,7 +2146,7 @@ pub const Resolver = struct {
                 if (!incoming.from.eql(&upstream)) continue;
                 switch (classifyUpstreamPacket(self.allocator, query, expected_id, incoming.data, scope)) {
                     .ignore => continue,
-                    .truncated => return self.queryTcpAfterTruncation(query_buffer[0..upstream_query.len], query, expected_id, UPSTREAM_TCP_DEADLINES_SUPPORTED, scope),
+                    .truncated => return self.queryTcpAfterTruncation(upstream, query_buffer[0..upstream_query.len], query, expected_id, UPSTREAM_TCP_DEADLINES_SUPPORTED, scope),
                     .ready => |message| return message,
                 }
             }
@@ -1988,6 +2159,34 @@ pub const Resolver = struct {
     /// never used: the socket is closed and another one is bound until a
     /// port outside the denylist is found, and the query fails when there
     /// is none.
+    /// One iterative resolution of `query`'s question from the root hints.
+    /// A hop that cannot be completed is the resolver's upstream failure,
+    /// so the failure cache and the stale-answer path treat it alike.
+    fn iterate(self: *Resolver, query: dns_message.Message) !dns_message.Message {
+        const question = query.question orelse return Error.UpstreamFailure;
+        const now: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(self.io).nanoseconds, std.time.ns_per_s));
+        var answer_zone = dns_name.Name.root();
+        const options: iterate_mod.Options = .{
+            .cache = &self.delegations,
+            .now = now,
+            .dnssec_ok = self.validating(query),
+            .zone_out = &answer_zone,
+        };
+        const resolved = iterate_mod.resolve(self.allocator, .{ .context = self, .send = iterateSend }, self.root_hints[0..self.hint_count], question, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return Error.UpstreamFailure,
+        };
+        self.iterate_zone = answer_zone;
+        return resolved;
+    }
+
+    fn iterateSend(context: *anyopaque, allocator: std.mem.Allocator, server: std.Io.net.IpAddress, query_bytes: []const u8, dnssec_ok: bool) anyerror!dns_message.Message {
+        const self: *Resolver = @ptrCast(@alignCast(context));
+        var hop = try dns_message.Message.parse(allocator, query_bytes);
+        defer hop.deinit();
+        return self.queryUdp(server, query_bytes, hop, null, dnssec_ok);
+    }
+
     fn bindSourceSocket(self: *Resolver, upstream: std.Io.net.IpAddress) !std.Io.net.Socket {
         var attempt: usize = 0;
         while (attempt < SOURCE_PORT_ATTEMPTS) : (attempt += 1) {
@@ -2001,13 +2200,14 @@ pub const Resolver = struct {
         }
         return Error.UpstreamFailure;
     }
-    fn queryTcpAfterTruncation(self: *Resolver, query_bytes: []const u8, query: dns_message.Message, expected_id: u16, comptime deadline_support: bool, scope: ?EcsScope) !dns_message.Message {
+    fn queryTcpAfterTruncation(self: *Resolver, upstream: std.Io.net.IpAddress, query_bytes: []const u8, query: dns_message.Message, expected_id: u16, comptime deadline_support: bool, scope: ?EcsScope) !dns_message.Message {
         if (comptime !deadline_support) return Error.UpstreamFailure;
-        return self.queryTcp(query_bytes, query, expected_id, scope);
+        return self.queryTcp(upstream, query_bytes, query, expected_id, scope);
     }
 
-    fn queryTcp(self: *Resolver, query_bytes: []const u8, query: dns_message.Message, expected_id: u16, scope: ?EcsScope) !dns_message.Message {
-        const upstream = self.upstream orelse return Error.NoForwarder;
+    fn queryTcp(self: *Resolver, upstream: std.Io.net.IpAddress, query_bytes: []const u8, query: dns_message.Message, expected_id: u16, scope: ?EcsScope) !dns_message.Message {
+        // The upstream address is the delegation server or the configured
+        // forwarder; the caller resolved it.
         var stream = if (comptime UPSTREAM_TCP_DEADLINES_SUPPORTED)
             connectTcpWithTimeoutAvoiding(self.io, &upstream, .{
                 .mode = .stream,
@@ -2510,11 +2710,13 @@ fn classifyUpstreamPacket(allocator: std.mem.Allocator, query: dns_message.Messa
 /// classic 512-octet payload, the DO bit set, and no option data. RFC 3225
 /// section 3 wants the DO bit on every recursive request, so a client query
 /// that carried no OPT still gets one upstream.
-fn writeDoOptRecord(buffer: []u8) void {
+fn writeDoOptRecord(buffer: []u8, dnssec_ok: bool) void {
     buffer[0] = 0;
     std.mem.writeInt(u16, buffer[1..3], 41, .big);
-    std.mem.writeInt(u16, buffer[3..5], dns_message.CLASSIC_UDP_PAYLOAD_SIZE, .big);
-    std.mem.writeInt(u32, buffer[5..9], 0x00008000, .big);
+    // RFC 6891 section 6.2.5: the sender's own payload size. 1232 is the
+    // DNS Flag Day 2020 recommendation and fits every ordinary referral.
+    std.mem.writeInt(u16, buffer[3..5], dns_message.DEFAULT_EDNS_UDP_PAYLOAD_SIZE, .big);
+    std.mem.writeInt(u32, buffer[5..9], if (dnssec_ok) 0x00008000 else 0, .big);
     std.mem.writeInt(u16, buffer[9..11], 0, .big);
 }
 
@@ -2524,6 +2726,7 @@ fn buildUpstreamQuery(
     output: []u8,
     anchors: *const validate.Anchors,
     scope: ?EcsScope,
+    dnssec_ok: bool,
 ) ![]const u8 {
     if (query.edns == null) {
         // RFC 3225 section 3: a recursive DNSSEC-aware server MUST set the DO
@@ -2544,7 +2747,7 @@ fn buildUpstreamQuery(
         const additional_count = std.mem.readInt(u16, output[10..12], .big);
         if (additional_count == std.math.maxInt(u16)) return Error.UpstreamFailure;
         std.mem.writeInt(u16, output[10..12], additional_count + 1, .big);
-        writeDoOptRecord(output[original.len..][0..opt_record_len]);
+        writeDoOptRecord(output[original.len..][0..opt_record_len], dnssec_ok);
         return output[0 .. original.len + opt_record_len];
     }
 
@@ -2566,7 +2769,7 @@ fn buildUpstreamQuery(
     // proofs from. A client that did not ask for them gets them stripped on
     // the way out instead.
     var upstream_edns = query.edns.?;
-    upstream_edns.dnssec_ok = true;
+    upstream_edns.dnssec_ok = dnssec_ok;
     try appendOpt(&sanitized, upstream_edns);
     // RFC 7871 section 7.1.1: the SOURCE PREFIX-LENGTH of the client's own
     // option caps what this server may ask upstream, and the server's
@@ -3737,7 +3940,7 @@ test "TC fallback is fail closed without deadline support" {
     defer resolver.deinit();
     var query = try makeTestQuery(std.testing.allocator, 0x2580, "example.com.", false);
     defer query.deinit();
-    try std.testing.expectError(Error.UpstreamFailure, resolver.queryTcpAfterTruncation(&.{}, query, 0, false, null));
+    try std.testing.expectError(Error.UpstreamFailure, resolver.queryTcpAfterTruncation(.{ .ip4 = .loopback(53) }, &.{}, query, 0, false, null));
 }
 
 test "resolver rejects non-query opcodes before cache or upstream" {
@@ -3766,7 +3969,7 @@ test "resolver forwards the client subnet option upstream" {
     try appendOption(&query, dns_rdata.EDNS_ECS_OPTION_CODE, &ecs);
 
     var output: [512]u8 = undefined;
-    const encoded = try buildUpstreamQuery(&.{ 0xde, 0xad }, query, &output, &.{}, ecsScope(query));
+    const encoded = try buildUpstreamQuery(&.{ 0xde, 0xad }, query, &output, &.{}, ecsScope(query), true);
 
     var parsed_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer parsed_arena.deinit();
@@ -4045,7 +4248,7 @@ test "a client without the client subnet option keeps today's behavior" {
     defer plain.deinit();
 
     var output: [512]u8 = undefined;
-    const encoded = try buildUpstreamQuery(&.{ 0xde, 0xad }, plain, &output, &.{}, null);
+    const encoded = try buildUpstreamQuery(&.{ 0xde, 0xad }, plain, &output, &.{}, null, true);
     var parsed_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer parsed_arena.deinit();
     const upstream = try dns_message.Message.parse(parsed_arena.allocator(), encoded);
@@ -4114,7 +4317,7 @@ test "buildUpstreamQuery strips the other client EDNS options but preserves payl
     try appendOption(&query, dns_rdata.EDNS_EXPIRE_OPTION_CODE, &.{});
 
     var output: [512]u8 = undefined;
-    const encoded = try buildUpstreamQuery(&.{ 0xde, 0xad }, query, &output, &.{}, ecsScope(query));
+    const encoded = try buildUpstreamQuery(&.{ 0xde, 0xad }, query, &output, &.{}, ecsScope(query), true);
 
     var parsed_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer parsed_arena.deinit();
@@ -4145,7 +4348,7 @@ test "RFC 3225: buildUpstreamQuery sets DO=1 when the client cleared DO" {
     query.additionals.items[0].ttl = 0;
 
     var output: [512]u8 = undefined;
-    const encoded = try buildUpstreamQuery(&.{ 0xde, 0xad }, query, &output, &.{}, null);
+    const encoded = try buildUpstreamQuery(&.{ 0xde, 0xad }, query, &output, &.{}, null, true);
 
     var parsed_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer parsed_arena.deinit();
@@ -4165,7 +4368,7 @@ test "RFC 4343 4.1: the upstream query keeps the case the client sent" {
     )).name;
 
     var output: [512]u8 = undefined;
-    const encoded = try buildUpstreamQuery(&.{ 0xde, 0xad }, query, &output, &.{}, null);
+    const encoded = try buildUpstreamQuery(&.{ 0xde, 0xad }, query, &output, &.{}, null, true);
 
     var parsed_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer parsed_arena.deinit();
@@ -4186,7 +4389,7 @@ test "RFC 4035 section 4.6: buildUpstreamQuery clears the client's AD bit" {
     const original = try encodeTestMessage(plain, &original_bytes);
 
     var output: [512]u8 = undefined;
-    const composed = try buildUpstreamQuery(original, plain, &output, &.{}, null);
+    const composed = try buildUpstreamQuery(original, plain, &output, &.{}, null, true);
 
     // The client's own octets head the upstream query with the AD bit
     // cleared, and one OPT record with DO=1 follows them (RFC 3225 section 3):
@@ -4214,7 +4417,7 @@ test "RFC 4035 section 4.6: buildUpstreamQuery clears the client's AD bit" {
     dnssec_query.additionals.items[0].ttl = 0x8000;
 
     var edns_output: [512]u8 = undefined;
-    const composed_edns = try buildUpstreamQuery(&.{ 0xde, 0xad }, dnssec_query, &edns_output, &.{}, null);
+    const composed_edns = try buildUpstreamQuery(&.{ 0xde, 0xad }, dnssec_query, &edns_output, &.{}, null, true);
     var parsed_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer parsed_arena.deinit();
     const upstream = try dns_message.Message.parse(parsed_arena.allocator(), composed_edns);
@@ -4234,10 +4437,12 @@ test "RFC 3225 section 3: a client query without EDNS still asks the upstream wi
     const original = try encodeTestMessage(plain, &original_bytes);
 
     var output: [512]u8 = undefined;
-    const composed = try buildUpstreamQuery(original, plain, &output, &.{}, null);
+    const composed = try buildUpstreamQuery(original, plain, &output, &.{}, null, true);
 
     // The question the client sent is the question that goes upstream: only
-    // the header's ARCOUNT grows, to carry the record appended to it.
+    // the header's ARCOUNT grows, to carry the record appended to it. The
+    // appended OPT advertises this server's own 1232-octet payload, so a
+    // referral is not truncated at the 512-octet classic size.
     try std.testing.expectEqualSlices(u8, original[0..10], composed[0..10]);
     try std.testing.expectEqualSlices(u8, original[12..], composed[12..original.len]);
     try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, composed[10..12], .big));
@@ -4245,7 +4450,7 @@ test "RFC 3225 section 3: a client query without EDNS still asks the upstream wi
     try std.testing.expectEqual(@as(usize, opt_record_len), opt.len);
     try std.testing.expectEqual(@as(u8, 0), opt[0]);
     try std.testing.expectEqual(@as(u16, 41), std.mem.readInt(u16, opt[1..3], .big));
-    try std.testing.expectEqual(@as(u16, dns_message.CLASSIC_UDP_PAYLOAD_SIZE), std.mem.readInt(u16, opt[3..5], .big));
+    try std.testing.expectEqual(@as(u16, dns_message.DEFAULT_EDNS_UDP_PAYLOAD_SIZE), std.mem.readInt(u16, opt[3..5], .big));
     try std.testing.expectEqual(@as(u32, 0x8000), std.mem.readInt(u32, opt[5..9], .big));
     try std.testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, opt[9..11], .big));
 }
@@ -4318,7 +4523,7 @@ test "RFC 8145: an upstream DNSKEY query carries the anchors' key tags and nothi
     dnskey_query.question.?.qtype = .DNSKEY;
     const dnskey_upstream = try dns_message.Message.parse(
         parsed_arena.allocator(),
-        try buildUpstreamQuery(&.{ 0xde, 0xad }, dnskey_query, &output, &anchors, null),
+        try buildUpstreamQuery(&.{ 0xde, 0xad }, dnskey_query, &output, &anchors, null, true),
     );
     // 34959 is the RFC 4034 Appendix B checksum of the DNSKEY RDATA
     // 01 01 03 08 41 42 43 44 that `257 3 8 QUJDRA==` encodes.
@@ -4332,7 +4537,7 @@ test "RFC 8145: an upstream DNSKEY query carries the anchors' key tags and nothi
     ds_query.question.?.qtype = .DNSKEY;
     const ds_upstream = try dns_message.Message.parse(
         parsed_arena.allocator(),
-        try buildUpstreamQuery(&.{ 0xbe, 0xef }, ds_query, &output, &anchors, null),
+        try buildUpstreamQuery(&.{ 0xbe, 0xef }, ds_query, &output, &anchors, null, true),
     );
     try std.testing.expectEqualSlices(u8, &.{ 0xec, 0x45 }, findOption(ds_upstream, dns_rdata.EDNS_KEY_TAG_OPTION_CODE).?);
 
@@ -4342,7 +4547,7 @@ test "RFC 8145: an upstream DNSKEY query carries the anchors' key tags and nothi
     defer a_query.deinit();
     const a_upstream = try dns_message.Message.parse(
         parsed_arena.allocator(),
-        try buildUpstreamQuery(&.{ 0xbe, 0xef }, a_query, &output, &anchors, null),
+        try buildUpstreamQuery(&.{ 0xbe, 0xef }, a_query, &output, &anchors, null, true),
     );
     try std.testing.expect(findOption(a_upstream, dns_rdata.EDNS_KEY_TAG_OPTION_CODE) == null);
     try std.testing.expectEqual(@as(usize, 0), a_upstream.additionals.items[0].rdata.OPT.bytes().len);
@@ -4354,7 +4559,7 @@ test "RFC 8145: an upstream DNSKEY query carries the anchors' key tags and nothi
     unanchored.question.?.qtype = .DNSKEY;
     const plain_upstream = try dns_message.Message.parse(
         parsed_arena.allocator(),
-        try buildUpstreamQuery(&.{ 0xbe, 0xef }, unanchored, &output, &.{}, null),
+        try buildUpstreamQuery(&.{ 0xbe, 0xef }, unanchored, &output, &.{}, null, true),
     );
     try std.testing.expect(findOption(plain_upstream, dns_rdata.EDNS_KEY_TAG_OPTION_CODE) == null);
 }
@@ -8978,7 +9183,7 @@ test "RFC 1035 section 4.1.1: the upstream query never carries the reserved Z bi
     try std.testing.expectEqual(@as(u8, 0x40), raw[3] & 0x40);
 
     var output: [512]u8 = undefined;
-    const composed = try buildUpstreamQuery(raw[0..original.len], query, &output, &.{}, null);
+    const composed = try buildUpstreamQuery(raw[0..original.len], query, &output, &.{}, null, true);
     // RFC 1035 section 4.1.1: the Z bit must be zero in all queries.
     try std.testing.expectEqual(@as(u8, 0), composed[3] & 0x40);
 }
@@ -10476,4 +10681,40 @@ test "RFC 9567 section 6.1: the answer to a report query produces no second repo
 
     _ = try fixture.resolver.answer(fixture.encoded, fixture.query, &client, &output);
     try std.testing.expectEqual(@as(usize, 1), fixture.upstream.reports);
+}
+
+test "RFC 1034 section 4.3.2: with no forwarder the resolver resolves from its hints" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var server_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server_socket = try std.Io.net.IpAddress.bind(&server_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer server_socket.close(io);
+
+    var upstream = EcsUpstream{ .io = io, .udp = &server_socket, .max_requests = 1 };
+    const thread = try std.Thread.spawn(.{}, serveEcsUpstream, .{&upstream});
+
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .recursion_allow_len = 1,
+    });
+    defer resolver.deinit();
+    // The hint is the loopback server; a real root would answer the same
+    // question with an authoritative A record after its own referral.
+    resolver.hint_count = 1;
+    resolver.root_hints[0] = server_socket.address;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2610, "example.com.", false);
+    defer query.deinit();
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42631);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    thread.join();
+
+    const response = try dns_message.Message.parse(arena.allocator(), bytes);
+    try std.testing.expectEqual(dns_header.Rcode.no_error, response.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+    try std.testing.expectEqual([4]u8{ 192, 0, 2, 1 }, response.answers.slice()[0].rdata.A);
+    try std.testing.expect(response.header.recursion_available);
 }
