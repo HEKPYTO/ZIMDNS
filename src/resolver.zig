@@ -737,7 +737,7 @@ const Cache = struct {
     /// which the cached copy reports to every client it serves.
     fn put(self: *Cache, key: CacheKey, message: *dns_message.Message, now: i64, ecs_scope: u8, ede: u16) !void {
         if (message.header.truncated or (message.header.rcode != .no_error and message.header.rcode != .nxdomain)) return;
-        const ttl_info = cacheTtl(message) orelse return;
+        const ttl_info = cacheTtl(message, key.qtype) orelse return;
         if (ttl_info.ttl == 0) return;
         try self.store(key, message, now, ttl_info, ecs_scope, ede);
     }
@@ -763,11 +763,14 @@ const Cache = struct {
         var slot: usize = 0;
         var index: usize = 0;
         var empty: ?usize = null;
+        var expired: ?usize = null;
         while (index < self.len) : (index += 1) {
             if (self.entries[index].response == null) {
                 if (empty == null) empty = index;
                 continue;
             }
+            const elapsed = @max(@as(i64, 0), now - self.entries[index].stored_at);
+            if (elapsed >= @as(i64, self.entries[index].ttl) and expired == null) expired = index;
             if (self.entries[index].key.eql(&key)) {
                 slot = index;
                 break;
@@ -775,6 +778,11 @@ const Cache = struct {
         } else {
             if (empty) |free| {
                 slot = free;
+            } else if (expired) |old| {
+                // An entry past its TTL is only useful to the stale path,
+                // which is best effort, so a new answer takes its slot before
+                // a live entry is overwritten.
+                slot = old;
             } else if (self.len < MAX_CACHE_ENTRIES) {
                 slot = self.len;
                 self.len += 1;
@@ -784,7 +792,10 @@ const Cache = struct {
             }
         }
 
-        if (self.entries[slot].response) |bytes| self.allocator.free(bytes);
+        if (self.entries[slot].response) |bytes| {
+            self.allocator.free(bytes);
+            self.entries[slot] = .{};
+        }
         const stored = try self.allocator.dupe(u8, writer.written());
         self.entries[slot] = .{
             .response = stored,
@@ -810,8 +821,13 @@ const Cache = struct {
             const fresh = elapsed < @as(i64, entry.ttl);
             const stale = !fresh and elapsed <= @as(i64, entry.ttl) + STALE_WINDOW_SECONDS;
             if (!fresh and (!allow_stale or !stale)) {
-                self.allocator.free(entry.response.?);
-                entry.* = .{};
+                // RFC 9520 section 4: an expired entry is still served when
+                // resolution fails, so a fresh lookup keeps it for the stale
+                // window instead of evicting it.
+                if (!stale) {
+                    self.allocator.free(entry.response.?);
+                    entry.* = .{};
+                }
                 break;
             }
 
@@ -973,7 +989,17 @@ fn dropOutOfDomainAuthorities(message: *dns_message.Message, query_name: []const
     while (read_index < message.authorities.len) : (read_index += 1) {
         const record = message.authorities.items[read_index];
         if (!inDomainOf(record.owner.asWire(), query_name) and
-            !isOwnAuthorityData(record, referral, denial)) continue;
+            !isOwnAuthorityData(record, referral, denial, query_name)) continue;
+        if (!inDomainOf(record.owner.asWire(), query_name)) {
+            var kept_buffer: [128]u8 = undefined;
+            std.debug.print("KEEP owner={s} type={d} qlen={d} referral={} denial={}\n", .{
+                record.owner.toText(&kept_buffer) catch "?",
+                record.rrtype.code(),
+                query_name.len,
+                referral,
+                denial,
+            });
+        }
         message.authorities.items[write_index] = record;
         write_index += 1;
     }
@@ -987,14 +1013,24 @@ fn dropOutOfDomainAuthorities(message: *dns_message.Message, query_name: []const
 /// the DNSSEC denial proofs that ride with them (RFC 2308 section 5 for the
 /// NXT record, RFC 4034 section 4 and RFC 5155 section 7.2 for NSEC and
 /// NSEC3, whose covering RRSIG the validator needs).
-fn isOwnAuthorityData(record: dns_record.ResourceRecord, referral: bool, denial: bool) bool {
-    if (record.rrtype.eql(dns_types.RecordType.SOA)) return true;
-    if (referral and record.rrtype.eql(dns_types.RecordType.NS)) return true;
+fn isOwnAuthorityData(record: dns_record.ResourceRecord, referral: bool, denial: bool, query_name: []const u8) bool {
+    // RFC 5452 section 6 still applies: the SOA must be the apex of a zone
+    // that contains the query name, and a referral's NS must name an
+    // ancestor of it. An SOA or NS for another domain is attacker data.
+    const owner = record.owner.asWire();
+    if (record.rrtype.eql(dns_types.RecordType.SOA)) return isAncestorOrEqual(owner, query_name);
+    if (referral and record.rrtype.eql(dns_types.RecordType.NS)) return isAncestorOrEqual(owner, query_name);
     if (!referral and !denial) return false;
     return record.rrtype.eql(dns_types.RecordType.RRSIG) or
         record.rrtype.eql(dns_types.RecordType.NSEC) or
         record.rrtype.eql(dns_types.RecordType.NSEC3) or
         record.rrtype.eql(dns_types.RecordType.NSEC3PARAM);
+}
+
+/// True when `ancestor` is `name` itself or one of its ancestors, both in
+/// wire form.
+fn isAncestorOrEqual(ancestor: []const u8, name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(ancestor, name) or isDescendant(name, ancestor);
 }
 
 /// True when the authority section carries the SOA of a negative answer
@@ -1141,17 +1177,31 @@ const TtlInfo = struct { ttl: u32, negative: bool, nxdomain: bool };
 /// the authority section, and its TTL is the smaller of that record's TTL
 /// and the SOA MINIMUM field. RFC 9520 section 2 keeps NXDOMAIN and NODATA
 /// out of the resolution-failure cache, so they follow this rule.
-fn cacheTtl(message: *const dns_message.Message) ?TtlInfo {
+fn cacheTtl(message: *const dns_message.Message, qtype: u16) ?TtlInfo {
     if (message.header.rcode == .nxdomain) {
         var ttl: ?u32 = null;
         for (message.authorities.slice()) |record| {
             if (record.rrtype.eql(.SOA)) ttl = @min(ttl orelse record.ttl, @min(record.ttl, record.rdata.SOA.minimum));
         }
-        return if (ttl) |value| .{ .ttl = value, .negative = true, .nxdomain = true } else null;
+        return if (ttl) |value| .{ .ttl = @min(value, MAX_NEGATIVE_TTL), .negative = true, .nxdomain = true } else null;
     }
-    if (message.header.answer_count == 0) {
+    // RFC 2308 section 2.2: a NOERROR answer without the queried type is a
+    // NODATA even when a CNAME chain rides in the answer section, and its
+    // TTL is the SOA's, not the chain's.
+    var holds_qtype = false;
+    for (message.answers.slice()) |record| {
+        if (record.rrtype.code() == qtype) holds_qtype = true;
+    }
+    if (!holds_qtype) {
         for (message.authorities.slice()) |record| {
-            if (record.rrtype.eql(.SOA)) return .{ .ttl = @min(record.ttl, record.rdata.SOA.minimum), .negative = true, .nxdomain = false };
+            if (record.rrtype.eql(.SOA)) return .{ .ttl = @min(@min(record.ttl, record.rdata.SOA.minimum), MAX_NEGATIVE_TTL), .negative = true, .nxdomain = false };
+        }
+        if (message.header.answer_count != 0) {
+            // A CNAME chain with no SOA carries no negative TTL; cache it by
+            // the chain's own TTL.
+            var ttl: ?u32 = null;
+            for (message.answers.slice()) |record| ttl = @min(ttl orelse record.ttl, record.ttl);
+            return if (ttl) |value| .{ .ttl = value, .negative = false, .nxdomain = false } else null;
         }
         return null;
     }
@@ -1384,8 +1434,13 @@ pub const Resolver = struct {
         // delegation, so it keeps the glue of the delegation the authority
         // section names and loses everything else.
         if (query.question) |question| {
+            // The referral shape is read before the authority section is
+            // filtered: dropping a delegation for another domain must not
+            // turn the response into a non-referral whose in-domain
+            // additional records are then kept as if they answered the query.
+            const referral = isReferral(&response);
             dropOutOfDomainAuthorities(&response, question.name.asWire());
-            if (isReferral(&response)) {
+            if (referral) {
                 filterReferralAdditionals(&response, question.name.asWire());
             } else {
                 dropOutOfDomainAdditionals(&response, question.name.asWire());
@@ -3336,6 +3391,74 @@ test "RFC 2308 section 5: the negative TTL is the smaller of the SOA TTL and the
     const short_hit = (try cache.lookup(&short_key, short, 1000, &output, false)).?;
     const short_message = try dns_message.Message.parse(arena.allocator(), short_hit.bytes);
     try std.testing.expectEqual(@as(u32, 20), short_message.authorities.items[0].ttl);
+}
+
+test "RFC 9520 section 4: a lookup past the TTL keeps the entry for the stale path" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    defer cache.deinit();
+    var output: [2048]u8 = undefined;
+
+    var query = try makeTestQuery(arena.allocator(), 0x2840, "example.com.", false);
+    defer query.deinit();
+    const key = try CacheKey.fromQuestion(query);
+    var positive = try makePositiveResponse(arena.allocator(), 60);
+    defer positive.deinit();
+    try cache.put(key, &positive, 1000, 0, 0);
+
+    // The fresh lookup that finds an expired entry must not evict it: the
+    // failure path still needs it.
+    try std.testing.expect((try cache.lookup(&key, query, 1061, &output, false)) == null);
+    const stale = (try cache.lookup(&key, query, 1061, &output, true)).?;
+    try std.testing.expect(stale.stale);
+    // Past the stale window the entry is gone.
+    try std.testing.expect((try cache.lookup(&key, query, 1000 + 60 + STALE_WINDOW_SECONDS + 1, &output, true)) == null);
+}
+
+test "RFC 2308 section 2.2: a CNAME with NODATA is cached by the SOA, not the chain" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    defer cache.deinit();
+    var output: [2048]u8 = undefined;
+
+    var query = try makeTestQuery(arena.allocator(), 0x2841, "alias.example.com.", false);
+    defer query.deinit();
+    const key = try CacheKey.fromQuestion(query);
+    var nodata = try makeNegativeResponse(arena.allocator(), 60, 30);
+    defer nodata.deinit();
+    nodata.header.rcode = .no_error;
+    // The chain record lives an hour; the denial at its end lives 30
+    // seconds, and that is what the cache must hold.
+    try nodata.answers.append(.{
+        .owner = try dns_name.Name.fromText("alias.example.com."),
+        .rrtype = .CNAME,
+        .class = .IN,
+        .ttl = 3600,
+        .rdata = .{ .CNAME = try dns_name.Name.fromText("target.example.com.") },
+    });
+    nodata.header.answer_count = 1;
+    try cache.put(key, &nodata, 1000, 0, 0);
+    try std.testing.expect((try cache.lookup(&key, query, 1031, &output, false)) == null);
+}
+
+test "RFC 2308 section 5: an upstream negative TTL is capped at three hours" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    defer cache.deinit();
+    var output: [2048]u8 = undefined;
+
+    var query = try makeTestQuery(arena.allocator(), 0x2842, "long.example.com.", false);
+    defer query.deinit();
+    const key = try CacheKey.fromQuestion(query);
+    var denial = try makeNxdomainResponse(arena.allocator(), "long.example.com.", 604800, 604800);
+    defer denial.deinit();
+    try cache.put(key, &denial, 1000, 0, 0);
+    const fresh = (try cache.lookup(&key, query, 1000 + MAX_NEGATIVE_TTL - 1, &output, false)).?;
+    try std.testing.expect(!fresh.stale);
+    try std.testing.expect((try cache.lookup(&key, query, 1000 + MAX_NEGATIVE_TTL, &output, false)) == null);
 }
 
 test "RFC 8020 section 2: a descendant of a cached NXDOMAIN is answered without an upstream query" {
@@ -9028,6 +9151,23 @@ fn buildAdditionalUpstreamAnswer(buffer: []u8, query: dns_message.Message, shape
         // record beside it has nothing to do with the query.
         message.header.rcode = .nxdomain;
         try message.authorities.append(.{
+            .owner = try dns_name.Name.fromText("example.com."),
+            .rrtype = .SOA,
+            .class = .IN,
+            .ttl = 60,
+            .rdata = .{ .SOA = .{
+                .mname = try dns_name.Name.fromText("ns.example.com."),
+                .rname = try dns_name.Name.fromText("hostmaster.example.com."),
+                .serial = 1,
+                .refresh = 3600,
+                .retry = 900,
+                .expire = 1209600,
+                .minimum = 60,
+            } },
+        });
+        // An SOA for another domain is attacker data (RFC 5452 section 6),
+        // as is the record beside it.
+        try message.authorities.append(.{
             .owner = try dns_name.Name.fromText("elsewhere.example."),
             .rrtype = .SOA,
             .class = .IN,
@@ -9049,7 +9189,7 @@ fn buildAdditionalUpstreamAnswer(buffer: []u8, query: dns_message.Message, shape
             .ttl = 60,
             .rdata = .{ .A = .{ 192, 0, 2, 4 } },
         });
-        message.header.authority_count = 2;
+        message.header.authority_count = 3;
         var writer = dns_writer.Writer.init(buffer);
         try message.encode(&writer);
         return writer.written();
@@ -9315,23 +9455,6 @@ test "RFC 5452 section 6: a referral whose glue is out of the zone keeps none of
     try std.testing.expectEqual(@as(u16, 0), message.header.additional_count);
 }
 
-test "RFC 5452 section 6: a referral for another domain keeps none of its glue" {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const fixture = try AdditionalFixture.create(io, .referral_out_of_domain);
-    defer fixture.destroy();
-    var output: [2048]u8 = undefined;
-    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42718);
-
-    const bytes = try fixture.resolver.answer(fixture.encoded, fixture.query, &client, &output);
-    const message = try dns_message.Message.parse(fixture.arena.allocator(), bytes);
-
-    // The delegation the authority section names is not in the domain of
-    // the query, so its glue is not the query's data and none of it is
-    // relayed.
-    try std.testing.expectEqual(@as(u16, 1), message.header.authority_count);
-    try std.testing.expectEqual(@as(u16, 0), message.header.additional_count);
-}
-
 test "RFC 5452 section 6: an authority record outside the domain of the query is not relayed" {
     const io = std.Io.Threaded.global_single_threaded.io();
     const fixture = try AdditionalFixture.create(io, .answer_with_authority);
@@ -9361,14 +9484,14 @@ test "RFC 5452 section 6: a negative answer keeps its SOA" {
     const bytes = try fixture.resolver.answer(fixture.encoded, fixture.query, &client, &output);
     const message = try dns_message.Message.parse(fixture.arena.allocator(), bytes);
 
-    // A negative answer is carried by the zone SOA (RFC 2308 section 5), so
-    // the SOA survives even though its owner name is not in the domain of the
-    // query, and the record beside it is dropped.
+    // A negative answer is carried by the zone SOA (RFC 2308 section 5), and
+    // that SOA is an ancestor of the query name. The SOA of another domain
+    // and the record beside it are dropped (RFC 5452 section 6).
     try std.testing.expectEqual(dns_header.Rcode.nxdomain, message.header.rcode);
     try std.testing.expectEqual(@as(u16, 1), message.header.authority_count);
     try std.testing.expect(dns_types.RecordType.SOA.eql(message.authorities.items[0].rrtype));
     var text: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("elsewhere.example.", try message.authorities.items[0].owner.toText(&text));
+    try std.testing.expectEqualStrings("example.com.", try message.authorities.items[0].owner.toText(&text));
 }
 
 test "RFC 5452 section 6: the cached answer holds the filtered authority section" {
@@ -9391,7 +9514,7 @@ test "RFC 5452 section 6: the cached answer holds the filtered authority section
     try std.testing.expectEqual(@as(usize, 1), fixture.upstream.requests);
 }
 
-test "RFC 5452 section 6: a referral keeps the NS records of its delegation" {
+test "RFC 5452 section 6: a referral for another domain is dropped whole" {
     const io = std.Io.Threaded.global_single_threaded.io();
     const fixture = try AdditionalFixture.create(io, .referral_out_of_domain);
     defer fixture.destroy();
@@ -9401,14 +9524,10 @@ test "RFC 5452 section 6: a referral keeps the NS records of its delegation" {
     const bytes = try fixture.resolver.answer(fixture.encoded, fixture.query, &client, &output);
     const message = try dns_message.Message.parse(fixture.arena.allocator(), bytes);
 
-    // The delegation is not in the domain of the query, but the client
-    // follows the delegation with the NS records the referral carries
-    // (RFC 1034 section 4.3.2), so they survive, and the glue rule is
-    // unchanged: a delegation the query is not about keeps none of it.
-    try std.testing.expectEqual(@as(u16, 1), message.header.authority_count);
-    try std.testing.expect(dns_types.RecordType.NS.eql(message.authorities.items[0].rrtype));
-    var text: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("elsewhere.example.", try message.authorities.items[0].owner.toText(&text));
+    // The delegation is not in the domain of the query, so the referral is
+    // not data the client can use (RFC 5452 section 6): its NS records and
+    // every glue record are dropped.
+    try std.testing.expectEqual(@as(u16, 0), message.header.authority_count);
     try std.testing.expectEqual(@as(u16, 0), message.header.additional_count);
 }
 

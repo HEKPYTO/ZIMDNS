@@ -123,7 +123,7 @@ pub fn apply(
             if (isQueryMetaType(rr.rrtype)) return .{ .rcode = .formerr };
         } else if (class == CLASS_ANY) {
             if (rr.ttl != 0 or encodedLen(rr) != 0) return .{ .rcode = .formerr };
-            if (rr.rrtype.eql(.AXFR)) return .{ .rcode = .formerr };
+            if (!rr.rrtype.eql(.ANY) and isQueryMetaType(rr.rrtype)) return .{ .rcode = .formerr };
         } else if (class == CLASS_NONE) {
             if (rr.ttl != 0 or isQueryMetaType(rr.rrtype)) return .{ .rcode = .formerr };
         } else {
@@ -175,6 +175,10 @@ fn applyAdd(
     // RFC 2136 section 3.4.2.2: a CNAME never shares a name with other data.
     if (is_cname and saw_other) return;
     if (!is_cname and saw_cname) return;
+    // RFC 2181 section 10.1: a name holds exactly one CNAME. An add matches
+    // the existing record by type, because a second CNAME is never a valid
+    // outcome.
+    if (is_cname and saw_cname) return;
 
     if (rr.rrtype.eql(.SOA)) {
         if (rr.rdata != .SOA) return;
@@ -474,8 +478,18 @@ fn serialGreaterThan(candidate: u32, current: u32) bool {
     return @as(i32, @bitCast(candidate -% current)) > 0;
 }
 
+/// RFC 2136 section 3.4.1.2: the types that name a query, a transfer, or a
+/// channel record rather than zone data. None of them may be added or
+/// deleted by an update.
 fn isQueryMetaType(rrtype: RecordType) bool {
-    return rrtype.eql(.ANY) or rrtype.eql(.AXFR);
+    const code = rrtype.code();
+    return code == 255 // ANY
+    or code == 252 // AXFR
+    or code == 251 // IXFR
+    or code == 253 // MAILB
+    or code == 254 // MAILA
+    or code == 250 // TSIG
+    or code == 41; // OPT
 }
 
 const test_zone_text =
@@ -636,6 +650,50 @@ test "delete every RRset at an apex name keeps the SOA and the NS" {
     var ns_lookup = rebuilt.lookup(std.testing.allocator, "example.com.", .NS);
     defer ns_lookup.deinit(std.testing.allocator);
     try std.testing.expectEqual(.answer, ns_lookup.kind);
+}
+
+test "RFC 2181 section 10.1: an add never creates a second CNAME" {
+    const cname_zone =
+        \\$ORIGIN example.com.
+        \\$TTL 3600
+        \\@ IN SOA ns1.example.com. hostmaster.example.com. 7 3600 900 1209600 3600
+        \\@ IN NS ns1.example.com.
+        \\alias IN CNAME first.example.com.
+        \\
+    ;
+    var zone = try buildZone(cname_zone);
+    defer zone.deinit();
+    var updates = [_]dns_record.ResourceRecord{makeRecord("alias.example.com.", .CNAME, CLASS_IN, 60, .{ .CNAME = makeName("second.example.com.") })};
+    const outcome = try apply(std.testing.allocator, &zone, "example.com.", &.{}, &updates);
+    const text = zoneText(outcome);
+    defer std.testing.allocator.free(text);
+    var rebuilt = try buildZone(text);
+    defer rebuilt.deinit();
+    var count: usize = 0;
+    for (rebuilt.records.items[0..rebuilt.records.len]) |record| {
+        if (!record.rrtype.eql(.CNAME)) continue;
+        count += 1;
+        try std.testing.expectEqualStrings("first.example.com.", record.rdataText());
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
+}
+
+test "RFC 2136 section 3.4.1.2: a meta type cannot be added by an update" {
+    var zone = try buildZone(test_zone_text);
+    defer zone.deinit();
+    const maila = RecordType{ .value = 254 };
+    const ixfr = RecordType{ .value = 251 };
+    const cases = [_]struct { rr: dns_record.ResourceRecord, class: u16 }{
+        .{ .rr = makeRecord("www.example.com.", maila, CLASS_IN, 60, emptyRdata()), .class = CLASS_IN },
+        .{ .rr = makeRecord("www.example.com.", ixfr, CLASS_IN, 60, emptyRdata()), .class = CLASS_IN },
+        .{ .rr = makeRecord("www.example.com.", .OPT, CLASS_IN, 0, emptyRdata()), .class = CLASS_IN },
+        .{ .rr = makeRecord("www.example.com.", ixfr, CLASS_ANY, 0, emptyRdata()), .class = CLASS_ANY },
+    };
+    for (cases) |case| {
+        var updates = [_]dns_record.ResourceRecord{case.rr};
+        const outcome = try apply(std.testing.allocator, &zone, "example.com.", &.{}, &updates);
+        try std.testing.expectEqual(header.Rcode.formerr, zoneRcode(outcome));
+    }
 }
 
 test "prerequisites refuse with the RFC rcode" {

@@ -50,27 +50,55 @@ pub const Name = struct {
     fn fromTextWithCase(text: []const u8, fold_case: bool) Error!Name {
         if (std.mem.eql(u8, text, ".")) return Name.root();
         var name = Name{ .wire_len = 0 };
-        var start: usize = 0;
-        while (start < text.len) {
-            const dot_index = std.mem.indexOfScalarPos(u8, text, start, '.') orelse return Error.EndOfInput;
-            const label = text[start..dot_index];
-            if (label.len == 0) {
-                if (dot_index == text.len - 1) {
+        var label: [max_label_len]u8 = undefined;
+        var label_len: usize = 0;
+        var index: usize = 0;
+        while (index < text.len) {
+            const byte = text[index];
+            if (byte == '\\') {
+                // RFC 1035 section 5.1: a backslash escapes the next octet,
+                // and three decimal digits name an arbitrary octet.
+                if (index + 1 >= text.len) return Error.EndOfInput;
+                const next = text[index + 1];
+                if (std.ascii.isDigit(next)) {
+                    if (index + 3 >= text.len) return Error.EndOfInput;
+                    const second = text[index + 2];
+                    const third = text[index + 3];
+                    if (!std.ascii.isDigit(second) or !std.ascii.isDigit(third)) return Error.EndOfInput;
+                    const value = @as(u16, next - '0') * 100 + @as(u16, second - '0') * 10 + @as(u16, third - '0');
+                    if (value > 255) return Error.EndOfInput;
+                    try pushLabelByte(&label, &label_len, @intCast(value), fold_case);
+                    index += 4;
+                } else {
+                    try pushLabelByte(&label, &label_len, next, fold_case);
+                    index += 2;
+                }
+                continue;
+            }
+            if (byte == '.') {
+                if (label_len == 0) return Error.EndOfInput;
+                try name.pushByte(@intCast(label_len));
+                for (label[0..label_len]) |label_byte| try name.pushByte(label_byte);
+                label_len = 0;
+                index += 1;
+                if (index == text.len) {
                     try name.pushByte(0);
                     return name;
                 }
-                return Error.EndOfInput;
+                continue;
             }
-            if (label.len > max_label_len) return Error.LabelTooLong;
-            try name.pushByte(@intCast(label.len));
-            for (label) |byte| try name.pushByte(if (fold_case) std.ascii.toLower(byte) else byte);
-            start = dot_index + 1;
-            if (start == text.len) {
-                try name.pushByte(0);
-                return name;
-            }
+            try pushLabelByte(&label, &label_len, byte, fold_case);
+            index += 1;
         }
+        // RFC 1035 section 5.1: a name without the trailing dot is relative,
+        // and this server only holds absolute names.
         return Error.EndOfInput;
+    }
+
+    fn pushLabelByte(label: *[max_label_len]u8, label_len: *usize, byte: u8, fold_case: bool) Error!void {
+        if (label_len.* >= max_label_len) return Error.LabelTooLong;
+        label[label_len.*] = if (fold_case) std.ascii.toLower(byte) else byte;
+        label_len.* += 1;
     }
 
     pub fn asWire(self: *const Name) []const u8 {
@@ -214,18 +242,44 @@ pub const Name = struct {
             }
             input_index += 1;
             if (input_index + len > self.wire_len) return Error.EndOfInput;
-            const separator_len: usize = if (output_index == 0) 0 else 1;
-            if (output_index + separator_len + len + 1 > buffer.len) return Error.OutputTooSmall;
-            if (separator_len == 1) {
+            if (output_index != 0) {
+                if (output_index >= buffer.len) return Error.OutputTooSmall;
                 buffer[output_index] = '.';
                 output_index += 1;
             }
-            @memcpy(buffer[output_index .. output_index + len], self.wire[input_index .. input_index + len]);
-            output_index += len;
+            for (self.wire[input_index .. input_index + len]) |byte| {
+                output_index = try appendTextByte(buffer, output_index, byte);
+            }
             input_index += len;
         }
 
         return Error.EndOfInput;
+    }
+
+    /// RFC 1035 section 5.1: the presentation form escapes the octets that
+    /// are syntax — the dot, the backslash, the dig special characters, and
+    /// everything that is not printable ASCII — so a rendered name reads back
+    /// as the name it came from and cannot break the zone line it is written
+    /// into.
+    fn appendTextByte(buffer: []u8, output_index: usize, byte: u8) Error!usize {
+        const escapes: []const u8 = "\\.;\"()@$";
+        if (byte >= 0x21 and byte <= 0x7e and std.mem.indexOfScalar(u8, escapes, byte) == null) {
+            if (output_index >= buffer.len) return Error.OutputTooSmall;
+            buffer[output_index] = byte;
+            return output_index + 1;
+        }
+        if (byte >= 0x21 and byte <= 0x7e) {
+            if (output_index + 2 > buffer.len) return Error.OutputTooSmall;
+            buffer[output_index] = '\\';
+            buffer[output_index + 1] = byte;
+            return output_index + 2;
+        }
+        if (output_index + 4 > buffer.len) return Error.OutputTooSmall;
+        buffer[output_index] = '\\';
+        buffer[output_index + 1] = '0' + (byte / 100);
+        buffer[output_index + 2] = '0' + (byte / 10 % 10);
+        buffer[output_index + 3] = '0' + (byte % 10);
+        return output_index + 4;
     }
 
     fn pushByte(self: *Name, byte: u8) Error!void {

@@ -60,14 +60,20 @@ pub fn serveXfrTlsStream(
     var output_buffer: [tls_server.output_buffer_len]u8 = undefined;
     // The channel reads and writes the raw descriptor under a poll deadline.
     // A socket timeout with a std.Io read would surface a timed-out read as
-    // EAGAIN, and the standard library treats that as a fatal error.
+    // EAGAIN, and the standard library treats that as a fatal error. The
+    // send timeout bounds a peer that stops reading, because a blocking
+    // write cannot be interrupted by the poll deadline.
+    tcp_deadline.setSocketTimeout(stream.socket.handle, listener.tcpIdleTimeout());
     var stream_reader = tcp_deadline.DeadlineReader.init(stream.socket.handle, io, &input_buffer, listener.tcpIdleTimeout());
     var stream_writer = tcp_deadline.DeadlineWriter.init(stream.socket.handle, io, &output_buffer, listener.tcpIdleTimeout());
-    // The handshake is part of the connection, so it shares its deadline.
-    if (connection_deadline) |value| {
-        stream_reader.setFrameDeadline(value);
-        stream_writer.setFrameDeadline(value);
-    }
+    // The handshake is part of the connection, so it shares its deadline;
+    // without an operator bound it still gets the module's own window, so a
+    // peer that dribbles handshake bytes holds the worker no longer than one
+    // frame timeout.
+    const handshake_timeout = listener.frameTimeout(io, connection_deadline, listener.tcpIdleTimeout()) orelse return;
+    const handshake_deadline = tcp_deadline.deadline(io, handshake_timeout);
+    stream_reader.setFrameDeadline(handshake_deadline);
+    stream_writer.setFrameDeadline(handshake_deadline);
     var connection = try server.handshake(&stream_reader.interface, &stream_writer.interface);
 
     var read_buffer: [STREAM_BUFFER_SIZE]u8 = undefined;
@@ -105,6 +111,7 @@ fn serveXfrFrames(channel: *const channel_mod.Channel, runtime: *Runtime, counte
         // arrived while the flag was set, so the answer that follows a
         // reload always comes from the new zone.
         _ = runtime.reloadZoneIfRequested(channel.io);
+        _ = runtime.refreshCatalogIfRequested(channel.io);
         // One deadline for the whole frame: a peer that stalls in the middle
         // of a frame loses the frame, not the server.
         if (!channel.applyFrameDeadline()) return;
@@ -119,6 +126,7 @@ fn serveXfrFrames(channel: *const channel_mod.Channel, runtime: *Runtime, counte
         var frame_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer frame_arena.deinit();
         _ = runtime.reloadZoneIfRequested(channel.io);
+        _ = runtime.refreshCatalogIfRequested(channel.io);
         // The answer gets its own deadline: the read took time, and the
         // connection may be nearly over.
         if (!channel.applyFrameDeadline()) return;

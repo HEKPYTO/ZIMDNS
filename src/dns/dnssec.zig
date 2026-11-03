@@ -367,10 +367,16 @@ fn orderLabel(a: []const u8, b: []const u8) i8 {
     return 0;
 }
 
-/// True when `qname` falls strictly inside the NSEC span (owner, next):
-/// owner < qname < next in canonical order, the RFC 4035 denial condition.
+/// True when `qname` falls strictly inside the NSEC span (owner, next) in
+/// canonical order. The last NSEC of a zone has an owner that sorts after
+/// its next name (the apex), and its span wraps around the end of the zone:
+/// it covers every name after its owner (RFC 4035 section 5.4 and RFC 6840
+/// section 4.3).
 pub fn nsecCovers(owner: Name, next: Name, qname: Name) bool {
-    return compareNames(owner, qname) < 0 and compareNames(qname, next) < 0;
+    const owner_before_name = compareNames(owner, qname) < 0;
+    const name_before_next = compareNames(qname, next) < 0;
+    if (compareNames(owner, next) < 0) return owner_before_name and name_before_next;
+    return owner_before_name or name_before_next;
 }
 
 /// NSEC3 hash (RFC 5155 section 5): iterated salted SHA-1 over the
@@ -2203,4 +2209,19 @@ test "aggressive cache proofs expire, cap, and refresh (RFC 8198 4)" {
     // Re-inserting after expiry refreshes the proof.
     cache.insertNsec(owner, next, &bitmap, 2_000, 60, null, .{});
     try std.testing.expectEqual(Denial.nodata, (try cache.deny(owner, qtxt, 2_059)).?.denial);
+}
+
+test "RFC 4035 section 5.4: the last NSEC covers the end of the zone" {
+    const apex = try Name.fromText("example.");
+    const last = try Name.fromText("zzz.example.");
+    const queried = try Name.fromText("zzzz.example.");
+    // The last NSEC of a zone has an owner sorting after its next name (the
+    // apex); its span wraps around and covers the names after it.
+    try std.testing.expect(nsecCovers(last, apex, queried));
+    try std.testing.expect(!nsecCovers(last, apex, try Name.fromText("a.example.")));
+    // A normal span does not wrap.
+    const a = try Name.fromText("a.example.");
+    const m = try Name.fromText("m.example.");
+    try std.testing.expect(nsecCovers(a, m, try Name.fromText("b.example.")));
+    try std.testing.expect(!nsecCovers(a, m, try Name.fromText("z.example.")));
 }

@@ -491,7 +491,9 @@ pub fn buildResponseWithPolicy(
             // The minimal ANY answer signs its own RRsets, so the covering
             // signatures are attached with it.
             if (!any_answer) appendCoveringRrsigs(&response, zone, .ANY, lookup.answer_owner) catch {};
-            if (lookup.kind == .nodata or lookup.kind == .nxdomain) {
+            // The minimal ANY answer is an answer, not a denial: it carries
+            // its own signatures and no denial proof.
+            if (!any_answer and (lookup.kind == .nodata or lookup.kind == .nxdomain)) {
                 const proved = appendDenialProofs(&response, zone, qname_text, q.qtype, lookup.kind) catch false;
                 if (!proved) refuseUnprovenDenial(&response);
             } else if (lookup.kind == .referral) {
@@ -870,6 +872,13 @@ fn answerHoldsSignature(response: *const dns_message.Message, owner: dns_name.Na
 /// it has always served. The result is false when the chain cannot prove the
 /// denial: a wrong proof is worse than none, so the caller answers server
 /// failure instead.
+fn zoneCarriesDnssec(zone: *const zone_index.Zone) bool {
+    for (zone.records.items[0..zone.records.len]) |record| {
+        if (record.rrtype.eql(.NSEC) or record.rrtype.eql(.NSEC3) or record.rrtype.eql(.RRSIG)) return true;
+    }
+    return false;
+}
+
 fn appendDenialProofs(
     response: *dns_message.Message,
     zone: *const zone_index.Zone,
@@ -913,6 +922,10 @@ fn appendDenialProofs(
             attached += 1;
         }
     }
+    // A denial with no proof is not an authenticated denial, and serving an
+    // unsigned NXDOMAIN from a signed zone would be bogus to a validator. A
+    // zone that carries no DNSSEC records at all has nothing to prove.
+    if (attached == 0) return !zoneCarriesDnssec(zone);
     try appendApexNsec3Param(response, zone);
     return true;
 }

@@ -80,6 +80,8 @@ pub const Result = struct {
 const max_records = 256;
 const max_rrsets = 64;
 const max_proofs = 32;
+/// RFC 5155 section 10.3: the most iterations this validator will hash.
+const max_nsec3_iterations: u16 = 150;
 const max_chains = 8;
 /// Bounds the CNAME walk in `terminalName` and the closest-encloser walk.
 const max_labels = 128;
@@ -575,7 +577,10 @@ fn rsaPublicKeyParts(key: []const u8) ?struct { exponent: []const u8, modulus: [
 fn verifyRsa(key: []const u8, signature: []const u8, data: []const u8, comptime Hash: type) Error!void {
     const parts = rsaPublicKeyParts(key) orelse return Error.MalformedDnskey;
     const modulus_len = parts.modulus.len;
-    if (modulus_len < 64 or modulus_len > 512) return Error.UnsupportedAlgorithm;
+    // RFC 5702 sections 2.1 and 2.2: 512 bits is the floor for SHA-256 and
+    // 1024 bits for SHA-512; 4096 bits is the ceiling for both.
+    const min_modulus: usize = if (Hash == std.crypto.hash.sha2.Sha512) 128 else 64;
+    if (modulus_len < min_modulus or modulus_len > 512) return Error.UnsupportedAlgorithm;
     if (signature.len != modulus_len) return Error.SignatureInvalid;
     const public_key = std.crypto.Certificate.rsa.PublicKey.fromBytes(parts.exponent, parts.modulus) catch
         return Error.MalformedDnskey;
@@ -1207,6 +1212,10 @@ const Validator = struct {
         var saw_signature = false;
         var has_keys = false;
         var unsupported_algorithm = false;
+        // RFC 4035 section 5.3.3: a validator tries every RRSIG that covers
+        // the RRset, so one expired or not-yet-valid signature beside a good
+        // one does not make the answer bogus.
+        var time_failure: ?u16 = null;
         for (self.rrsigs.items) |rrsig| {
             if (rrsig.covered != rrset.rrtype or !rrsig.owner.eql(&rrset.owner)) continue;
             saw_signature = true;
@@ -1232,7 +1241,10 @@ const Validator = struct {
                 continue;
             }
             const status = dnssec.rrsigTimeStatus(rrsig.raw, self.now) catch return self.fail(dnssec.EDE_DNSSEC_BOGUS);
-            if (status != .valid) return self.fail(dnssec.rrsigTimeEde(status).?);
+            if (status != .valid) {
+                time_failure = dnssec.rrsigTimeEde(status).?;
+                continue;
+            }
             const data = try signedData(self.allocator, rrset.records.items, rrsig);
             for (keys) |key| {
                 verifyWithKey(key, rrsig, data) catch continue;
@@ -1249,6 +1261,7 @@ const Validator = struct {
             if (self.anchors.covers(rrset.owner)) return self.fail(dnssec.EDE_RRSIGS_MISSING);
             return .insecure;
         }
+        if (time_failure) |ede| return self.fail(ede);
         if (!has_keys) return .insecure;
         if (unsupported_algorithm) {
             self.noteInsecure(dnssec.EDE_UNSUPPORTED_DNSKEY_ALGORITHM);
@@ -1502,6 +1515,10 @@ const Validator = struct {
     /// used and any other set is rejected outright.
     fn hash(self: *Validator, name: Name) [20]u8 {
         const proof = self.nsec3s.items[0];
+        // RFC 5155 section 10.3: the iteration count drives the validator's
+        // work and comes from the response, so a count above this ceiling is
+        // not hashed at all. RFC 9276 section 3.1 asks publishers for zero;
+        // this is the validator's own bound.
         var out: [20]u8 = undefined;
         dnssec.nsec3Hash(name, proof.salt, proof.iterations, &out);
         return out;
@@ -1519,6 +1536,13 @@ const Validator = struct {
     /// RFC 5155 sections 8.4 to 8.7, dispatched on what the response claims.
     fn checkNsec3Denial(self: *Validator, name: Name, qtype: u16, delegation: bool, nxdomain: bool) Error!Outcome {
         if (!self.nsec3ParamsConsistent()) return self.fail(dnssec.EDE_DNSSEC_BOGUS);
+        // RFC 5155 section 10.3: bound the work a proof can demand. A chain
+        // this far above the recommendation cannot be authenticated here, so
+        // the answer is insecure rather than an expensive denial.
+        if (self.nsec3s.items[0].iterations > max_nsec3_iterations) {
+            self.noteInsecure(dnssec.EDE_UNSUPPORTED_NSEC3_ITERATIONS);
+            return .insecure;
+        }
         const outcome = try self.nsec3Denial(name, qtype, delegation, nxdomain);
         if (outcome == .bogus) return .bogus;
         // RFC 4035 section 5.4: the proof must be authenticated before it may
@@ -4006,6 +4030,29 @@ test "RFC 9276 section 3.2: an answer proven by an NSEC3 chain with an iteration
     const next_labels = [_][]const u8{ h_ns1, "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv" };
     const bitmaps = [_][]const u8{ &apex_bitmap, &covering_bitmap };
     var pair = try nsec3Exchange(std.testing.allocator, &key, "w.example.", .A, .nxdomain, &labels, &flags, &next_labels, &bitmaps, nsec3_iterations);
+    defer pair.query.deinit();
+    defer pair.response.deinit();
+
+    const result = try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds);
+    try expectStatus(.insecure, result);
+    try std.testing.expectEqual(dnssec.EDE_UNSUPPORTED_NSEC3_ITERATIONS, result.ede);
+}
+
+test "RFC 5155 section 10.3: an iteration count above the validator ceiling is not hashed" {
+    var key = try zone_signer.parseKey(ed25519_secret);
+    defer key.deinit();
+    const dnskey_rdata = try key.dnskeyRdata(std.testing.allocator);
+    defer std.testing.allocator.free(dnskey_rdata);
+    var anchors = try dnskeyAnchor(std.testing.allocator, "example.", dnskey_rdata);
+    defer anchors.deinit(std.testing.allocator);
+
+    const apex_bitmap = typeBitmap(&.{ .SOA, .NS, .RRSIG, .NSEC3, .DNSKEY });
+    const covering_bitmap = typeBitmap(&.{ .RRSIG, .NSEC3 });
+    const labels = [_][]const u8{ h_example, "00000000000000000000000000000000" };
+    const flags = [_]u8{ 0, 0 };
+    const next_labels = [_][]const u8{ h_ns1, "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv" };
+    const bitmaps = [_][]const u8{ &apex_bitmap, &covering_bitmap };
+    var pair = try nsec3Exchange(std.testing.allocator, &key, "w.example.", .A, .nxdomain, &labels, &flags, &next_labels, &bitmaps, 65535);
     defer pair.query.deinit();
     defer pair.response.deinit();
 

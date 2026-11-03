@@ -10,6 +10,7 @@ const response_mod = @import("../auth/response.zig");
 const dns_message = @import("../dns/message.zig");
 const keyring_mod = @import("../auth/keyring.zig");
 const xfr_client = @import("../zone/xfr_client.zig");
+const catalog_mod = @import("../zone/catalog.zig");
 const blocklist_mod = @import("../blocklist.zig");
 const parser = @import("parser.zig");
 const listener = @import("../platform/listener.zig");
@@ -56,6 +57,13 @@ pub const Error = error{
     BadCatalogMember,
 };
 
+/// The RFC 9432 consumer facts the loader hands to the runtime.
+pub const CatalogConsumerState = struct {
+    apex: []const u8,
+    primary: std.Io.net.IpAddress,
+    members: []const catalog_mod.Member,
+};
+
 pub const ServerContext = struct {
     allocator: std.mem.Allocator,
     config: parser.Config,
@@ -67,6 +75,10 @@ pub const ServerContext = struct {
     /// `dnssec-key-file` is configured. The runtime that inherits it owns it
     /// and wipes it when it is deinited.
     dnssec_session: ?signer.Session = null,
+    /// RFC 9432 section 5 consumer facts, moved into the runtime by
+    /// `takeRuntime`; the names and the member slice are owned here until
+    /// then.
+    catalog_consumer_state: ?CatalogConsumerState = null,
     /// RFC 4035 section 5.2 trust anchors for the forwarding path. Empty when
     /// no `trust-anchor-file` is configured, which is what keeps the forwarder
     /// a non-validating one.
@@ -419,6 +431,24 @@ pub const ServerContext = struct {
             restoreJournal(self.allocator, &runtime, journal) catch return Error.BadConfiguration;
             journal_mod.activate(journal);
         }
+        if (self.catalog_consumer_state) |*state| {
+            runtime.setCatalogConsumer(state.apex, state.primary) catch {
+                runtime.deinit();
+                return error.BadConfiguration;
+            };
+            runtime.setCatalogMembers(state.members) catch {
+                runtime.deinit();
+                return error.BadConfiguration;
+            };
+            // The runtime holds its own copies.
+            self.allocator.free(state.apex);
+            for (state.members) |member| {
+                self.allocator.free(member.label);
+                self.allocator.free(member.name);
+            }
+            self.allocator.free(state.members);
+            self.catalog_consumer_state = null;
+        }
         self.blocklist = .{};
         self.config = .{};
         return runtime;
@@ -435,6 +465,15 @@ pub const ServerContext = struct {
         self.zones = .empty;
         self.blocklist = .{};
         self.keyring.deinit();
+        if (self.catalog_consumer_state) |*state| {
+            self.allocator.free(state.apex);
+            for (state.members) |member| {
+                self.allocator.free(member.label);
+                self.allocator.free(member.name);
+            }
+            self.allocator.free(state.members);
+            self.catalog_consumer_state = null;
+        }
         self.config = .{};
         if (self.dnssec_session) |*session| session.deinit();
         self.dnssec_session = null;
@@ -738,75 +777,44 @@ fn consumeCatalog(
 
     const catalog_text = xfr_client.fetch(allocator, io, &primary, apex, timeout) catch return Error.BadCatalogMember;
     defer allocator.free(catalog_text);
-    try loadZoneText(context, allocator, io, catalog_text, apex, null, now_seconds, chain_policy);
-
-    var catalog: ?*const zone_index.Zone = null;
-    for (context.zones.items) |*zone| {
-        if (std.ascii.eqlIgnoreCase(zone.originText(), apex)) catalog = zone;
-    }
-    const catalog_zone = catalog orelse return Error.BadCatalogMember;
-
-    // RFC 9432 section 4.2.1: exactly one `version.<catalog>` TXT RR whose
-    // value is the schema this build implements.
-    var version_owner_buffer: [512]u8 = undefined;
-    const version_owner = std.fmt.bufPrint(&version_owner_buffer, "version.{s}", .{apex}) catch return Error.BadCatalogMember;
-    var version_records: usize = 0;
-    var version_is_two = false;
-    for (catalog_zone.records.items[0..catalog_zone.records.len]) |record| {
-        if (!record.rrtype.eql(.TXT)) continue;
-        if (!std.ascii.eqlIgnoreCase(record.ownerText(), version_owner)) continue;
-        version_records += 1;
-        const parsed = zone_parser.parseRData(.TXT, record.rdataText()) catch return Error.BadCatalogMember;
-        const value = switch (parsed) {
-            .TXT => |txt| txt.text(),
-            else => return Error.BadCatalogMember,
-        };
-        if (std.mem.eql(u8, value, "2")) version_is_two = true;
-    }
-    if (version_records != 1 or !version_is_two) return Error.BadCatalogMember;
-
-    // Section 4.1: one PTR per member node, the target naming the zone.
-    var members: std.ArrayList([]const u8) = .empty;
+    const members = catalog_mod.members(allocator, catalog_text, apex) catch return Error.BadCatalogMember;
     defer {
-        for (members.items) |member| allocator.free(member);
-        members.deinit(allocator);
-    }
-    for (catalog_zone.records.items[0..catalog_zone.records.len]) |record| {
-        if (!record.rrtype.eql(.PTR)) continue;
-        const label = catalogMemberLabel(record.ownerText(), apex) orelse continue;
-        _ = label;
-        const parsed = zone_parser.parseRData(.PTR, record.rdataText()) catch return Error.BadCatalogMember;
-        const target = switch (parsed) {
-            .PTR => |name| name,
-            else => return Error.BadCatalogMember,
-        };
-        var target_buffer: [512]u8 = undefined;
-        const target_text = target.toText(&target_buffer) catch return Error.BadCatalogMember;
-        for (members.items) |existing| {
-            if (std.ascii.eqlIgnoreCase(existing, target_text)) return Error.BadCatalogMember;
+        for (members) |member| {
+            allocator.free(member.label);
+            allocator.free(member.name);
         }
-        try members.append(allocator, try allocator.dupe(u8, target_text));
+        allocator.free(members);
     }
-
-    for (members.items) |member| {
-        if (std.ascii.eqlIgnoreCase(member, apex)) return Error.BadCatalogMember;
-        const member_text = xfr_client.fetch(allocator, io, &primary, member, timeout) catch return Error.BadCatalogMember;
+    try loadZoneText(context, allocator, io, catalog_text, apex, null, now_seconds, chain_policy);
+    for (members) |member| {
+        const member_text = xfr_client.fetch(allocator, io, &primary, member.name, timeout) catch return Error.BadCatalogMember;
         defer allocator.free(member_text);
-        try loadZoneText(context, allocator, io, member_text, member, null, now_seconds, chain_policy);
+        try loadZoneText(context, allocator, io, member_text, member.name, null, now_seconds, chain_policy);
     }
-}
 
-/// The member label when `owner` is `<label>.zones.<apex>` and `label` is one
-/// non-empty label; null for every other name.
-fn catalogMemberLabel(owner: []const u8, apex: []const u8) ?[]const u8 {
-    const tail = ".zones.";
-    if (owner.len <= apex.len + tail.len) return null;
-    const tail_offset = owner.len - (apex.len + tail.len);
-    if (!std.ascii.eqlIgnoreCase(owner[tail_offset..][0..tail.len], tail)) return null;
-    if (!std.ascii.eqlIgnoreCase(owner[tail_offset + tail.len ..], apex)) return null;
-    const label = owner[0..tail_offset];
-    if (label.len == 0 or std.mem.indexOfScalar(u8, label, '.') != null) return null;
-    return label;
+    // The runtime keeps the same facts so a NOTIFY for the catalog can ask
+    // for another read (RFC 9432 section 5.4).
+    const owned_members = try allocator.alloc(catalog_mod.Member, members.len);
+    var filled: usize = 0;
+    errdefer {
+        for (owned_members[0..filled]) |member| {
+            allocator.free(member.label);
+            allocator.free(member.name);
+        }
+        allocator.free(owned_members);
+    }
+    for (members, 0..) |member, index| {
+        owned_members[index] = .{
+            .label = try allocator.dupe(u8, member.label),
+            .name = try allocator.dupe(u8, member.name),
+        };
+        filled += 1;
+    }
+    context.catalog_consumer_state = .{
+        .apex = try allocator.dupe(u8, apex),
+        .primary = primary,
+        .members = owned_members,
+    };
 }
 
 /// The RFC 9432 section 4 catalog zone for the zones this server serves: the

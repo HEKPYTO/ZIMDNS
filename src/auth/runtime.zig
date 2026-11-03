@@ -27,6 +27,9 @@ const tsig = @import("../dns/tsig.zig");
 const transfer = @import("../zone/transfer.zig");
 const journal_mod = @import("../zone/journal.zig");
 const zone_update = @import("../zone/update.zig");
+const catalog_mod = @import("../zone/catalog.zig");
+const zonemd = @import("../zone/zonemd.zig");
+const xfr_client = @import("../zone/xfr_client.zig");
 
 /// Scratch memory for one answer. Nothing parsed or built for a response
 /// outlives the encoded bytes, so one arena per thread is reset and reused
@@ -69,6 +72,28 @@ pub const ReloadSource = struct {
     path: []const u8,
     origin: []const u8,
 };
+
+/// RFC 9432 section 5 consumer state: the catalog apex, the primary it is
+/// fetched from, and the members most recently provisioned.
+pub const CatalogConsumer = struct {
+    apex: []const u8,
+    primary: std.Io.net.IpAddress,
+    members: std.ArrayList(CatalogMember) = .empty,
+};
+
+/// One provisioned member: the `<unique>` label of the catalog node and the
+/// zone it names. A changed label is a removal and a fresh add (RFC 9432
+/// section 5.4), so both travel together.
+pub const CatalogMember = struct {
+    label: []const u8,
+    name: []const u8,
+};
+
+/// What one catalog refresh did.
+pub const CatalogRefreshOutcome = enum { unchanged, updated, failed };
+
+/// The smallest interval between two catalog refresh attempts.
+pub const catalog_refresh_window_ns: i64 = 1 * std.time.ns_per_s;
 
 /// One RFC 1996 NOTIFY destination: the zone apex whose change is announced
 /// and the address the announcement goes to.
@@ -183,7 +208,8 @@ pub const Runtime = struct {
     transfer_delta_logs: std.ArrayList(journal_mod.DeltaLog) = .empty,
     /// The zone file an operator can replace, and the apex it must provide.
     /// Null when no zone file is reloadable.
-    reload_source: ?ReloadSource = null,
+    /// Every configured zone file a SIGHUP re-reads, in configuration order.
+    reload_sources: std.ArrayList(ReloadSource) = .empty,
     /// RFC 2136 update policies, one per zone the operator allowed updates
     /// for. Empty unless `allow-update` is configured.
     update_policies: std.ArrayList(UpdatePolicy) = .empty,
@@ -193,6 +219,16 @@ pub const Runtime = struct {
     /// The TTL of the service-binding records. RFC 9461 sets none; an hour is
     /// the answer's own lifetime, not the zone's.
     ddr_ttl: u32 = 3600,
+    /// RFC 9432 section 5: the catalog this server was provisioned from, and
+    /// the members it currently serves. Null unless `catalog-consumer` is
+    /// configured; every name is owned.
+    catalog_consumer: ?CatalogConsumer = null,
+    /// Set by a NOTIFY for the catalog apex and cleared by the refresh that
+    /// answers it; the serving loop performs the network fetch.
+    catalog_refresh_requested: std.atomic.Value(bool) = .init(false),
+    /// The last refresh attempt, so a NOTIFY storm cannot drive one transfer
+    /// per packet through the serving thread.
+    catalog_refresh_attempted_ns: ?i64 = null,
     /// RFC 9461 service-binding RDATA (wire form) the resolver publishes at
     /// `_dns.resolver.arpa.` for RFC 9462 discovery. Empty unless `ddr` is
     /// configured; every slice is owned.
@@ -301,11 +337,12 @@ pub const Runtime = struct {
         self.zones = .empty;
         self.transfer_delta_logs.deinit(self.allocator);
         self.transfer_delta_logs = .empty;
-        if (self.reload_source) |source| {
+        for (self.reload_sources.items) |source| {
             self.allocator.free(source.path);
             self.allocator.free(source.origin);
-            self.reload_source = null;
         }
+        self.reload_sources.deinit(self.allocator);
+        self.reload_sources = .empty;
         for (self.update_policies.items) |policy| {
             self.allocator.free(policy.origin);
             self.allocator.free(policy.key_name);
@@ -319,6 +356,15 @@ pub const Runtime = struct {
         for (self.ddr_rdatas.items) |rdata| self.allocator.free(rdata);
         self.ddr_rdatas.deinit(self.allocator);
         self.ddr_rdatas = .empty;
+        if (self.catalog_consumer) |*consumer| {
+            self.allocator.free(consumer.apex);
+            for (consumer.members.items) |member| {
+                self.allocator.free(member.label);
+                self.allocator.free(member.name);
+            }
+            consumer.members.deinit(self.allocator);
+            self.catalog_consumer = null;
+        }
         self.blocklist = .{};
         if (self.answer_policy.nsid) |nsid| self.allocator.free(nsid);
         self.answer_policy = .{};
@@ -349,14 +395,26 @@ pub const Runtime = struct {
     /// must provide. The runtime copies the path and the apex, so the caller
     /// keeps ownership of its own text; the directory is borrowed.
     pub fn setReloadSource(self: *Runtime, dir: std.Io.Dir, path: []const u8, origin: []const u8) !void {
+        self.clearReloadSources();
+        try self.addReloadSource(dir, path, origin);
+    }
+
+    /// Adds one configured zone file a SIGHUP re-reads. A multi-zone
+    /// configuration calls this once per zone file.
+    pub fn addReloadSource(self: *Runtime, dir: std.Io.Dir, path: []const u8, origin: []const u8) !void {
         const owned_path = try self.allocator.dupe(u8, path);
         errdefer self.allocator.free(owned_path);
         const owned_origin = try self.allocator.dupe(u8, origin);
-        if (self.reload_source) |source| {
+        errdefer self.allocator.free(owned_origin);
+        try self.reload_sources.append(self.allocator, .{ .dir = dir, .path = owned_path, .origin = owned_origin });
+    }
+
+    fn clearReloadSources(self: *Runtime) void {
+        for (self.reload_sources.items) |source| {
             self.allocator.free(source.path);
             self.allocator.free(source.origin);
         }
-        self.reload_source = .{ .dir = dir, .path = owned_path, .origin = owned_origin };
+        self.reload_sources.clearRetainingCapacity();
     }
 
     /// Records an RFC 2136 update policy: the apex, the TSIG key name that may
@@ -392,6 +450,275 @@ pub const Runtime = struct {
         const owned = try self.allocator.dupe(u8, writer.written());
         errdefer self.allocator.free(owned);
         try self.ddr_rdatas.append(self.allocator, owned);
+    }
+
+    /// Records the RFC 9432 catalog this server is provisioned from. The
+    /// apex is copied.
+    pub fn setCatalogConsumer(self: *Runtime, apex: []const u8, primary: std.Io.net.IpAddress) !void {
+        const owned = try self.allocator.dupe(u8, apex);
+        errdefer self.allocator.free(owned);
+        if (self.catalog_consumer) |*consumer| {
+            // A consumer pointed at a different primary keeps the members it
+            // serves; the next refresh reconciles them against the catalog.
+            self.allocator.free(consumer.apex);
+            consumer.apex = owned;
+            consumer.primary = primary;
+            return;
+        }
+        self.catalog_consumer = .{ .apex = owned, .primary = primary };
+    }
+
+    /// Records the members the catalog currently names.
+    pub fn setCatalogMembers(self: *Runtime, members: []const catalog_mod.Member) !void {
+        var list: std.ArrayList(CatalogMember) = .empty;
+        errdefer {
+            for (list.items) |member| {
+                self.allocator.free(member.label);
+                self.allocator.free(member.name);
+            }
+            list.deinit(self.allocator);
+        }
+        for (members) |member| {
+            const label = try self.allocator.dupe(u8, member.label);
+            errdefer self.allocator.free(label);
+            const name = try self.allocator.dupe(u8, member.name);
+            errdefer self.allocator.free(name);
+            try list.append(self.allocator, .{ .label = label, .name = name });
+        }
+        const consumer = if (self.catalog_consumer) |*value| value else {
+            for (list.items) |member| {
+                self.allocator.free(member.label);
+                self.allocator.free(member.name);
+            }
+            list.deinit(self.allocator);
+            return;
+        };
+        for (consumer.members.items) |member| {
+            self.allocator.free(member.label);
+            self.allocator.free(member.name);
+        }
+        consumer.members.deinit(self.allocator);
+        consumer.members = list;
+    }
+
+    /// RFC 9432 section 5.4: a NOTIFY for the catalog asks the consumer to
+    /// read it again. The handler only sets the flag; the serve path fetches.
+    pub fn requestCatalogRefresh(self: *Runtime) void {
+        self.catalog_refresh_requested.store(true, .release);
+    }
+
+    /// Answers a pending catalog NOTIFY: re-fetch the catalog and apply its
+    /// members. The fetch runs before the exclusive lock is taken, so other
+    /// answers are not blocked by the lock; the fetch itself runs on the
+    /// serving thread, so an answer that arrives during it waits for the
+    /// transfer (a bounded ceiling, not a background job). At most one
+    /// attempt starts per `catalog_refresh_window_ns`, and a failed attempt
+    /// re-arms the request, so a transient failure retries after the window
+    /// instead of never.
+    pub fn refreshCatalogIfRequested(self: *Runtime, io: std.Io) ?CatalogRefreshOutcome {
+        if (!self.catalog_refresh_requested.swap(false, .acq_rel)) return null;
+        const now: i64 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
+        if (self.catalog_refresh_attempted_ns) |last| {
+            if (now - last < catalog_refresh_window_ns) {
+                self.catalog_refresh_requested.store(true, .release);
+                return null;
+            }
+        }
+        self.catalog_refresh_attempted_ns = now;
+        const outcome = self.refreshCatalog(io);
+        if (outcome == .failed) self.catalog_refresh_requested.store(true, .release);
+        return outcome;
+    }
+
+    fn refreshCatalog(self: *Runtime, io: std.Io) CatalogRefreshOutcome {
+        const consumer = if (self.catalog_consumer) |*value| value else return .failed;
+        const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(5000), .clock = .awake } };
+        const catalog_text = xfr_client.fetch(self.allocator, io, &consumer.primary, consumer.apex, timeout) catch {
+            reportReload(io, "error: cannot fetch the catalog {s}", .{consumer.apex});
+            return .failed;
+        };
+        defer self.allocator.free(catalog_text);
+        const new_members = catalog_mod.members(self.allocator, catalog_text, consumer.apex) catch {
+            reportReload(io, "error: the catalog {s} is malformed", .{consumer.apex});
+            return .failed;
+        };
+        defer {
+            for (new_members) |member| {
+                self.allocator.free(member.label);
+                self.allocator.free(member.name);
+            }
+            self.allocator.free(new_members);
+        }
+
+        var catalog_file = zone_parser.ZoneFile.parse(catalog_text) catch return .failed;
+        defer catalog_file.deinit();
+        var catalog_zone = zone_index.Zone.fromZoneFile(&catalog_file) catch return .failed;
+        if (!std.ascii.eqlIgnoreCase(catalog_zone.originText(), consumer.apex)) {
+            catalog_zone.deinit();
+            return .failed;
+        }
+        const new_serial = catalog_zone.soaSerial() orelse {
+            catalog_zone.deinit();
+            return .failed;
+        };
+        if (!self.refreshedZoneDigestOk(io, &catalog_zone)) {
+            catalog_zone.deinit();
+            return .failed;
+        }
+
+        // An unchanged serial means an unchanged membership: the members are
+        // not fetched at all.
+        self.lockShared();
+        const old_serial: ?u32 = if (self.zoneIndexForOrigin(consumer.apex)) |index| self.zones.items[index].soaSerial() else null;
+        self.unlockShared();
+        if (old_serial) |value| {
+            if (journal_mod.compareSerial(new_serial, value) != .newer) {
+                catalog_zone.deinit();
+                return .unchanged;
+            }
+        }
+
+        // Every member is fetched and parsed before the lock is taken, so a
+        // failed transfer or a broken zone leaves the served set whole.
+        var member_zones: std.ArrayList(zone_index.Zone) = .empty;
+        for (new_members) |member| {
+            const text = xfr_client.fetch(self.allocator, io, &consumer.primary, member.name, timeout) catch {
+                reportReload(io, "error: cannot fetch the catalog member {s}", .{member.name});
+                for (member_zones.items) |*zone| zone.deinit();
+                member_zones.deinit(self.allocator);
+                catalog_zone.deinit();
+                return .failed;
+            };
+            defer self.allocator.free(text);
+            var member_file = zone_parser.ZoneFile.parse(text) catch {
+                reportReload(io, "error: the catalog member {s} is malformed", .{member.name});
+                for (member_zones.items) |*zone| zone.deinit();
+                member_zones.deinit(self.allocator);
+                catalog_zone.deinit();
+                return .failed;
+            };
+            defer member_file.deinit();
+            var member_zone = zone_index.Zone.fromZoneFile(&member_file) catch {
+                reportReload(io, "error: the catalog member {s} is malformed", .{member.name});
+                for (member_zones.items) |*zone| zone.deinit();
+                member_zones.deinit(self.allocator);
+                catalog_zone.deinit();
+                return .failed;
+            };
+            if (!std.ascii.eqlIgnoreCase(member_zone.originText(), member.name)) {
+                member_zone.deinit();
+                reportReload(io, "error: the catalog member {s} arrived as another zone", .{member.name});
+                for (member_zones.items) |*zone| zone.deinit();
+                member_zones.deinit(self.allocator);
+                catalog_zone.deinit();
+                return .failed;
+            }
+            if (!self.refreshedZoneDigestOk(io, &member_zone)) {
+                member_zone.deinit();
+                for (member_zones.items) |*zone| zone.deinit();
+                member_zones.deinit(self.allocator);
+                catalog_zone.deinit();
+                return .failed;
+            }
+            member_zones.append(self.allocator, member_zone) catch {
+                member_zone.deinit();
+                for (member_zones.items) |*zone| zone.deinit();
+                member_zones.deinit(self.allocator);
+                catalog_zone.deinit();
+                return .failed;
+            };
+        }
+
+        self.lockExclusive();
+        defer self.unlockExclusive();
+        if (self.zoneIndexForOrigin(consumer.apex)) |_| {
+            const catalog_outcome = self.installZoneLocked(io, consumer.apex, &catalog_zone);
+            if (catalog_outcome != .replaced) {
+                catalog_zone.deinit();
+                for (member_zones.items) |*zone| zone.deinit();
+                member_zones.deinit(self.allocator);
+                // Another refresh installed the same serial first.
+                return if (catalog_outcome == .serial_not_newer) .unchanged else .failed;
+            }
+        } else {
+            self.zones.append(self.allocator, catalog_zone) catch {
+                catalog_zone.deinit();
+                for (member_zones.items) |*zone| zone.deinit();
+                member_zones.deinit(self.allocator);
+                return .failed;
+            };
+            self.transfer_delta_logs.append(self.allocator, .{}) catch {};
+        }
+
+        // A member whose label changed is removed and added again with fresh
+        // state (RFC 9432 section 5.4); a member the catalog stops naming is
+        // removed. The catalog zone itself stays.
+        var index: usize = 0;
+        while (index < consumer.members.items.len) {
+            const old = consumer.members.items[index];
+            var keep = false;
+            for (new_members) |member| {
+                if (!std.ascii.eqlIgnoreCase(member.name, old.name)) continue;
+                if (!std.ascii.eqlIgnoreCase(member.label, old.label)) continue;
+                keep = true;
+            }
+            if (keep) {
+                index += 1;
+                continue;
+            }
+            self.removeZoneLocked(old.name);
+            self.allocator.free(old.label);
+            self.allocator.free(old.name);
+            _ = consumer.members.orderedRemove(index);
+        }
+        for (new_members, 0..) |member, zone_index_value| {
+            var member_zone = member_zones.items[zone_index_value];
+            if (self.zoneIndexForOrigin(member.name) != null) {
+                const installed = self.installZoneLocked(io, member.name, &member_zone);
+                if (installed != .replaced) member_zone.deinit();
+            } else {
+                self.zones.append(self.allocator, member_zone) catch {
+                    member_zone.deinit();
+                    continue;
+                };
+                self.transfer_delta_logs.append(self.allocator, .{}) catch {};
+            }
+            const label = self.allocator.dupe(u8, member.label) catch continue;
+            const name = self.allocator.dupe(u8, member.name) catch {
+                self.allocator.free(label);
+                continue;
+            };
+            consumer.members.append(self.allocator, .{ .label = label, .name = name }) catch {
+                self.allocator.free(label);
+                self.allocator.free(name);
+            };
+        }
+        member_zones.deinit(self.allocator);
+        reportReload(io, "reloaded the catalog {s}: {d} member(s)", .{ consumer.apex, consumer.members.items.len });
+        return .updated;
+    }
+
+    /// RFC 8976 section 4: a zone whose apex ZONEMD does not match its data
+    /// is refused, the same check the startup loader makes. The
+    /// anchor-based authenticity steps stay a startup check: the runtime
+    /// holds no trust anchors.
+    fn refreshedZoneDigestOk(self: *Runtime, io: std.Io, zone: *const zone_index.Zone) bool {
+        var report: [zonemd.report_max_len]u8 = undefined;
+        _ = zonemd.verify(zone, self.allocator, &report) catch {
+            const written = std.mem.indexOfScalar(u8, &report, 0) orelse report.len;
+            reportReload(io, "{s}", .{report[0..written]});
+            return false;
+        };
+        return true;
+    }
+
+    /// Removes one zone from the served set. The caller holds the exclusive
+    /// lock.
+    fn removeZoneLocked(self: *Runtime, origin: []const u8) void {
+        const index = self.zoneIndexForOrigin(origin) orelse return;
+        self.zones.items[index].deinit();
+        _ = self.zones.orderedRemove(index);
+        if (index < self.transfer_delta_logs.items.len) _ = self.transfer_delta_logs.orderedRemove(index);
     }
 
     /// Registers one RFC 1996 NOTIFY destination. The apex is copied, so the
@@ -512,16 +839,24 @@ pub const Runtime = struct {
     /// The file is read, parsed, and built completely before the served zone
     /// changes, so a broken file leaves the old zone serving.
     pub fn reloadZone(self: *Runtime, io: std.Io) ReloadOutcome {
-        const source = self.reload_source orelse {
+        if (self.reload_sources.items.len == 0) {
             reportReload(io, "error: no zone file is configured to reload", .{});
             return .no_source;
-        };
-        const text = source.dir.readFileAlloc(io, source.path, self.allocator, .limited(1024 * 1024)) catch |err| {
-            reportReload(io, "error: cannot read the zone file {s}: {t}", .{ source.path, err });
-            return .load_failed;
-        };
-        defer self.allocator.free(text);
-        return self.replaceZoneText(io, source.origin, text);
+        }
+        // Every configured zone is re-read; one broken file leaves that zone
+        // serving its old data and the others reload.
+        var outcome: ReloadOutcome = .replaced;
+        for (self.reload_sources.items) |source| {
+            const text = source.dir.readFileAlloc(io, source.path, self.allocator, .limited(1024 * 1024)) catch |err| {
+                reportReload(io, "error: cannot read the zone file {s}: {t}", .{ source.path, err });
+                outcome = .load_failed;
+                continue;
+            };
+            defer self.allocator.free(text);
+            const replaced = self.replaceZoneText(io, source.origin, text);
+            if (replaced != .replaced and outcome == .replaced) outcome = replaced;
+        }
+        return outcome;
     }
 
     /// Replaces the zone with apex `origin` by the zone built from `text`.
@@ -1035,11 +1370,11 @@ pub const Runtime = struct {
             .incoming => |incoming| {
                 if (counters) |value| countInboundBits(value, incoming.query);
                 if (incoming.auth) |auth| {
-                    return self.encodeSignedMessage(try self.buildMessage(incoming.query, over_tcp), output, auth, 0, &.{}, null);
+                    return self.encodeSignedMessage(try self.buildMessage(incoming.query, over_tcp, client), output, auth, 0, &.{}, null);
                 }
                 if (client) |address| return self.answerFromUnlocked(query_bytes, output, address, incoming.query, over_tcp);
                 if (try self.localZoneAnswer(incoming.query)) |local| return self.encodeMessage(local, output);
-                return self.encodeMessage(try self.buildMessage(incoming.query, over_tcp), output);
+                return self.encodeMessage(try self.buildMessage(incoming.query, over_tcp, client), output);
             },
         }
     }
@@ -1114,7 +1449,13 @@ pub const Runtime = struct {
         _ = self;
         var temp_buffer: [512]u8 = undefined;
         const temp_path = std.fmt.bufPrint(&temp_buffer, "{s}.update.tmp", .{policy.path}) catch return error.PathTooLong;
-        try policy.dir.writeFile(io, .{ .sub_path = temp_path, .data = text });
+        // The temporary file is flushed to nonvolatile storage before the
+        // rename, so the committed name never refers to a page that only
+        // exists in the page cache (RFC 2136 section 3.5).
+        const file = try policy.dir.createFile(io, temp_path, .{ .truncate = true });
+        defer file.close(io);
+        try file.writeStreamingAll(io, text);
+        try file.sync(io);
         try policy.dir.rename(temp_path, policy.dir, policy.path, io);
     }
 
@@ -1209,7 +1550,7 @@ pub const Runtime = struct {
                     var output: [transfer.tcp_max_frame_size]u8 = undefined;
                     const single = if (incoming.auth) |auth|
                         try self.encodeSignedMessage(
-                            try self.buildMessage(incoming.query, false),
+                            try self.buildMessage(incoming.query, false, null),
                             &output,
                             auth,
                             0,
@@ -1217,7 +1558,7 @@ pub const Runtime = struct {
                             null,
                         )
                     else
-                        try self.encodeMessage(try self.buildMessage(incoming.query, false), &output);
+                        try self.encodeMessage(try self.buildMessage(incoming.query, false, null), &output);
                     return frameSingle(allocator, single);
                 }
                 var qname_text_buffer: [256]u8 = undefined;
@@ -1391,6 +1732,13 @@ pub const Runtime = struct {
         over_tcp: bool,
     ) ![]const u8 {
         const q = query.question orelse return Error.BadQuery;
+        // RFC 1996 section 3.8: a NOTIFY is answered over the transport it
+        // arrived on, so it takes the same path as a query. Every other
+        // opcode this server does not implement is NOTIMP (RFC 2136
+        // section 3 handles UPDATE before this point).
+        if (query.header.opcode == .notify) {
+            return self.encodeMessage(try self.buildMessage(query, over_tcp, client), output);
+        }
         if (query.header.opcode != .query) {
             return self.encodeMessage(try response.buildNotImplementedResponse(query), output);
         }
@@ -1406,12 +1754,12 @@ pub const Runtime = struct {
                     resolver_mod.Error.BadCookie => return self.encodeMessage(try resolver.badCookieResponse(query, client), output),
                     else => return err,
                 };
-                var message = try self.buildMessage(query, over_tcp);
+                var message = try self.buildMessage(query, over_tcp, client);
                 errdefer message.deinit();
                 if (server_cookie) |cookie| try resolver_mod.appendCookie(&message, cookie);
                 return self.encodeMessage(message, output);
             }
-            return self.encodeMessage(try self.buildMessage(query, over_tcp), output);
+            return self.encodeMessage(try self.buildMessage(query, over_tcp, client), output);
         }
         if (try self.localZoneAnswer(query)) |local| return self.encodeMessage(local, output);
         // RFC 9462 section 4: a client asks its resolver for the designated
@@ -1503,7 +1851,27 @@ pub const Runtime = struct {
         return writer.written();
     }
 
-    fn buildMessage(self: *const Runtime, query: dns_message.Message, over_tcp: bool) !dns_message.Message {
+    /// True when two addresses name the same host. RFC 1996 lets a master
+    /// notify from any source port, so the port is not compared.
+    fn sameIp(a: *const std.Io.net.IpAddress, b: *const std.Io.net.IpAddress) bool {
+        return switch (a.*) {
+            .ip4 => |ip| switch (b.*) {
+                .ip4 => |other| std.mem.eql(u8, &ip.bytes, &other.bytes),
+                .ip6 => false,
+            },
+            .ip6 => |ip| switch (b.*) {
+                .ip4 => false,
+                .ip6 => |other| std.mem.eql(u8, &ip.bytes, &other.bytes),
+            },
+        };
+    }
+
+    fn buildMessage(
+        self: *const Runtime,
+        query: dns_message.Message,
+        over_tcp: bool,
+        notify_source: ?*const std.Io.net.IpAddress,
+    ) !dns_message.Message {
         // RFC 2136 section 3 answers an unimplemented UPDATE with NOTIMP,
         // and section 3.4.1.3 lets it carry no zone section, so the
         // refusal is built before a question is required.
@@ -1526,6 +1894,16 @@ pub const Runtime = struct {
             const notify_name = q.name.toText(&notify_name_buffer) catch return response.Error.BadQName;
             if (self.blocklist.blocks(notify_name)) return response.buildBlockedResponse(query);
             const zone = self.selectZone(notify_name) orelse return response.buildRefusedResponse(query);
+            // RFC 9432 section 5.4: a NOTIFY for the catalog means the
+            // consumer should read it again. RFC 1996 section 3.10: a NOTIFY
+            // from a host that is not the zone's master is ignored, so only
+            // the configured primary can start the fetch.
+            if (self.catalog_consumer) |*consumer| {
+                if (std.ascii.eqlIgnoreCase(consumer.apex, notify_name)) {
+                    const from_master = if (notify_source) |source| sameIp(source, &consumer.primary) else false;
+                    if (from_master) @constCast(self).requestCatalogRefresh();
+                }
+            }
             return transfer.buildNotifyResponse(query.allocator, &query, zone, notify_serial) catch return Error.EncodeFailed;
         }
         var qname_text_buffer: [256]u8 = undefined;
@@ -1809,6 +2187,53 @@ const reload_zone_text =
     \\dns IN A 192.168.1.1
     \\
 ;
+
+test "a reload re-reads every configured zone file" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    const first_text =
+        \\$ORIGIN a.example.
+        \\$TTL 3600
+        \\@ IN SOA ns.a.example. hostmaster.a.example. 1 3600 900 1209600 3600
+        \\@ IN NS ns.a.example.
+        \\www IN A 192.0.2.1
+        \\
+    ;
+    const second_text =
+        \\$ORIGIN b.example.
+        \\$TTL 3600
+        \\@ IN SOA ns.b.example. hostmaster.b.example. 1 3600 900 1209600 3600
+        \\@ IN NS ns.b.example.
+        \\www IN A 192.0.2.2
+        \\
+    ;
+    try dir.dir.writeFile(io, .{ .sub_path = "a.zone", .data = first_text });
+    try dir.dir.writeFile(io, .{ .sub_path = "b.zone", .data = second_text });
+    var runtime = try Runtime.fromZoneTexts(&.{ first_text, second_text });
+    defer runtime.deinit();
+    try runtime.setReloadSource(dir.dir, "a.zone", "a.example.");
+    try runtime.addReloadSource(dir.dir, "b.zone", "b.example.");
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try dir.dir.writeFile(io, .{ .sub_path = "a.zone", .data = try std.mem.replaceOwned(u8, arena.allocator(), first_text, "a.example. 1 3600", "a.example. 2 3600") });
+    try dir.dir.writeFile(io, .{ .sub_path = "b.zone", .data = try std.mem.replaceOwned(u8, arena.allocator(), second_text, "b.example. 1 3600", "b.example. 2 3600") });
+    runtime.requestZoneReload();
+    try std.testing.expectEqual(ReloadOutcome.replaced, runtime.reloadZoneIfRequested(io).?);
+    try std.testing.expectEqual(@as(?u32, 2), runtime.zones.items[runtime.zoneIndexForOrigin("a.example.").?].soaSerial());
+    try std.testing.expectEqual(@as(?u32, 2), runtime.zones.items[runtime.zoneIndexForOrigin("b.example.").?].soaSerial());
+
+    // One broken file leaves that zone serving its old data and the other
+    // zones reload.
+    try dir.dir.writeFile(io, .{ .sub_path = "a.zone", .data = try std.mem.replaceOwned(u8, arena.allocator(), first_text, "a.example. 1 3600", "a.example. 3 3600") });
+    try dir.dir.writeFile(io, .{ .sub_path = "b.zone", .data = "not a zone file\n" });
+    runtime.requestZoneReload();
+    try std.testing.expectEqual(ReloadOutcome.load_failed, runtime.reloadZoneIfRequested(io).?);
+    try std.testing.expectEqual(@as(?u32, 3), runtime.zones.items[runtime.zoneIndexForOrigin("a.example.").?].soaSerial());
+    try std.testing.expectEqual(@as(?u32, 2), runtime.zones.items[runtime.zoneIndexForOrigin("b.example.").?].soaSerial());
+}
 
 test "a reload adds the TSIG key the new key file names" {
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -3730,6 +4155,38 @@ fn encodeSignedNotifyRequest(
     const signed = try tsig.sign(writer.written(), key.secret, final.owner, final.tsig, null);
     try tsig.patchMac(buffer[0..writer.len()], final, signed.slice());
     return writer.written();
+}
+
+test "a catalog NOTIFY is honored only from the configured primary" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var runtime = try Runtime.fromZoneText(
+        \\$ORIGIN catalog.example.
+        \\$TTL 3600
+        \\@ IN SOA invalid. hostmaster.invalid. 2 3600 900 1209600 3600
+        \\@ IN NS invalid.
+        \\version IN TXT "2"
+        \\m1.zones IN PTR one.example.
+        \\
+    );
+    defer runtime.deinit();
+    try runtime.setCatalogConsumer("catalog.example.", try std.Io.net.IpAddress.parse("192.0.2.1", 53));
+
+    var output: [1024]u8 = undefined;
+    var request_buffer: [512]u8 = undefined;
+    const request = try encodeNotifyRequest(arena.allocator(), &request_buffer, "catalog.example.", 2, .SOA);
+
+    // RFC 1996 section 3.10: a NOTIFY from a host that is not the zone's
+    // master is ignored.
+    var stranger = try std.Io.net.IpAddress.parse("127.0.0.1", 40000);
+    _ = try runtime.answerFrom(request, &output, &stranger);
+    try std.testing.expect(!runtime.catalog_refresh_requested.load(.acquire));
+
+    // A NOTIFY from the master's address asks for a read; the source port
+    // is not part of the identity.
+    var master = try std.Io.net.IpAddress.parse("192.0.2.1", 40000);
+    _ = try runtime.answerFrom(request, &output, &master);
+    try std.testing.expect(runtime.catalog_refresh_requested.load(.acquire));
 }
 
 test "runtime answers NOTIFY by comparing the serial and refuses transfers singly" {

@@ -159,7 +159,7 @@ pub const Key = struct {
     /// the RFC 8032 `R || S` form. The standard library emits both as
     /// fixed-width big-endian pairs, so `toBytes` is the DNSSEC encoding.
     fn sign(self: *const Key, message: []const u8, out: []u8) Error![]const u8 {
-        return signMaterial(self.material, message, out);
+        return signMaterial(&self.material, message, out);
     }
 
     /// Wipes the private scalar, the Ed25519 seed, and the public key.
@@ -334,21 +334,25 @@ fn dsRdataOf(
 }
 
 /// Signs with one key's material.
-fn signMaterial(material: Material, message: []const u8, out: []u8) Error![]const u8 {
-    switch (material) {
-        .rsa_sha256 => |key| return rsaPkcs1Sign(key, message, out, std.crypto.hash.sha2.Sha256),
-        .rsa_sha512 => |key| return rsaPkcs1Sign(key, message, out, std.crypto.hash.sha2.Sha512),
-        .ecdsa_p256_sha256 => |key_pair| {
-            const bytes = (try signEcdsa(EcdsaP256Sha256, key_pair, message)).toBytes();
+fn signMaterial(material: *const Material, message: []const u8, out: []u8) Error![]const u8 {
+    // The payload is reached through pointers, so the private key is not
+    // copied again; the one copy the switch needs is wiped on the way out.
+    var copy = material.*;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&copy));
+    switch (copy) {
+        .rsa_sha256 => |*key| return rsaPkcs1Sign(key, message, out, std.crypto.hash.sha2.Sha256),
+        .rsa_sha512 => |*key| return rsaPkcs1Sign(key, message, out, std.crypto.hash.sha2.Sha512),
+        .ecdsa_p256_sha256 => |*key_pair| {
+            const bytes = (try signEcdsa(EcdsaP256Sha256, key_pair.*, message)).toBytes();
             @memcpy(out[0..bytes.len], &bytes);
             return out[0..bytes.len];
         },
-        .ecdsa_p384_sha384 => |key_pair| {
-            const bytes = (try signEcdsa(EcdsaP384Sha384, key_pair, message)).toBytes();
+        .ecdsa_p384_sha384 => |*key_pair| {
+            const bytes = (try signEcdsa(EcdsaP384Sha384, key_pair.*, message)).toBytes();
             @memcpy(out[0..bytes.len], &bytes);
             return out[0..bytes.len];
         },
-        .ed25519 => |key_pair| {
+        .ed25519 => |*key_pair| {
             const bytes = (key_pair.sign(message, null) catch return Error.SigningFailed).toBytes();
             @memcpy(out[0..bytes.len], &bytes);
             return out[0..bytes.len];
@@ -392,9 +396,12 @@ fn rsaPublicKeyBytes(key: RsaKey, buffer: []u8) []const u8 {
 /// RFC 8017 section 9.2, RSASSA-PKCS1-v1_5 with the DigestInfo the DNS
 /// algorithm names (RFC 5702 section 3): EM = 0x00 || 0x01 || PS || 0x00 || T,
 /// and the signature is EM^d mod n, encoded in k octets.
-fn rsaPkcs1Sign(key: RsaKey, message: []const u8, out: []u8, comptime Hash: type) Error![]const u8 {
+fn rsaPkcs1Sign(key: *const RsaKey, message: []const u8, out: []u8, comptime Hash: type) Error![]const u8 {
     const k: usize = key.modulus_len;
-    if (k < 64 or k > max_rsa_modulus_bytes or out.len < k) return Error.SigningFailed;
+    // RFC 5702 sections 2.1 and 2.2: 512 bits is the floor for SHA-256 and
+    // 1024 bits for SHA-512.
+    const min_modulus: usize = if (Hash == std.crypto.hash.sha2.Sha512) 128 else 64;
+    if (k < min_modulus or k > max_rsa_modulus_bytes or out.len < k) return Error.SigningFailed;
     const prefix = digestInfoPrefix(Hash);
     const t_len = prefix.len + Hash.digest_length;
     if (k < t_len + 11) return Error.SigningFailed;
@@ -533,10 +540,16 @@ fn keyFromBase64(algorithm_text: []const u8, secret_text: []const u8) Error!Key 
         return .{ .material = .{ .ecdsa_p384_sha384 = EcdsaP384Sha384.KeyPair.fromSecretKey(secret_key) catch return Error.BadSecret } };
     }
     if (std.ascii.eqlIgnoreCase(algorithm_text, "rsasha256")) {
-        return .{ .material = .{ .rsa_sha256 = try rsaKeyFromDer(decoded[0..expected]) } };
+        const key = try rsaKeyFromDer(decoded[0..expected]);
+        // RFC 5702 section 2.1: RSA/SHA-256 keys are 512 to 4096 bits.
+        if (key.modulus_len < 64 or key.modulus_len > 512) return Error.BadSecret;
+        return .{ .material = .{ .rsa_sha256 = key } };
     }
     if (std.ascii.eqlIgnoreCase(algorithm_text, "rsasha512")) {
-        return .{ .material = .{ .rsa_sha512 = try rsaKeyFromDer(decoded[0..expected]) } };
+        const key = try rsaKeyFromDer(decoded[0..expected]);
+        // RFC 5702 section 2.2: RSA/SHA-512 keys are 1024 to 4096 bits.
+        if (key.modulus_len < 128 or key.modulus_len > 512) return Error.BadSecret;
+        return .{ .material = .{ .rsa_sha512 = key } };
     }
     if (std.ascii.eqlIgnoreCase(algorithm_text, "ed25519")) {
         if (expected != Ed25519.KeyPair.seed_length) return Error.BadSecret;
@@ -1525,6 +1538,9 @@ fn emit(
         const published_ksk: ?*const Ksk = if (key.published_ksk) |*candidate| candidate else null;
         var signers: [2]SigningKey = undefined;
         var signer_count: usize = 1;
+        // The copied private material lives on this stack frame; wipe it when
+        // the RRset is done.
+        defer std.crypto.secureZero(u8, std.mem.sliceAsBytes(signers[0..signer_count]));
         signers[0] = .{ .material = key.material, .tag = key_tag };
         if (rrset.rrtype == RecordType.DNSKEY.code() and ksk != null) {
             signers[0] = .{ .material = ksk.?.material, .tag = ksk_tag };
@@ -1533,14 +1549,14 @@ fn emit(
                 signer_count = 2;
             }
         }
-        for (signers[0..signer_count]) |signing_key| {
+        for (signers[0..signer_count]) |*signing_key| {
             const signed = try signedData(scratch, rrset, signing_key.material, signing_key.tag, signer_wire, options);
             // RRSIG RDATA is the RRSIG header followed by the Signature field. The
             // RRs that were signed go in neither: they are already published from
             // the zone file. The widest signature this build produces is 96 octets.
             var rdata_buffer: [18 + 255 + 128]u8 = undefined;
             @memcpy(rdata_buffer[0..signed.header_len], signed.bytes[0..signed.header_len]);
-            const signature = try signMaterial(signing_key.material, signed.bytes, rdata_buffer[signed.header_len..]);
+            const signature = try signMaterial(&signing_key.material, signed.bytes, rdata_buffer[signed.header_len..]);
             try generated.append(scratch, try genericRecord(
                 records,
                 rrset.owner_wire,

@@ -101,8 +101,11 @@ fn serveUdpOnceWithTimeout(socket: *const std.Io.net.Socket, io: std.Io, runtime
     // the second one answers a request that arrived while the flag was set,
     // so the answer that follows a reload always comes from the new zone.
     _ = runtime.reloadZoneIfRequested(io);
+    _ = runtime.refreshCatalogIfRequested(io);
     var request_buffer: [UDP_REQUEST_BUFFER_SIZE]u8 = undefined;
     const incoming = try socket.receiveTimeout(io, &request_buffer, timeout);
+    // A NOTIFY handled by the last answer set the catalog flag; its fetch
+    // waits for the next iteration, so this answer is already on the wire.
     _ = runtime.reloadZoneIfRequested(io);
     var response_buffer: [UDP_RESPONSE_BUFFER_SIZE]u8 = undefined;
     var classic_response_buffer: [UDP_RESPONSE_BUFFER_SIZE]u8 = undefined;
@@ -119,8 +122,11 @@ fn serveUdpOnceWithMetricsTimeout(socket: *const std.Io.net.Socket, io: std.Io, 
     // The same reload the plain UDP path performs, so a metrics run reloads
     // its zone on the same trigger.
     _ = runtime.reloadZoneIfRequested(io);
+    _ = runtime.refreshCatalogIfRequested(io);
     var request_buffer: [UDP_REQUEST_BUFFER_SIZE]u8 = undefined;
     const incoming = try socket.receiveTimeout(io, &request_buffer, timeout);
+    // A NOTIFY handled by the last answer set the catalog flag; its fetch
+    // waits for the next iteration, so this answer is already on the wire.
     _ = runtime.reloadZoneIfRequested(io);
     var response_buffer: [UDP_RESPONSE_BUFFER_SIZE]u8 = undefined;
     var classic_response_buffer: [UDP_RESPONSE_BUFFER_SIZE]u8 = undefined;
@@ -226,6 +232,7 @@ fn serveTcpStreamOnceWithTimeout(stream: std.Io.net.Stream, io: std.Io, runtime:
     // outside the signal handler, so the answer that follows it comes from
     // the new zone.
     _ = runtime.reloadZoneIfRequested(io);
+    _ = runtime.refreshCatalogIfRequested(io);
     return unix_tcp_deadlines.serve(stream, io, runtime, timeout, counters);
 }
 

@@ -81,6 +81,11 @@ pub const Error = error{
     /// The request carries two content lengths that differ, which makes
     /// the body length ambiguous.
     ConflictingContentLength,
+    /// RFC 9112 section 3.2: an HTTP/1.1 request must carry a Host header.
+    MissingHost,
+    /// RFC 9110 section 10.1.1: a 100-continue expectation this channel does
+    /// not honor is answered with a final status.
+    ExpectationFailed,
 };
 
 const Status = enum(u16) {
@@ -88,6 +93,7 @@ const Status = enum(u16) {
     bad_request = 400,
     not_found = 404,
     method_not_allowed = 405,
+    expectation_failed = 417,
     unsupported_media_type = 415,
     request_header_fields_too_large = 431,
     payload_too_large = 413,
@@ -99,6 +105,7 @@ const Status = enum(u16) {
             .bad_request => "Bad Request",
             .not_found => "Not Found",
             .method_not_allowed => "Method Not Allowed",
+            .expectation_failed => "Expectation Failed",
             .unsupported_media_type => "Unsupported Media Type",
             .request_header_fields_too_large => "Request Header Fields Too Large",
             .payload_too_large => "Payload Too Large",
@@ -117,6 +124,8 @@ fn statusForError(err: anyerror) Status {
         Error.TruncatedRequest => .bad_request,
         Error.TransferEncodingUnsupported => .bad_request,
         Error.ConflictingContentLength => .bad_request,
+        Error.MissingHost => .bad_request,
+        Error.ExpectationFailed => .expectation_failed,
         else => .bad_request,
     };
 }
@@ -128,6 +137,7 @@ const ParsedRequest = struct {
     content_type: ?[]u8,
     content_length: ?usize,
     close: bool,
+    host: bool = false,
 };
 
 fn trimCr(line: []u8) []u8 {
@@ -203,8 +213,18 @@ fn readRequest(reader: *std.Io.Reader, arena: std.mem.Allocator) !struct { head:
             return Error.TransferEncodingUnsupported;
         } else if (std.ascii.eqlIgnoreCase(name, "connection")) {
             if (std.ascii.eqlIgnoreCase(value, "close")) head.close = true;
+        } else if (std.ascii.eqlIgnoreCase(name, "host")) {
+            head.host = true;
+        } else if (std.ascii.eqlIgnoreCase(name, "expect")) {
+            // RFC 9110 section 10.1.1: this channel never sends 100 Continue,
+            // so the expectation is refused with a final status instead of
+            // leaving the client waiting.
+            return Error.ExpectationFailed;
         }
     }
+    // RFC 9112 section 3.2: an HTTP/1.1 request without Host is malformed;
+    // HTTP/1.0 does not require the header.
+    if (!head.host and !std.mem.eql(u8, version, "HTTP/1.0")) return Error.MissingHost;
 
     var body: []u8 = &.{};
     const declared = head.content_length orelse 0;
@@ -308,6 +328,14 @@ fn minTtl(message: *const dns_message.Message) u32 {
 }
 
 fn writeError(writer: *std.Io.Writer, status: Status) !void {
+    // RFC 9110 section 15.5.6: a 405 lists the methods the resource allows.
+    if (status == .method_not_allowed) {
+        try writer.print("HTTP/1.1 {d} {s}\r\nallow: GET, POST\r\ncontent-length: 0\r\nconnection: close\r\n\r\n", .{
+            @backingInt(status),
+            status.reason(),
+        });
+        return;
+    }
     try writer.print("HTTP/1.1 {d} {s}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n", .{
         @backingInt(status),
         status.reason(),
@@ -1097,6 +1125,52 @@ test "DoH refuses a request that carries a transfer coding and a content length"
     // The connection ends with the refusal: the chunked body that follows
     // is never answered as a request of its own.
     try std.testing.expectError(error.EndOfStream, takeTestLine(&client_reader.interface));
+}
+
+test "RFC 9112 3.2 and RFC 9110: no Host, a wrong method, and an Expect head are refused" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+
+    const cases = [_]struct { request: []const u8, status: []const u8, allow: bool }{
+        // RFC 9112 section 3.2: HTTP/1.1 requires Host.
+        .{ .request = "GET /dns-query?dns=AA HTTP/1.1\r\n\r\n", .status = "HTTP/1.1 400", .allow = false },
+        // RFC 9110 section 15.5.6: a 405 lists the allowed methods.
+        .{ .request = "PUT /dns-query HTTP/1.1\r\nHost: localhost\r\n\r\n", .status = "HTTP/1.1 405", .allow = true },
+        // RFC 9110 section 10.1.1: the expectation gets a final status.
+        .{ .request = "POST /dns-query HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\n", .status = "HTTP/1.1 417", .allow = false },
+    };
+    for (cases) |case| {
+        const streams = try streamPair();
+        var client_stream = streams[0];
+        defer client_stream.close(io);
+        var server_stream = streams[1];
+        var server_stream_closed = false;
+        defer {
+            if (!server_stream_closed) server_stream.close(io);
+        }
+
+        var client_write_buffer: [2048]u8 = undefined;
+        var client_writer = client_stream.writer(io, &client_write_buffer);
+        try client_writer.interface.writeAll(case.request);
+        try client_writer.interface.flush();
+
+        try serveDohStreamOnce(server_stream, io, &runtime);
+        server_stream.close(io);
+        server_stream_closed = true;
+
+        var response_buffer: [4096]u8 = undefined;
+        var client_reader = client_stream.reader(io, &response_buffer);
+        const status_line = try takeTestLine(&client_reader.interface);
+        try std.testing.expect(std.mem.startsWith(u8, status_line, case.status));
+        var saw_allow = false;
+        while (true) {
+            const line = try takeTestLine(&client_reader.interface);
+            if (line.len == 0) break;
+            if (std.ascii.eqlIgnoreCase(line, "allow: GET, POST")) saw_allow = true;
+        }
+        try std.testing.expectEqual(case.allow, saw_allow);
+    }
 }
 
 test "DoH refuses a request that declares two different content lengths" {

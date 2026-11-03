@@ -650,26 +650,24 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
     }
 
     var runtime: auth_runtime.Runtime = undefined;
-    // A configuration names the zone file it loads. Only a single-zone
-    // configuration is reloadable: replacing a whole zone set is a different
-    // operation this profile does not have.
-    const config_zone_path: ?[]const u8 = if (server_context) |*context|
-        if (context.config.zones.len == 1)
-            try allocator.dupe(u8, context.config.zones.items[0].fileText())
-        else
-            null
-    else
-        null;
-    // The apex of that one configured zone, so the reload source survives a
-    // runtime that serves more zones than the configuration names (a catalog
-    // or a blacklist zone is synthesized beside it).
-    const config_zone_origin: ?[]const u8 = if (server_context) |*context|
-        if (context.config.zones.len == 1)
-            try allocator.dupe(u8, context.config.zones.items[0].nameText())
-        else
-            null
-    else
-        null;
+    // The reload sources are read from the configuration now: taking the
+    // runtime moves the configuration out of the context.
+    var configured_reloads: std.ArrayList(struct { name: []const u8, path: []const u8 }) = .empty;
+    defer {
+        for (configured_reloads.items) |configured| {
+            allocator.free(configured.name);
+            allocator.free(configured.path);
+        }
+        configured_reloads.deinit(allocator);
+    }
+    if (!explicit_zone_file and server_context != null) {
+        for (server_context.?.config.zones.items) |configured| {
+            try configured_reloads.append(allocator, .{
+                .name = try allocator.dupe(u8, configured.nameText()),
+                .path = try allocator.dupe(u8, configured.fileText()),
+            });
+        }
+    }
     if (!explicit_zone_file and server_context != null) {
         if (server_context.?.zones.items.len == 0) {
             try writer.writeAll("error: server run requires --zone-file or --config with a zone\n");
@@ -694,22 +692,21 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
     defer runtime.deinit();
     // The handler must not reach a runtime that is already gone.
     defer reload_runtime = null;
-    // SIGHUP replaces the zone from the zone file the server was started
-    // from. The handler only sets a flag; the serve path reads the file and
-    // swaps the zone.
-    const reload_path: ?[]const u8 = if (explicit_zone_file) zone_file else config_zone_path;
-    if (reload_path) |path| {
-        var reload_origin: ?[]const u8 = null;
-        if (explicit_zone_file) {
-            if (runtime.zones.items.len == 1) reload_origin = runtime.zones.items[0].originText();
-        } else if (config_zone_origin) |configured| {
+    // SIGHUP re-reads every configured zone file. The handler only sets a
+    // flag; the serve path reads the files and swaps the zones. A catalog or
+    // blacklist zone is synthesized, so it has no file and is not a source.
+    if (explicit_zone_file) {
+        if (runtime.zones.items.len == 1) {
+            try runtime.setReloadSource(std.Io.Dir.cwd(), zone_file.?, runtime.zones.items[0].originText());
+        }
+    } else if (server_context != null) {
+        for (configured_reloads.items) |configured| {
             for (runtime.zones.items) |*zone| {
-                if (!sameZoneName(configured, zone.originText())) continue;
-                reload_origin = zone.originText();
+                if (!sameZoneName(configured.name, zone.originText())) continue;
+                try runtime.addReloadSource(std.Io.Dir.cwd(), configured.path, zone.originText());
                 break;
             }
         }
-        if (reload_origin) |origin| try runtime.setReloadSource(std.Io.Dir.cwd(), path, origin);
     }
     installReloadHandler(&runtime);
     var counters = metrics.Counters{};

@@ -109,6 +109,7 @@ fn serveDotFrames(
         // arrived while the flag was set, so the answer that follows a
         // reload always comes from the new zone.
         _ = runtime.reloadZoneIfRequested(channel.io);
+        _ = runtime.refreshCatalogIfRequested(channel.io);
         // One deadline for the whole frame: a peer that stalls in the middle
         // of a frame loses the frame, not the server. The write of the answer
         // shares it, so one frame cannot take two windows.
@@ -123,6 +124,7 @@ fn serveDotFrames(
             return err;
         };
         _ = runtime.reloadZoneIfRequested(channel.io);
+        _ = runtime.refreshCatalogIfRequested(channel.io);
         // RFC 9210 section 3: the answer comes from the same entry point the
         // cleartext TCP path uses, so the peer address reaches the recursion
         // policy, the local-zone table, and the cookie validation.
@@ -197,6 +199,10 @@ fn serveDotTlsStreamWithTimeout(
     timeout: tcp_deadline.Timeout,
 ) !void {
     if (comptime !listener.TCP_DEADLINES_SUPPORTED) return listener.Error.UnsupportedPlatform;
+    // A peer that stops reading must not block the worker in a write past
+    // its frame deadline: the socket carries the same timeout the poll-based
+    // deadline enforces.
+    tcp_deadline.setSocketTimeout(stream.socket.handle, timeout);
     // RFC 9210 section 4.2: the operator may bound the lifetime of one
     // connection, and that deadline covers the whole connection.
     const connection_deadline = channel_mod.connectionDeadline(io);

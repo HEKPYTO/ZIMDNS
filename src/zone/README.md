@@ -23,6 +23,16 @@ modular exponentiation and the primes are not needed. RSA/SHA-1 (algorithms 5
 and 7) is not offered because RFC 8624 §3.1 says a signer MUST NOT use it, and
 Ed448 needs a primitive the standard library does not ship.
 
+## The catalog zone's shape (RFC 9432)
+
+`src/zone/catalog.zig` is the one reader of a catalog zone's fixed shape: the
+schema-2 `version.<apex>` TXT RRset (exactly one record, value `"2"`) and the
+`<label>.zones.<apex>` PTR records that name the member zones. It refuses a
+catalog that lists itself or names the same member twice, and returns the
+member names it finds. `src/config/loader.zig` uses it at startup and
+`src/auth/runtime.zig` uses it again when a NOTIFY for the catalog asks for a
+new read, so the two paths cannot disagree about what a valid catalog is.
+
 ## The NSEC3 chain (RFC 9276 §3.1)
 
 The chain is opt-in: the zone's own apex NSEC3PARAM decides it, and the
