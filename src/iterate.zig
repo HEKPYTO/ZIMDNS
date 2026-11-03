@@ -151,6 +151,11 @@ pub const Options = struct {
     /// validating caller needs it to decide whether an unsigned answer came
     /// from an insecure delegation.
     zone_out: ?*Name = null,
+    /// RFC 9156 section 2.3: ask each delegation for the next label toward
+    /// the question with QTYPE=A, and only the last hop for the full name
+    /// and the client's type. Off by default so the module's own tests state
+    /// every hop explicitly; the resolver turns it on.
+    qname_minimization: bool = false,
 };
 
 /// Resolves `question` from `hints`: the root hint addresses for an ordinary
@@ -212,7 +217,8 @@ fn resolveFrom(
         var advanced = false;
         var index: usize = 0;
         while (index < server_count) : (index += 1) {
-            const query = encodeQuery(question, &query_buffer) catch return Error.MalformedResponse;
+            var hop = hopQuestion(question, zone, options.qname_minimization);
+            var query = encodeQuery(hop, &query_buffer) catch return Error.MalformedResponse;
             var response = sender.send(sender.context, allocator, servers[index], query, options.dnssec_ok) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => continue,
@@ -231,14 +237,42 @@ fn resolveFrom(
                 if (options.cache) |cache| cache.put(entry.zone, entry.servers[0..entry.server_count], entry.ttl, options.now);
                 pending = null;
             }
+            // RFC 9156 section 3 step (6c): a minimized hop answered with
+            // NOERROR and no referral means the same servers speak for the
+            // child, so the next label is asked of them. A response that is
+            // neither authoritative nor a denial cannot move the walk, and
+            // the full question is asked instead. Step (6d): NXDOMAIN ends
+            // the resolution; RFC 8020 makes the ancestor's absence cover
+            // every name below it.
+            if (!hop.name.eql(&question.name) and rcode == .no_error and
+                referral(&response, zone, &targets, &glue) == null)
+            {
+                if (response.header.authoritative or hasSoa(&response)) {
+                    zone = hop.name;
+                    response.deinit();
+                    advanced = true;
+                    break;
+                }
+                response.deinit();
+                hop = question;
+                query = encodeQuery(hop, &query_buffer) catch return Error.MalformedResponse;
+                response = sender.send(sender.context, allocator, servers[index], query, options.dnssec_ok) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => continue,
+                };
+                if (response.header.rcode != .no_error and response.header.rcode != .nxdomain) {
+                    response.deinit();
+                    continue;
+                }
+            }
             // RFC 1034 section 4.3.2 step 3: the answer section ends the
             // resolution. NXDOMAIN ends it too, and an empty answer with an
             // SOA in the authority section is the NODATA denial.
-            if (rcode == .nxdomain or answered(&response, question) or hasSoa(&response)) {
+            if (rcode == .nxdomain or answered(&response, hop) or hasSoa(&response)) {
                 if (options.zone_out) |out| out.* = zone;
                 return response;
             }
-            if (aliasTarget(&response, question.name)) |target| {
+            if (aliasTarget(&response, hop.name)) |target| {
                 var final = try resolveAt(allocator, sender, hints, .{
                     .name = target,
                     .qtype = question.qtype,
@@ -475,6 +509,46 @@ fn hasSoa(message: *const dns_message.Message) bool {
     return false;
 }
 
+/// RFC 9156 section 2.3: the question for the next delegation is the
+/// question name one label past `zone`, asked for A. The final hop, where
+/// that name is the question itself, carries the client's own type.
+fn hopQuestion(question: dns_question.Question, zone: Name, minimized: bool) dns_question.Question {
+    if (!minimized) return question;
+    const next = nextLabelBelow(zone, question.name) orelse return question;
+    if (next.eql(&question.name)) return question;
+    return .{ .name = next, .qtype = .A, .qclass = question.qclass };
+}
+
+/// The suffix of `name` holding one label more than `zone`, or null when
+/// `zone` is not a proper ancestor of `name`.
+fn nextLabelBelow(zone: Name, name: Name) ?Name {
+    const zone_wire = zone.asWire();
+    const wire = name.asWire();
+    if (zone_wire.len >= wire.len) return null;
+    if (!std.mem.eql(u8, wire[wire.len - zone_wire.len ..], zone_wire)) return null;
+    var offsets: [128]usize = undefined;
+    var labels: usize = 0;
+    var index: usize = 0;
+    while (index < wire.len and wire[index] != 0 and labels < offsets.len) : (labels += 1) {
+        offsets[labels] = index;
+        index += 1 + wire[index];
+    }
+    const zone_labels = labelCount(zone_wire);
+    if (labels <= zone_labels) return null;
+    const start = offsets[labels - zone_labels - 1];
+    var out = Name{};
+    @memcpy(out.wire[0 .. wire.len - start], wire[start..]);
+    out.wire_len = @intCast(wire.len - start);
+    return out;
+}
+
+fn labelCount(wire: []const u8) usize {
+    var count: usize = 0;
+    var index: usize = 0;
+    while (index < wire.len and wire[index] != 0) : (count += 1) index += 1 + wire[index];
+    return count;
+}
+
 fn isAncestorOrEqual(ancestor: *const Name, name: *const Name) bool {
     const parent = ancestor.asWire();
     const child = name.asWire();
@@ -493,6 +567,9 @@ const TestScript = struct {
     server: [4]u8,
     qname: []const u8,
     qtype: RecordType,
+    /// An answer a server that is not authoritative for the name gives: it
+    /// cannot advance a minimized walk (RFC 9156 section 3 step 6c).
+    lame: bool = false,
     kind: Kind,
 
     const Kind = union(enum) {
@@ -552,7 +629,7 @@ const FakeSender = struct {
             .address => |octets| {
                 try message.answers.append(.{ .owner = question.name, .rrtype = .A, .class = .IN, .ttl = 300, .rdata = .{ .A = octets } });
                 message.header.answer_count = 1;
-                message.header.authoritative = true;
+                message.header.authoritative = !script.lame;
             },
             .cname => |target| {
                 try message.answers.append(.{ .owner = question.name, .rrtype = .CNAME, .class = .IN, .ttl = 300, .rdata = .{ .CNAME = try Name.fromText(target) } });
@@ -874,4 +951,87 @@ test "RFC 1034 section 4.3.2: a delegation whose server answers SERVFAIL is not 
         .qclass = .IN,
     }, .{ .cache = &cache, .now = 1000 }));
     try std.testing.expectEqual(@as(usize, 0), cache.len);
+}
+
+test "RFC 9156 section 2.3: each delegation is asked the next label with QTYPE=A" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    // The scripts name the minimized question each delegation must be asked.
+    // A walk that sent the full name to the root would match no script.
+    const scripts = [_]TestScript{
+        .{ .server = .{ 198, 41, 0, 4 }, .qname = "com.", .qtype = .A, .kind = .{ .referral = .{ .child = "com.", .ns = "a.gtld-servers.net.", .glue = .{ 203, 0, 113, 7 } } } },
+        .{ .server = .{ 203, 0, 113, 7 }, .qname = "example.com.", .qtype = .A, .kind = .{ .referral = .{ .child = "example.com.", .ns = "ns.example.com.", .glue = .{ 203, 0, 113, 5 } } } },
+        .{ .server = .{ 203, 0, 113, 5 }, .qname = "www.example.com.", .qtype = .A, .kind = .{ .address = .{ 192, 0, 2, 7 } } },
+    };
+    var used = std.mem.zeroes([scripts.len]bool);
+    var fake = FakeSender{ .scripts = &scripts, .used = &used };
+    const hints = [_]std.Io.net.IpAddress{hint(.{ 198, 41, 0, 4 })};
+
+    var answer = try resolve(allocator, .{ .context = &fake, .send = FakeSender.send }, &hints, .{
+        .name = try Name.fromText("www.example.com."),
+        .qtype = .A,
+        .qclass = .IN,
+    }, .{ .qname_minimization = true });
+    defer answer.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), answer.answers.len);
+    try std.testing.expectEqual([4]u8{ 192, 0, 2, 7 }, answer.answers.slice()[0].rdata.A);
+    for (used) |entry| try std.testing.expect(entry);
+}
+
+test "RFC 9156 section 2.3: an answer to the minimized hop falls back to the full name" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    // The root answers the minimized `com. A` with an A record instead of a
+    // referral, so the same server is asked the full question.
+    const scripts = [_]TestScript{
+        .{ .server = .{ 198, 41, 0, 4 }, .qname = "com.", .qtype = .A, .lame = true, .kind = .{ .address = .{ 192, 0, 2, 99 } } },
+        .{ .server = .{ 198, 41, 0, 4 }, .qname = "www.example.com.", .qtype = .A, .kind = .{ .referral = .{ .child = "example.com.", .ns = "ns.example.com.", .glue = .{ 203, 0, 113, 5 } } } },
+        .{ .server = .{ 203, 0, 113, 5 }, .qname = "www.example.com.", .qtype = .A, .kind = .{ .address = .{ 192, 0, 2, 7 } } },
+    };
+    var used = std.mem.zeroes([scripts.len]bool);
+    var fake = FakeSender{ .scripts = &scripts, .used = &used };
+    const hints = [_]std.Io.net.IpAddress{hint(.{ 198, 41, 0, 4 })};
+
+    var answer = try resolve(allocator, .{ .context = &fake, .send = FakeSender.send }, &hints, .{
+        .name = try Name.fromText("www.example.com."),
+        .qtype = .A,
+        .qclass = .IN,
+    }, .{ .qname_minimization = true });
+    defer answer.deinit();
+
+    try std.testing.expectEqual([4]u8{ 192, 0, 2, 7 }, answer.answers.slice()[0].rdata.A);
+    for (used) |entry| try std.testing.expect(entry);
+}
+
+test "RFC 9156 section 3 step 6c: an authoritative minimized answer continues with the next label" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    // The root answers `com. A` authoritatively instead of referring, so the
+    // walk must ask the *same* server the next label, not fall back to the
+    // full question.
+    const scripts = [_]TestScript{
+        .{ .server = .{ 198, 41, 0, 4 }, .qname = "com.", .qtype = .A, .kind = .{ .address = .{ 192, 0, 2, 99 } } },
+        .{ .server = .{ 198, 41, 0, 4 }, .qname = "example.com.", .qtype = .A, .kind = .{ .referral = .{ .child = "example.com.", .ns = "ns.example.com.", .glue = .{ 203, 0, 113, 5 } } } },
+        .{ .server = .{ 203, 0, 113, 5 }, .qname = "www.example.com.", .qtype = .A, .kind = .{ .address = .{ 192, 0, 2, 7 } } },
+    };
+    var used = std.mem.zeroes([scripts.len]bool);
+    var fake = FakeSender{ .scripts = &scripts, .used = &used };
+    const hints = [_]std.Io.net.IpAddress{hint(.{ 198, 41, 0, 4 })};
+
+    var answer = try resolve(allocator, .{ .context = &fake, .send = FakeSender.send }, &hints, .{
+        .name = try Name.fromText("www.example.com."),
+        .qtype = .A,
+        .qclass = .IN,
+    }, .{ .qname_minimization = true });
+    defer answer.deinit();
+
+    try std.testing.expectEqual([4]u8{ 192, 0, 2, 7 }, answer.answers.slice()[0].rdata.A);
+    for (used) |entry| try std.testing.expect(entry);
 }

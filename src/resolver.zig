@@ -1247,6 +1247,10 @@ pub const Resolver = struct {
     /// The zone the last iterative answer came from, which fixes the zone cut
     /// a validation decision needs. Read and written under the resolver lock.
     iterate_zone: dns_name.Name = dns_name.Name.root(),
+    /// DS and DNSKEY RRsets the validating path fetched, reused until their
+    /// TTL runs out so a new name does not re-walk the chain per zone.
+    chain_entries: [max_chain_entries]ChainEntry = undefined,
+    chain_len: usize = 0,
     cache: Cache,
     /// RFC 8198 aggressive cache of NSEC and NSEC3 proofs. Fed from the
     /// proofs an upstream answer carries on the forward path and consulted
@@ -1271,6 +1275,55 @@ pub const Resolver = struct {
         self.cache.deinit();
         self.policy.cookies.deinit();
         self.policy.anchors.deinit(self.allocator);
+        for (self.chain_entries[0..self.chain_len]) |entry| self.allocator.free(entry.records);
+    }
+
+    const max_chain_entries: usize = 48;
+    /// The most records one zone's DS or DNSKEY answer contributes.
+    const max_chain_zone_records: usize = 16;
+    /// The chain record TTL is capped like the delegation cache.
+    const max_chain_ttl: u32 = 24 * 60 * 60;
+
+    const ChainEntry = struct {
+        zone: dns_name.Name,
+        qtype: dns_types.RecordType,
+        expires: i64,
+        records: []dns_record.ResourceRecord,
+    };
+
+    fn lookupChain(self: *Resolver, apex: dns_name.Name, qtype: dns_types.RecordType, now: i64) ?[]const dns_record.ResourceRecord {
+        for (self.chain_entries[0..self.chain_len]) |*entry| {
+            if (entry.expires <= now) continue;
+            if (!entry.qtype.eql(qtype)) continue;
+            if (!entry.zone.eql(&apex)) continue;
+            return entry.records;
+        }
+        return null;
+    }
+
+    fn putChain(self: *Resolver, apex: dns_name.Name, qtype: dns_types.RecordType, ttl: u32, now: i64, records: []const dns_record.ResourceRecord) !void {
+        if (records.len == 0) return;
+        const count = @min(records.len, max_chain_zone_records);
+        const copy = try self.allocator.dupe(dns_record.ResourceRecord, records[0..count]);
+        const expires = now + @as(i64, @min(ttl, max_chain_ttl));
+        for (self.chain_entries[0..self.chain_len]) |*entry| {
+            if (!entry.qtype.eql(qtype) or !entry.zone.eql(&apex)) continue;
+            self.allocator.free(entry.records);
+            entry.* = .{ .zone = apex, .qtype = qtype, .expires = expires, .records = copy };
+            return;
+        }
+        const slot: usize = if (self.chain_len < self.chain_entries.len) blk: {
+            self.chain_len += 1;
+            break :blk self.chain_len - 1;
+        } else blk: {
+            var victim: usize = 0;
+            for (self.chain_entries, 0..) |entry, index| {
+                if (entry.expires < self.chain_entries[victim].expires) victim = index;
+            }
+            self.allocator.free(self.chain_entries[victim].records);
+            break :blk victim;
+        };
+        self.chain_entries[slot] = .{ .zone = apex, .qtype = qtype, .expires = expires, .records = copy };
     }
 
     pub fn validateCookie(self: *Resolver, query: dns_message.Message, client: *const std.Io.net.IpAddress) Error!?[24]u8 {
@@ -1620,26 +1673,62 @@ pub const Resolver = struct {
     }
 
     fn checkDnssec(self: *Resolver, query: dns_message.Message, response: dns_message.Message, now: u32) !validate.Result {
-        if (self.upstream == null and !hasRrsig(response)) {
+        if (!hasRrsig(response)) {
             // RFC 4035 section 5.2: an unsigned answer is relayed as insecure
             // when the parent's signed DS denial proves an insecure
             // delegation; a zone that publishes a DS must have signed it.
-            return self.unsignedVerdict(self.iterate_zone, now);
+            // The iterative walk knows the zone that should have signed, so
+            // it runs that check. A forwarded answer does not name its zone,
+            // and a DS probe of the wrong name would fail an unsigned
+            // domain, so it stays honestly insecure.
+            if (self.upstream == null) return self.unsignedVerdict(self.iterate_zone, now, .iterate);
+            // A forwarded answer does not name the zone that should have
+            // signed it. An anchor that names an ancestor below the root is
+            // a zone that must sign its answers, so an unsigned one lost its
+            // signatures; anywhere else the zone may be an unsigned
+            // delegation under a signed parent and the answer is insecure.
+            if (self.anchoredAncestor(query.question.?.name)) |anchor_zone| {
+                if (!anchor_zone.eql(&dns_name.Name.root())) {
+                    return .{ .status = .bogus, .ede = dnssec.EDE_RRSIGS_MISSING };
+                }
+            }
+            return .{ .status = .insecure, .ede = 0 };
         }
-        if (self.upstream != null) {
-            // `extra` is empty: the forward path answers from the response
-            // alone, so a DS-only anchor has no child DNSKEY RRset to match
-            // and the answer is honestly insecure rather than secure.
-            return validate.validate(self.allocator, &self.policy.anchors, query, response, &.{}, now);
-        }
-        // The iterative path fetched the answer, not a validating upstream,
-        // so the chain from the anchor to the answer zone is this server's
+        // The chain from the anchor to the answer zone is this server's
         // work: the DS each parent publishes and the DNSKEY each zone
-        // publishes, for every zone on the way to the anchor.
+        // publishes, for every zone on the way to the anchor. An iterative
+        // answer is fetched that way by definition; a forwarded one is
+        // fetched through the same forwarder, and only when the answer is
+        // signed, because an unsigned answer has no chain to chase.
         var extra: std.ArrayList(dns_record.ResourceRecord) = .empty;
         defer extra.deinit(self.allocator);
-        try self.fetchChain(response, @intCast(now), &extra);
+        if (self.upstream == null) {
+            try self.fetchChain(response, @intCast(now), &extra, .iterate);
+        } else if (hasRrsig(response)) {
+            try self.fetchChain(response, @intCast(now), &extra, .forward);
+        }
         return validate.validate(self.allocator, &self.policy.anchors, query, response, extra.items, now);
+    }
+
+    const ChainSource = enum { iterate, forward };
+
+    /// True when a configured DNSKEY anchor names `name` itself.
+    fn dnskeyAnchorFor(self: *const Resolver, name: dns_name.Name) bool {
+        for (self.policy.anchors.items[0..self.policy.anchors.len]) |anchor| {
+            if (!anchor.rrtype.eql(.DNSKEY) or !anchor.owner.eql(&name)) continue;
+            return true;
+        }
+        return false;
+    }
+
+    /// The closest ancestor of `name`, itself included, that a configured
+    /// trust anchor names.
+    fn anchoredAncestor(self: *const Resolver, name: dns_name.Name) ?dns_name.Name {
+        var candidate = name;
+        while (true) {
+            if (self.policy.anchors.anchorsZone(candidate)) return candidate;
+            candidate = parentOf(candidate) orelse return null;
+        }
     }
 
     /// RFC 4035 section 5.2: decide an unsigned answer by the parent's DS
@@ -1647,7 +1736,7 @@ pub const Resolver = struct {
     /// the unsigned answer is a stripped signature; a signed denial of the DS
     /// means the delegation is insecure; a DS answer that cannot be validated
     /// keeps the failure closed.
-    fn unsignedVerdict(self: *Resolver, apex: dns_name.Name, now: u32) !validate.Result {
+    fn unsignedVerdict(self: *Resolver, apex: dns_name.Name, now: u32, source: ChainSource) !validate.Result {
         var ds_query = dns_message.Message{
             .allocator = self.allocator,
             .header = .{ .id = 0, .question_count = 1 },
@@ -1657,16 +1746,21 @@ pub const Resolver = struct {
             .additionals = dns_message.RecordSection.init(self.allocator, 0) catch return .{ .status = .bogus, .ede = dnssec.EDE_DNSSEC_BOGUS },
         };
         defer ds_query.deinit();
-        const options: iterate_mod.Options = .{ .now = @intCast(now), .dnssec_ok = true };
-        var ds_response = iterate_mod.resolve(self.allocator, .{ .context = self, .send = iterateSend }, self.root_hints[0..self.hint_count], .{
-            .name = apex,
-            .qtype = .DS,
-            .qclass = .IN,
-        }, options) catch return .{ .status = .bogus, .ede = dnssec.EDE_DNSSEC_BOGUS };
+        var ds_response = switch (source) {
+            .iterate => blk: {
+                const options: iterate_mod.Options = .{ .now = @intCast(now), .dnssec_ok = true, .qname_minimization = true };
+                break :blk iterate_mod.resolve(self.allocator, .{ .context = self, .send = iterateSend }, self.root_hints[0..self.hint_count], .{
+                    .name = apex,
+                    .qtype = .DS,
+                    .qclass = .IN,
+                }, options) catch return .{ .status = .bogus, .ede = dnssec.EDE_DNSSEC_BOGUS };
+            },
+            .forward => self.forwardZoneQuery(apex, .DS) catch return .{ .status = .bogus, .ede = dnssec.EDE_DNSSEC_BOGUS },
+        };
         defer ds_response.deinit();
         var extra: std.ArrayList(dns_record.ResourceRecord) = .empty;
         defer extra.deinit(self.allocator);
-        try self.fetchChain(ds_response, @intCast(now), &extra);
+        try self.fetchChain(ds_response, @intCast(now), &extra, source);
         const result = validate.validate(self.allocator, &self.policy.anchors, ds_query, ds_response, extra.items, now) catch return .{ .status = .bogus, .ede = dnssec.EDE_DNSSEC_BOGUS };
         switch (result.status) {
             // The DS RRset is present and authenticated, so the zone is
@@ -1710,7 +1804,7 @@ pub const Resolver = struct {
     /// from each RRSIG signer up to the root, so the validator can walk the
     /// chain itself. Best effort: a zone that does not answer leaves its
     /// part of the chain absent and the answer insecure, never bogus.
-    fn fetchChain(self: *Resolver, response: dns_message.Message, now: i64, extra: *std.ArrayList(dns_record.ResourceRecord)) !void {
+    fn fetchChain(self: *Resolver, response: dns_message.Message, now: i64, extra: *std.ArrayList(dns_record.ResourceRecord), source: ChainSource) !void {
         var signers: [max_chain_signers]dns_name.Name = undefined;
         var signer_count: usize = 0;
         for ([_][]const dns_record.ResourceRecord{ response.answers.slice(), response.authorities.slice() }) |section| {
@@ -1727,40 +1821,92 @@ pub const Resolver = struct {
             }
         }
         for (signers[0..signer_count]) |signer| {
+            // A DNSKEY anchor names the key itself, so the signer zone owes
+            // no chain: its key is already trusted. A DS anchor names only
+            // the digest, so that zone's DNSKEY RRset must still be fetched
+            // for the DS to match against.
+            if (self.dnskeyAnchorFor(signer)) continue;
             var ancestor = signer;
             var steps: usize = 0;
             while (steps < max_chain_zones) : (steps += 1) {
-                try self.fetchZoneRecords(ancestor, .DNSKEY, now, extra);
-                try self.fetchZoneRecords(ancestor, .DS, now, extra);
+                try self.fetchZoneRecords(ancestor, .DNSKEY, now, extra, source);
+                try self.fetchZoneRecords(ancestor, .DS, now, extra, source);
                 ancestor = parentOf(ancestor) orelse break;
             }
         }
     }
 
-    fn fetchZoneRecords(self: *Resolver, apex: dns_name.Name, qtype: dns_types.RecordType, now: i64, extra: *std.ArrayList(dns_record.ResourceRecord)) !void {
+    fn fetchZoneRecords(self: *Resolver, apex: dns_name.Name, qtype: dns_types.RecordType, now: i64, extra: *std.ArrayList(dns_record.ResourceRecord), source: ChainSource) !void {
         // RFC 4035 section 5.2: the DS for a zone lives in the parent, so the
         // query must reach the parent's servers. A cached delegation for the
         // zone would start the walk inside the child, which cannot answer
         // for its own DS, so the DS query starts from the root.
         const root = dns_name.Name.root();
         if (qtype.eql(.DS) and apex.eql(&root)) return;
-        const options: iterate_mod.Options = .{
-            .cache = if (qtype.eql(.DS)) null else &self.delegations,
-            .now = now,
-            .dnssec_ok = true,
-        };
-        var chain_answer = iterate_mod.resolve(self.allocator, .{ .context = self, .send = iterateSend }, self.root_hints[0..self.hint_count], .{
-            .name = apex,
-            .qtype = qtype,
-            .qclass = .IN,
-        }, options) catch return;
-        defer chain_answer.deinit();
-        for ([_][]const dns_record.ResourceRecord{ chain_answer.answers.slice(), chain_answer.authorities.slice() }) |section| {
-            for (section) |record| {
+        if (self.lookupChain(apex, qtype, now)) |records| {
+            for (records) |record| {
                 if (extra.items.len == max_chain_records) return;
                 try extra.append(self.allocator, record);
             }
+            return;
         }
+        var chain_answer = switch (source) {
+            .iterate => blk: {
+                const options: iterate_mod.Options = .{
+                    .cache = if (qtype.eql(.DS)) null else &self.delegations,
+                    .now = now,
+                    .dnssec_ok = true,
+                    .qname_minimization = true,
+                };
+                break :blk iterate_mod.resolve(self.allocator, .{ .context = self, .send = iterateSend }, self.root_hints[0..self.hint_count], .{
+                    .name = apex,
+                    .qtype = qtype,
+                    .qclass = .IN,
+                }, options) catch return;
+            },
+            .forward => self.forwardZoneQuery(apex, qtype) catch return,
+        };
+        defer chain_answer.deinit();
+        var collected: [max_chain_zone_records]dns_record.ResourceRecord = undefined;
+        var count: usize = 0;
+        var ttl: u32 = std.math.maxInt(u32);
+        for ([_][]const dns_record.ResourceRecord{ chain_answer.answers.slice(), chain_answer.authorities.slice() }) |section| {
+            for (section) |record| {
+                if (extra.items.len == max_chain_records) break;
+                try extra.append(self.allocator, record);
+                if (count < collected.len) {
+                    collected[count] = record;
+                    count += 1;
+                    ttl = @min(ttl, record.ttl);
+                }
+            }
+        }
+        if (count != 0) self.putChain(apex, qtype, ttl, now, collected[0..count]) catch {};
+    }
+
+    /// One chain query through the configured forwarder. The response is the
+    /// answer the forwarder gives for the zone's DS or DNSKEY RRset, with the
+    /// records the validator needs to chain it.
+    fn forwardZoneQuery(self: *Resolver, apex: dns_name.Name, qtype: dns_types.RecordType) !dns_message.Message {
+        const upstream = self.upstream orelse return Error.NoForwarder;
+        var request = dns_message.Message{
+            .allocator = self.allocator,
+            // RFC 1035 section 4.1.1: a forwarder is a recursive server, so
+            // the chain query asks it to recurse.
+            .header = .{ .id = 0, .question_count = 1, .recursion_desired = true },
+            .question = .{ .name = apex, .qtype = qtype, .qclass = .IN },
+            .answers = try dns_message.RecordSection.init(self.allocator, 0),
+            .authorities = try dns_message.RecordSection.init(self.allocator, 0),
+            .additionals = try dns_message.RecordSection.init(self.allocator, 0),
+        };
+        defer request.deinit();
+        var bytes_buffer: [512]u8 = undefined;
+        var writer = dns_writer.Writer.init(&bytes_buffer);
+        request.encode(&writer) catch return Error.UpstreamFailure;
+        const bytes = writer.written();
+        var parsed = dns_message.Message.parse(self.allocator, bytes) catch return Error.BadUpstreamResponse;
+        defer parsed.deinit();
+        return self.queryUdp(upstream, bytes, parsed, null, true);
     }
 
     /// SERVFAIL plus the RFC 8914 DNSSEC-bogus INFO-CODE the validator
@@ -2166,11 +2312,16 @@ pub const Resolver = struct {
         const question = query.question orelse return Error.UpstreamFailure;
         const now: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(self.io).nanoseconds, std.time.ns_per_s));
         var answer_zone = dns_name.Name.root();
+        // RFC 4035 section 5.2: a DS RRset lives in the parent zone, so a DS
+        // question must reach the parent's servers. A cached delegation for
+        // the queried name would start the walk inside the child, which
+        // answers for its own apex but not for its DS.
         const options: iterate_mod.Options = .{
-            .cache = &self.delegations,
+            .cache = if (question.qtype.eql(.DS)) null else &self.delegations,
             .now = now,
             .dnssec_ok = self.validating(query),
             .zone_out = &answer_zone,
+            .qname_minimization = true,
         };
         const resolved = iterate_mod.resolve(self.allocator, .{ .context = self, .send = iterateSend }, self.root_hints[0..self.hint_count], question, options) catch |err| switch (err) {
             error.OutOfMemory => return err,
@@ -10689,7 +10840,9 @@ test "RFC 1034 section 4.3.2: with no forwarder the resolver resolves from its h
     var server_socket = try std.Io.net.IpAddress.bind(&server_addr, io, .{ .mode = .dgram, .protocol = .udp });
     defer server_socket.close(io);
 
-    var upstream = EcsUpstream{ .io = io, .udp = &server_socket, .max_requests = 1 };
+    // Two requests: the minimized `com. A` hop, which the fake answers
+    // authoritatively, and the full name that the next label becomes.
+    var upstream = EcsUpstream{ .io = io, .udp = &server_socket, .max_requests = 2 };
     const thread = try std.Thread.spawn(.{}, serveEcsUpstream, .{&upstream});
 
     var resolver = try Resolver.init(std.testing.allocator, io, .{
@@ -10717,4 +10870,75 @@ test "RFC 1034 section 4.3.2: with no forwarder the resolver resolves from its h
     try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
     try std.testing.expectEqual([4]u8{ 192, 0, 2, 1 }, response.answers.slice()[0].rdata.A);
     try std.testing.expect(response.header.recursion_available);
+}
+
+test "the chain cache reuses a zone's DS and DNSKEY records until the TTL" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var resolver = try Resolver.init(std.testing.allocator, io, .{});
+    defer resolver.deinit();
+
+    const apex = try dns_name.Name.fromText("example.com.");
+    const ttl: u32 = 300;
+    const records = [_]dns_record.ResourceRecord{
+        .{ .owner = apex, .rrtype = .DNSKEY, .class = .IN, .ttl = ttl, .rdata = .{ .Unknown = .{} } },
+    };
+    try resolver.putChain(apex, .DNSKEY, ttl, 1000, &records);
+    try std.testing.expect(resolver.lookupChain(apex, .DNSKEY, 1100) != null);
+    // The entry expires at its TTL.
+    try std.testing.expect(resolver.lookupChain(apex, .DNSKEY, 1400) == null);
+    // The DS and the DNSKEY are cached separately.
+    try std.testing.expect(resolver.lookupChain(apex, .DS, 1100) == null);
+    // A second store for the same zone replaces the entry.
+    try resolver.putChain(apex, .DNSKEY, ttl, 2000, &records);
+    try std.testing.expectEqual(@as(usize, 1), resolver.chain_len);
+}
+
+test "a forwarded unsigned answer stays insecure under a root anchor" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    // The zone publishes no DS, so the answer is honestly insecure. The
+    // resolver's knowledge stops at the root, which cannot tell a signed
+    // child from an unsigned delegation, so the answer must not be failed.
+    const a_records = [_]dns_record.ResourceRecord{dns64TestARecord("www.example.com.")};
+    var upstream = Dns64Upstream{
+        .io = io,
+        .udp = &upstream_socket,
+        .a = &a_records,
+    };
+    const thread = try std.Thread.spawn(.{}, serveDns64Upstream, .{&upstream});
+
+    const anchors = try validate.Anchors.parse(std.testing.allocator,
+        \\. DNSKEY 257 3 15 zPnZ/QwEe7S8C5SPz2OfS5RR40ATk2/rYnE9xHIEijs=
+        \\
+    );
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = upstream_socket.address },
+        .anchors = anchors,
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var query = try makeTestQuery(scratch, 0x2946, "www.example.com.", true);
+    defer query.deinit();
+    query.question.?.qtype = .A;
+    query.edns.?.dnssec_ok = true;
+    query.additionals.items[0].ttl |= 0x8000;
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42746);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    thread.join();
+
+    const response = try dns_message.Message.parse(scratch, bytes);
+    try std.testing.expectEqual(dns_header.Rcode.no_error, response.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+    try std.testing.expect(!response.header.authenticated_data);
+    // The unsigned answer needs no chain, so the forwarder saw one query.
+    try std.testing.expectEqual(@as(usize, 1), upstream.requests);
 }
