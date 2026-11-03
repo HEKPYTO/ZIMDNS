@@ -71,19 +71,21 @@ TCP.
 ## DNSSEC deferral — current status
 
 Accepted 2026-09-09 for the authoritative-serving-minimum profile; partially
-superseded 2026-10-19. What landed since: zone signing (`dnssec-key-file`,
-`src/zone/signer.zig`), chain validation on the forwarding path
-(`trust-anchor-file`, `src/dns/validate.zig`, AD on secure / SERVFAIL+EDE on
-bogus / EDE on an insecure answer that says why it is insecure), and a static
-trust-anchor store (`Anchors.parse`). The child-side half of the RFC 6781
-§4.1.2 key-signing key rollover landed with it (`dnssec-new-ksk-file`; see
-`src/zone/README.md`), and with it the revoke phase of §4.1.2.1
-(`dnssec-new-ksk-file <path> revoked`), which publishes the key being
-removed with the RFC 5011 §3 REVOKE bit set. Iterative
-recursion from the built-in root hints now lives in `src/iterate.zig` and
-runs when `recursion allow` is configured without a `forwarder`; its hops
-ask no DNSSEC proofs, so chained validation over that path is still open.
-Also deferred: root priming, RFC 5011 automated rollover, the parent-side
-half of a key-signing key rollover, and the zone-signing key rollover
-tooling.
-Matrix rows 77/91/96 describe the shipped split.
+superseded 2026-10-19 and 2026-11-03. What landed since: zone signing
+(`dnssec-key-file`, `src/zone/signer.zig`), chain validation on the forwarding
+and iterative paths (`trust-anchor-file`, `src/dns/validate.zig`, AD on secure /
+SERVFAIL+EDE on bogus / EDE on an insecure answer that says why it is insecure),
+and a static trust-anchor store (`Anchors.parse`). The child-side half of the
+RFC 6781 §4.1.2 key-signing key rollover landed with it (`dnssec-new-ksk-file`;
+see `src/zone/README.md`), and with it the revoke phase of §4.1.2.1
+(`dnssec-new-ksk-file <path> revoked`), which publishes the key being removed
+with the RFC 5011 §3 REVOKE bit set. Iterative recursion from the built-in root
+hints lives in `src/iterate.zig` and runs when `recursion allow` is configured
+without a `forwarder`; its hops carry DO=1 and validate through the DS/DNSKEY
+chain up to the configured anchor. Root priming is implemented (RFC 9609 §2):
+the walk primes the root with the `. NS` query and reuses the addresses until
+their TTL expires, falling back to the built-in hints. Still deferred by decision
+or open work: RFC 5011 automated anchor rollover (the operator's anchor file is
+the trust configuration), the parent-side half of a key-signing key rollover,
+and the zone-signing key rollover tooling. Matrix rows 51, 91, 92, 117, and 126
+describe the shipped split.

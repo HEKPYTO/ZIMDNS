@@ -4,8 +4,8 @@
 /// negative answer is checked against the RFC 6840 sections 4.1, 4.3 and 4.4
 /// spoof rules and the RFC 5155 section 8 NSEC3 proofs.
 /// What this module does: DS and DNSKEY anchors, RFC 4034 section 6 canonical
-/// signed-data assembly, RSA/SHA-256, RSA/SHA-512, ECDSA P-256/P-384, and
-/// Ed25519 verification, the
+/// signed-data assembly, RSA/SHA-1, RSA/SHA-256, RSA/SHA-512, ECDSA
+/// P-256/P-384, and Ed25519 verification, the
 /// RFC 5011 section 3 REVOKE bit that keeps a revoked key out of the trusted
 /// set, NSEC NXDOMAIN and NODATA proofs, NSEC3 closest-encloser and opt-out
 /// proofs, and the secure/insecure/bogus outcome with an RFC 8914 INFO-CODE
@@ -18,10 +18,10 @@
 /// configured anchor (RFC 8976 section 4 step 3).
 /// What this module does NOT do: iterative resolution, chasing a delegation
 /// chain across several zones, the RFC 5011 anchor rollover beyond the REVOKE
-/// bit, NSEC3 generation, RSA/SHA-1 (5 and 7, a MUST in the IANA "DNS
-/// Security Algorithm Numbers" registry's "Implement for DNSSEC Validation"
-/// column as revised by RFC 9904; not implementing it is a recorded
-/// deviation), and Ed448, for which the standard library carries no primitive.
+/// bit, NSEC3 generation, RSA/SHA-1 signing (5 and 7, which the IANA "DNS
+/// Security Algorithm Numbers" registry's "Implement for DNSSEC Signing"
+/// column marks NOT RECOMMENDED), and Ed448, for which the standard library
+/// carries no primitive.
 /// Ownership: `validate` runs on one arena and frees it before returning.
 /// `Anchors` owns its parsed RDATA until `deinit`.
 /// Errors: a malformed anchor file or opaque RDATA is a typed error. A failed
@@ -538,19 +538,19 @@ fn verifyEd25519(key: []const u8, signature: []const u8, data: []const u8) Error
     Ed25519.Signature.fromBytes(raw).verifyStrict(data, public_key) catch return Error.SignatureInvalid;
 }
 
-/// The DNSSEC algorithms this build verifies: 8 and 10 (RFC 5702), 13 and 14
-/// (RFC 6605), and 15 (RFC 8080). A DNSKEY RRset of any other algorithm is
-/// the case RFC 8914 section 4.2 names; a DS RRset of them is the case
-/// RFC 4035 section 5.2 names. Either way the zone has no supported
-/// authentication path. RSA/SHA-1 (5 and 7) is not here: the IANA "DNS
-/// Security Algorithm Numbers" registry, as revised by RFC 9904, marks it MUST
+/// The DNSSEC algorithms this build verifies: 5 and 7 (RSA/SHA-1, RFC 3110),
+/// 8 and 10 (RFC 5702), 13 and 14 (RFC 6605), and 15 (RFC 8080). A DNSKEY
+/// RRset of any other algorithm is the case RFC 8914 section 4.2 names; a DS
+/// RRset of them is the case RFC 4035 section 5.2 names. Either way the zone
+/// has no supported authentication path. The IANA "DNS Security Algorithm
+/// Numbers" registry, as revised by RFC 9904, marks RSA/SHA-1 (5 and 7) MUST
 /// under "Implement for DNSSEC Validation" and NOT RECOMMENDED under
-/// "Implement for DNSSEC Signing"; this build deliberately does not implement
-/// that validation MUST and records the deviation, treating the algorithms as
-/// unsupported rather than insecure-by-silence.
+/// "Implement for DNSSEC Signing": validation is implemented here, and
+/// signing stays with the algorithms the registry recommends. Ed448 (16)
+/// remains absent from validation, where the registry marks it RECOMMENDED.
 fn algorithmSupported(number: u8) bool {
     return switch (number) {
-        8, 10, 13, 14, 15 => true,
+        5, 7, 8, 10, 13, 14, 15 => true,
         else => false,
     };
 }
@@ -602,6 +602,7 @@ fn verifyWithKey(dnskey_rdata: []const u8, rrsig: Rrsig, data: []const u8) Error
     if (dnskey_rdata[3] != rrsig.algorithm) return Error.KeyMismatch;
     const key = dnskey_rdata[4..];
     switch (rrsig.algorithm) {
+        5, 7 => try verifyRsa(key, rrsig.signature, data, std.crypto.hash.Sha1),
         8 => try verifyRsa(key, rrsig.signature, data, std.crypto.hash.sha2.Sha256),
         10 => try verifyRsa(key, rrsig.signature, data, std.crypto.hash.sha2.Sha512),
         13 => try verifyEcdsa(EcdsaP256Sha256, key, rrsig.signature, data),
@@ -633,7 +634,8 @@ fn verifyRsa(key: []const u8, signature: []const u8, data: []const u8, comptime 
     const parts = rsaPublicKeyParts(key) orelse return Error.MalformedDnskey;
     const modulus_len = parts.modulus.len;
     // RFC 5702 sections 2.1 and 2.2: 512 bits is the floor for SHA-256 and
-    // 1024 bits for SHA-512; 4096 bits is the ceiling for both.
+    // 1024 bits for SHA-512; 4096 bits is the ceiling for both. RFC 3110
+    // section 3 fixes 512 to 4096 bits for RSA/SHA-1 (5 and 7).
     const min_modulus: usize = if (Hash == std.crypto.hash.sha2.Sha512) 128 else 64;
     if (modulus_len < min_modulus or modulus_len > 512) return Error.UnsupportedAlgorithm;
     if (signature.len != modulus_len) return Error.SignatureInvalid;
@@ -3354,6 +3356,58 @@ test "a DS anchor whose child publishes no DNSKEY is bogus with the DNSKEY Missi
     try std.testing.expectEqual(dnssec.EDE_DNSKEY_MISSING, result.ede);
 }
 
+test "RFC 3110 section 3: an RSA/SHA-1 RRSIG verifies and a tampered one does not" {
+    // RFC 5702 section 6.1's 512-bit modulus, carried in the RFC 3110 section
+    // 2 key body: a one-octet exponent length, the exponent 01 00 01, then
+    // the modulus.
+    const modulus_text = "wVwaxrHF2CK64aYKRUibLiH30KpPuPBjel7E8ZydQW1HYWHfoGmidzC2RnhwCC293hCzw+TFR2nqn8OVSY5t2Q==";
+    const signature_text = "ie45HOIbWfRJPaVx/kMv/hWTv8ZIsdbYzKQKcNBR6xBm9iftClcXHW3ALv51HNvGc9d6COnlt2CFFDlpapAyhg==";
+    var key: [4 + 64]u8 = undefined;
+    key[0] = 3;
+    key[1] = 1;
+    key[2] = 0;
+    key[3] = 1;
+    _ = try std.base64.standard.Decoder.decode(key[4..], modulus_text);
+    var signature: [64]u8 = undefined;
+    _ = try std.base64.standard.Decoder.decode(&signature, signature_text);
+
+    const message = "zimdns RSA/SHA-1 validation vector";
+    try verifyRsa(&key, &signature, message, std.crypto.hash.Sha1);
+
+    // The RRSIG dispatch is what a zone reaches: a DNSKEY and RRSIG with
+    // algorithm 5 must verify through the same key body and signature.
+    var dnskey: [4 + 4 + 64]u8 = undefined;
+    std.mem.writeInt(u16, dnskey[0..2], 256, .big);
+    dnskey[2] = 3;
+    dnskey[3] = 5;
+    @memcpy(dnskey[4..], &key);
+    const rrsig = Rrsig{
+        .owner = Name.root(),
+        .raw = &.{},
+        .covered = RecordType.A.value,
+        .algorithm = 5,
+        .labels = 2,
+        .orig_ttl = 300,
+        .key_tag = dnssec.keyTag(&dnskey),
+        .signer = Name.root(),
+        .signature = &signature,
+        .header_len = 0,
+    };
+    try verifyWithKey(&dnskey, rrsig, message);
+
+    // A signature over one message must not verify over another, and one
+    // flipped bit must not verify at all.
+    try std.testing.expectError(Error.SignatureInvalid, verifyRsa(&key, &signature, message ++ "!", std.crypto.hash.Sha1));
+    signature[0] ^= 0x01;
+    try std.testing.expectError(Error.SignatureInvalid, verifyRsa(&key, &signature, message, std.crypto.hash.Sha1));
+}
+
+test "RFC 9904: RSA/SHA-1 is supported for validation and Ed448 is not" {
+    try std.testing.expect(algorithmSupported(5));
+    try std.testing.expect(algorithmSupported(7));
+    try std.testing.expect(!algorithmSupported(16));
+}
+
 test "a DNSKEY RRset with only an unsupported algorithm leaves the answer insecure with the Unsupported DNSKEY Algorithm EDE (RFC 8914 4.2)" {
     var signed = try signZoneText(std.testing.allocator, child_zone_text, p256_secret);
     defer signed.deinit(std.testing.allocator);
@@ -3363,23 +3417,20 @@ test "a DNSKEY RRset with only an unsupported algorithm leaves the answer insecu
     defer pair.response.deinit();
 
     // The zone publishes one DNSKEY, whose algorithm this build cannot verify
-    // with, and the DS at the parent names it. Algorithms 5 and 7 (RSA/SHA-1)
-    // are the RFC 9904 validation MUST this build deliberately does not meet;
-    // 16 (Ed448) is RECOMMENDED for validation and absent. All three are
-    // recorded deviations, so each is insecure rather than silently trusted.
-    for ([_]u8{ 5, 7, 16 }) |algorithm| {
-        const key = dnskeyRdata(256, algorithm);
-        var anchors = try dsAnchor(std.testing.allocator, "example.com.", &key, false);
-        defer anchors.deinit(std.testing.allocator);
-        try setApexDnskey(&pair.response, &key);
+    // with, and the DS at the parent names it. 16 (Ed448) is RECOMMENDED for
+    // validation and absent, so it is the recorded RFC 9904 deviation and is
+    // insecure rather than silently trusted.
+    const key = dnskeyRdata(256, 16);
+    var anchors = try dsAnchor(std.testing.allocator, "example.com.", &key, false);
+    defer anchors.deinit(std.testing.allocator);
+    try setApexDnskey(&pair.response, &key);
 
-        // RFC 4035 section 5.2: an unsupported algorithm leaves the zone with
-        // no authentication path, so the answer is insecure and the client
-        // still gets it -- not a SERVFAIL.
-        const result = try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds);
-        try expectStatus(.insecure, result);
-        try std.testing.expectEqual(dnssec.EDE_UNSUPPORTED_DNSKEY_ALGORITHM, result.ede);
-    }
+    // RFC 4035 section 5.2: an unsupported algorithm leaves the zone with no
+    // authentication path, so the answer is insecure and the client still gets
+    // it -- not a SERVFAIL.
+    const result = try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds);
+    try expectStatus(.insecure, result);
+    try std.testing.expectEqual(dnssec.EDE_UNSUPPORTED_DNSKEY_ALGORITHM, result.ede);
 }
 
 test "a DS whose digest type this build cannot compute leaves the answer insecure with the Unsupported DS Digest Type EDE (RFC 8914 4.3)" {
