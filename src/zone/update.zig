@@ -12,6 +12,7 @@ const RecordType = @import("../dns/types.zig").RecordType;
 const dns_writer = @import("../dns/writer.zig");
 const parser = @import("parser.zig");
 const Zone = @import("index.zig").Zone;
+const zonemd = @import("zonemd.zig");
 
 pub const Error = error{OutOfMemory};
 
@@ -293,6 +294,79 @@ fn render(allocator: std.mem.Allocator, domain: []const u8, records: []const par
         try writeRecord(&output.writer, record);
     }
     var list = output.toArrayList();
+    const text = list.toOwnedSlice(allocator) catch return Error.OutOfMemory;
+    // RFC 8976 section 3.4: a zone that publishes a ZONEMD publishes the
+    // digest of the data it now serves, with the serial the update produced.
+    if (try resealZonemdText(allocator, text)) |sealed| {
+        allocator.free(text);
+        return sealed;
+    }
+    return text;
+}
+
+/// Rewrites every apex ZONEMD record in a rendered zone text with the digest
+/// of the new data (RFC 8976 section 3.4). The digest covers neither the apex
+/// ZONEMD RRset nor its RRSIG (section 3.3.1.1), so one pass is enough. Null
+/// when the zone carries no apex ZONEMD.
+fn resealZonemdText(allocator: std.mem.Allocator, text: []const u8) Error!?[]u8 {
+    var zone_file = parser.ZoneFile.parse(text) catch return null;
+    defer zone_file.deinit();
+    var zone = Zone.fromZoneFile(&zone_file) catch return null;
+    defer zone.deinit();
+    if (!zonemd.hasApexRecord(&zone)) return null;
+    const serial = zone.soaSerial() orelse return null;
+
+    var output = std.Io.Writer.Allocating.init(allocator);
+    errdefer output.deinit();
+    var rewrote = false;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var tokens = std.mem.tokenizeAny(u8, line, " \t");
+        const fields = blk: {
+            const owner = tokens.next() orelse break :blk null;
+            const ttl_text = tokens.next() orelse break :blk null;
+            const class_text = tokens.next() orelse break :blk null;
+            const type_text = tokens.next() orelse break :blk null;
+            break :blk .{ owner, ttl_text, class_text, type_text };
+        };
+        const parsed_fields = fields orelse {
+            output.writer.print("{s}\n", .{line}) catch return Error.OutOfMemory;
+            continue;
+        };
+        const owner = parsed_fields[0];
+        const ttl_text = parsed_fields[1];
+        const class_text = parsed_fields[2];
+        const type_text = parsed_fields[3];
+        if (!std.ascii.eqlIgnoreCase(owner, zone.originText()) or !std.mem.eql(u8, type_text, "ZONEMD")) {
+            output.writer.print("{s}\n", .{line}) catch return Error.OutOfMemory;
+            continue;
+        }
+        const rdata_text = tokens.rest();
+        const parsed = parser.parseRData(.ZONEMD, rdata_text) catch return null;
+        const hash = zonemd.hashFromCode(parsed.ZONEMD.hash) orelse return null;
+        var digest: [dns_rdata.max_zonemd_digest_len]u8 = undefined;
+        zonemd.computeDigest(&zone, hash, allocator, &digest) catch |err| switch (err) {
+            error.OutOfMemory => return Error.OutOfMemory,
+            else => return null,
+        };
+        output.writer.print("{s} {s} {s} ZONEMD {d} {d} {d} ", .{
+            owner,
+            ttl_text,
+            class_text,
+            serial,
+            parsed.ZONEMD.scheme,
+            parsed.ZONEMD.hash,
+        }) catch return Error.OutOfMemory;
+        for (digest[0..hash.digestLen()]) |byte| output.writer.print("{x:0>2}", .{byte}) catch return Error.OutOfMemory;
+        output.writer.writeByte('\n') catch return Error.OutOfMemory;
+        rewrote = true;
+    }
+    if (!rewrote) {
+        output.deinit();
+        return null;
+    }
+    var list = output.toArrayList();
     return list.toOwnedSlice(allocator) catch return Error.OutOfMemory;
 }
 
@@ -463,6 +537,35 @@ test "an update adds an A record and raises the serial" {
     defer lookup.deinit(std.testing.allocator);
     try std.testing.expectEqual(.answer, lookup.kind);
     try std.testing.expectEqual(@as(u32, 8), rebuilt.soaSerial().?);
+}
+
+test "an update reseals a published ZONEMD" {
+    // RFC 8976 section 3.4: the digest follows the data and the serial the
+    // update produced. The placeholder digest is the right length and wrong
+    // value, so the old record cannot pass by accident.
+    const sealed_zone_text =
+        \\$ORIGIN example.com.
+        \\$TTL 3600
+        \\@ IN SOA ns1.example.com. hostmaster.example.com. 7 3600 900 1209600 3600
+        \\@ IN NS ns1.example.com.
+        \\@ IN ZONEMD 7 1 1 000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+        \\ns1 IN A 192.0.2.1
+        \\
+    ;
+    var zone = try buildZone(sealed_zone_text);
+    defer zone.deinit();
+    var updates = [_]dns_record.ResourceRecord{aRecord("new.example.com.", .{ 192, 0, 2, 20 }, 60)};
+    const outcome = try apply(std.testing.allocator, &zone, "example.com.", &.{}, &updates);
+    const text = zoneText(outcome);
+    defer std.testing.allocator.free(text);
+
+    var rebuilt = try buildZone(text);
+    defer rebuilt.deinit();
+    try std.testing.expectEqual(@as(u32, 8), rebuilt.soaSerial().?);
+    var report: [1024]u8 = undefined;
+    const message = try zonemd.verify(&rebuilt, std.testing.allocator, &report);
+    try std.testing.expect(std.mem.startsWith(u8, message, "zone example.com.: ZONEMD verified"));
+    try std.testing.expect(std.mem.indexOf(u8, text, "ZONEMD 8 1 1 0000000000") == null);
 }
 
 test "a duplicate add replaces the record's TTL" {

@@ -9,6 +9,7 @@ const auth_runtime = @import("../auth/runtime.zig");
 const response_mod = @import("../auth/response.zig");
 const dns_message = @import("../dns/message.zig");
 const keyring_mod = @import("../auth/keyring.zig");
+const xfr_client = @import("../zone/xfr_client.zig");
 const blocklist_mod = @import("../blocklist.zig");
 const parser = @import("parser.zig");
 const listener = @import("../platform/listener.zig");
@@ -47,6 +48,12 @@ pub const Error = error{
     /// The RFC 9432 catalog zone names a zone the server also serves, so the
     /// synthesized catalog and the configuration would contradict.
     BadCatalogZone,
+    /// An RFC 5782 entry list names an address or name the convention forbids,
+    /// or a form this profile refuses to publish.
+    BadBlacklistZone,
+    /// The RFC 9432 catalog fetched from the primary is missing, malformed,
+    /// or names a member the server cannot provision.
+    BadCatalogMember,
 };
 
 pub const ServerContext = struct {
@@ -218,6 +225,44 @@ pub const ServerContext = struct {
             );
         }
 
+        // RFC 9432 section 5: the consumer role. The catalog and every member
+        // are fetched once at startup and served from memory. There is no
+        // refresh: a changed catalog reaches this server on the next start.
+        if (context.config.catalog_consumer) |*consumer| {
+            consumeCatalog(&context, io, allocator, consumer, now_seconds, chain_policy) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return err,
+            };
+        }
+
+        // RFC 5782: a blacklist zone is a normal zone published from an entry
+        // list. The naming and the entry records are synthesized here; the
+        // zone is served, signed, and transferred like any other.
+        for (context.config.blacklist_zones.items[0..context.config.blacklist_zones.len]) |*configured| {
+            const apex = try lowerDot(allocator, configured.apexText());
+            defer allocator.free(apex);
+            for (context.config.zones.items[0..context.config.zones.len]) |*served| {
+                if (zoneNamesEqual(apex, served.nameText())) return Error.BadBlacklistZone;
+            }
+            if (context.config.catalogZoneText()) |catalog_text| {
+                if (zoneNamesEqual(apex, catalog_text)) return Error.BadBlacklistZone;
+            }
+            const entries_text = try readReferencedFile(dir, io, configured.fileText(), allocator);
+            defer allocator.free(entries_text);
+            const zone_text = synthesizeBlacklistZoneText(allocator, apex, entries_text) catch return Error.BadBlacklistZone;
+            defer allocator.free(zone_text);
+            try loadZoneText(
+                &context,
+                allocator,
+                io,
+                zone_text,
+                apex,
+                if (dnssec_key) |*key| key else null,
+                now_seconds,
+                chain_policy,
+            );
+        }
+
         // The key outlives the startup signing pass: the serving path signs
         // the RFC 8482 minimal answer, which is not part of the signed zone.
         if (dnssec_key) |*key| {
@@ -323,6 +368,35 @@ pub const ServerContext = struct {
                 if (std.ascii.eqlIgnoreCase(zone.nameText(), apex)) zone_path = zone.fileText();
             }
             runtime.setUpdatePolicy(std.Io.Dir.cwd(), apex, entry.keyText(), zone_path) catch {
+                runtime.deinit();
+                return error.BadConfiguration;
+            };
+        }
+        for (self.config.notifies.items[0..self.config.notifies.len]) |entry| {
+            var served = false;
+            for (self.config.zones.items[0..self.config.zones.len]) |zone| {
+                if (zoneNamesEqual(entry.apexText(), zone.nameText())) served = true;
+            }
+            if (!served) {
+                runtime.deinit();
+                return error.BadConfiguration;
+            }
+            const address = std.Io.net.IpAddress.parse(entry.addressText(), entry.port) catch {
+                runtime.deinit();
+                return error.BadConfiguration;
+            };
+            runtime.addNotifyTarget(entry.apexText(), address) catch {
+                runtime.deinit();
+                return error.BadConfiguration;
+            };
+        }
+        for (self.config.ddr_records.items[0..self.config.ddr_records.len]) |entry| {
+            runtime.addDdrRecord(
+                entry.targetText(),
+                entry.alpnText(),
+                entry.port,
+                if (entry.has_dohpath) entry.dohpathText() else null,
+            ) catch {
                 runtime.deinit();
                 return error.BadConfiguration;
             };
@@ -481,12 +555,13 @@ fn loadZoneText(
     // RFC 4035 section 2.3: signing adds DNSKEY, DS, RRSIG, and NSEC to
     // the loaded zone, so the signed RRsets are served from here on
     // without touching the zone file on disk.
+    const signature_window: signer.Options = .{
+        .inception = now_seconds,
+        .expiration = now_seconds + signature_validity_seconds,
+        .chain = chain_policy,
+    };
     if (dnssec_key) |key| {
-        signer.signZone(context.allocator, &zone, key, .{
-            .inception = now_seconds,
-            .expiration = now_seconds + signature_validity_seconds,
-            .chain = chain_policy,
-        }) catch |err| switch (err) {
+        signer.signZone(context.allocator, &zone, key, signature_window) catch |err| switch (err) {
             // The zone states the parameters of its own chain and the
             // configuration names other ones: the zone is refused
             // rather than served as two chains.
@@ -554,6 +629,186 @@ fn loadZoneText(
     try context.zones.append(allocator, zone);
 }
 
+/// RFC 5782 section 2: the blacklist zone an entry list publishes. Each entry
+/// is an IPv4 address, an IPv6 address, or a domain name, and its owner is the
+/// reversed-address or listed-name form the memo defines under the zone apex.
+/// Every entry carries `A 127.0.0.2` (section 2.1); section 5's mandated test
+/// entries are always published, and the forms it forbids are refused rather
+/// than written. Address ranges (CIDR entries) are refused: this profile
+/// publishes exact entries only.
+fn synthesizeBlacklistZoneText(allocator: std.mem.Allocator, apex: []const u8, entries: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var line: [1024]u8 = undefined;
+    try out.appendSlice(allocator, try std.fmt.bufPrint(
+        &line,
+        "$ORIGIN {s}\n$TTL 3600\n@ IN SOA invalid. hostmaster.invalid. 1 3600 900 1209600 3600\n@ IN NS invalid.\n",
+        .{apex},
+    ));
+    // RFC 5782 section 5: the test entries a client uses to prove the list
+    // exists are published for every list.
+    try appendBlacklistEntry(&out, allocator, apex, "127.0.0.2");
+    try appendBlacklistEntry(&out, allocator, apex, "::ffff:127.0.0.2");
+    try appendBlacklistEntry(&out, allocator, apex, "test");
+
+    var lines = std.mem.splitScalar(u8, entries, '\n');
+    while (lines.next()) |raw| {
+        const comment = std.mem.indexOfScalar(u8, raw, '#') orelse raw.len;
+        const entry = std.mem.trim(u8, raw[0..comment], " \t\r");
+        if (entry.len == 0) continue;
+        if (std.mem.indexOfScalar(u8, entry, '/') != null) return error.AddressRangeUnsupported;
+        try appendBlacklistEntry(&out, allocator, apex, entry);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// One RFC 5782 entry: the owner of the reversed-address form (or the listed
+/// name itself) under `apex`, with the `A 127.0.0.2` record every entry must
+/// carry. Section 5's two forbidden forms are refused.
+fn appendBlacklistEntry(out: *std.ArrayList(u8), allocator: std.mem.Allocator, apex: []const u8, entry: []const u8) !void {
+    var owner_buffer: [512]u8 = undefined;
+    const owner = try blacklistOwner(&owner_buffer, entry);
+    var line: [1024]u8 = undefined;
+    try out.appendSlice(allocator, try std.fmt.bufPrint(&line, "{s}.{s} IN A 127.0.0.2\n", .{ owner, apex }));
+}
+
+/// The owner label the RFC 5782 conventions put in front of the zone apex: an
+/// IPv4 address is four reversed octets, an IPv6 address is its 32 reversed
+/// nibbles, and a name is the name itself.
+fn blacklistOwner(buffer: *[512]u8, entry: []const u8) ![]const u8 {
+    if (std.Io.net.IpAddress.parseIp4(entry, 0)) |address| {
+        const bytes = address.ip4.bytes;
+        // RFC 5782 section 5: a list must not publish its own loopback test
+        // address, and the A value clients check is 127.0.0.2.
+        if (std.mem.eql(u8, &bytes, &.{ 127, 0, 0, 1 })) return error.ForbiddenTestEntry;
+        return std.fmt.bufPrint(buffer, "{d}.{d}.{d}.{d}", .{ bytes[3], bytes[2], bytes[1], bytes[0] }) catch error.EntryTooLong;
+    } else |_| {}
+    if (std.Io.net.IpAddress.parseIp6(entry, 0)) |address| {
+        // The IPv6 forbidden test address is ::ffff:127.0.0.1, whatever
+        // spelling the entry used.
+        if (std.mem.eql(u8, &address.ip6.bytes, &.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1 })) return error.ForbiddenTestEntry;
+        var written: usize = 0;
+        const bytes = address.ip6.bytes;
+        var index: usize = bytes.len;
+        while (index > 0) {
+            index -= 1;
+            const byte = bytes[index];
+            const nibbles = [_]u8{ "0123456789abcdef"[byte & 0x0f], "0123456789abcdef"[byte >> 4] };
+            for (nibbles, 0..) |nibble, offset| {
+                if (written != 0) {
+                    buffer[written] = '.';
+                    written += 1;
+                }
+                buffer[written] = nibble;
+                written += 1;
+                _ = offset;
+            }
+        }
+        return buffer[0..written];
+    } else |_| {}
+    const name = std.mem.trim(u8, entry, ".");
+    if (name.len == 0) return error.BadEntry;
+    if (std.ascii.eqlIgnoreCase(name, "invalid")) return error.ForbiddenTestEntry;
+    for (name) |byte| {
+        if (std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_' or byte == '.') continue;
+        return error.BadEntry;
+    }
+    return std.ascii.lowerString(buffer[0..name.len], name);
+}
+
+/// RFC 9432 section 5: fetch the configured catalog from its primary, publish
+/// it, and provision every member it names. The version property must be the
+/// one schema this build understands ("2"), every member node must be a
+/// single label under `zones`, and two members naming the same zone are a
+/// broken catalog (section 5.1). A member is served unsigned locally: its
+/// records arrive with whatever signatures its own primary publishes, and
+/// this server never re-signs a zone it does not hold the key for.
+fn consumeCatalog(
+    context: *ServerContext,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    consumer: *const parser.CatalogConsumer,
+    now_seconds: u32,
+    chain_policy: ?signer.ChainPolicy,
+) !void {
+    const primary = std.Io.net.IpAddress.parse(consumer.addressText(), consumer.port) catch return Error.BadConfiguration;
+    const apex = try lowerDot(allocator, consumer.apexText());
+    defer allocator.free(apex);
+    const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(5000), .clock = .awake } };
+
+    const catalog_text = xfr_client.fetch(allocator, io, &primary, apex, timeout) catch return Error.BadCatalogMember;
+    defer allocator.free(catalog_text);
+    try loadZoneText(context, allocator, io, catalog_text, apex, null, now_seconds, chain_policy);
+
+    var catalog: ?*const zone_index.Zone = null;
+    for (context.zones.items) |*zone| {
+        if (std.ascii.eqlIgnoreCase(zone.originText(), apex)) catalog = zone;
+    }
+    const catalog_zone = catalog orelse return Error.BadCatalogMember;
+
+    // RFC 9432 section 4.2.1: exactly one `version.<catalog>` TXT RR whose
+    // value is the schema this build implements.
+    var version_owner_buffer: [512]u8 = undefined;
+    const version_owner = std.fmt.bufPrint(&version_owner_buffer, "version.{s}", .{apex}) catch return Error.BadCatalogMember;
+    var version_records: usize = 0;
+    var version_is_two = false;
+    for (catalog_zone.records.items[0..catalog_zone.records.len]) |record| {
+        if (!record.rrtype.eql(.TXT)) continue;
+        if (!std.ascii.eqlIgnoreCase(record.ownerText(), version_owner)) continue;
+        version_records += 1;
+        const parsed = zone_parser.parseRData(.TXT, record.rdataText()) catch return Error.BadCatalogMember;
+        const value = switch (parsed) {
+            .TXT => |txt| txt.text(),
+            else => return Error.BadCatalogMember,
+        };
+        if (std.mem.eql(u8, value, "2")) version_is_two = true;
+    }
+    if (version_records != 1 or !version_is_two) return Error.BadCatalogMember;
+
+    // Section 4.1: one PTR per member node, the target naming the zone.
+    var members: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (members.items) |member| allocator.free(member);
+        members.deinit(allocator);
+    }
+    for (catalog_zone.records.items[0..catalog_zone.records.len]) |record| {
+        if (!record.rrtype.eql(.PTR)) continue;
+        const label = catalogMemberLabel(record.ownerText(), apex) orelse continue;
+        _ = label;
+        const parsed = zone_parser.parseRData(.PTR, record.rdataText()) catch return Error.BadCatalogMember;
+        const target = switch (parsed) {
+            .PTR => |name| name,
+            else => return Error.BadCatalogMember,
+        };
+        var target_buffer: [512]u8 = undefined;
+        const target_text = target.toText(&target_buffer) catch return Error.BadCatalogMember;
+        for (members.items) |existing| {
+            if (std.ascii.eqlIgnoreCase(existing, target_text)) return Error.BadCatalogMember;
+        }
+        try members.append(allocator, try allocator.dupe(u8, target_text));
+    }
+
+    for (members.items) |member| {
+        if (std.ascii.eqlIgnoreCase(member, apex)) return Error.BadCatalogMember;
+        const member_text = xfr_client.fetch(allocator, io, &primary, member, timeout) catch return Error.BadCatalogMember;
+        defer allocator.free(member_text);
+        try loadZoneText(context, allocator, io, member_text, member, null, now_seconds, chain_policy);
+    }
+}
+
+/// The member label when `owner` is `<label>.zones.<apex>` and `label` is one
+/// non-empty label; null for every other name.
+fn catalogMemberLabel(owner: []const u8, apex: []const u8) ?[]const u8 {
+    const tail = ".zones.";
+    if (owner.len <= apex.len + tail.len) return null;
+    const tail_offset = owner.len - (apex.len + tail.len);
+    if (!std.ascii.eqlIgnoreCase(owner[tail_offset..][0..tail.len], tail)) return null;
+    if (!std.ascii.eqlIgnoreCase(owner[tail_offset + tail.len ..], apex)) return null;
+    const label = owner[0..tail_offset];
+    if (label.len == 0 or std.mem.indexOfScalar(u8, label, '.') != null) return null;
+    return label;
+}
+
 /// The RFC 9432 section 4 catalog zone for the zones this server serves: the
 /// schema-2 version property, one member node per configured zone, and the
 /// SOA and NS that make the zone syntactically valid. Member labels are the
@@ -563,13 +818,33 @@ fn synthesizeCatalogZoneText(
     apex: []const u8,
     members: []const parser.Zone,
 ) ![]u8 {
+    // The SOA serial is a digest of the membership: a restart with the same
+    // zones keeps its serial, and a changed list advances it (RFC 1982
+    // ordering), so a consuming secondary sees the change in the SOA it
+    // polls.
+    var sha = std.crypto.hash.sha2.Sha256.init(.{});
+    for (members, 1..) |member, number| {
+        var member_line: [512]u8 = undefined;
+        const name = member.nameText();
+        const dotted = name.len != 0 and name[name.len - 1] == '.';
+        const rendered = try std.fmt.bufPrint(&member_line, "m{d}.zones IN PTR {s}{s}\n", .{
+            number,
+            name,
+            if (dotted) "" else ".",
+        });
+        sha.update(rendered);
+    }
+    var digest: [32]u8 = undefined;
+    sha.final(&digest);
+    const serial = std.mem.readInt(u32, digest[0..4], .big);
+
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     var line: [512]u8 = undefined;
     try out.appendSlice(allocator, try std.fmt.bufPrint(
         &line,
-        "$ORIGIN {s}\n$TTL 3600\n@ IN SOA invalid. hostmaster.invalid. 1 3600 900 1209600 0\n@ IN NS invalid.\nversion IN TXT \"2\"\n",
-        .{apex},
+        "$ORIGIN {s}\n$TTL 3600\n@ IN SOA invalid. hostmaster.invalid. {d} 3600 900 1209600 0\n@ IN NS invalid.\nversion IN TXT \"2\"\n",
+        .{ apex, serial },
     ));
     for (members, 1..) |member, number| {
         const name = member.nameText();
@@ -715,6 +990,308 @@ test "server context carries the TCP idle timeout to the listener and the answer
     try std.testing.expectEqual(@as(u16, 50), plain_runtime.answer_policy.tcp_keepalive_timeout);
 }
 
+test "a signed zone carries an RRSIG over its ZONEMD RRset" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    // RFC 8976 section 3.2: the signature over the ZONEMD RRset is made after
+    // the digest exists. The digest itself covers the zone-file records, so
+    // the signature pass does not change it.
+    try dir.dir.writeFile(io, .{ .sub_path = "example.zone", .data = zonemd_verified_zone_text });
+    try dir.dir.writeFile(io, .{ .sub_path = "zsk.key", .data = dnssec_test_key });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone example. primary example.zone\ndnssec-key-file zsk.key\n" });
+
+    var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+    defer context.deinit();
+    const zone = &context.zones.items[0];
+    try std.testing.expectEqual(@as(usize, 1), countType(zone.*, @import("../dns/types.zig").RecordType.ZONEMD));
+    try std.testing.expectEqual(@as(usize, 1), countRrsigCovering(zone.*, "example.", @import("../dns/types.zig").RecordType.ZONEMD.code()));
+
+    // The digest the served zone carries matches the data it serves: the
+    // verifier recomputes it and the startup check accepted the zone.
+    var report: [1024]u8 = undefined;
+    const message = try zonemd.verify(zone, std.testing.allocator, &report);
+    try std.testing.expect(std.mem.startsWith(u8, message, "zone example.: ZONEMD verified"));
+}
+
+// A loopback primary that answers the AXFR for whichever of the two zones the
+// question names, so the consumer's catalog fetch and member fetch both meet a
+// real transfer.
+const CatalogServer = struct {
+    io: std.Io,
+    listener: *std.Io.net.Server,
+    zones: *const [2]*const zone_index.Zone,
+    connections: usize,
+
+    fn run(args: CatalogServer) void {
+        var served: usize = 0;
+        while (served < args.connections) : (served += 1) {
+            var stream = args.listener.accept(args.io) catch return;
+            defer stream.close(args.io);
+            var read_buffer: [4096]u8 = undefined;
+            var reader = stream.reader(args.io, &read_buffer);
+            var length_bytes: [2]u8 = undefined;
+            reader.interface.readSliceAll(&length_bytes) catch return;
+            const length = std.mem.readInt(u16, &length_bytes, .big);
+            var query_buffer: [65535]u8 = undefined;
+            reader.interface.readSliceAll(query_buffer[0..length]) catch return;
+
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            const request = dns_message.Message.parseQuery(arena.allocator(), query_buffer[0..length]) catch return;
+            var question_buffer: [256]u8 = undefined;
+            const qname = request.question.?.name.toText(&question_buffer) catch return;
+            const zone = for (args.zones) |candidate| {
+                if (std.ascii.eqlIgnoreCase(candidate.originText(), qname)) break candidate;
+            } else return;
+            const messages = @import("../zone/transfer.zig").buildAxfrMessages(std.heap.page_allocator, &request, zone, 2) catch return;
+            defer {
+                for (messages) |*message| message.deinit();
+                std.heap.page_allocator.free(messages);
+            }
+            var write_buffer: [4096]u8 = undefined;
+            var writer = stream.writer(args.io, &write_buffer);
+            for (messages) |*message| {
+                var frame: [65535]u8 = undefined;
+                var frame_writer = @import("../dns/writer.zig").Writer.init(&frame);
+                message.encode(&frame_writer) catch return;
+                var prefix: [2]u8 = undefined;
+                std.mem.writeInt(u16, &prefix, @intCast(frame_writer.len()), .big);
+                writer.interface.writeAll(&prefix) catch return;
+                writer.interface.writeAll(frame_writer.written()) catch return;
+            }
+            writer.interface.flush() catch return;
+        }
+    }
+};
+
+test "the catalog consumer refuses a schema version this build does not implement" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    const broken_catalog_text =
+        \\$ORIGIN catalog.example.
+        \\$TTL 3600
+        \\@ IN SOA invalid. hostmaster.invalid. 1 3600 900 1209600 3600
+        \\@ IN NS invalid.
+        \\version IN TXT "1"
+        \\
+    ;
+    var catalog_file = try zone_parser.ZoneFile.parse(broken_catalog_text);
+    defer catalog_file.deinit();
+    var catalog_zone = try zone_index.Zone.fromZoneFile(&catalog_file);
+    defer catalog_zone.deinit();
+    const zones = [2]*const zone_index.Zone{ &catalog_zone, &catalog_zone };
+
+    var listen_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var transfer_server = try std.Io.net.IpAddress.listen(&listen_address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer transfer_server.deinit(io);
+    const port = switch (transfer_server.socket.address) {
+        .ip4 => |ip4| ip4.port,
+        .ip6 => |ip6| ip6.port,
+    };
+    const thread = try std.Thread.spawn(.{}, CatalogServer.run, .{CatalogServer{
+        .io = io,
+        .listener = &transfer_server,
+        .zones = &zones,
+        .connections = 1,
+    }});
+    defer thread.join();
+
+    var config_buffer: [256]u8 = undefined;
+    const config = try std.fmt.bufPrint(&config_buffer, "catalog-consumer catalog.example. 127.0.0.1:{d}\n", .{port});
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = config });
+    try std.testing.expectError(Error.BadCatalogMember, ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator));
+}
+
+test "the catalog consumer provisions the members a catalog names" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    const catalog_text =
+        \\$ORIGIN catalog.example.
+        \\$TTL 3600
+        \\@ IN SOA invalid. hostmaster.invalid. 1 3600 900 1209600 3600
+        \\@ IN NS invalid.
+        \\version IN TXT "2"
+        \\m1.zones IN PTR member.example.
+        \\
+    ;
+    const member_text =
+        \\$ORIGIN member.example.
+        \\$TTL 3600
+        \\@ IN SOA ns.member.example. hostmaster.member.example. 3 3600 900 1209600 3600
+        \\@ IN NS ns.member.example.
+        \\www IN A 192.0.2.80
+        \\
+    ;
+    var catalog_file = try zone_parser.ZoneFile.parse(catalog_text);
+    defer catalog_file.deinit();
+    var catalog_zone = try zone_index.Zone.fromZoneFile(&catalog_file);
+    defer catalog_zone.deinit();
+    var member_file = try zone_parser.ZoneFile.parse(member_text);
+    defer member_file.deinit();
+    var member_zone = try zone_index.Zone.fromZoneFile(&member_file);
+    defer member_zone.deinit();
+    const zones = [2]*const zone_index.Zone{ &catalog_zone, &member_zone };
+
+    var listen_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var transfer_server = try std.Io.net.IpAddress.listen(&listen_address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer transfer_server.deinit(io);
+    const port = switch (transfer_server.socket.address) {
+        .ip4 => |ip4| ip4.port,
+        .ip6 => |ip6| ip6.port,
+    };
+    const thread = try std.Thread.spawn(.{}, CatalogServer.run, .{CatalogServer{
+        .io = io,
+        .listener = &transfer_server,
+        .zones = &zones,
+        .connections = 2,
+    }});
+    defer thread.join();
+
+    var config_buffer: [256]u8 = undefined;
+    const config = try std.fmt.bufPrint(&config_buffer, "catalog-consumer catalog.example. 127.0.0.1:{d}\n", .{port});
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = config });
+
+    var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 2), context.zones.items.len);
+
+    var runtime = try context.takeRuntime(io);
+    defer runtime.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const query_bytes = [_]u8{
+        0x55, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        3,    'w',  'w',  'w',  6,    'm',  'e',  'm',  'b',  'e',  'r',  7,
+        'e',  'x',  'a',  'm',  'p',  'l',  'e',  0,    0x00, 0x01, 0x00, 0x01,
+    };
+    var output: [512]u8 = undefined;
+    const response_bytes = try runtime.answer(&query_bytes, &output);
+    const response = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+    try std.testing.expectEqualSlices(u8, &.{ 192, 0, 2, 80 }, &response.answers.items[0].rdata.A);
+}
+
+test "server context publishes an RFC 5782 blacklist zone" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{ .sub_path = "one.zone", .data = "$ORIGIN one.example.\n$TTL 3600\n@ IN SOA ns.one.example. hostmaster.one.example. 1 3600 900 1209600 3600\n@ IN NS ns.one.example.\n" });
+    try dir.dir.writeFile(io, .{ .sub_path = "entries.txt", .data = "# the list\n192.0.2.99\n::1\nSpam.Example.\n" });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone one.example primary one.zone\nblacklist-zone bad.example. entries.txt\n" });
+
+    var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 2), context.zones.items.len);
+
+    var blacklist: ?*const zone_index.Zone = null;
+    for (context.zones.items) |*zone| {
+        if (std.ascii.eqlIgnoreCase(zone.originText(), "bad.example.")) blacklist = zone;
+    }
+    const zone = blacklist orelse return error.TestUnexpectedResult;
+
+    // RFC 5782 section 2: reversed-octet IPv4, reversed-nibble IPv6, and the
+    // listed name itself, each with the A record every entry must carry.
+    try std.testing.expect(hasBlacklistEntry(zone.*, "99.2.0.192.bad.example."));
+    try std.testing.expect(hasBlacklistEntry(zone.*, "spam.example.bad.example."));
+    try std.testing.expect(hasBlacklistEntry(zone.*, "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.bad.example."));
+    // Section 5: the test entries exist and the forbidden ones do not.
+    try std.testing.expect(hasBlacklistEntry(zone.*, "2.0.0.127.bad.example."));
+    try std.testing.expect(hasBlacklistEntry(zone.*, "test.bad.example."));
+    try std.testing.expect(!hasBlacklistEntry(zone.*, "1.0.0.127.bad.example."));
+
+    var runtime = try context.takeRuntime(io);
+    defer runtime.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // A listed address answers with the entry record; an unlisted one is
+    // NXDOMAIN, which is the "no records" rule of section 2.1.
+    const listed_query = [_]u8{
+        0x33, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        2,    '9',  '9',  1,    '2',  1,    '0',  3,    '1',  '9',  '2',  3,
+        'b',  'a',  'd',  7,    'e',  'x',  'a',  'm',  'p',  'l',  'e',  0,
+        0x00, 0x01, 0x00, 0x01,
+    };
+    var output: [512]u8 = undefined;
+    const listed_response = try runtime.answer(&listed_query, &output);
+    const listed = try dns_message.Message.parse(arena.allocator(), listed_response);
+    try std.testing.expectEqual(@as(u16, 1), listed.header.answer_count);
+    try std.testing.expect(listed.answers.items[0].rrtype.eql(.A));
+    try std.testing.expectEqualSlices(u8, &.{ 127, 0, 0, 2 }, &listed.answers.items[0].rdata.A);
+
+    const unlisted_query = [_]u8{
+        0x33, 0x02, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        1,    '4',  1,    '3',  1,    '2',  1,    '1',  3,    'b',  'a',  'd',
+        7,    'e',  'x',  'a',  'm',  'p',  'l',  'e',  0,    0x00, 0x01, 0x00,
+        0x01,
+    };
+    const unlisted_response = try runtime.answer(&unlisted_query, &output);
+    const unlisted = try dns_message.Message.parse(arena.allocator(), unlisted_response);
+    try std.testing.expectEqual(@as(@TypeOf(unlisted.header.rcode), .nxdomain), unlisted.header.rcode);
+    try std.testing.expectEqual(@as(u16, 0), unlisted.header.answer_count);
+}
+
+test "an RFC 5782 entry list the convention forbids fails the load" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{ .sub_path = "one.zone", .data = "$ORIGIN one.example.\n$TTL 3600\n@ IN SOA ns.one.example. hostmaster.one.example. 1 3600 900 1209600 3600\n@ IN NS ns.one.example.\n" });
+    try dir.dir.writeFile(io, .{ .sub_path = "loopback.txt", .data = "127.0.0.1\n" });
+    try dir.dir.writeFile(io, .{ .sub_path = "mapped.txt", .data = "::ffff:127.0.0.1\n" });
+    try dir.dir.writeFile(io, .{ .sub_path = "invalid.txt", .data = "invalid\n" });
+    try dir.dir.writeFile(io, .{ .sub_path = "range.txt", .data = "10.0.0.0/8\n" });
+    try dir.dir.writeFile(io, .{ .sub_path = "loopback.gdns", .data = "zone one.example primary one.zone\nblacklist-zone bad.example. loopback.txt\n" });
+    try dir.dir.writeFile(io, .{ .sub_path = "mapped.gdns", .data = "zone one.example primary one.zone\nblacklist-zone bad.example. mapped.txt\n" });
+    try dir.dir.writeFile(io, .{ .sub_path = "invalid.gdns", .data = "zone one.example primary one.zone\nblacklist-zone bad.example. invalid.txt\n" });
+    try dir.dir.writeFile(io, .{ .sub_path = "range.gdns", .data = "zone one.example primary one.zone\nblacklist-zone bad.example. range.txt\n" });
+
+    try std.testing.expectError(Error.BadBlacklistZone, ServerContext.load(dir.dir, io, "loopback.gdns", std.testing.allocator));
+    try std.testing.expectError(Error.BadBlacklistZone, ServerContext.load(dir.dir, io, "mapped.gdns", std.testing.allocator));
+    try std.testing.expectError(Error.BadBlacklistZone, ServerContext.load(dir.dir, io, "invalid.gdns", std.testing.allocator));
+    try std.testing.expectError(Error.BadBlacklistZone, ServerContext.load(dir.dir, io, "range.gdns", std.testing.allocator));
+}
+
+/// True when the zone carries the RFC 5782 entry record at `owner`.
+fn hasBlacklistEntry(zone: zone_index.Zone, owner: []const u8) bool {
+    for (zone.records.items[0..zone.records.len]) |record| {
+        if (!record.rrtype.eql(.A)) continue;
+        if (!std.ascii.eqlIgnoreCase(record.ownerText(), owner)) continue;
+        if (!std.mem.eql(u8, record.rdataText(), "127.0.0.2")) continue;
+        return true;
+    }
+    return false;
+}
+
+test "server context carries the notify targets and refuses one for an unserved zone" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{ .sub_path = "one.zone", .data = "$ORIGIN one.example.\n$TTL 3600\n@ IN SOA ns.one.example. hostmaster.one.example. 1 3600 900 1209600 3600\n@ IN NS ns.one.example.\n" });
+    try dir.dir.writeFile(io, .{ .sub_path = "good.gdns", .data = "zone one.example primary one.zone\nnotify one.example. 192.0.2.10:5353\n" });
+    try dir.dir.writeFile(io, .{ .sub_path = "bad.gdns", .data = "zone one.example primary one.zone\nnotify other.example. 192.0.2.10:5353\n" });
+
+    var context = try ServerContext.load(dir.dir, io, "good.gdns", std.testing.allocator);
+    defer context.deinit();
+    var runtime = try context.takeRuntime(io);
+    defer runtime.deinit();
+    try std.testing.expectEqual(@as(usize, 1), runtime.notify_targets.items.len);
+    try std.testing.expectEqualStrings("one.example.", runtime.notify_targets.items[0].apex);
+
+    var bad = try ServerContext.load(dir.dir, io, "bad.gdns", std.testing.allocator);
+    defer bad.deinit();
+    try std.testing.expectError(error.BadConfiguration, bad.takeRuntime(io));
+}
+
 test "server context publishes a catalog zone listing the served zones" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var dir = std.testing.tmpDir(.{});
@@ -776,6 +1353,42 @@ test "server context publishes a catalog zone listing the served zones" {
 
 // A configuration that names the catalog apex as one of its own zones cannot
 // be published: the catalog would list itself.
+test "the catalog SOA serial follows the membership" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    const one = "$ORIGIN one.example.\n$TTL 3600\n@ IN SOA ns.one.example. hostmaster.one.example. 1 3600 900 1209600 3600\n@ IN NS ns.one.example.\n";
+    const two = "$ORIGIN two.example.\n$TTL 3600\n@ IN SOA ns.two.example. hostmaster.two.example. 1 3600 900 1209600 3600\n@ IN NS ns.two.example.\n";
+    const three = "$ORIGIN three.example.\n$TTL 3600\n@ IN SOA ns.three.example. hostmaster.three.example. 1 3600 900 1209600 3600\n@ IN NS ns.three.example.\n";
+    try dir.dir.writeFile(io, .{ .sub_path = "one.zone", .data = one });
+    try dir.dir.writeFile(io, .{ .sub_path = "two.zone", .data = two });
+    try dir.dir.writeFile(io, .{ .sub_path = "three.zone", .data = three });
+    try dir.dir.writeFile(io, .{ .sub_path = "pair.gdns", .data = "zone one.example primary one.zone\nzone two.example primary two.zone\ncatalog-zone catalog.example.\n" });
+    try dir.dir.writeFile(io, .{ .sub_path = "triple.gdns", .data = "zone one.example primary one.zone\nzone two.example primary two.zone\nzone three.example primary three.zone\ncatalog-zone catalog.example.\n" });
+
+    var first = try ServerContext.load(dir.dir, io, "pair.gdns", std.testing.allocator);
+    defer first.deinit();
+    const first_serial = catalogSerial(&first) orelse return error.TestUnexpectedResult;
+
+    var again = try ServerContext.load(dir.dir, io, "pair.gdns", std.testing.allocator);
+    defer again.deinit();
+    try std.testing.expectEqual(first_serial, catalogSerial(&again).?);
+
+    var grown = try ServerContext.load(dir.dir, io, "triple.gdns", std.testing.allocator);
+    defer grown.deinit();
+    try std.testing.expect(catalogSerial(&grown).? != first_serial);
+}
+
+/// The SOA serial of the catalog zone the context publishes.
+fn catalogSerial(context: *const ServerContext) ?u32 {
+    for (context.zones.items) |*zone| {
+        if (!std.ascii.eqlIgnoreCase(zone.originText(), "catalog.example.")) continue;
+        return zone.soaSerial();
+    }
+    return null;
+}
+
 test "server context refuses a catalog apex that names a served zone" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var dir = std.testing.tmpDir(.{});

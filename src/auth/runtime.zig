@@ -70,6 +70,13 @@ pub const ReloadSource = struct {
     origin: []const u8,
 };
 
+/// One RFC 1996 NOTIFY destination: the zone apex whose change is announced
+/// and the address the announcement goes to.
+pub const NotifyTarget = struct {
+    apex: []const u8,
+    address: std.Io.net.IpAddress,
+};
+
 /// One RFC 2136 update policy: the zone apex an operator allowed updates for,
 /// the one TSIG key allowed to write it, and the zone file the accepted change
 /// is persisted to before the response.
@@ -180,6 +187,16 @@ pub const Runtime = struct {
     /// RFC 2136 update policies, one per zone the operator allowed updates
     /// for. Empty unless `allow-update` is configured.
     update_policies: std.ArrayList(UpdatePolicy) = .empty,
+    /// RFC 1996 secondaries to notify when one of the listed zones changes.
+    /// Empty unless `notify` is configured. The apex string is heap-owned.
+    notify_targets: std.ArrayList(NotifyTarget) = .empty,
+    /// The TTL of the service-binding records. RFC 9461 sets none; an hour is
+    /// the answer's own lifetime, not the zone's.
+    ddr_ttl: u32 = 3600,
+    /// RFC 9461 service-binding RDATA (wire form) the resolver publishes at
+    /// `_dns.resolver.arpa.` for RFC 9462 discovery. Empty unless `ddr` is
+    /// configured; every slice is owned.
+    ddr_rdatas: std.ArrayList([]const u8) = .empty,
     /// Set by the SIGHUP handler and cleared by the reload that answers it.
     /// The handler only stores the flag; the file is read outside it.
     reload_requested: std.atomic.Value(bool) = .init(false),
@@ -296,6 +313,12 @@ pub const Runtime = struct {
         }
         self.update_policies.deinit(self.allocator);
         self.update_policies = .empty;
+        for (self.notify_targets.items) |target| self.allocator.free(target.apex);
+        self.notify_targets.deinit(self.allocator);
+        self.notify_targets = .empty;
+        for (self.ddr_rdatas.items) |rdata| self.allocator.free(rdata);
+        self.ddr_rdatas.deinit(self.allocator);
+        self.ddr_rdatas = .empty;
         self.blocklist = .{};
         if (self.answer_policy.nsid) |nsid| self.allocator.free(nsid);
         self.answer_policy = .{};
@@ -351,6 +374,77 @@ pub const Runtime = struct {
             .dir = dir,
             .path = owned_path,
         });
+    }
+
+    /// Registers one RFC 9461 SVCB record for `_dns.resolver.arpa.`. The
+    /// presentation form is parsed and its wire RDATA kept, so a query costs
+    /// no re-parse.
+    pub fn addDdrRecord(self: *Runtime, target: []const u8, alpn: []const u8, port: u16, dohpath: ?[]const u8) !void {
+        var text_buffer: [512]u8 = undefined;
+        const text = if (dohpath) |path|
+            try std.fmt.bufPrint(&text_buffer, "1 {s} alpn={s} port={d} dohpath={s}", .{ target, alpn, port, path })
+        else
+            try std.fmt.bufPrint(&text_buffer, "1 {s} alpn={s} port={d}", .{ target, alpn, port });
+        const parsed = zone_parser.parseRData(dns_types.RecordType.SVCB, text) catch return error.BadConfiguration;
+        var wire: [512]u8 = undefined;
+        var writer = dns_writer.Writer.init(&wire);
+        parsed.encode(&writer) catch return error.BadConfiguration;
+        const owned = try self.allocator.dupe(u8, writer.written());
+        errdefer self.allocator.free(owned);
+        try self.ddr_rdatas.append(self.allocator, owned);
+    }
+
+    /// Registers one RFC 1996 NOTIFY destination. The apex is copied, so the
+    /// configuration text can be released.
+    pub fn addNotifyTarget(self: *Runtime, apex: []const u8, address: std.Io.net.IpAddress) !void {
+        const owned = try self.allocator.dupe(u8, apex);
+        errdefer self.allocator.free(owned);
+        try self.notify_targets.append(self.allocator, .{ .apex = owned, .address = address });
+    }
+
+    /// RFC 1996 section 3.8: a master sends a NOTIFY to its secondaries when a
+    /// zone changes. One datagram per configured target, sent from the answer
+    /// path after the change is committed; a lost datagram falls back to the
+    /// secondary's refresh timer, and no retry loop runs here.
+    fn notifySecondaries(self: *Runtime, origin: []const u8, zone: *const zone_index.Zone) void {
+        const soa = zone.soa orelse return;
+        for (self.notify_targets.items) |target| {
+            if (!std.ascii.eqlIgnoreCase(target.apex, origin)) continue;
+            self.sendNotify(target.address, origin, soa) catch {};
+        }
+    }
+
+    fn sendNotify(self: *Runtime, address: std.Io.net.IpAddress, origin: []const u8, soa: zone_parser.ZoneRecord) !void {
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        const allocator = scratch.allocator();
+        var id_bytes: [2]u8 = undefined;
+        self.io.random(&id_bytes);
+        const name = dns_name_mod.Name.fromText(origin) catch return error.BadZoneRecord;
+        const soa_rr = try response.zoneRecordToResourceRecord(soa, null);
+        var message = dns_message.Message{
+            .allocator = allocator,
+            .header = .{
+                .id = std.mem.readInt(u16, &id_bytes, .big),
+                .opcode = .notify,
+                .authoritative = true,
+                .question_count = 1,
+                .answer_count = 1,
+            },
+            .question = .{ .name = name, .qtype = dns_types.RecordType.SOA, .qclass = dns_types.Class.IN },
+            .answers = try dns_message.RecordSection.init(allocator, 1),
+        };
+        try message.answers.append(soa_rr);
+        var buffer: [1024]u8 = undefined;
+        var writer = dns_writer.Writer.init(&buffer);
+        try message.encode(&writer);
+        var local = switch (address) {
+            .ip4 => std.Io.net.IpAddress{ .ip4 = .unspecified(0) },
+            .ip6 => std.Io.net.IpAddress{ .ip6 = .unspecified(0) },
+        };
+        var socket = try std.Io.net.IpAddress.bind(&local, self.io, .{ .mode = .dgram, .protocol = .udp });
+        defer socket.close(self.io);
+        try socket.send(self.io, &address, writer.written());
     }
 
     fn updatePolicyFor(self: *const Runtime, origin: []const u8) ?*const UpdatePolicy {
@@ -547,6 +641,9 @@ pub const Runtime = struct {
         self.zones.items[target].deinit();
         self.zones.items[target] = zone.*;
         reportReload(io, "reloaded the zone for {s}: serial {d} -> {d}", .{ origin, old_serial, new_serial });
+        // RFC 1996 section 3.8: a master notifies its secondaries when a zone
+        // changes, and both the RFC 2136 path and a reload land here.
+        self.notifySecondaries(origin, &self.zones.items[target]);
         return .replaced;
     }
 
@@ -1317,6 +1414,14 @@ pub const Runtime = struct {
             return self.encodeMessage(try self.buildMessage(query, over_tcp), output);
         }
         if (try self.localZoneAnswer(query)) |local| return self.encodeMessage(local, output);
+        // RFC 9462 section 4: a client asks its resolver for the designated
+        // resolver's SVCB records at `_dns.resolver.arpa.`. The name is
+        // special-use, so it is answered here rather than forwarded; a QTYPE
+        // the name does not carry is NODATA.
+        if (self.ddr_rdatas.items.len != 0 and std.ascii.eqlIgnoreCase(qname_text, "_dns.resolver.arpa.")) {
+            const answers: []const []const u8 = if (q.qtype.eql(.SVCB) or q.qtype.eql(.ANY)) self.ddr_rdatas.items else &.{};
+            return self.encodeMessage(try response.buildDdrResponse(query, answers, self.ddr_ttl), output);
+        }
         if (self.blocklist.blocks(qname_text)) return self.encodeMessage(try response.buildBlockedResponse(query), output);
         if (!q.qclass.eql(@import("../dns/types.zig").Class.IN)) {
             return self.encodeMessage(try response.buildRefusedResponse(query), output);
@@ -2969,6 +3074,120 @@ fn encodeSignedUpdateRequest(
     const signed = try tsig.sign(writer.written(), key.secret, final.owner, final.tsig, null);
     try tsig.patchMac(buffer[0..writer.len()], final, signed.slice());
     return writer.written();
+}
+
+test "the resolver publishes RFC 9461 SVCB records at _dns.resolver.arpa" {
+    var keyring = try keyring_mod.Keyring.parse("key \"key.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };");
+    var runtime = try Runtime.fromZoneTextWithKeyring(
+        \\$ORIGIN one.example.
+        \\$TTL 3600
+        \\@ IN SOA ns.one.example. hostmaster.one.example. 1 3600 900 1209600 3600
+        \\@ IN NS ns.one.example.
+        \\
+    , &keyring);
+    defer runtime.deinit();
+    try runtime.addDdrRecord("dns.example.", "dot", 853, null);
+    try runtime.addDdrRecord("dns.example.", "h2", 443, "/dns-query{?dns}");
+    try std.testing.expectEqual(@as(usize, 2), runtime.ddr_rdatas.items.len);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const client = try std.Io.net.IpAddress.parse("192.0.2.1", 5555);
+
+    // _dns.resolver.arpa. SVCB
+    const svcb_query = [_]u8{
+        0x44, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        4,    '_',  'd',  'n',  's',  8,    'r',  'e',  's',  'o',  'l',  'v',
+        'e',  'r',  4,    'a',  'r',  'p',  'a',  0,    0x00, 0x40, 0x00, 0x01,
+    };
+    var output: [1024]u8 = undefined;
+    const svcb_response = try runtime.answerFrom(&svcb_query, &output, &client);
+    const svcb = try dns_message.Message.parse(arena.allocator(), svcb_response);
+    try std.testing.expectEqual(@as(u16, 2), svcb.header.answer_count);
+    try std.testing.expectEqual(@as(@TypeOf(svcb.header.rcode), .no_error), svcb.header.rcode);
+    try std.testing.expect(svcb.answers.items[0].rrtype.eql(.SVCB));
+    const target_buffer = svcb.answers.items[0].rdata.SVCB.target.toText(&output) catch return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("dns.example.", target_buffer);
+    try std.testing.expect(svcb.answers.items[0].rdata.SVCB.paramsBytes().len != 0);
+
+    // The same name with a QTYPE it does not carry is NODATA, not a forward.
+    const a_query = [_]u8{
+        0x44, 0x02, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        4,    '_',  'd',  'n',  's',  8,    'r',  'e',  's',  'o',  'l',  'v',
+        'e',  'r',  4,    'a',  'r',  'p',  'a',  0,    0x00, 0x01, 0x00, 0x01,
+    };
+    const a_response = try runtime.answerFrom(&a_query, &output, &client);
+    const a_answer = try dns_message.Message.parse(arena.allocator(), a_response);
+    try std.testing.expectEqual(@as(@TypeOf(a_answer.header.rcode), .no_error), a_answer.header.rcode);
+    try std.testing.expectEqual(@as(u16, 0), a_answer.header.answer_count);
+}
+
+test "a signed update sends an RFC 1996 NOTIFY to the configured secondary" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const now = 1_700_000_000;
+    var keyring = try keyring_mod.Keyring.parse("key \"key.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };");
+    var runtime = try Runtime.fromZoneTextWithKeyring(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
+        \\
+    , &keyring);
+    defer runtime.deinit();
+    runtime.setTsigNow(now);
+
+    // The secondary the master announces to: a loopback socket the test reads.
+    var secondary_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var secondary = try std.Io.net.IpAddress.bind(&secondary_address, io, .{ .mode = .dgram, .protocol = .udp });
+    defer secondary.close(io);
+    const port = switch (secondary.address) {
+        .ip4 => |ip4| ip4.port,
+        .ip6 => |ip6| ip6.port,
+    };
+    try runtime.addNotifyTarget("home.arpa.", try std.Io.net.IpAddress.parse("127.0.0.1", port));
+    // A target for another zone is never told about this one.
+    try runtime.addNotifyTarget("other.arpa.", try std.Io.net.IpAddress.parse("127.0.0.1", port));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try runtime.setUpdatePolicy(tmp.dir, "home.arpa.", "key.", "zone.db");
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var request_buffer: [1024]u8 = undefined;
+    var updates = [_]dns_record_mod.ResourceRecord{.{
+        .owner = try dns_name_mod.Name.fromText("www.home.arpa."),
+        .rrtype = dns_types.RecordType.A,
+        .class = dns_types.Class.IN,
+        .ttl = 60,
+        .rdata = .{ .A = .{ 192, 168, 1, 9 } },
+    }};
+    const request = try encodeSignedUpdateRequest(arena.allocator(), &request_buffer, "home.arpa.", &.{}, &updates, now, .{
+        .algorithm = "hmac-sha256.",
+        .secret = "01234567890123456789012345678901",
+    });
+    var output: [1024]u8 = undefined;
+    _ = try runtime.answer(request, &output);
+
+    // RFC 1996 section 4.3: a NOTIFY with the question's SOA and the zone's
+    // SOA, carrying the serial the update produced.
+    var notify_buffer: [1024]u8 = undefined;
+    const incoming = secondary.receiveTimeout(io, &notify_buffer, .{ .duration = .{ .raw = .fromMilliseconds(2000), .clock = .awake } }) catch return error.TestUnexpectedResult;
+    const notify = try dns_message.Message.parse(arena.allocator(), incoming.data);
+    try std.testing.expectEqual(@as(@TypeOf(notify.header.opcode), .notify), notify.header.opcode);
+    try std.testing.expect(!notify.header.qr);
+    try std.testing.expect(notify.header.authoritative);
+    try std.testing.expectEqual(@as(u16, 1), notify.header.question_count);
+    try std.testing.expectEqual(@as(u16, 1), notify.header.answer_count);
+    try std.testing.expect(notify.question.?.name.eql(&try dns_name_mod.Name.fromText("home.arpa.")));
+    try std.testing.expect(notify.answers.items[0].rrtype.eql(.SOA));
+    const soa = notify.answers.items[0].rdata.SOA;
+    try std.testing.expectEqual(@as(u32, 2), soa.serial);
+
+    // Exactly one datagram: the other zone's target hears nothing.
+    var extra: [1024]u8 = undefined;
+    try std.testing.expectError(error.Timeout, secondary.receiveTimeout(io, &extra, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }));
 }
 
 test "runtime applies a signed RFC 2136 update and persists the zone" {

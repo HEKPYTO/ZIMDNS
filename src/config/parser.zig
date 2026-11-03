@@ -297,6 +297,76 @@ pub const AllowUpdate = struct {
     }
 };
 
+/// One `notify <apex> <address:port>` line: RFC 1996 section 3.8 has the
+/// master notify its secondaries when a zone changes. The address is the
+/// operator's, not one derived from the NS RRset.
+pub const NotifyTarget = struct {
+    apex: Text = .{},
+    address: Text = .{},
+    port: u16 = 0,
+
+    pub fn apexText(self: *const NotifyTarget) []const u8 {
+        return self.apex.text();
+    }
+
+    pub fn addressText(self: *const NotifyTarget) []const u8 {
+        return self.address.text();
+    }
+};
+
+/// One `blacklist-zone <apex> <file>` line: the RFC 5782 zone the server
+/// publishes from an entry list.
+pub const BlacklistZone = struct {
+    apex: Text = .{},
+    file: Text = .{},
+
+    pub fn apexText(self: *const BlacklistZone) []const u8 {
+        return self.apex.text();
+    }
+
+    pub fn fileText(self: *const BlacklistZone) []const u8 {
+        return self.file.text();
+    }
+};
+
+/// One `ddr <target> <alpn> <port> [<dohpath>]` line: the RFC 9461 SVCB
+/// record the resolver publishes at `_dns.resolver.arpa.` (RFC 9462).
+pub const DdrRecord = struct {
+    target: Text = .{},
+    alpn: Text = .{},
+    port: u16 = 0,
+    dohpath: Text = .{},
+    has_dohpath: bool = false,
+
+    pub fn targetText(self: *const DdrRecord) []const u8 {
+        return self.target.text();
+    }
+
+    pub fn alpnText(self: *const DdrRecord) []const u8 {
+        return self.alpn.text();
+    }
+
+    pub fn dohpathText(self: *const DdrRecord) []const u8 {
+        return self.dohpath.text();
+    }
+};
+
+/// One `catalog-consumer <catalog-apex> <primary:address:port>` line: the
+/// RFC 9432 catalog this server fetches at startup and provisions from.
+pub const CatalogConsumer = struct {
+    apex: Text = .{},
+    address: Text = .{},
+    port: u16 = 0,
+
+    pub fn apexText(self: *const CatalogConsumer) []const u8 {
+        return self.apex.text();
+    }
+
+    pub fn addressText(self: *const CatalogConsumer) []const u8 {
+        return self.address.text();
+    }
+};
+
 pub const BlocklistFile = struct {
     path: Text = .{},
 
@@ -326,6 +396,10 @@ pub const Config = struct {
     zones: List(Zone) = .{},
     blocklists: List(BlocklistFile) = .{},
     allow_updates: List(AllowUpdate) = .{},
+    notifies: List(NotifyTarget) = .{},
+    blacklist_zones: List(BlacklistZone) = .{},
+    ddr_records: List(DdrRecord) = .{},
+    catalog_consumer: ?CatalogConsumer = null,
     tsig_key_file: Text = .{},
     has_tsig_key_file: bool = false,
     /// Path to the DNSSEC signing key file. One key signs every configured
@@ -529,6 +603,10 @@ pub const Config = struct {
         if (std.mem.eql(u8, first, "zone")) return self.parseZone(&tokens);
         if (std.mem.eql(u8, first, "blocklist")) return self.parseBlocklist(&tokens);
         if (std.mem.eql(u8, first, "allow-update")) return self.parseAllowUpdate(&tokens);
+        if (std.mem.eql(u8, first, "notify")) return self.parseNotify(&tokens);
+        if (std.mem.eql(u8, first, "blacklist-zone")) return self.parseBlacklistZone(&tokens);
+        if (std.mem.eql(u8, first, "ddr")) return self.parseDdr(&tokens);
+        if (std.mem.eql(u8, first, "catalog-consumer")) return self.parseCatalogConsumer(&tokens);
         if (std.mem.eql(u8, first, "tsig-key-file")) return self.parseTsigKeyFile(&tokens);
         if (std.mem.eql(u8, first, "dnssec-key-file")) return self.parseDnssecKeyFile(&tokens);
         if (std.mem.eql(u8, first, "dnssec-ksk-file")) return self.parseDnssecKskFile(&tokens);
@@ -612,6 +690,66 @@ pub const Config = struct {
         try zone.file.set(tokens.next() orelse return Error.BadDirective);
         try requireNoTrailingTokens(tokens);
         try self.zones.append(zone);
+    }
+
+    fn parseCatalogConsumer(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        if (self.catalog_consumer != null) return Error.BadDirective;
+        var consumer = CatalogConsumer{};
+        try consumer.apex.set(tokens.next() orelse return Error.BadDirective);
+        const parsed = try parseEndpoint(tokens.next() orelse return Error.BadDirective);
+        try consumer.address.set(parsed.address);
+        consumer.port = parsed.port;
+        try requireNoTrailingTokens(tokens);
+        self.catalog_consumer = consumer;
+    }
+
+    fn parseDdr(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        var record = DdrRecord{};
+        try record.target.set(tokens.next() orelse return Error.BadDirective);
+        const alpn = tokens.next() orelse return Error.BadDirective;
+        if (!(std.mem.eql(u8, alpn, "dot") or std.mem.eql(u8, alpn, "doq") or
+            std.mem.eql(u8, alpn, "h2") or std.mem.eql(u8, alpn, "h3")))
+        {
+            return Error.BadDirective;
+        }
+        try record.alpn.set(alpn);
+        const port_text = tokens.next() orelse return Error.BadDirective;
+        record.port = std.fmt.parseInt(u16, port_text, 10) catch return Error.BadPort;
+        if (record.port == 0) return Error.BadPort;
+        if (tokens.next()) |path| {
+            // RFC 9461 section 5: the DoH path is required with an HTTP ALPN
+            // and carries the {?dns} variable; a non-HTTP transport carries
+            // none.
+            if (!(std.mem.eql(u8, alpn, "h2") or std.mem.eql(u8, alpn, "h3"))) return Error.BadDirective;
+            if (std.mem.indexOf(u8, path, "{?dns}") == null) return Error.BadDirective;
+            try record.dohpath.set(path);
+            record.has_dohpath = true;
+        } else if (std.mem.eql(u8, alpn, "h2") or std.mem.eql(u8, alpn, "h3")) {
+            return Error.BadDirective;
+        }
+        try requireNoTrailingTokens(tokens);
+        try self.ddr_records.append(record);
+    }
+
+    fn parseBlacklistZone(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        var entry = BlacklistZone{};
+        try entry.apex.set(tokens.next() orelse return Error.BadDirective);
+        try entry.file.set(tokens.next() orelse return Error.BadDirective);
+        try requireNoTrailingTokens(tokens);
+        for (self.blacklist_zones.items[0..self.blacklist_zones.len]) |existing| {
+            if (std.ascii.eqlIgnoreCase(existing.apexText(), entry.apexText())) return Error.BadDirective;
+        }
+        try self.blacklist_zones.append(entry);
+    }
+
+    fn parseNotify(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        var target = NotifyTarget{};
+        try target.apex.set(tokens.next() orelse return Error.BadDirective);
+        const parsed = try parseEndpoint(tokens.next() orelse return Error.BadDirective);
+        try target.address.set(parsed.address);
+        target.port = parsed.port;
+        try requireNoTrailingTokens(tokens);
+        try self.notifies.append(target);
     }
 
     fn parseCatalogZone(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
@@ -1040,6 +1178,54 @@ test "config parser rejects unsupported zone kinds and trailing tokens" {
     try std.testing.expectError(error.BadDirective, Config.parse("listen dns udp 127.0.0.1:1053 extra\n"));
     try std.testing.expectError(error.BadDirective, Config.parse("zone home.arpa primary /etc/zimdns/zones/home.arpa.zone extra\n"));
     try std.testing.expectError(error.BadDirective, Config.parse("blocklist file /etc/zimdns/blocklists/ads.txt extra\n"));
+}
+
+test "catalog-consumer names one catalog and its primary" {
+    const config = try Config.parse("catalog-consumer catalog.example. 192.0.2.53:5353\n");
+    try std.testing.expectEqualStrings("catalog.example.", config.catalog_consumer.?.apexText());
+    try std.testing.expectEqualStrings("192.0.2.53", config.catalog_consumer.?.addressText());
+    try std.testing.expectEqual(@as(u16, 5353), config.catalog_consumer.?.port);
+    try std.testing.expect((try Config.parse("zone one.example primary one.zone\n")).catalog_consumer == null);
+    try std.testing.expectError(error.BadDirective, Config.parse("catalog-consumer catalog.example.\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("catalog-consumer catalog.example. 192.0.2.53:5353 extra\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("catalog-consumer a.example. 192.0.2.53:5353\ncatalog-consumer b.example. 192.0.2.53:5353\n"));
+}
+
+test "ddr names the SVCB record for an encrypted endpoint" {
+    const config = try Config.parse("ddr dns.example. dot 853\nddr dns.example. h2 443 /dns-query{?dns}\n");
+    try std.testing.expectEqual(@as(usize, 2), config.ddr_records.len);
+    try std.testing.expectEqualStrings("dns.example.", config.ddr_records.items[0].targetText());
+    try std.testing.expectEqualStrings("dot", config.ddr_records.items[0].alpnText());
+    try std.testing.expectEqual(@as(u16, 853), config.ddr_records.items[0].port);
+    try std.testing.expect(config.ddr_records.items[1].has_dohpath);
+    try std.testing.expectError(error.BadDirective, Config.parse("ddr dns.example. h2 443\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("ddr dns.example. dot 853 /dns-query{?dns}\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("ddr dns.example. h3 443 /plain\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("ddr dns.example. quic 853\n"));
+    try std.testing.expectError(error.BadPort, Config.parse("ddr dns.example. dot 0\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("ddr dns.example. dot 853 extra\n"));
+}
+
+test "blacklist-zone names an apex and its entry list" {
+    const config = try Config.parse("blacklist-zone bad.example. entries.txt\nblacklist-zone spam.example. other.txt\n");
+    try std.testing.expectEqual(@as(usize, 2), config.blacklist_zones.len);
+    try std.testing.expectEqualStrings("bad.example.", config.blacklist_zones.items[0].apexText());
+    try std.testing.expectEqualStrings("entries.txt", config.blacklist_zones.items[0].fileText());
+    try std.testing.expectError(error.BadDirective, Config.parse("blacklist-zone bad.example.\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("blacklist-zone bad.example. entries.txt extra\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("blacklist-zone bad.example. a.txt\nblacklist-zone BAD.example. b.txt\n"));
+}
+
+test "notify names a zone and the secondary address" {
+    const config = try Config.parse("notify home.arpa. 192.0.2.10:5353\nnotify home.arpa. [2001:db8::10]:5353\n");
+    try std.testing.expectEqual(@as(usize, 2), config.notifies.len);
+    try std.testing.expectEqualStrings("home.arpa.", config.notifies.items[0].apexText());
+    try std.testing.expectEqualStrings("192.0.2.10", config.notifies.items[0].addressText());
+    try std.testing.expectEqual(@as(u16, 5353), config.notifies.items[0].port);
+    try std.testing.expectEqualStrings("2001:db8::10", config.notifies.items[1].addressText());
+    try std.testing.expectError(error.BadDirective, Config.parse("notify home.arpa.\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("notify home.arpa. 192.0.2.10:5353 extra\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("notify home.arpa. 192.0.2.10\n"));
 }
 
 test "catalog-zone names one catalog apex" {

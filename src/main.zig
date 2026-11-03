@@ -427,6 +427,20 @@ fn parseQueryType(text: []const u8) !@import("dns/types.zig").RecordType {
     return error.UnsupportedType;
 }
 
+/// Two zone names are the same when they compare case-insensitively and only
+/// the trailing dot differs: the configuration text is written the way the
+/// operator typed it, and the runtime stores the parsed origin.
+fn sameZoneName(configured: []const u8, parsed: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(configured, parsed)) return true;
+    if (parsed.len > 0 and parsed[parsed.len - 1] == '.') {
+        return std.ascii.eqlIgnoreCase(configured, parsed[0 .. parsed.len - 1]);
+    }
+    if (configured.len > 0 and configured[configured.len - 1] == '.') {
+        return std.ascii.eqlIgnoreCase(configured[0 .. configured.len - 1], parsed);
+    }
+    return false;
+}
+
 fn ensureAbsoluteName(name: []const u8, buffer: []u8) ![]const u8 {
     if (std.mem.endsWith(u8, name, ".")) return name;
     if (name.len + 1 > buffer.len) return error.NameTooLong;
@@ -646,6 +660,16 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
             null
     else
         null;
+    // The apex of that one configured zone, so the reload source survives a
+    // runtime that serves more zones than the configuration names (a catalog
+    // or a blacklist zone is synthesized beside it).
+    const config_zone_origin: ?[]const u8 = if (server_context) |*context|
+        if (context.config.zones.len == 1)
+            try allocator.dupe(u8, context.config.zones.items[0].nameText())
+        else
+            null
+    else
+        null;
     if (!explicit_zone_file and server_context != null) {
         if (server_context.?.zones.items.len == 0) {
             try writer.writeAll("error: server run requires --zone-file or --config with a zone\n");
@@ -675,9 +699,17 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
     // swaps the zone.
     const reload_path: ?[]const u8 = if (explicit_zone_file) zone_file else config_zone_path;
     if (reload_path) |path| {
-        if (runtime.zones.items.len == 1) {
-            try runtime.setReloadSource(std.Io.Dir.cwd(), path, runtime.zones.items[0].originText());
+        var reload_origin: ?[]const u8 = null;
+        if (explicit_zone_file) {
+            if (runtime.zones.items.len == 1) reload_origin = runtime.zones.items[0].originText();
+        } else if (config_zone_origin) |configured| {
+            for (runtime.zones.items) |*zone| {
+                if (!sameZoneName(configured, zone.originText())) continue;
+                reload_origin = zone.originText();
+                break;
+            }
         }
+        if (reload_origin) |origin| try runtime.setReloadSource(std.Io.Dir.cwd(), path, origin);
     }
     installReloadHandler(&runtime);
     var counters = metrics.Counters{};

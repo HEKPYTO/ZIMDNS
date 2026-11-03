@@ -902,7 +902,7 @@ test "the journal file carries a transition across a restart" {
     defer deactivate(&journal);
 
     var log = DeltaLog{};
-    log.setOrigin("one.example.");
+    log.setOrigin("restart-journal.example.");
     const difference = try testDifference(std.testing.allocator, 10, 11);
     defer std.testing.allocator.free(difference);
     try log.record(10, 11, difference);
@@ -914,17 +914,17 @@ test "the journal file carries a transition across a restart" {
     const transitions = try reopened.read(std.testing.allocator);
     defer std.testing.allocator.free(transitions);
     try std.testing.expectEqual(@as(usize, 1), transitions.len);
-    try std.testing.expectEqualStrings("one.example.", transitions[0].originText());
+    try std.testing.expectEqualStrings("restart-journal.example.", transitions[0].originText());
     try std.testing.expectEqual(@as(u32, 10), transitions[0].from_serial);
     try std.testing.expectEqual(@as(u32, 11), transitions[0].to_serial);
 
     var restored = DeltaLog{};
-    restored.setOrigin("one.example.");
+    restored.setOrigin("restart-journal.example.");
     try restored.restore(transitions[0].from_serial, transitions[0].to_serial);
     try std.testing.expect(restored.canServeIncremental(10, 11));
     try std.testing.expect(!restored.canServeIncremental(9, 11));
     // The difference the file carried is what the answer is built from.
-    try std.testing.expect(differenceFor("one.example.", 10, 11) != null);
+    try std.testing.expect(differenceFor("restart-journal.example.", 10, 11) != null);
     // The client at the old serial is answered incrementally again.
     const transfer = @import("transfer.zig");
     try std.testing.expectEqual(transfer.IxfrDecision.incremental, transfer.decideIxfr(11, 10, &restored));
