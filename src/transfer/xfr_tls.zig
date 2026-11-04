@@ -11,9 +11,9 @@
 /// configured, and every frame runs under a deadline on the raw descriptor,
 /// the same bounds the DoT port holds. A SIGHUP re-reads the zone file on
 /// this path too, outside the signal handler, so the answer that follows a
-/// reload comes from the new zone. A TSIG-signed transfer is refused with
-/// one REFUSED message: the multi-message TSIG chaining stays deferred on
-/// this channel per the axfr.zig policy.
+/// TSIG-signed transfer is served signed, the way the cleartext path serves
+/// it: the runtime encodes the chained sequence (RFC 8945 sections 5.3 and
+/// 5.3.1), so this channel adds no signing logic of its own.
 /// Ownership: Runtime is borrowed; streams are consumed/closed by the caller
 /// loop; wire buffers are local.
 /// Errors: DNS failures are typed; socket read/write failures propagate as
@@ -21,6 +21,7 @@
 const std = @import("std");
 const tls = @import("tls");
 const Runtime = @import("../auth/runtime.zig").Runtime;
+const keyring_mod = @import("../auth/keyring.zig");
 const dns_message = @import("../dns/message.zig");
 const dns_padding = @import("../dns/padding.zig");
 const dns_tsig = @import("../dns/tsig.zig");
@@ -32,7 +33,6 @@ const tls_policy = @import("../transport/tls.zig");
 const tls_server = @import("../transport/tls_server.zig");
 const channel_mod = @import("../transport/channel.zig");
 const transfer_mod = @import("../zone/transfer.zig");
-const axfr = @import("axfr.zig");
 
 /// RFC 9103 section 7.1: the transfer channel selects the same "dot" token
 /// the DoT port speaks.
@@ -161,25 +161,13 @@ fn serveXfrFrames(channel: *const channel_mod.Channel, runtime: *Runtime, counte
 }
 
 /// The answer to a transfer query, framed the way the cleartext TCP path
-/// frames it: one two-octet length prefix per message. The runtime answers
-/// the transfer, so this channel serves the same transfer the cleartext TCP
-/// path serves, the incremental RFC 1995 answer included. A TSIG-signed
-/// transfer is refused with one REFUSED message, the policy the axfr.zig
-/// module encodes: the multi-message TSIG chaining stays deferred on this
-/// channel. Null means the query is not a transfer query, so the ordinary
+/// frames it: one two-octet length prefix per message. Signed and unsigned
+/// requests share the runtime's encode path, so a signed transfer is served
+/// with the chained TSIG sequence the cleartext path serves (RFC 8945
+/// sections 5.3 and 5.3.1) and an unsigned transfer stays byte-identical.
+/// Null means the query is not a transfer query, so the ordinary
 /// answer path runs.
 fn transferAnswer(allocator: std.mem.Allocator, request: []const u8, runtime: *const Runtime) !?[]u8 {
-    if (dns_tsig.parseFinalAdditional(request) catch null) |_| {
-        // A signed query is either a signed transfer, which the policy
-        // refuses, or an ordinary signed query, which the ordinary answer
-        // path answers.
-        const messages = axfr.buildTransferResponses(allocator, request, runtime) catch |err| switch (err) {
-            error.NotTransferQuery => return null,
-            else => return err,
-        };
-        defer for (messages) |*message| message.deinit();
-        return try frameMessages(allocator, messages);
-    }
     if (!isTransferQuery(allocator, request)) return null;
     // The runtime answers the transfer and frames it, the way the cleartext
     // TCP path gets it, so the incremental RFC 1995 answer is served here too.
@@ -188,33 +176,19 @@ fn transferAnswer(allocator: std.mem.Allocator, request: []const u8, runtime: *c
 
 /// Whether the request is a transfer query. The strict query parser rejects
 /// an RFC 1995 IXFR query, which carries the client's serial in an authority
-/// record, so the transfer profile parses that shape.
+/// record, so the transfer profile parses that shape; a signed request is
+/// stripped first, so signed AXFR and IXFR are detected the same way.
 fn isTransferQuery(allocator: std.mem.Allocator, request: []const u8) bool {
-    var parsed = dns_message.Message.parseQuery(allocator, request) catch {
-        var fallback = dns_message.Message.parse(allocator, request) catch return false;
-        defer fallback.deinit();
-        const kind = transfer_mod.validateTransferRequest(&fallback) catch return false;
-        return kind != .none;
-    };
-    defer parsed.deinit();
-    return transfer_mod.classifyMessage(&parsed) != .none;
-}
-
-/// Frames the messages the way the cleartext TCP path frames them: a
-/// two-octet length prefix and the message.
-fn frameMessages(allocator: std.mem.Allocator, messages: []dns_message.Message) ![]u8 {
-    var blob: std.ArrayList(u8) = .empty;
-    errdefer blob.deinit(allocator);
-    for (messages) |message| {
-        var mutable = message;
-        var message_writer = dns_writer.Writer.init(try allocator.alloc(u8, listener.TCP_MAX_FRAME_SIZE));
-        mutable.encode(&message_writer) catch return listener.Error.ResponseTooLarge;
-        var prefix: [2]u8 = undefined;
-        std.mem.writeInt(u16, &prefix, @intCast(message_writer.len()), .big);
-        try blob.appendSlice(allocator, &prefix);
-        try blob.appendSlice(allocator, message_writer.written());
-    }
-    return blob.toOwnedSlice(allocator);
+    const final = dns_tsig.parseFinalAdditional(request) catch null;
+    var stripped: ?[]u8 = null;
+    defer if (stripped) |bytes| allocator.free(bytes);
+    const bytes = if (final) |tsig_final| blk: {
+        stripped = transfer_mod.stripTsigRecord(allocator, request, tsig_final.record_start, tsig_final.record_end) catch return false;
+        break :blk stripped.?;
+    } else request;
+    var message = dns_message.Message.parse(allocator, bytes) catch return false;
+    defer message.deinit();
+    return (transfer_mod.validateTransferRequest(&message) catch return false) != .none;
 }
 
 /// The number of answer records the framed transfer answer carries, so the
@@ -669,7 +643,7 @@ test "a transfer query answered after a SIGHUP comes from the reloaded zone" {
     thread.join();
 }
 
-test "the transfer channel refuses an out-of-zone AXFR and a TSIG-signed AXFR" {
+test "the transfer channel refuses an out-of-zone AXFR" {
     var io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_backend.deinit();
     const io = io_backend.io();
@@ -728,19 +702,118 @@ test "the transfer channel refuses an out-of-zone AXFR and a TSIG-signed AXFR" {
     try std.testing.expectEqual(@import("../dns/header.zig").Rcode.refused, refused_message.header.rcode);
     try std.testing.expectEqual(@as(usize, 0), refused_message.answers.len);
 
-    // A TSIG-signed transfer is refused with one REFUSED message too: the
-    // multi-message chaining stays deferred on this channel.
-    var signed_buffer: [512]u8 = undefined;
-    try writeTestFrame(&connection_writer.interface, try signedAxfrQuery(&signed_buffer));
-    const signed_refused = try readTestFrame(&connection_reader.interface);
-    const signed_message = try @import("../dns/message.zig").Message.parse(allocator, signed_refused);
-    try std.testing.expectEqual(@import("../dns/header.zig").Rcode.refused, signed_message.header.rcode);
-    try std.testing.expectEqual(@as(usize, 0), signed_message.answers.len);
-
     connection.close() catch {};
     thread.join();
 }
 
+test "the transfer channel serves a signed AXFR as a chained TSIG sequence" {
+    var io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_backend.deinit();
+    const io = io_backend.io();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // More records than one frame carries, so the signed answer is a
+    // sequence and the chain between its frames is exercised.
+    var zone_text: std.ArrayList(u8) = .empty;
+    defer zone_text.deinit(std.testing.allocator);
+    try zone_text.appendSlice(std.testing.allocator,
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\
+    );
+    var index: usize = 0;
+    while (index < 70) : (index += 1) {
+        const line = try std.fmt.allocPrint(std.testing.allocator, "h{d} IN A 192.0.2.{d}\n", .{ index, index % 254 + 1 });
+        defer std.testing.allocator.free(line);
+        try zone_text.appendSlice(std.testing.allocator, line);
+    }
+    var keyring = try keyring_mod.Keyring.parse("key \"key.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };");
+    var runtime = try Runtime.fromZoneTextWithKeyring(zone_text.items, &keyring);
+    defer runtime.deinit();
+    const now = 1_700_000_000;
+    runtime.setTsigNow(now);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestIdentity(tmp.dir, io);
+
+    var server: tls_server.Server = undefined;
+    try server.init(allocator, io, tmp.dir, "cert.pem", "key.pem", XFR_ALPN);
+    defer server.deinit();
+
+    var bind_address = std.Io.net.IpAddress{ .ip4 = .loopback(0) };
+    var listener_socket = try std.Io.net.IpAddress.listen(&bind_address, io, .{ .reuse_address = true });
+    defer listener_socket.deinit(io);
+    const port = listener_socket.socket.address.getPort();
+
+    const thread = try std.Thread.spawn(.{}, serveOneConnection, .{ &listener_socket, io, &server, &runtime });
+
+    var address = std.Io.net.IpAddress{ .ip4 = .loopback(port) };
+    const stream = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer stream.close(io);
+
+    var client_input: [tls_server.input_buffer_len]u8 = undefined;
+    var client_output: [tls_server.output_buffer_len]u8 = undefined;
+    var client_reader = stream.reader(io, &client_input);
+    var client_writer = stream.writer(io, &client_output);
+    var rng_source: std.Random.IoSource = .{ .io = io };
+    var connection = try tls.client(&client_reader.interface, &client_writer.interface, .{
+        .rng = rng_source.interface(),
+        .host = "localhost",
+        .root_ca = .empty,
+        .insecure_skip_verify = true,
+        .now = std.Io.Clock.real.now(io),
+        .alpn_protocols = &.{XFR_ALPN},
+    });
+    defer connection.close() catch {};
+
+    var read_buffer: [4096]u8 = undefined;
+    var write_buffer: [4096]u8 = undefined;
+    var connection_reader = connection.reader(&read_buffer);
+    var connection_writer = connection.writer(&write_buffer);
+
+    // An unsigned transfer carries no TSIG record on any frame.
+    try writeTestFrame(&connection_writer.interface, axfr_query);
+    const unsigned_first = try readTestFrame(&connection_reader.interface);
+    try std.testing.expect((try dns_tsig.parseFinalAdditional(unsigned_first)) == null);
+    const unsigned_second = try readTestFrame(&connection_reader.interface);
+    try std.testing.expect((try dns_tsig.parseFinalAdditional(unsigned_second)) == null);
+
+    // RFC 8945 section 5.3.1: the first frame verifies with the request MAC
+    // and the whole TSIG record; the second chains on the first frame's MAC.
+    var query_buffer: [512]u8 = undefined;
+    const signed_query = try signedTransferQuery(&query_buffer, 0x00fc, null, now);
+    const request_final = (try dns_tsig.parseFinalAdditional(signed_query)) orelse return error.TestExpectedEqual;
+    var request_mac: [32]u8 = undefined;
+    @memcpy(&request_mac, request_final.tsig.macBytes()[0..32]);
+    try writeTestFrame(&connection_writer.interface, signed_query);
+    const first_frame = try readTestFrame(&connection_reader.interface);
+    const first_final = (try dns_tsig.parseFinalAdditional(first_frame)) orelse return error.TestExpectedEqual;
+    var first_frame_mac: [32]u8 = undefined;
+    @memcpy(&first_frame_mac, first_final.tsig.macBytes()[0..32]);
+    _ = try dns_tsig.verify(first_frame, tsig_secret, &request_mac);
+    const second_frame = try readTestFrame(&connection_reader.interface);
+    _ = try dns_tsig.verifyChained(&.{second_frame}, tsig_secret, &first_frame_mac);
+
+    // A signed IXFR is served signed too: one frame verifying with the
+    // request MAC.
+    var ixfr_buffer: [512]u8 = undefined;
+    const signed_ixfr = try signedTransferQuery(&ixfr_buffer, 0x00fb, 1, now);
+    const ixfr_request_final = (try dns_tsig.parseFinalAdditional(signed_ixfr)) orelse return error.TestExpectedEqual;
+    var ixfr_request_mac: [32]u8 = undefined;
+    @memcpy(&ixfr_request_mac, ixfr_request_final.tsig.macBytes()[0..32]);
+    try writeTestFrame(&connection_writer.interface, signed_ixfr);
+    const ixfr_frame = try readTestFrame(&connection_reader.interface);
+    _ = try dns_tsig.verify(ixfr_frame, tsig_secret, &ixfr_request_mac);
+
+    connection.close() catch {};
+    thread.join();
+}
 test "the transfer channel answers an ordinary query the ordinary way" {
     var io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_backend.deinit();
@@ -900,19 +973,42 @@ fn readTestFrame(reader: *std.Io.Reader) ![]const u8 {
     return reader.take(frame_len);
 }
 
-/// A TSIG-signed AXFR query: the question plus a final TSIG record. The
-/// refusal never reaches MAC verification, so only the structure matters.
-fn signedAxfrQuery(buffer: []u8) ![]const u8 {
+/// The HMAC-SHA256 secret the signed-transfer tests sign with, as base64 in
+/// the keyring fixture above.
+const tsig_secret = "01234567890123456789012345678901";
+
+/// A TSIG-signed transfer query: the question plus a final TSIG record
+/// carrying a real MAC, and (for IXFR) the client's serial in an authority
+/// SOA.
+fn signedTransferQuery(buffer: []u8, qtype: u16, client_serial: ?u32, time_signed: u64) ![]const u8 {
     const dns_name = @import("../dns/name.zig");
     const dns_rdata = @import("../dns/rdata.zig");
     const dns_record = @import("../dns/record.zig");
     var writer = dns_writer.Writer.init(buffer);
-    try writer.writeBytes(&.{
-        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
-    });
-    try writer.writeBytes(&.{ 4, 'h', 'o', 'm', 'e', 4, 'a', 'r', 'p', 'a', 0 });
-    try writer.writeU16(0x00fc);
+    try writer.writeBytes(&.{ 0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00 });
+    try writer.writeU16(if (client_serial != null) 1 else 0);
     try writer.writeU16(1);
+    try writer.writeBytes(&.{ 4, 'h', 'o', 'm', 'e', 4, 'a', 'r', 'p', 'a', 0 });
+    try writer.writeU16(qtype);
+    try writer.writeU16(1);
+    if (client_serial) |serial| {
+        const client_soa = dns_record.ResourceRecord{
+            .owner = try dns_name.Name.fromText(zone_origin),
+            .rrtype = .SOA,
+            .class = .IN,
+            .ttl = 3600,
+            .rdata = .{ .SOA = .{
+                .mname = try dns_name.Name.fromText("ns1.home.arpa."),
+                .rname = try dns_name.Name.fromText("hostmaster.home.arpa."),
+                .serial = serial,
+                .refresh = 3600,
+                .retry = 900,
+                .expire = 1209600,
+                .minimum = 3600,
+            } },
+        };
+        try client_soa.encode(&writer);
+    }
     const algorithm = try dns_name.Name.fromText("hmac-sha256.");
     const owner = try dns_name.Name.fromText("key.");
     var zeros: [32]u8 = @splat(0);
@@ -921,8 +1017,11 @@ fn signedAxfrQuery(buffer: []u8) ![]const u8 {
         .rrtype = .TSIG,
         .class = .ANY,
         .ttl = 0,
-        .rdata = .{ .TSIG = try dns_rdata.Tsig.init(algorithm, 0, 300, &zeros, 0x1234, 0, &.{}) },
+        .rdata = .{ .TSIG = try dns_rdata.Tsig.init(algorithm, time_signed, 300, &zeros, 0x1234, 0, &.{}) },
     }).encode(&writer);
+    const final = (try dns_tsig.parseFinalAdditional(writer.written())).?;
+    const signed = try dns_tsig.sign(writer.written(), tsig_secret, final.owner, final.tsig, null);
+    try dns_tsig.patchMac(buffer[0..writer.len()], final, signed.slice());
     return writer.written();
 }
 

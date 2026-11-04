@@ -21,6 +21,7 @@ const dnssec = @import("dns/dnssec.zig");
 const validate = @import("dns/validate.zig");
 const iterate_mod = @import("iterate.zig");
 const zone = @import("zone/index.zig");
+const zone_parser = @import("zone/parser.zig");
 const zone_signer = @import("zone/signer.zig");
 const tcp_deadline = @import("platform/tcp_deadline.zig");
 const tls_client = @import("transport/tls_client.zig");
@@ -150,6 +151,7 @@ pub const Policy = struct {
     /// synthesizes an AAAA, which is what an operator gets without a
     /// `nat64-prefix` directive.
     nat64_prefixes: Dns64List(config.Nat64Prefix) = .{},
+    dns64: bool = false,
 
     /// RFC 6147 section 5.1.4: the IPv6 prefix ranges whose AAAA records are
     /// treated as an empty answer, on top of the default set.
@@ -224,6 +226,7 @@ pub const Policy = struct {
             policy.nat64_prefixes.items[index] = value.nat64_prefixes.items[index];
         }
         policy.nat64_prefixes.len = value.nat64_prefixes.len;
+        policy.dns64 = value.dns64 or (value.nat64_prefixes.len > 0);
         if (value.dns64_excluded.len > policy.dns64_excluded.items.len) return error.TooManyItems;
         index = 0;
         while (index < value.dns64_excluded.len) : (index += 1) {
@@ -1376,6 +1379,7 @@ pub const Resolver = struct {
     root_servers: [iterate_mod.root_hint_text.len]std.Io.net.IpAddress = undefined,
     root_server_count: usize = 0,
     root_servers_expires_at: i64 = 0,
+    local_root_zone: bool = false,
     /// Delegations the iterative path has learned, reused until their NS TTL
     /// runs out. Read and written under this resolver's lock.
     delegations: iterate_mod.DelegationCache = .{},
@@ -1423,6 +1427,142 @@ pub const Resolver = struct {
         };
         _ = iterate_mod.rootHints(&resolver.root_hints);
         return resolver;
+    }
+
+    /// Override the built-in InterNIC hints for the priming query and the
+    /// iterative walk. Callers that parsed `root-hint` directives feed the
+    /// validated addresses here. An empty slice restores the built-in hints.
+    pub fn setRootHints(self: *Resolver, hints: []const std.Io.net.IpAddress) void {
+        if (hints.len == 0) {
+            self.hint_count = iterate_mod.root_hint_text.len;
+            _ = iterate_mod.rootHints(&self.root_hints);
+            return;
+        }
+        const count = @min(hints.len, self.root_hints.len);
+        @memcpy(self.root_hints[0..count], hints[0..count]);
+        self.hint_count = count;
+    }
+
+    /// RFC 8806: the root zone the operator supplied answers root queries
+    /// and disables network priming. The zone text, already validated by
+    /// the loader, is parsed here into the root server list and the
+    /// delegation cache: the walk starts from the list, and a name under a
+    /// delegated zone starts at that zone's servers. The list expires far
+    /// in the future, so the priming query never runs.
+    pub fn enableLocalRootZone(self: *Resolver, zone_text: []const u8) !void {
+        var zone_file = try zone_parser.ZoneFile.parse(zone_text);
+        defer zone_file.deinit();
+        if (!std.mem.eql(u8, zone_file.origin, ".")) return error.BadLocalRootZone;
+        const now: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(self.io).nanoseconds, std.time.ns_per_s));
+        // The addresses the root NS RRset names, the way the priming
+        // answer is read: an address whose owner the RRset does not name
+        // never enters the list.
+        var names: [iterate_mod.MAX_SERVERS]dns_name.Name = undefined;
+        var name_count: usize = 0;
+        for (zone_file.records.items[0..zone_file.records.len]) |record| {
+            if (!record.rrtype.eql(.NS)) continue;
+            const owner = dns_name.Name.fromText(record.ownerText()) catch continue;
+            if (!owner.eql(&dns_name.Name.root())) continue;
+            const rdata = zone_parser.parseRData(.NS, record.rdataText()) catch continue;
+            if (rdata != .NS) continue;
+            if (name_count == names.len) break;
+            names[name_count] = rdata.NS;
+            name_count += 1;
+        }
+        if (name_count == 0) return error.BadLocalRootZone;
+        var count: usize = 0;
+        for (zone_file.records.items[0..zone_file.records.len]) |record| {
+            if (!record.rrtype.eql(.A) and !record.rrtype.eql(.AAAA)) continue;
+            const owner = dns_name.Name.fromText(record.ownerText()) catch continue;
+            var listed = false;
+            for (names[0..name_count]) |name| {
+                if (owner.eql(&name)) {
+                    listed = true;
+                    break;
+                }
+            }
+            if (!listed) continue;
+            if (count == self.root_servers.len) break;
+            const rdata = zone_parser.parseRData(record.rrtype, record.rdataText()) catch continue;
+            const address: std.Io.net.IpAddress = switch (rdata) {
+                .A => |octets| .{ .ip4 = .{ .bytes = octets, .port = 53 } },
+                .AAAA => |octets| .{ .ip6 = .{ .port = 53, .bytes = octets } },
+                else => continue,
+            };
+            self.root_servers[count] = address;
+            count += 1;
+        }
+        if (count == 0) return error.BadLocalRootZone;
+        self.root_server_count = count;
+        // Far future: the priming query never runs while the local zone
+        // answers. Ten years of seconds fits the i64 clock with room.
+        const far_future: i64 = 10 * 365 * 24 * 3600;
+        self.root_servers_expires_at = now + far_future;
+        self.local_root_zone = true;
+        // Every delegation the root zone carries: the NS names and the
+        // in-zone glue for each delegation owner, through the bounded
+        // cache, so a walk for a name under the zone starts there.
+        var zones: [iterate_mod.MAX_DELEGATIONS]dns_name.Name = undefined;
+        var zone_count: usize = 0;
+        for (zone_file.records.items[0..zone_file.records.len]) |record| {
+            if (!record.rrtype.eql(.NS)) continue;
+            const owner = dns_name.Name.fromText(record.ownerText()) catch continue;
+            var seen = false;
+            for (zones[0..zone_count]) |zone_name| {
+                if (zone_name.eql(&owner)) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (seen) continue;
+            if (zone_count == zones.len) break;
+            zones[zone_count] = owner;
+            zone_count += 1;
+        }
+        for (zones[0..zone_count]) |zone_name| {
+            var targets: [iterate_mod.MAX_SERVERS]dns_name.Name = undefined;
+            var target_count: usize = 0;
+            var ttl: u32 = std.math.maxInt(u32);
+            for (zone_file.records.items[0..zone_file.records.len]) |record| {
+                if (!record.rrtype.eql(.NS)) continue;
+                const owner = dns_name.Name.fromText(record.ownerText()) catch continue;
+                if (!owner.eql(&zone_name)) continue;
+                const rdata = zone_parser.parseRData(.NS, record.rdataText()) catch continue;
+                if (rdata != .NS) continue;
+                if (target_count == targets.len) break;
+                targets[target_count] = rdata.NS;
+                target_count += 1;
+                ttl = @min(ttl, record.ttl);
+            }
+            if (target_count == 0) continue;
+            var servers: [iterate_mod.MAX_DELEGATION_SERVERS]std.Io.net.IpAddress = undefined;
+            var server_count: usize = 0;
+            for (zone_file.records.items[0..zone_file.records.len]) |record| {
+                if (!record.rrtype.eql(.A) and !record.rrtype.eql(.AAAA)) continue;
+                const owner = dns_name.Name.fromText(record.ownerText()) catch continue;
+                var listed = false;
+                for (targets[0..target_count]) |target| {
+                    if (owner.eql(&target)) {
+                        listed = true;
+                        break;
+                    }
+                }
+                if (!listed) continue;
+                if (server_count == servers.len) break;
+                const rdata = zone_parser.parseRData(record.rrtype, record.rdataText()) catch continue;
+                const address: std.Io.net.IpAddress = switch (rdata) {
+                    .A => |octets| .{ .ip4 = .{ .bytes = octets, .port = 53 } },
+                    .AAAA => |octets| .{ .ip6 = .{ .port = 53, .bytes = octets } },
+                    else => continue,
+                };
+                servers[server_count] = address;
+                server_count += 1;
+                ttl = @min(ttl, record.ttl);
+            }
+            if (server_count == 0) continue;
+            if (ttl == std.math.maxInt(u32)) ttl = 3600;
+            self.delegations.put(zone_name, servers[0..server_count], ttl, now);
+        }
     }
 
     pub fn deinit(self: *Resolver) void {
@@ -1542,8 +1682,12 @@ pub const Resolver = struct {
         if (self.upstream == null and self.policy.recursion_allow_len == 0) return Error.NoForwarder;
         // RFC 8198 section 3: a cached NSEC proof answers denial queries
         // without an upstream round trip. Only when the client asked for
-        // DNSSEC proofs (DO) and did not disable checking (CD).
-        if (wantsDnssecProofs(query)) {
+        // DNSSEC proofs (DO) and did not disable checking (CD). A DNS64
+        // answer for AAAA must still fetch the empty AAAA upstream and
+        // synthesize from A, so an aggressive denial never answers it.
+        const dns64_aaaa = (self.policy.dns64 or self.policy.nat64_prefixes.len > 0) and
+            if (query.question) |q| q.qtype.eql(.AAAA) else false;
+        if (wantsDnssecProofs(query) and !dns64_aaaa) {
             if (query.question) |question| {
                 const denial = self.dnssec_aggressive.deny(question.name, question.qtype, now) catch {
                     // Fail closed: an exact-owner NSEC or NSEC3 proof is
@@ -2763,6 +2907,8 @@ pub const Resolver = struct {
     /// root answers the walk directly.
     fn rootServers(self: *Resolver, now: i64) []const std.Io.net.IpAddress {
         if (self.hint_count != iterate_mod.root_hint_text.len) return self.root_hints[0..self.hint_count];
+        // RFC 8806: the local root zone answers, so no priming query is sent.
+        if (self.local_root_zone and self.root_server_count != 0) return self.root_servers[0..self.root_server_count];
         if (self.root_server_count == 0 or now >= self.root_servers_expires_at) self.primeRootServers(now);
         if (self.root_server_count != 0) return self.root_servers[0..self.root_server_count];
         return self.root_hints[0..self.hint_count];
@@ -3005,7 +3151,15 @@ const Dns64Outcome = union(enum) {
 /// Returns `.none` when nothing is synthesized, which leaves the answer as
 /// the upstream sent it.
 fn synthesizeDns64Answer(self: *Resolver, query: dns_message.Message, response: *dns_message.Message, scope: ?EcsScope, transport: UpstreamTransport, now: i64) !Dns64Outcome {
-    if (self.policy.nat64_prefixes.len == 0) return .none;
+    // RFC 6147 section 5.2: with no configured prefix, the algorithm uses
+    // the Well-Known Prefix 64:ff9b::/96 of RFC 6052 section 2.1.
+    if (!self.policy.dns64 and self.policy.nat64_prefixes.len == 0) return .none;
+    if (self.policy.dns64 and self.policy.nat64_prefixes.len == 0) {
+        const implicit = config.Nat64Prefix.parse("64:ff9b::/96") catch return .none;
+        if (self.policy.nat64_prefixes.items.len == 0) return .none;
+        self.policy.nat64_prefixes.items[0] = implicit;
+        self.policy.nat64_prefixes.len = 1;
+    }
     // RFC 6147 section 5.3.1 option 2: a PTR query for an address one of the
     // configured prefixes embeds is answered with a CNAME into IN-ADDR.ARPA
     // before the AAAA synthesis, which only accepts AAAA, is considered.
@@ -3513,14 +3667,27 @@ fn synthesizeDns64(policy: *const Policy, owner: dns_name.Name, response: *dns_m
     }
     response.header.answer_count = @intCast(response.answers.len);
 
-    // The authority section keeps the zone's SOA alone.
+    // RFC 6147 section 5.4: the authority and additional sections are
+    // copied from the A answer the synthesis rests on. When the A answer
+    // carries no authority, the negative answer's SOA is kept, capped the
+    // way a negative answer's SOA always is.
     response.authorities.len = 0;
-    if (soa) |record| {
-        var soa_record = record;
-        soa_record.ttl = @min(record.ttl, record.rdata.SOA.minimum);
-        try response.authorities.append(soa_record);
+    for (a_response.authorities.slice()) |record| {
+        try response.authorities.append(record);
+    }
+    if (a_response.authorities.len == 0) {
+        if (soa) |record| {
+            var soa_record = record;
+            soa_record.ttl = @min(record.ttl, record.rdata.SOA.minimum);
+            try response.authorities.append(soa_record);
+        }
     }
     response.header.authority_count = @intCast(response.authorities.len);
+    response.additionals.len = 0;
+    for (a_response.additionals.slice()) |record| {
+        try response.additionals.append(record);
+    }
+    response.header.additional_count = @intCast(response.additionals.len);
     response.header.authoritative = false;
     response.header.authenticated_data = false;
     // RFC 6147 section 5.4: the header of a synthesized answer is set by the
@@ -4673,7 +4840,7 @@ fn serveDeniedNameUpstream(args: *DeniedNameUpstream) void {
         const soa = makeTestSoa(60, 30) catch return;
         const authority = [_]dns_record.ResourceRecord{soa};
         var response_buffer: [2048]u8 = undefined;
-        const bytes = buildUpstreamAnswer(&response_buffer, query, answers, &authority, .nxdomain, null) catch return;
+        const bytes = buildUpstreamAnswer(&response_buffer, query, answers, &authority, &.{}, .nxdomain, null) catch return;
         args.udp.send(args.io, &incoming.from, bytes) catch return;
     }
 }
@@ -4991,7 +5158,7 @@ fn serveEcsUpstream(args: *EcsUpstream) void {
                 ecs = echoed[0..len];
             }
         }
-        const bytes = buildUpstreamAnswer(&response_buffer, query, &answer_slot, &.{}, .no_error, ecs) catch return;
+        const bytes = buildUpstreamAnswer(&response_buffer, query, &answer_slot, &.{}, &.{}, .no_error, ecs) catch return;
         args.udp.send(args.io, &incoming.from, bytes) catch return;
     }
 }
@@ -5898,13 +6065,13 @@ fn makeTestRrsig(now_expired: bool) dns_rdata.Unknown {
 }
 
 /// An RRSIG over an A record whose algorithm this build cannot verify with
-/// (16 is Ed448, which this build does not implement), signed by the zone the
+/// (17 is GOST, which this build does not implement), signed by the zone the
 /// trust anchor speaks for.
 fn makeUnsupportedAlgorithmRrsig() dns_rdata.Unknown {
     var raw = dns_rdata.Unknown{};
     raw.data[0] = 0x00;
     raw.data[1] = 0x01;
-    raw.data[2] = 0x10;
+    raw.data[2] = 0x11;
     raw.data[3] = 0x03;
     std.mem.writeInt(u32, raw.data[4..8], 3600, .big);
     std.mem.writeInt(u32, raw.data[8..12], 2_000_000_000, .big);
@@ -8299,6 +8466,120 @@ test "RFC 6147: an empty AAAA answer is answered with an AAAA synthesized from t
     try std.testing.expectEqual(@as(usize, 2), upstream.requests);
 }
 
+test "RFC 6147 section 5.4: the synthesized answer copies the A authority and additional sections" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    const a_records = [_]dns_record.ResourceRecord{dns64TestARecord("v4only.example.")};
+    const soa_records = [_]dns_record.ResourceRecord{dns64TestSoaRecord("example.")};
+    const a_authority = [_]dns_record.ResourceRecord{dns64TestSoaRecord("example.")};
+    const a_additional = [_]dns_record.ResourceRecord{dns64TestARecord("extra.example.")};
+    var upstream = Dns64Upstream{
+        .io = io,
+        .udp = &upstream_socket,
+        .a = &a_records,
+        .soa = &soa_records,
+        .a_authority = &a_authority,
+        .a_additional = &a_additional,
+    };
+    const thread = try std.Thread.spawn(.{}, serveDns64Upstream, .{&upstream});
+
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = upstream_socket.address },
+        .nat64_prefixes = .init(&.{try config.Nat64Prefix.parse("64:ff9b::/96")}),
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2901, "v4only.example.", false);
+    defer query.deinit();
+    query.question.?.qtype = .AAAA;
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42700);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    thread.join();
+
+    const response = try dns_message.Message.parse(arena.allocator(), bytes);
+    try std.testing.expectEqual(dns_header.Rcode.no_error, response.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+    try std.testing.expect(response.answers.items[0].rrtype.eql(.AAAA));
+    // The A answer's authority section replaces the negative SOA, verbatim.
+    try std.testing.expectEqual(@as(u16, 1), response.header.authority_count);
+    try std.testing.expect(response.authorities.items[0].rrtype.eql(.SOA));
+    try std.testing.expectEqual(@as(u32, 3600), response.authorities.items[0].ttl);
+    // The A answer's additional section rides along.
+    try std.testing.expectEqual(@as(u16, 1), response.header.additional_count);
+    try std.testing.expect(response.additionals.items[0].rrtype.eql(.A));
+    try std.testing.expect(response.additionals.items[0].owner.eql(&try dns_name.Name.fromText("extra.example.")));
+    try std.testing.expectEqual(@as(usize, 2), upstream.requests);
+}
+
+test "RFC 8198 with DNS64: an aggressive denial does not answer an AAAA synthesis" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    const a_records = [_]dns_record.ResourceRecord{dns64TestARecord("v4only.example.")};
+    const soa_records = [_]dns_record.ResourceRecord{dns64TestSoaRecord("example.")};
+    var upstream = Dns64Upstream{
+        .io = io,
+        .udp = &upstream_socket,
+        .a = &a_records,
+        .soa = &soa_records,
+    };
+    const thread = try std.Thread.spawn(.{}, serveDns64Upstream, .{&upstream});
+
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = upstream_socket.address },
+        .nat64_prefixes = .init(&.{try config.Nat64Prefix.parse("64:ff9b::/96")}),
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // The cached NSEC bitmap carries A and NSEC, so it denies AAAA.
+    const bitmap = [_]u8{ 0x00, 0x06, 0x40, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    const now: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+    resolver.dnssec_aggressive.insertNsec(
+        try dns_name.Name.fromText("v4only.example."),
+        try dns_name.Name.fromText("w4only.example."),
+        &bitmap,
+        now,
+        3600,
+        try makeTestSoa(3600, 3600),
+        .{},
+    );
+
+    var query = try makeTestQuery(arena.allocator(), 0x2902, "v4only.example.", true);
+    defer query.deinit();
+    query.question.?.qtype = .AAAA;
+    query.edns.?.dnssec_ok = true;
+    query.additionals.items[0].ttl |= 0x8000;
+    try std.testing.expect(wantsDnssecProofs(query));
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42700);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    thread.join();
+
+    const response = try dns_message.Message.parse(arena.allocator(), bytes);
+    try std.testing.expectEqual(dns_header.Rcode.no_error, response.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+    try std.testing.expect(response.answers.items[0].rrtype.eql(.AAAA));
+    try std.testing.expectEqualSlices(u8, &.{
+        0x00, 0x64, 0xff, 0x9b, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x5d, 0xb8, 0xd8, 0x22,
+    }, &response.answers.items[0].rdata.AAAA);
+    try std.testing.expectEqual(@as(usize, 2), upstream.requests);
+}
+
 test "RFC 6052 section 3.1: the well-known prefix does not represent a non-global address" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
@@ -9991,6 +10272,11 @@ const Dns64Upstream = struct {
     /// The whole authority section of the AAAA answer, for the test that
     /// needs more than the SOA alone (a signed denial, for instance).
     authority: []const dns_record.ResourceRecord = &.{},
+    /// The authority section of the A answer, for the test that checks
+    /// RFC 6147 section 5.4 copies it verbatim.
+    a_authority: []const dns_record.ResourceRecord = &.{},
+    /// The additional section of the A answer, for the same check.
+    a_additional: []const dns_record.ResourceRecord = &.{},
     /// The RCODE the AAAA answer carries (RFC 6147 section 5.1.2).
     rcode: dns_header.Rcode = .no_error,
     requests: usize = 0,
@@ -10050,6 +10336,7 @@ fn serveDns64Upstream(args: *Dns64Upstream) void {
             args.a;
         var soa_slot: [1]dns_record.ResourceRecord = undefined;
         var authority: []const dns_record.ResourceRecord = &.{};
+        var additionals: []const dns_record.ResourceRecord = &.{};
         if (question.qtype.eql(.AAAA)) {
             if (args.authority.len != 0) {
                 authority = args.authority;
@@ -10057,6 +10344,9 @@ fn serveDns64Upstream(args: *Dns64Upstream) void {
                 soa_slot[0] = args.soa[0];
                 authority = soa_slot[0..1];
             }
+        } else if (question.qtype.eql(.A)) {
+            authority = args.a_authority;
+            additionals = args.a_additional;
         }
         const rcode = if (refused) .refused else if (question.qtype.eql(.AAAA)) args.rcode else .no_error;
         // RFC 7871 section 6: an answer that carries the client subnet
@@ -10073,7 +10363,7 @@ fn serveDns64Upstream(args: *Dns64Upstream) void {
             }
         }
         var response_buffer: [2048]u8 = undefined;
-        const bytes = buildUpstreamAnswer(&response_buffer, query, answers, authority, rcode, ecs) catch return;
+        const bytes = buildUpstreamAnswer(&response_buffer, query, answers, authority, additionals, rcode, ecs) catch return;
         args.udp.send(args.io, &incoming.from, bytes) catch return;
     }
 }
@@ -10084,6 +10374,7 @@ fn buildUpstreamAnswer(
     query: dns_message.Message,
     answers: []const dns_record.ResourceRecord,
     authority: []const dns_record.ResourceRecord,
+    additionals: []const dns_record.ResourceRecord,
     rcode: dns_header.Rcode,
     ecs: ?[]const u8,
 ) ![]const u8 {
@@ -10105,8 +10396,10 @@ fn buildUpstreamAnswer(
     defer message.deinit();
     for (answers) |record| try message.answers.append(record);
     for (authority) |record| try message.authorities.append(record);
+    for (additionals) |record| try message.additionals.append(record);
     message.header.answer_count = @intCast(message.answers.len);
     message.header.authority_count = @intCast(message.authorities.len);
+    message.header.additional_count = @intCast(message.additionals.len);
     if (ecs) |option| {
         try appendOpt(&message, query.edns.?);
         try appendOption(&message, dns_rdata.EDNS_ECS_OPTION_CODE, option);
@@ -10170,7 +10463,7 @@ fn serveDns64AliasUpstream(args: *Dns64AliasUpstream) void {
             authority = soa_slot[0..1];
         }
         var response_buffer: [2048]u8 = undefined;
-        const bytes = buildUpstreamAnswer(&response_buffer, query, answers, authority, .no_error, null) catch return;
+        const bytes = buildUpstreamAnswer(&response_buffer, query, answers, authority, &.{}, .no_error, null) catch return;
         args.udp.send(args.io, &incoming.from, bytes) catch return;
     }
 }
@@ -11783,7 +12076,7 @@ fn serveRefusingUpstream(args: *RefusingUpstream) void {
             answers = answer_slot[0..1];
         }
         var response_buffer: [2048]u8 = undefined;
-        const bytes = buildUpstreamAnswer(&response_buffer, query, answers, &.{}, rcode, null) catch return;
+        const bytes = buildUpstreamAnswer(&response_buffer, query, answers, &.{}, &.{}, rcode, null) catch return;
         args.udp.send(args.io, &incoming.from, bytes) catch return;
     }
 }
@@ -11981,7 +12274,7 @@ test "RFC 8914 section 4.2: an answer the server cannot verify carries the code 
     // 4035 section 5.2 leaves the zone unsigned, and RFC 8914 section 4.2
     // names the code the client is told.
     const anchors = try validate.Anchors.parse(std.testing.allocator,
-        \\example.com. DNSKEY 256 3 16 AwEAAQ==
+        \\example.com. DNSKEY 256 3 17 AwEAAQ==
         \\
     );
     var resolver = try Resolver.init(std.testing.allocator, io, .{
@@ -12018,7 +12311,7 @@ test "the cached copy of an unverifiable answer carries the same code" {
     const thread = try std.Thread.spawn(.{}, serveUnsupportedAlgorithmUpstream, .{&upstream});
 
     const anchors = try validate.Anchors.parse(std.testing.allocator,
-        \\example.com. DNSKEY 256 3 16 AwEAAQ==
+        \\example.com. DNSKEY 256 3 17 AwEAAQ==
         \\
     );
     var resolver = try Resolver.init(std.testing.allocator, io, .{
@@ -12766,4 +13059,111 @@ test "RFC 9609 section 2: a priming answer fills the root server list" {
     try std.testing.expectEqual(@as(u8, 0x42), resolver.root_servers[1].ip6.bytes[15]);
     // The shortest TTL of the answer bounds the life of the list.
     try std.testing.expectEqual(@as(i64, 1600), resolver.root_servers_expires_at);
+}
+
+const test_root_zone_text =
+    \\$ORIGIN .
+    \\$TTL 3600
+    \\@ IN SOA a.root-servers.net. nstld.verisign-grs.com. 2024010101 1800 900 604800 86400
+    \\@ IN NS a.root-servers.net.
+    \\@ IN NS b.root-servers.net.
+    \\a.root-servers.net. IN A 198.41.0.4
+    \\b.root-servers.net. IN A 198.41.0.5
+    \\com. IN NS a.gtld-servers.net.
+    \\a.gtld-servers.net. IN A 192.5.6.30
+;
+
+/// The stub sender for the local root zone walk: only the TLD server under
+/// `com.` answers, and an answer from it ends the walk at once.
+const RootStub = struct {
+    root: [4]u8,
+    tld: [4]u8,
+    root_queries: usize = 0,
+    tld_queries: usize = 0,
+
+    fn send(context: *anyopaque, allocator: std.mem.Allocator, server: std.Io.net.IpAddress, query_bytes: []const u8, dnssec_ok: bool) anyerror!dns_message.Message {
+        _ = dnssec_ok;
+        const self: *RootStub = @ptrCast(@alignCast(context));
+        var query = try dns_message.Message.parse(allocator, query_bytes);
+        defer query.deinit();
+        const question = query.question orelse return error.MalformedResponse;
+        const is_root = switch (server) {
+            .ip4 => |address| std.mem.eql(u8, &self.root, &address.bytes),
+            .ip6 => false,
+        };
+        const is_tld = switch (server) {
+            .ip4 => |address| std.mem.eql(u8, &self.tld, &address.bytes),
+            .ip6 => false,
+        };
+        if (is_root) self.root_queries += 1;
+        if (is_tld) self.tld_queries += 1;
+        if (!is_tld) return error.NoReachableServer;
+        if (!question.name.eql(&(dns_name.Name.fromText("www.com.") catch unreachable))) return error.NoReachableServer;
+        if (!question.qtype.eql(.A)) return error.NoReachableServer;
+        var message = dns_message.Message{
+            .allocator = allocator,
+            .header = .{ .id = 0, .qr = true, .question_count = 1, .authoritative = true },
+            .question = question,
+            .answers = try dns_message.RecordSection.init(allocator, 0),
+            .authorities = try dns_message.RecordSection.init(allocator, 0),
+            .additionals = try dns_message.RecordSection.init(allocator, 0),
+        };
+        errdefer message.deinit();
+        try message.answers.append(.{ .owner = question.name, .rrtype = .A, .class = .IN, .ttl = 300, .rdata = .{ .A = .{ 192, 0, 2, 1 } } });
+        message.header.answer_count = 1;
+        return message;
+    }
+};
+
+test "RFC 8806: a local root zone supplies the root servers with no priming query" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var resolver = try Resolver.init(std.testing.allocator, io, .{});
+    defer resolver.deinit();
+
+    try resolver.enableLocalRootZone(test_root_zone_text);
+    try std.testing.expect(resolver.local_root_zone);
+    try std.testing.expectEqual(@as(usize, 2), resolver.root_server_count);
+    try std.testing.expectEqual([4]u8{ 198, 41, 0, 4 }, resolver.root_servers[0].ip4.bytes);
+    try std.testing.expectEqual([4]u8{ 198, 41, 0, 5 }, resolver.root_servers[1].ip4.bytes);
+    try std.testing.expectEqual(@as(u16, 53), resolver.root_servers[0].ip4.port);
+    const now: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+    try std.testing.expect(resolver.root_servers_expires_at > now + 3 * 365 * 24 * 3600);
+    // The walk starts from the local list, and reading it sends no priming
+    // query: a prime would clear the count and go to the network for the
+    // built-in hints instead.
+    const started = resolver.rootServers(now);
+    try std.testing.expectEqual(@as(usize, 2), started.len);
+    try std.testing.expectEqual(@as(usize, 2), resolver.root_server_count);
+    // The `com.` delegation is already known, with its in-zone glue.
+    const cached = resolver.delegations.lookup(dns_name.Name.fromText("www.com.") catch unreachable, now).?;
+    try std.testing.expect(cached.zone.eql(&(dns_name.Name.fromText("com.") catch unreachable)));
+    try std.testing.expectEqual(@as(usize, 1), cached.server_count);
+    try std.testing.expectEqual([4]u8{ 192, 5, 6, 30 }, cached.servers[0].ip4.bytes);
+}
+
+test "RFC 8806: a query under a TLD reaches that TLD server, not a root server" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var resolver = try Resolver.init(std.testing.allocator, io, .{});
+    defer resolver.deinit();
+    try resolver.enableLocalRootZone(test_root_zone_text);
+    const now: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2870, "www.com.", false);
+    defer query.deinit();
+    var stub = RootStub{ .root = .{ 198, 41, 0, 4 }, .tld = .{ 192, 5, 6, 30 } };
+    var answer = try iterate_mod.resolve(
+        arena.allocator(),
+        .{ .context = &stub, .send = RootStub.send },
+        resolver.rootServers(now),
+        query.question.?,
+        .{ .cache = &resolver.delegations, .now = now },
+    );
+    defer answer.deinit();
+    try std.testing.expectEqual(@as(usize, 1), answer.answers.len);
+    try std.testing.expect(answer.answers.items[0].rrtype.eql(.A));
+    try std.testing.expectEqualSlices(u8, &.{ 192, 0, 2, 1 }, &answer.answers.items[0].rdata.A);
+    try std.testing.expectEqual(@as(usize, 0), stub.root_queries);
+    try std.testing.expect(stub.tld_queries > 0);
 }

@@ -201,7 +201,7 @@ fn rrsigCoversZonemd(rdata: dns_rdata.RData) bool {
 /// this server generated when it signed the zone at startup, whose signatures
 /// no publisher could have covered. Every other DNSSEC RR in the zone file
 /// stays in, and a non-apex ZONEMD is ordinary zone data.
-fn canonicalEntries(zone: *const zone_index.Zone, allocator: std.mem.Allocator) Error![]Entry {
+fn canonicalEntries(zone: *const zone_index.Zone, allocator: std.mem.Allocator, include_generated: bool) Error![]Entry {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const scratch = arena.allocator();
@@ -211,11 +211,12 @@ fn canonicalEntries(zone: *const zone_index.Zone, allocator: std.mem.Allocator) 
     // fit in the 2048-octet buffer the typed RDATA uses, so the buffer here
     // is the zone's own bound.
     const rdata_buffer = try scratch.alloc(u8, dns_rdata.max_message_rdata_len);
-    // The records this server generated when it signed the zone at startup are
-    // not part of the zone the publisher digested: their signatures depend on
-    // the run, so no publisher can have covered them.
-    const file_len = zone.records.len -| zone.generated.len;
-    for (zone.records.items[0..file_len]) |record| {
+    // The records this server generated when it signed the zone at startup
+    // are not part of a zone-file digest, because no file publisher could have
+    // covered the run's signatures. The startup publisher digests the fully
+    // served zone instead, so it includes them.
+    const record_count = if (include_generated) zone.records.len else zone.records.len -| zone.generated.len;
+    for (zone.records.items[0..record_count]) |record| {
         if (!zone.contains(record.ownerText())) continue;
         const is_apex = std.ascii.eqlIgnoreCase(record.ownerText(), zone.originText());
         if (record.rrtype.eql(.ZONEMD) and is_apex) continue;
@@ -263,7 +264,22 @@ fn canonicalEntries(zone: *const zone_index.Zone, allocator: std.mem.Allocator) 
 pub fn computeDigest(zone: *const zone_index.Zone, hash: Hash, allocator: std.mem.Allocator, out: *[dns_rdata.max_zonemd_digest_len]u8) Error!void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const entries = try canonicalEntries(zone, arena.allocator());
+    const entries = try canonicalEntries(zone, arena.allocator(), false);
+
+    switch (hash) {
+        .sha384 => hashEntries(entries, std.crypto.hash.sha2.Sha384, 48, out[0..48]),
+        .sha512 => hashEntries(entries, std.crypto.hash.sha2.Sha512, 64, out[0..64]),
+    }
+}
+
+/// The digest over the fully served zone, including the records the signer
+/// generated at startup (RFC 8976 sections 3.3.1 and 3.3.1.1). The startup
+/// publisher uses this, because it signs first and digests second; the
+/// zone-file verifier keeps using `computeDigest`.
+pub fn computeDigestServed(zone: *const zone_index.Zone, hash: Hash, allocator: std.mem.Allocator, out: *[dns_rdata.max_zonemd_digest_len]u8) Error!void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const entries = try canonicalEntries(zone, arena.allocator(), true);
 
     switch (hash) {
         .sha384 => hashEntries(entries, std.crypto.hash.sha2.Sha384, 48, out[0..48]),
@@ -354,6 +370,16 @@ pub fn hasApexRecord(zone: *const zone_index.Zone) bool {
 /// no apex ZONEMD RRset succeeds without computing anything. Any one supported
 /// (scheme, hash) pair matching is sufficient; nothing matching fails closed.
 pub fn verify(zone: *const zone_index.Zone, allocator: std.mem.Allocator, report: []u8) Error![]const u8 {
+    return verifyWith(zone, allocator, report, false);
+}
+
+/// Verifies every apex ZONEMD RR against the fully served zone, including the
+/// records the signer generated at startup.
+pub fn verifyServed(zone: *const zone_index.Zone, allocator: std.mem.Allocator, report: []u8) Error![]const u8 {
+    return verifyWith(zone, allocator, report, true);
+}
+
+fn verifyWith(zone: *const zone_index.Zone, allocator: std.mem.Allocator, report: []u8, served: bool) Error![]const u8 {
     if (report.len < report_max_len) return Error.ReportTooSmall;
 
     var wanted: [16]dns_rdata.Zonemd = undefined;
@@ -424,7 +450,7 @@ pub fn verify(zone: *const zone_index.Zone, allocator: std.mem.Allocator, report
 
         var computed: [dns_rdata.max_zonemd_digest_len]u8 = undefined;
         const digest_len = hash.digestLen();
-        try computeDigest(zone, hash, allocator, &computed);
+        if (served) try computeDigestServed(zone, hash, allocator, &computed) else try computeDigest(zone, hash, allocator, &computed);
         if (std.mem.eql(u8, computed[0..digest_len], zonemd.digestBytes())) {
             return writeReport(report, "zone {s}: ZONEMD verified ({s} {s}, serial {d})", .{
                 zone.originText(),

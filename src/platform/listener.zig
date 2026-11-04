@@ -102,6 +102,7 @@ fn serveUdpOnceWithTimeout(socket: *const std.Io.net.Socket, io: std.Io, runtime
     // so the answer that follows a reload always comes from the new zone.
     _ = runtime.reloadZoneIfRequested(io);
     _ = runtime.refreshCatalogIfRequested(io);
+    _ = runtime.maybeRefreshSecondaries(@intCast(std.Io.Clock.awake.now(io).nanoseconds), Runtime.fetchSecondaryViaXfr, runtime) catch {};
     var request_buffer: [UDP_REQUEST_BUFFER_SIZE]u8 = undefined;
     const incoming = try socket.receiveTimeout(io, &request_buffer, timeout);
     // A NOTIFY handled by the last answer set the catalog flag; its fetch
@@ -123,6 +124,7 @@ fn serveUdpOnceWithMetricsTimeout(socket: *const std.Io.net.Socket, io: std.Io, 
     // its zone on the same trigger.
     _ = runtime.reloadZoneIfRequested(io);
     _ = runtime.refreshCatalogIfRequested(io);
+    _ = runtime.maybeRefreshSecondaries(@intCast(std.Io.Clock.awake.now(io).nanoseconds), Runtime.fetchSecondaryViaXfr, runtime) catch {};
     var request_buffer: [UDP_REQUEST_BUFFER_SIZE]u8 = undefined;
     const incoming = try socket.receiveTimeout(io, &request_buffer, timeout);
     // A NOTIFY handled by the last answer set the catalog flag; its fetch
@@ -233,6 +235,7 @@ fn serveTcpStreamOnceWithTimeout(stream: std.Io.net.Stream, io: std.Io, runtime:
     // the new zone.
     _ = runtime.reloadZoneIfRequested(io);
     _ = runtime.refreshCatalogIfRequested(io);
+    _ = runtime.maybeRefreshSecondaries(@intCast(std.Io.Clock.awake.now(io).nanoseconds), Runtime.fetchSecondaryViaXfr, runtime) catch {};
     return unix_tcp_deadlines.serve(stream, io, runtime, timeout, counters);
 }
 

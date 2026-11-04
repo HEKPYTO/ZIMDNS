@@ -16,14 +16,14 @@ directives.
 ## The key file
 
 One `<algorithm> <secret>` line per key. `ECDSAP256SHA256`, `ECDSAP384SHA384`,
-and `ED25519` take the raw private scalar or seed in base64. `RSASHA256` and
+and `ED25519` take the raw private scalar or seed in base64; `ED448` takes
+the raw 57-octet secret in base64. `RSASHA256` and
 `RSASHA512` take a base64 PKCS#1 `RSAPrivateKey` DER, which an operator makes
 with `openssl rsa -traditional -outform DER | base64`; the signature is one
 modular exponentiation and the primes are not needed. RSA/SHA-1 (algorithms 5
 and 7) is not offered because the IANA "DNS Security Algorithm Numbers"
 registry, as revised by RFC 9904, marks it NOT RECOMMENDED under "Implement
-for DNSSEC Signing", and Ed448 needs a primitive the standard library does not
-ship.
+for DNSSEC Signing".
 
 ## The catalog zone's shape (RFC 9432)
 

@@ -43,6 +43,27 @@ const second_member_text =
     \\
 ;
 
+/// Secondaries refresh on the SOA timers (REFRESH 1, RETRY 1, EXPIRE 3),
+/// so a test can advance the clock past the refresh interval and observe
+/// the pull.
+const refresh_member_v1_text =
+    \\$ORIGIN one.example.
+    \\$TTL 3600
+    \\@ IN SOA ns.one.example. hostmaster.one.example. 1 1 1 3 3600
+    \\@ IN NS ns.one.example.
+    \\www IN A 192.0.2.1
+    \\
+;
+
+const refresh_member_v2_text =
+    \\$ORIGIN one.example.
+    \\$TTL 3600
+    \\@ IN SOA ns.one.example. hostmaster.one.example. 2 1 1 3 3600
+    \\@ IN NS ns.one.example.
+    \\www IN A 192.0.2.1
+    \\
+;
+
 const first_catalog_text =
     \\$ORIGIN catalog.example.
     \\$TTL 3600
@@ -315,4 +336,83 @@ fn expectAddress(io: std.Io, runtime: *Runtime, qname: []const u8, a: u8, b: u8,
     const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
     try std.testing.expectEqual(@as(usize, 1), response.answers.len);
     try std.testing.expectEqualSlices(u8, &.{ a, b, c, d }, &response.answers.items[0].rdata.A);
+}
+
+fn expectSoaSerial(io: std.Io, runtime: *Runtime, qname: []const u8, expected: u32, id: u16) !void {
+    var server_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server_socket = try std.Io.net.IpAddress.bind(&server_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer server_socket.close(io);
+    var client_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var client_socket = try std.Io.net.IpAddress.bind(&client_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer client_socket.close(io);
+
+    var query_buffer: [512]u8 = undefined;
+    const query = try cli_query.buildQueryPacket(&query_buffer, id, qname, .SOA, false);
+    try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, query);
+    try listener.serveUdpOnce(&server_socket, io, runtime);
+
+    var response_buffer: [512]u8 = undefined;
+    var response = try cli_query.receiveUdpResponse(std.testing.allocator, &client_socket, io, &response_buffer, &server_socket.address, query);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(usize, 1), response.answers.len);
+    try std.testing.expect(response.answers.items[0].rrtype.eql(.SOA));
+    try std.testing.expectEqual(expected, response.answers.items[0].rdata.SOA.serial);
+}
+
+test "secondary refresh pulls a changed member after the SOA refresh interval" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var primary_a = try Runtime.fromZoneTexts(&.{ first_catalog_text, refresh_member_v1_text });
+    defer primary_a.deinit();
+    var primary_b = try Runtime.fromZoneTexts(&.{ first_catalog_text, refresh_member_v2_text });
+    defer primary_b.deinit();
+
+    var first_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var first_server = try std.Io.net.IpAddress.listen(&first_addr, io, .{ .reuse_address = true });
+    const first_args = try startPrimary(io, &first_server, &primary_a, 2);
+    var first_joined = false;
+    var first_closed = false;
+    defer {
+        if (!first_closed) first_server.deinit(io);
+        if (!first_joined) first_args.thread.join();
+        std.testing.allocator.destroy(first_args);
+    }
+
+    var consumer = try Runtime.fromZoneTexts(&.{boot_text});
+    defer consumer.deinit();
+    try consumer.setCatalogConsumer(catalog_apex, first_server.socket.address, null);
+    consumer.requestCatalogRefresh();
+    try std.testing.expectEqual(@as(?zimdns.auth_runtime.CatalogRefreshOutcome, .updated), consumer.refreshCatalogIfRequested(io));
+    try expectSoaSerial(io, &consumer, "one.example.", 1, 0x4b21);
+    const clock_now_ns: u64 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
+    try joinPrimary(first_args, &first_joined);
+    // The second primary takes over the same loopback port after the first
+    // listener is gone, so the secondary's stored primary address reaches
+    // it even though the unchanged catalog serial is not re-provisioned.
+    const shared_addr = first_server.socket.address;
+    first_server.deinit(io);
+    first_closed = true;
+
+    // The catalog refresh window has to pass before the next attempt runs.
+    // The synthetic refresh clock stays anchored to provisioning so the
+    // 2s advance lands inside the (1,3) refresh-to-expire window.
+    try std.Io.sleep(io, .fromMilliseconds(catalog_window_ms + 100), .awake);
+    var second_addr = shared_addr;
+    var second_server = try std.Io.net.IpAddress.listen(&second_addr, io, .{ .reuse_address = true });
+    const second_args = try startPrimary(io, &second_server, &primary_b, 2);
+    var second_joined = false;
+    defer {
+        second_server.deinit(io);
+        if (!second_joined) second_args.thread.join();
+        std.testing.allocator.destroy(second_args);
+    }
+
+    try consumer.setCatalogConsumer(catalog_apex, second_server.socket.address, null);
+    consumer.requestCatalogRefresh();
+    try std.testing.expectEqual(@as(?zimdns.auth_runtime.CatalogRefreshOutcome, .unchanged), consumer.refreshCatalogIfRequested(io));
+    try consumer.maybeRefreshSecondaries(clock_now_ns + 2_000_000_000, Runtime.fetchSecondaryViaXfr, &consumer);
+    try expectSoaSerial(io, &consumer, "one.example.", 2, 0x4b22);
+    try joinPrimary(second_args, &second_joined);
 }

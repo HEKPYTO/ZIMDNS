@@ -75,6 +75,7 @@ test {
     _ = @import("dns/question.zig");
     _ = @import("dns/message.zig");
     _ = @import("dns/tsig.zig");
+    _ = @import("dns/ed448.zig");
     _ = golden_fixture;
     _ = @import("zone/journal.zig");
     _ = zone_parser;
@@ -579,6 +580,7 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
     }
     if (!explicit_zone_file and server_context != null) {
         for (server_context.?.config.zones.items) |configured| {
+            if (std.mem.eql(u8, configured.kindText(), "secondary")) continue;
             try configured_reloads.append(allocator, .{
                 .name = try allocator.dupe(u8, configured.nameText()),
                 .path = try allocator.dupe(u8, configured.fileText()),

@@ -1,8 +1,8 @@
 /// Contract: Signs one primary zone with a single DNSSEC key -- ECDSA P-256
-/// (RFC 6605 algorithm 13), ECDSA P-384 (RFC 6605 algorithm 14), or Ed25519
-/// (RFC 8080 algorithm 15) -- producing the apex DNSKEY and DS, an NSEC chain
-/// of denial, and one RRSIG per RRset (RFC 4034 sections 3.1.8.1 and 5.1.4,
-/// RFC 4035 section 2.3).
+/// (RFC 6605 algorithm 13), ECDSA P-384 (RFC 6605 algorithm 14), Ed25519
+/// (RFC 8080 algorithm 15), or Ed448 (RFC 8080 algorithm 16) -- producing the
+/// apex DNSKEY and DS, an NSEC chain of denial, and one RRSIG per RRset
+/// (RFC 4034 sections 3.1.8.1 and 5.1.4, RFC 4035 section 2.3).
 /// Ownership: every generated zone record, RDATA blob, and byte string is
 /// allocated from `allocator`, which the caller keeps alive for as long as it
 /// keeps the signed zone. `Key` owns private key material; call `Key.deinit`.
@@ -43,19 +43,21 @@ pub const Error = error{
 const EcdsaP256Sha256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 const EcdsaP384Sha384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
 const Ed25519 = std.crypto.sign.Ed25519;
+const ed448 = @import("../dns/ed448.zig");
 
 /// The signing algorithms this build carries. RFC 5702's RSA/SHA-256 (8) and
 /// RSA/SHA-512 (10) are here; RSA/SHA-1 (5) and RSA/SHA-1-NSEC3 (7) are not,
 /// because the IANA "DNS Security Algorithm Numbers" registry, as revised by
 /// RFC 9904, marks them NOT RECOMMENDED under "Implement for DNSSEC Signing".
-/// Ed448 (RFC 8080 algorithm 16) is absent: the standard library has no
-/// primitive for it.
+/// Ed25519 (RFC 8080 algorithm 15) and Ed448 (RFC 8080 algorithm 16) are here,
+/// the latter on the `src/dns/ed448.zig` primitive.
 pub const Algorithm = enum(u8) {
     rsa_sha256 = 8,
     rsa_sha512 = 10,
     ecdsa_p256_sha256 = 13,
     ecdsa_p384_sha384 = 14,
     ed25519 = 15,
+    ed448 = 16,
 
     pub fn mnemonic(self: Algorithm) []const u8 {
         return switch (self) {
@@ -64,6 +66,7 @@ pub const Algorithm = enum(u8) {
             .ecdsa_p256_sha256 => "ECDSAP256SHA256",
             .ecdsa_p384_sha384 => "ECDSAP384SHA384",
             .ed25519 => "ED25519",
+            .ed448 => "ED448",
         };
     }
 };
@@ -133,6 +136,7 @@ pub const Material = union(Algorithm) {
     ecdsa_p256_sha256: EcdsaP256Sha256.KeyPair,
     ecdsa_p384_sha384: EcdsaP384Sha384.KeyPair,
     ed25519: Ed25519.KeyPair,
+    ed448: ed448.SecretKey,
 };
 
 pub const Key = struct {
@@ -164,7 +168,7 @@ pub const Key = struct {
         return signMaterial(&self.material, message, out);
     }
 
-    /// Wipes the private scalar, the Ed25519 seed, and the public key.
+    /// Wipes the private scalar, the Ed25519 seed, the Ed448 secret, and the public key.
     pub fn deinit(self: *Key) void {
         std.crypto.secureZero(u8, std.mem.asBytes(&self.material));
         if (self.ksk) |*ksk| ksk.deinit();
@@ -175,7 +179,8 @@ pub const Key = struct {
     /// the public key. ECDSA uses the uncompressed curve point as "x | y"
     /// (RFC 6605 section 4), which is SEC 1's uncompressed form with the
     /// leading 0x04 octet dropped; Ed25519 uses its raw 32 octets, per
-    /// RFC 8080 section 3.2. Public because a trust anchor is exactly this
+    /// RFC 8080 section 3.2, and Ed448 its raw 57 octets, per RFC 8080
+    /// section 3. Public because a trust anchor is exactly this
     /// record, and an operator (or a test) cannot write one without it.
     pub fn dnskeyRdata(self: *const Key, allocator: std.mem.Allocator) Error![]const u8 {
         return dnskeyRdataOf(self.material, allocator, dnskey_flags);
@@ -255,6 +260,11 @@ fn publicKeyBytes(material: Material, buffer: []u8) []const u8 {
             @memcpy(buffer[0..public.len], &public);
             return buffer[0..public.len];
         },
+        .ed448 => |secret| {
+            const public = ed448.derivePublicKey(secret);
+            @memcpy(buffer[0..public.len], &public);
+            return buffer[0..public.len];
+        },
     }
 }
 
@@ -293,6 +303,11 @@ fn dnskeyRdataOf(material: Material, allocator: std.mem.Allocator, flags: u16) E
         },
         .ed25519 => |key_pair| {
             const public = key_pair.public_key.toBytes();
+            @memcpy(buffer[len..][0..public.len], &public);
+            len += public.len;
+        },
+        .ed448 => |secret| {
+            const public = ed448.derivePublicKey(secret);
             @memcpy(buffer[len..][0..public.len], &public);
             len += public.len;
         },
@@ -358,6 +373,12 @@ fn signMaterial(material: *const Material, message: []const u8, out: []u8) Error
             const bytes = (key_pair.sign(message, null) catch return Error.SigningFailed).toBytes();
             @memcpy(out[0..bytes.len], &bytes);
             return out[0..bytes.len];
+        },
+        .ed448 => |*secret| {
+            var signature: ed448.Signature = undefined;
+            ed448.sign(message, secret.*, ed448.derivePublicKey(secret.*), &signature);
+            @memcpy(out[0..signature.len], &signature);
+            return out[0..signature.len];
         },
     }
 }
@@ -502,9 +523,10 @@ fn rsaKeyFromDer(der: []const u8) Error!RsaKey {
 // ------------------------------------------------------------------ key file
 
 /// Reads the project key file: one whitespace-separated `<algorithm> <secret>`
-/// pair per line, the secret being the base64 private scalar (ECDSA) or seed
-/// (Ed25519). Blank lines and `#` comments are skipped. The key is not named
-/// here: the signer is always told which zone it signs, and a DNSKEY owner is
+/// pair per line, the secret being the base64 private scalar (ECDSA), seed
+/// (Ed25519), or 57-octet secret (Ed448, RFC 8080 section 3). Blank lines and
+/// `#` comments are skipped. The key is not named here: the signer is always
+/// told which zone it signs, and a DNSKEY owner is
 /// that zone's apex by definition (RFC 4034 section 5.1.1), so a name in the
 /// file could only ever be wrong.
 pub fn parseKey(text: []const u8) Error!Key {
@@ -558,6 +580,11 @@ fn keyFromBase64(algorithm_text: []const u8, secret_text: []const u8) Error!Key 
         const seed: [Ed25519.KeyPair.seed_length]u8 = decoded[0..Ed25519.KeyPair.seed_length].*;
         return .{ .material = .{ .ed25519 = Ed25519.KeyPair.generateDeterministic(seed) catch return Error.BadSecret } };
     }
+    if (std.ascii.eqlIgnoreCase(algorithm_text, "ed448")) {
+        if (expected != @sizeOf(ed448.SecretKey)) return Error.BadSecret;
+        const secret: ed448.SecretKey = decoded[0..@sizeOf(ed448.SecretKey)].*;
+        return .{ .material = .{ .ed448 = secret } };
+    }
     return Error.BadKeyFile;
 }
 
@@ -591,6 +618,7 @@ pub const Options = struct {
     /// zone's own apex NSEC3PARAM in charge, which is what the server did
     /// before the operator could choose.
     chain: ?ChainPolicy = null,
+    zonemd: ?zonemd.Hash = null,
 
     /// The same window counted from `now`: the validity period the server
     /// was configured with, starting at the moment of the signing
@@ -601,6 +629,7 @@ pub const Options = struct {
             .inception = now,
             .expiration = now +| (self.expiration -| self.inception),
             .chain = self.chain,
+            .zonemd = self.zonemd,
         };
     }
 };
@@ -739,6 +768,29 @@ pub fn signZone(
         try key.dsRdata(work, origin_wire, zsk_dnskey);
     try appendSingle(work, origin_wire, RecordType.DS.code(), soa_ttl, ds_rdata, &rrsets);
     std.mem.sort(Rrset, rrsets.items, {}, rrsetLessThan);
+    // RFC 8976 ZONEMD publishing: the placeholder RRset is present before the
+    // chain is built so the denial bitmap names type 63. Its digest is zero;
+    // the real digest and signature are installed after emit, when every
+    // other generated record exists. A zone that already carries an apex
+    // ZONEMD keeps it, and the loader verifies it.
+    var publish_zonemd: ?zonemd.Hash = null;
+    var zonemd_serial: u32 = 0;
+    if (options.zonemd) |hash| {
+        if (!zonemd.hasApexRecord(zone)) {
+            publish_zonemd = hash;
+            const soa_record = zone.soa orelse return Error.BadZoneRecord;
+            const soa_rdata = zone_parser.parseRData(RecordType.SOA, soa_record.rdataText()) catch return Error.BadZoneRecord;
+            if (soa_rdata != .SOA) return Error.BadZoneRecord;
+            zonemd_serial = soa_rdata.SOA.serial;
+            const placeholder = try work.alloc(u8, 6 + hash.digestLen());
+            std.mem.writeInt(u32, placeholder[0..4], zonemd_serial, .big);
+            placeholder[4] = @backingInt(zonemd.Scheme.simple);
+            placeholder[5] = @backingInt(hash);
+            @memset(placeholder[6..], 0);
+            try appendSingle(work, origin_wire, RecordType.ZONEMD.code(), soa_ttl, placeholder, &rrsets);
+            std.mem.sort(Rrset, rrsets.items, {}, rrsetLessThan);
+        }
+    }
 
     // An apex NSEC3PARAM is the opt-in: the zone states the parameters of the
     // chain it publishes, and the signer builds that chain (RFC 5155 section
@@ -757,7 +809,21 @@ pub fn signZone(
             try appendNsec3Chain(work, &rrsets, origin_wire, soa_ttl, chain.params);
         },
     }
-    try emit(work, allocator, zone, key, dns_dnssec.keyTag(zsk_dnskey), ksk_tag, published_ksk_tag, options, rrsets.items, chain.publish_param);
+    try emit(work, allocator, zone, key, dns_dnssec.keyTag(zsk_dnskey), ksk_tag, published_ksk_tag, options, rrsets.items, chain.publish_param, publish_zonemd != null);
+    if (publish_zonemd) |hash| {
+        var digest: [dns_rdata.max_zonemd_digest_len]u8 = undefined;
+        zonemd.computeDigestServed(zone, hash, allocator, &digest) catch return Error.BadZoneRecord;
+        const real_rdata = try work.alloc(u8, 6 + hash.digestLen());
+        std.mem.writeInt(u32, real_rdata[0..4], zonemd_serial, .big);
+        real_rdata[4] = @backingInt(zonemd.Scheme.simple);
+        real_rdata[5] = @backingInt(hash);
+        @memcpy(real_rdata[6..], digest[0..hash.digestLen()]);
+        const zonemd_record = try genericRecord(allocator, origin_wire, RecordType.ZONEMD.code(), soa_ttl, real_rdata);
+        const rrsig_rdata = try signRrset(allocator, origin, origin, RecordType.ZONEMD.code(), &.{real_rdata}, soa_ttl, key, options);
+        defer allocator.free(rrsig_rdata);
+        const rrsig_record = try genericRecord(allocator, origin_wire, RecordType.RRSIG.code(), soa_ttl, rrsig_rdata);
+        try appendGenerated(allocator, zone, &.{ zonemd_record, rrsig_record });
+    }
     // The signed zone carries the records the signer generated, so the full
     // transfer of the zone is larger than the one the zone file holds.
     zone_index.registerZoneSize(zone);
@@ -1507,6 +1573,7 @@ fn emit(
     options: Options,
     rrsets: []const Rrset,
     publish_param: bool,
+    skip_zonemd: bool,
 ) Error!void {
     const signer_wire = try scratch.dupe(u8, (Name.fromText(zone.originText()) catch return Error.BadZoneRecord).asWire());
 
@@ -1530,6 +1597,7 @@ fn emit(
             },
             else => {},
         }
+        if (skip_zonemd and rrset.rrtype == RecordType.ZONEMD.code()) continue;
 
         // RFC 6781 section 3.1: the key-signing key signs the DNSKEY RRset
         // and nothing else; the zone-signing key signs every other RRset. A
@@ -1617,6 +1685,22 @@ fn install(allocator: std.mem.Allocator, zone: *zone_index.Zone, generated: []co
     zone.generated_allocator = allocator;
 }
 
+/// Appends records to an already-signed zone, keeping the split between the
+/// loaded records and the generated tail. The old combined array is freed;
+/// the per-record strings keep their owner and move with the structs.
+fn appendGenerated(allocator: std.mem.Allocator, zone: *zone_index.Zone, extra: []const zone_parser.ZoneRecord) Error!void {
+    const original_len = zone.records.len - zone.generated.len;
+    const old = zone.generated_allocation;
+    const combined = try allocator.alloc(zone_parser.ZoneRecord, zone.records.len + extra.len);
+    @memcpy(combined[0..zone.records.len], zone.records.items[0..zone.records.len]);
+    @memcpy(combined[zone.records.len..], extra);
+    allocator.free(old);
+    zone.records = .{ .items = combined, .len = combined.len };
+    zone.generated = combined[original_len..];
+    zone.generated_allocation = combined;
+    zone.generated_allocator = allocator;
+}
+
 // ------------------------------------------------------------------- vectors
 //
 // Nothing here compares the signer against itself. Three sources pin it, and
@@ -1649,6 +1733,9 @@ const rfc8080_ed25519_key = "ed25519 DSSF3o0s0f+ElWzj9E/Osxw8hLpk55chkmx0LYN5WiY
 const rfc8080_ed25519_dnskey = "zPnZ/QwEe7S8C5SPz2OfS5RR40ATk2/rYnE9xHIEijs=";
 const rfc8080_ed25519_ds = "401781b934e392de492ec77ae2e15d70f6575a1c0bc59c5275c04ebe80c6614c";
 const rfc8080_ed25519_key_tag: u16 = 35217;
+/// RFC 8032 section 7.4 blank-message secret, base64-encoded so the key file
+/// can carry it. It is a test secret, not a published DNSSEC vector.
+const ed448_key = "ed448 bIKlYsuAjRDWMr6JyFE+v2ySnzTd+oyfY8mWDvbjSKNSjIo/zC8ETjmj/FuUSS+PAy51SaIAmPlb\n";
 const rfc8080_mx_rrsig_hex =
     "000f0f0200000e1055d4fc6055b94ce08991076578616d706c6503636f6d00" ++
     "cd74346e4620413105c9f2f28bd428898e83f19758a38c32521562a1865715d4f" ++
@@ -2805,9 +2892,52 @@ test "a window counted from now keeps the validity period it was given" {
     );
 }
 
+test "RFC 8080: an Ed448-signed zone carries a 114-octet signature that verifies" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var key = try parseKey(ed448_key);
+    defer key.deinit();
+    try std.testing.expectEqual(Algorithm.ed448, key.algorithm());
+
+    var zone = try loadZone(rfc8080_zone);
+    defer zone.deinit();
+    try signZone(allocator, &zone, &key, rfc8080_window);
+
+    const dnskey = try allocator.dupe(u8, (try findOpaque(&zone, "example.com.", .DNSKEY, null)).?);
+    try std.testing.expectEqual(@as(u8, 16), dnskey[3]);
+    try std.testing.expectEqual(@as(usize, 57), dnskey.len - 4);
+    const rrsig = try allocator.dupe(u8, (try findOpaque(&zone, "example.com.", .RRSIG, RecordType.MX.code())).?);
+    try std.testing.expectEqual(@as(u8, 16), rrsig[2]);
+
+    // Rebuild the canonical signed data for the MX RRset the same way the
+    // signer built it, then check the signature over it.
+    const apex = try Name.fromText("example.com.");
+    const exchange = try Name.fromText("mail.example.com.");
+    var mx: [2 + 255]u8 = undefined;
+    std.mem.writeInt(u16, mx[0..2], 10, .big);
+    @memcpy(mx[2..][0..exchange.asWire().len], exchange.asWire());
+    const rrset = Rrset{
+        .owner_wire = apex.asWire(),
+        .rrtype = RecordType.MX.code(),
+        .ttl = 3600,
+        .rdata = &[_][]const u8{mx[0 .. 2 + exchange.asWire().len]},
+    };
+    const signed = try signedData(allocator, rrset, .ed448, dns_dnssec.keyTag(dnskey), apex.asWire(), rfc8080_window);
+    try std.testing.expectEqualSlices(u8, signed.bytes[0..signed.header_len], rrsig[0..signed.header_len]);
+    const signature = rrsig[signed.header_len..];
+    try std.testing.expectEqual(@as(usize, 114), signature.len);
+    try std.testing.expect(ed448.verify(
+        signed.bytes,
+        signature[0..@sizeOf(ed448.Signature)].*,
+        dnskey[4..][0..@sizeOf(ed448.PublicKey)].*,
+    ));
+}
+
 test "the key file accepts only one known algorithm and a correctly sized secret" {
     try std.testing.expectError(Error.BadKeyFile, parseKey("rsa-sha256 AAAA\n"));
-    try std.testing.expectError(Error.BadKeyFile, parseKey("ed448 AAAA\n"));
+    try std.testing.expectError(Error.BadSecret, parseKey("ed448 AAAA\n"));
     try std.testing.expectError(Error.BadSecret, parseKey("ed25519 QUJD\n"));
     try std.testing.expectError(Error.BadKeyFile, parseKey("# only a comment\n"));
     try std.testing.expectError(Error.BadKeyFile, parseKey("ed25519 AAAA BBBB\n"));

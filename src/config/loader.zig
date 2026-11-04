@@ -16,6 +16,7 @@ const parser = @import("parser.zig");
 const listener = @import("../platform/listener.zig");
 const zone_index = @import("../zone/index.zig");
 const zone_parser = @import("../zone/parser.zig");
+const dns_name_mod = @import("../dns/name.zig");
 const resolver_mod = @import("../resolver.zig");
 const zonemd = @import("../zone/zonemd.zig");
 const signer = @import("../zone/signer.zig");
@@ -44,6 +45,7 @@ pub const Error = error{
     /// The zone publishes no ZONEMD record, and none of its own DNSSEC
     /// records proves that the RRset does not exist.
     ZonemdAbsenceUnproven,
+    ZonemdPublishRequiresSigning,
     BadDnssecKey,
     BadTrustAnchorFile,
     /// The RFC 9432 catalog zone names a zone the server also serves, so the
@@ -55,6 +57,9 @@ pub const Error = error{
     /// The RFC 9432 catalog fetched from the primary is missing, malformed,
     /// or names a member the server cannot provision.
     BadCatalogMember,
+    /// A standalone secondary zone could not be fetched or parsed: the
+    /// primary did not answer or the transferred text is not the zone.
+    BadSecondary,
 };
 
 /// The RFC 9432 consumer facts the loader hands to the runtime.
@@ -88,6 +93,9 @@ pub const ServerContext = struct {
     /// configuration names no journal file, and the delta log then lives in
     /// memory only.
     journal: ?journal_mod.Journal = null,
+    /// Standalone secondary refresh facts, moved into the runtime by
+    /// `takeRuntime`; the apex strings are owned here until then.
+    secondary_zones: std.ArrayList(auth_runtime.SecondaryState) = .empty,
 
     pub fn load(dir: std.Io.Dir, io: std.Io, config_path: []const u8, allocator: std.mem.Allocator) !ServerContext {
         try ensureConfined(dir, io, config_path);
@@ -200,18 +208,22 @@ pub const ServerContext = struct {
         } else null;
 
         for (context.config.zones.items[0..context.config.zones.len]) |*configured| {
-            const zone_text = try readReferencedFile(dir, io, configured.fileText(), allocator);
-            defer allocator.free(zone_text);
-            try loadZoneText(
-                &context,
-                allocator,
-                io,
-                zone_text,
-                configured.nameText(),
-                if (dnssec_key) |*key| key else null,
-                now_seconds,
-                chain_policy,
-            );
+            if (std.mem.eql(u8, configured.kindText(), "secondary")) {
+                try loadSecondaryZone(&context, io, allocator, configured, now_seconds, chain_policy);
+            } else {
+                const zone_text = try readReferencedFile(dir, io, configured.fileText(), allocator);
+                defer allocator.free(zone_text);
+                try loadZoneText(
+                    &context,
+                    allocator,
+                    io,
+                    zone_text,
+                    configured.nameText(),
+                    if (dnssec_key) |*key| key else null,
+                    now_seconds,
+                    chain_policy,
+                );
+            }
         }
 
         // RFC 9432 section 4: a catalog zone is a normal zone. The producer
@@ -278,10 +290,16 @@ pub const ServerContext = struct {
 
         // The key outlives the startup signing pass: the serving path signs
         // the RFC 8482 minimal answer, which is not part of the signed zone.
+        const publish_hash: ?zonemd.Hash = switch (context.config.zonemd_mode) {
+            .off => null,
+            .sha384 => .sha384,
+            .sha512 => .sha512,
+        };
         if (dnssec_key) |*key| {
             context.dnssec_session = signer.Session.start(key, .{
                 .inception = now_seconds,
                 .expiration = now_seconds + signature_validity_seconds,
+                .zonemd = publish_hash,
             });
             // The session holds its own copy, so the local one is wiped here.
             key.deinit();
@@ -414,6 +432,49 @@ pub const ServerContext = struct {
                 return error.BadConfiguration;
             };
         }
+        // Carry parsed root hints into the resolver's priming/walk entry.
+        if (self.config.root_hints.len != 0) {
+            var hints: [32]std.Io.net.IpAddress = undefined;
+            var hint_count: usize = 0;
+            var hint_ok = true;
+            var i: usize = 0;
+            while (i < self.config.root_hints.len) : (i += 1) {
+                const hint = self.config.root_hints.items[i];
+                const address = std.Io.net.IpAddress.parse(hint.address.text(), hint.port) catch {
+                    hint_ok = false;
+                    break;
+                };
+                hints[hint_count] = address;
+                hint_count += 1;
+            }
+            if (!hint_ok) {
+                runtime.deinit();
+                return error.BadConfiguration;
+            }
+            if (runtime.resolver) |*resolver| resolver.setRootHints(hints[0..hint_count]);
+        }
+        // RFC 8806: a local root zone answers root queries and disables
+        // network priming. Validate before accepting it.
+        if (self.config.has_root_zone) {
+            const zone_text = std.Io.Dir.cwd().readFileAlloc(io, self.config.root_zone.text(), self.allocator, .limited(16 * 1024 * 1024)) catch {
+                runtime.deinit();
+                return error.BadConfiguration;
+            };
+            defer self.allocator.free(zone_text);
+            var zone_file = zone_parser.ZoneFile.parse(zone_text) catch {
+                runtime.deinit();
+                return error.BadConfiguration;
+            };
+            defer zone_file.deinit();
+            if (!std.mem.eql(u8, zone_file.origin, ".")) {
+                runtime.deinit();
+                return error.BadConfiguration;
+            }
+            if (runtime.resolver) |*resolver| resolver.enableLocalRootZone(zone_text) catch {
+                runtime.deinit();
+                return error.BadConfiguration;
+            };
+        }
         if (self.config.minimal_any_ttl) |ttl| runtime.answer_policy.minimal_any_ttl = ttl;
         if (self.config.minimal_any_ttl_tcp) |ttl| runtime.answer_policy.minimal_any_ttl_tcp = ttl;
         // RFC 7828 section 3.3.2: the option carries the idle timeout the
@@ -451,6 +512,8 @@ pub const ServerContext = struct {
             self.allocator.free(state.members);
             self.catalog_consumer_state = null;
         }
+        runtime.secondary_zones = self.secondary_zones;
+        self.secondary_zones = .empty;
         self.blocklist = .{};
         self.config = .{};
         return runtime;
@@ -467,6 +530,9 @@ pub const ServerContext = struct {
         self.zones = .empty;
         self.blocklist = .{};
         self.keyring.deinit();
+        for (self.secondary_zones.items) |*secondary| self.allocator.free(secondary.apex);
+        self.secondary_zones.deinit(self.allocator);
+        self.secondary_zones = .empty;
         if (self.catalog_consumer_state) |*state| {
             self.allocator.free(state.apex);
             if (state.group) |value| self.allocator.free(value);
@@ -597,10 +663,18 @@ fn loadZoneText(
     // RFC 4035 section 2.3: signing adds DNSKEY, DS, RRSIG, and NSEC to
     // the loaded zone, so the signed RRsets are served from here on
     // without touching the zone file on disk.
+    const had_apex_zonemd = zonemd.hasApexRecord(&zone);
+    const publish_hash: ?zonemd.Hash = switch (context.config.zonemd_mode) {
+        .off => null,
+        .sha384 => .sha384,
+        .sha512 => .sha512,
+    };
+    if (publish_hash != null and dnssec_key == null) return Error.ZonemdPublishRequiresSigning;
     const signature_window: signer.Options = .{
         .inception = now_seconds,
         .expiration = now_seconds + signature_validity_seconds,
         .chain = chain_policy,
+        .zonemd = publish_hash,
     };
     if (dnssec_key) |key| {
         signer.signZone(context.allocator, &zone, key, signature_window) catch |err| switch (err) {
@@ -663,7 +737,7 @@ fn loadZoneText(
     // tampered zone file fails closed at startup instead of answering
     // queries. The report names the zone and both digests.
     var zonemd_report: [zonemd.report_max_len]u8 = undefined;
-    _ = zonemd.verify(&zone, allocator, &zonemd_report) catch {
+    _ = (if (publish_hash != null and !had_apex_zonemd) zonemd.verifyServed(&zone, allocator, &zonemd_report) else zonemd.verify(&zone, allocator, &zonemd_report)) catch {
         const written = std.mem.indexOfScalar(u8, &zonemd_report, 0) orelse zonemd_report.len;
         printStartupError(io, zonemd_report[0..written]);
         return Error.ZonemdMismatch;
@@ -756,6 +830,49 @@ fn blacklistOwner(buffer: *[512]u8, entry: []const u8) ![]const u8 {
         return error.BadEntry;
     }
     return std.ascii.lowerString(buffer[0..name.len], name);
+}
+/// A standalone secondary: fetch the zone once at startup over AXFR, serve
+/// it unsigned from memory, and keep the primary address with the SOA
+/// refresh/retry/expire timers the refresh tick polls (RFC 1035 section 7.3).
+fn loadSecondaryZone(
+    context: *ServerContext,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    configured: *const parser.Zone,
+    now_seconds: u32,
+    chain_policy: ?signer.ChainPolicy,
+) !void {
+    const primary = std.Io.net.IpAddress.parse(configured.addressText(), configured.port) catch return Error.BadSecondary;
+    const apex = try lowerDot(allocator, configured.nameText());
+    defer allocator.free(apex);
+    const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } };
+    const zone_text = xfr_client.fetch(allocator, io, &primary, apex, timeout) catch return Error.BadSecondary;
+    defer allocator.free(zone_text);
+    const zone_index_before = context.zones.items.len;
+    loadZoneText(context, allocator, io, zone_text, apex, null, now_seconds, chain_policy) catch |err| if (err == error.OutOfMemory) return error.OutOfMemory else return Error.BadSecondary;
+    var refresh_sec: u32 = 3600;
+    var retry_sec: u32 = 900;
+    var expire_sec: u32 = 1209600;
+    if (context.zones.items.len > zone_index_before) {
+        const loaded = &context.zones.items[context.zones.items.len - 1];
+        if (loaded.soa) |record| {
+            if (zone_parser.parseRData(.SOA, record.rdataText())) |soa_rdata| {
+                if (soa_rdata == .SOA) {
+                    refresh_sec = soa_rdata.SOA.refresh;
+                    retry_sec = soa_rdata.SOA.retry;
+                    expire_sec = soa_rdata.SOA.expire;
+                }
+            } else |_| {}
+        }
+    }
+    try context.secondary_zones.append(allocator, .{
+        .apex = try allocator.dupe(u8, apex),
+        .primary = primary,
+        .last_success_ns = @intCast(std.Io.Clock.awake.now(io).nanoseconds),
+        .refresh_sec = refresh_sec,
+        .retry_sec = retry_sec,
+        .expire_sec = expire_sec,
+    });
 }
 
 /// RFC 9432 section 5: fetch the configured catalog from its primary, publish
@@ -2128,6 +2245,55 @@ const zonemd_zone_text =
     \\
 ;
 
+test "zonemd publish signs one served ZONEMD over all served records" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.writeFile(io, .{ .sub_path = "example.zone", .data = zonemd_absent_zone_text });
+    try dir.dir.writeFile(io, .{ .sub_path = "zsk.key", .data = dnssec_test_key });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone example. primary example.zone\ndnssec-key-file zsk.key\nzonemd publish sha384\n" });
+    var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+    defer context.deinit();
+    const zone = &context.zones.items[0];
+    try std.testing.expectEqual(@as(usize, 1), countType(zone.*, RecordType.ZONEMD));
+    var report: [1024]u8 = undefined;
+    try std.testing.expect(std.mem.startsWith(u8, try zonemd.verifyServed(zone, std.testing.allocator, &report), "zone example.: ZONEMD verified (SIMPLE SHA384"));
+}
+
+test "zonemd publish sha512 and zonemd off and unsigned refusal" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    {
+        var dir = std.testing.tmpDir(.{});
+        defer dir.cleanup();
+        try dir.dir.writeFile(io, .{ .sub_path = "example.zone", .data = zonemd_absent_zone_text });
+        try dir.dir.writeFile(io, .{ .sub_path = "zsk.key", .data = dnssec_test_key });
+        try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone example. primary example.zone\ndnssec-key-file zsk.key\nzonemd publish sha512\n" });
+        var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+        defer context.deinit();
+        const zone = &context.zones.items[0];
+        try std.testing.expectEqual(@as(usize, 1), countType(zone.*, RecordType.ZONEMD));
+        var report: [1024]u8 = undefined;
+        try std.testing.expect(std.mem.startsWith(u8, try zonemd.verifyServed(zone, std.testing.allocator, &report), "zone example.: ZONEMD verified (SIMPLE SHA512"));
+    }
+    {
+        var dir = std.testing.tmpDir(.{});
+        defer dir.cleanup();
+        try dir.dir.writeFile(io, .{ .sub_path = "example.zone", .data = zonemd_absent_zone_text });
+        try dir.dir.writeFile(io, .{ .sub_path = "zsk.key", .data = dnssec_test_key });
+        try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone example. primary example.zone\ndnssec-key-file zsk.key\nzonemd off\n" });
+        var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+        defer context.deinit();
+        try std.testing.expectEqual(@as(usize, 0), countType(context.zones.items[0], RecordType.ZONEMD));
+    }
+    {
+        var dir = std.testing.tmpDir(.{});
+        defer dir.cleanup();
+        try dir.dir.writeFile(io, .{ .sub_path = "example.zone", .data = zonemd_absent_zone_text });
+        try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone example. primary example.zone\nzonemd publish\n" });
+        try std.testing.expectError(Error.ZonemdPublishRequiresSigning, ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator));
+    }
+}
+
 test "server context loads a zone whose ZONEMD digest matches" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var dir = std.testing.tmpDir(.{});
@@ -2561,4 +2727,18 @@ test "without the journal directive no file is written and the delta log stays i
 
     const frames = try ixfrFrames(arena.allocator(), &runtime, &ixfr_query_bytes);
     try std.testing.expectEqual(@as(usize, 0), countSoaSerial(frames, 10));
+}
+
+test "RFC 8806: a root-zone file without SOA or NS is refused at startup" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{ .sub_path = "one.zone", .data = "$ORIGIN one.example.\n$TTL 3600\n@ IN SOA ns.one.example. hostmaster.one.example. 1 3600 900 1209600 3600\n@ IN NS ns.one.example.\n" });
+    // No apex SOA here, so the zone parse in takeRuntime refuses it.
+    try dir.dir.writeFile(io, .{ .sub_path = "root.zone", .data = "$ORIGIN .\n$TTL 3600\n@ IN NS a.root-servers.net.\n" });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone one.example primary one.zone\nroot-zone root.zone\n" });
+    var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+    defer context.deinit();
+    try std.testing.expectError(error.BadConfiguration, context.takeRuntime(io));
 }

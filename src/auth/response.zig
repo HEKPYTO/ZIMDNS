@@ -1217,26 +1217,32 @@ fn appendNsec3Proofs(
     const wildcard = dns_name.Name.fromText(wildcard_text) catch return false;
     const wildcard_digest = nsec3HashOf(chain, wildcard);
 
-    var proof: [3]usize = undefined;
+    var proof: [4]usize = undefined;
     var proof_len: usize = 0;
     if (nxdomain) {
-        // RFC 5155 section 7.2.2: the closest encloser proof plus the NSEC3
-        // that covers the wildcard at the closest encloser.
+        // RFC 5155 section 7.2.2: the closest encloser proof plus both
+        // the wildcard match (when the wildcard exists) and the NSEC3
+        // covering the wildcard at the closest encloser. Strict
+        // validators require the cover to prove no wildcard expansion
+        // applies, so serve it even when the chain holds the wildcard;
+        // in a valid chain only one of the two exists for the same
+        // hash, and both are included when the chain holds both.
         proof[proof_len] = encloser.match;
         proof_len += 1;
         proof[proof_len] = encloser.cover;
         proof_len += 1;
+        var seen_wildcard: bool = false;
         if (nsec3Match(chain, wildcard_digest)) |wildcard_match| {
-            // RFC 5155 section 7.2.2 asks for the NSEC3 that covers the
-            // (nonexistent) wildcard; the chain holds the wildcard, so the
-            // proof carries the NSEC3 that matches it instead.
             proof[proof_len] = wildcard_match;
             proof_len += 1;
-        } else {
-            const wildcard_cover = nsec3Cover(chain, wildcard_digest) orelse return false;
+            seen_wildcard = true;
+        }
+        if (nsec3Cover(chain, wildcard_digest)) |wildcard_cover| {
             proof[proof_len] = wildcard_cover;
             proof_len += 1;
+            seen_wildcard = true;
         }
+        if (!seen_wildcard) return false;
     } else {
         // RFC 5155 section 7.2.5: a wildcard NODATA carries the closest
         // encloser proof and the NSEC3 that matches the wildcard.
@@ -1467,6 +1473,19 @@ pub fn buildFormerrResponse(request: dns_message.Message) !dns_message.Message {
     response.edns = null;
     response.additionals.len = 0;
     response.header.additional_count = 0;
+    return response;
+}
+
+/// RFC 8914 section 4.22: the requested operation is not supported.
+pub const EDE_NOT_SUPPORTED: u16 = 21;
+const ede_not_supported_text: []const u8 = "operation not supported";
+
+/// A NOTIMP that says which condition it is: the opcode is not one this
+/// server implements.
+pub fn buildNotSupportedResponse(request: dns_message.Message) !dns_message.Message {
+    var response = try buildNotImplementedResponse(request);
+    errdefer response.deinit();
+    appendEde(&response, EDE_NOT_SUPPORTED, ede_not_supported_text);
     return response;
 }
 
@@ -1898,6 +1917,23 @@ test "authoritative response builder returns CNAME and SOA-backed negatives" {
     const missing_response = try buildResponse(missing_request, &zone);
     try std.testing.expectEqual(header.Rcode.nxdomain, missing_response.header.rcode);
     try std.testing.expectEqual(@as(u16, 1), missing_response.header.authority_count);
+}
+
+test "the not-supported builder attaches EDE 21 to an OPT-aware request" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var request = try testQuery(arena.allocator(), "home.arpa.", .SOA);
+    request.edns = .{ .udp_payload_size = 1232, .extended_rcode = 0, .version = 0, .dnssec_ok = false };
+    var response = try buildNotSupportedResponse(request);
+    defer response.deinit();
+    try std.testing.expectEqual(header.Rcode.notimp, response.header.rcode);
+    var found: ?[]const u8 = null;
+    for (response.additionals.items[0..response.additionals.len]) |record| {
+        if (!record.rrtype.eql(.OPT)) continue;
+        found = dns_rdata.findOption(record.rdata.OPT.bytes(), 15);
+    }
+    try std.testing.expect(found != null);
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x15 }, found.?[0..2]);
 }
 
 test "non-IN queries return NOTIMP with the question and EDNS OPT preserved" {
@@ -2593,6 +2629,37 @@ test "an NXDOMAIN under a wildcard carries the wildcard proof (RFC 5155 7.2.2)" 
     var next_closer: [20]u8 = undefined;
     dns_dnssec.nsec3Hash(try dns_name.Name.fromText("b.example."), &[_]u8{ 0x73, 0x61, 0x6c, 0x74 }, 2, &next_closer);
     try std.testing.expect(servedNsec3Cover(&response, next_closer) != null);
+    // RFC 5155 section 7.2.2 also requires the cover that proves no
+    // wildcard expansion applies: the NSEC3 covering the queried name,
+    // whose owner is the apex and not the wildcard hash, served alongside
+    // the wildcard match. Both records are needed by strict validators.
+    var qname_hash: [20]u8 = undefined;
+    dns_dnssec.nsec3Hash(try dns_name.Name.fromText("x.b.example."), &[_]u8{ 0x73, 0x61, 0x6c, 0x74 }, 2, &qname_hash);
+    const qname_cover = servedNsec3Cover(&response, qname_hash) orelse return error.TestExpectedEqual;
+    const qname_cover_owner = dns_validate.nsec3OwnerHash(qname_cover.owner) orelse return error.TestExpectedEqual;
+    try std.testing.expect(!std.mem.eql(u8, &qname_cover_owner, &nsec3_wildcard_hash));
+
+    // Every proof record rides with the RRSIG that covers it.
+    try expectNsec3ProofsSigned(&response);
+}
+
+test "an NXDOMAIN where the wildcard does not exist carries the cover only (RFC 5155 7.2.2)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try zone_parser.ZoneFile.parse(nsec3_test_zone);
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    const response = try buildResponse(try testDoQuery(arena.allocator(), 0x447a, "nothere.example.", .A, true), &zone);
+    try std.testing.expectEqual(header.Rcode.nxdomain, response.header.rcode);
+
+    // The wildcard at the closest encloser does not exist here, so the proof
+    // carries the NSEC3 covering it, and no NSEC3 matching it (cover only).
+    const wildcard_cover = servedNsec3Cover(&response, nsec3_wildcard_hash) orelse return error.TestExpectedEqual;
+    const wildcard_cover_owner = dns_validate.nsec3OwnerHash(wildcard_cover.owner) orelse return error.TestExpectedEqual;
+    try std.testing.expect(!std.mem.eql(u8, &wildcard_cover_owner, &nsec3_wildcard_hash));
+    try std.testing.expect(servedNsec3Match(&response, nsec3_wildcard_hash) == null);
 
     // Every proof record rides with the RRSIG that covers it.
     try expectNsec3ProofsSigned(&response);

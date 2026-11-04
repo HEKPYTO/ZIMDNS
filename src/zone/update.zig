@@ -155,7 +155,7 @@ pub fn apply(
     // carried no newer SOA raises the serial by one here.
     try raiseSerial(arena, &records, domain, soa_replaced);
 
-    return .{ .zone_text = try render(allocator, domain, records.items) };
+    return .{ .zone_text = try renderZoneText(allocator, domain, records.items) };
 }
 
 fn applyAdd(
@@ -288,7 +288,7 @@ fn raiseSerial(arena: std.mem.Allocator, records: *std.ArrayList(parser.ZoneReco
     }
 }
 
-fn render(allocator: std.mem.Allocator, domain: []const u8, records: []const parser.ZoneRecord) Error![]u8 {
+pub fn renderZoneText(allocator: std.mem.Allocator, domain: []const u8, records: []const parser.ZoneRecord) Error![]u8 {
     var output = std.Io.Writer.Allocating.init(allocator);
     errdefer output.deinit();
     // Every rendered record carries its own TTL; the directive is only the

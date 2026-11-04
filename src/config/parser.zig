@@ -37,6 +37,9 @@ pub const ChainConfig = struct {
     }
 };
 
+/// RFC 8976 ZONEMD publishing the operator chose for signed zones.
+pub const ZonemdMode = enum { off, sha384, sha512 };
+
 /// RFC 9520 section 3.2: a resolution failure is cached for at least one
 /// second and never longer than five minutes, so the operator's cache time
 /// is a number of seconds inside those bounds.
@@ -289,13 +292,23 @@ pub const Zone = struct {
     name: Text = .{},
     kind: Text = .{},
     file: Text = .{},
+    address: Text = .{},
+    port: u16 = 0,
 
     pub fn nameText(self: *const Zone) []const u8 {
         return self.name.text();
     }
 
+    pub fn kindText(self: *const Zone) []const u8 {
+        return self.kind.text();
+    }
+
     pub fn fileText(self: *const Zone) []const u8 {
         return self.file.text();
+    }
+
+    pub fn addressText(self: *const Zone) []const u8 {
+        return self.address.text();
     }
 };
 
@@ -412,6 +425,12 @@ fn List(comptime T: type) type {
     };
 }
 
+pub const RootHint = struct {
+    /// Literal address text.
+    address: Text = .{},
+    port: u16 = 53,
+};
+
 pub const Config = struct {
     listeners: List(Listener) = .{},
     recursion_allow: List(Cidr) = .{},
@@ -423,6 +442,9 @@ pub const Config = struct {
     notifies: List(NotifyTarget) = .{},
     blacklist_zones: List(BlacklistZone) = .{},
     ddr_records: List(DdrRecord) = .{},
+    root_hints: List(RootHint) = .{},
+    root_zone: Text = .{},
+    has_root_zone: bool = false,
     catalog_consumer: ?CatalogConsumer = null,
     tsig_key_file: Text = .{},
     has_tsig_key_file: bool = false,
@@ -502,6 +524,7 @@ pub const Config = struct {
     /// forwarder never synthesizes an AAAA, which is the default; set via
     /// `nat64-prefix <prefix> [<ipv4-range>]`.
     nat64_prefixes: List(Nat64Prefix) = .{},
+    dns64: bool = false,
 
     /// RFC 6147 section 5.1.4: the IPv6 prefix ranges whose AAAA records are
     /// treated as an empty answer, on top of the default set. Repeatable via
@@ -532,6 +555,11 @@ pub const Config = struct {
     /// The chain the signed zones publish. Null means the zone's own apex
     /// NSEC3PARAM decides, as it always did; set via `dnssec-chain`.
     chain: ?ChainConfig = null,
+    /// RFC 8976 ZONEMD publishing for signed zones. Off means no record is
+    /// added at startup; a zone that already carries an apex ZONEMD is still
+    /// verified. Set via `zonemd publish [sha384|sha512]` or `zonemd off`.
+    zonemd_mode: ZonemdMode = .off,
+    has_zonemd: bool = false,
 
     /// RFC 9432 section 4: the apex of the catalog zone the server publishes
     /// for the zones it serves. Null means no catalog is served; set via
@@ -654,7 +682,10 @@ pub const Config = struct {
         if (std.mem.eql(u8, first, "zoneversion")) return self.parseZoneversion(&tokens);
         if (std.mem.eql(u8, first, "minimal-any-ttl")) return self.parseMinimalAnyTtl(&tokens);
         if (std.mem.eql(u8, first, "minimal-any-ttl-tcp")) return self.parseMinimalAnyTtlTcp(&tokens);
+        if (std.mem.eql(u8, first, "root-hint")) return self.parseRootHint(&tokens);
+        if (std.mem.eql(u8, first, "root-zone")) return self.parseRootZone(&tokens);
         if (std.mem.eql(u8, first, "nat64-prefix")) return self.parseNat64Prefix(&tokens);
+        if (std.mem.eql(u8, first, "dns64")) return self.parseDns64(&tokens);
         if (std.mem.eql(u8, first, "dns64-exclude")) return self.parseDns64Exclude(&tokens);
         if (std.mem.eql(u8, first, "minimum-failure-cache-time")) return self.parseMinimumFailureCacheTime(&tokens);
         if (std.mem.eql(u8, first, "forwarder-deny-port")) return self.parseForwarderDenyPort(&tokens);
@@ -664,6 +695,7 @@ pub const Config = struct {
         if (std.mem.eql(u8, first, "tcp-max-connections-per-source")) return self.parseTcpMaxConnectionsPerSource(&tokens);
         if (std.mem.eql(u8, first, "tcp-max-connection-duration")) return self.parseTcpMaxConnectionDuration(&tokens);
         if (std.mem.eql(u8, first, "tcp-idle-timeout")) return self.parseTcpIdleTimeout(&tokens);
+        if (std.mem.eql(u8, first, "zonemd")) return self.parseZonemd(&tokens);
         return Error.UnknownDirective;
     }
 
@@ -765,10 +797,22 @@ pub const Config = struct {
         var zone = Zone{};
         try zone.name.set(tokens.next() orelse return Error.BadDirective);
         const kind = tokens.next() orelse return Error.BadDirective;
-        if (!std.mem.eql(u8, kind, "primary")) return Error.BadDirective;
-        try zone.kind.set(kind);
-        try zone.file.set(tokens.next() orelse return Error.BadDirective);
+        if (std.mem.eql(u8, kind, "primary")) {
+            try zone.kind.set(kind);
+            try zone.file.set(tokens.next() orelse return Error.BadDirective);
+        } else if (std.mem.eql(u8, kind, "secondary")) {
+            try zone.kind.set(kind);
+            const endpoint = tokens.next() orelse return Error.BadDirective;
+            const parsed = try parseEndpointOptional(endpoint);
+            try zone.address.set(parsed.address);
+            zone.port = parsed.port;
+        } else {
+            return Error.BadDirective;
+        }
         try requireNoTrailingTokens(tokens);
+        for (self.zones.items[0..self.zones.len]) |existing| {
+            if (zoneNamesEqual(existing.nameText(), zone.nameText())) return Error.BadDirective;
+        }
         try self.zones.append(zone);
     }
 
@@ -1064,6 +1108,46 @@ pub const Config = struct {
         self.minimal_any_ttl_tcp = parsed;
     }
 
+    fn parseDns64(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        const value = tokens.next() orelse return Error.BadDirective;
+        if (std.mem.eql(u8, value, "on")) {
+            self.dns64 = true;
+        } else if (std.mem.eql(u8, value, "off")) {
+            self.dns64 = false;
+        } else {
+            return Error.BadDirective;
+        }
+        if (tokens.next() != null) return Error.BadDirective;
+    }
+
+    fn parseRootHint(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        const address_text = tokens.next() orelse return Error.BadDirective;
+        var hint = RootHint{};
+        hint.address.set(address_text) catch return Error.BadDirective;
+        // validate address
+        if (std.Io.net.IpAddress.parse(address_text, 53)) |_| {} else |_| return Error.BadAddress;
+        if (tokens.next()) |port_text| {
+            const port = std.fmt.parseInt(u16, port_text, 10) catch return Error.BadDirective;
+            if (port == 0) return Error.BadDirective;
+            hint.port = port;
+            if (tokens.next() != null) return Error.BadDirective;
+        }
+        // duplicate check
+        var i: usize = 0;
+        while (i < self.root_hints.len) : (i += 1) {
+            if (std.mem.eql(u8, self.root_hints.items[i].address.text(), hint.address.text()) and self.root_hints.items[i].port == hint.port) return Error.TooManyItems;
+        }
+        try self.root_hints.append(hint);
+    }
+
+    fn parseRootZone(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        if (self.has_root_zone) return Error.TooManyItems;
+        const path = tokens.next() orelse return Error.BadDirective;
+        if (tokens.next() != null) return Error.BadDirective;
+        self.root_zone.set(path) catch return Error.BadDirective;
+        self.has_root_zone = true;
+    }
+
     fn parseNat64Prefix(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
         const value = tokens.next() orelse return Error.BadDirective;
         var prefix = try Nat64Prefix.parse(value);
@@ -1125,6 +1209,38 @@ pub const Config = struct {
             .iterations = std.fmt.parseInt(u16, iterations, 10) catch return Error.BadDirective,
         };
         self.chain = chain;
+    }
+
+    fn parseZonemd(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        if (self.has_zonemd) return Error.BadDirective;
+        const value = tokens.next() orelse return Error.BadDirective;
+        if (std.mem.eql(u8, value, "off")) {
+            try requireNoTrailingTokens(tokens);
+            self.zonemd_mode = .off;
+            self.has_zonemd = true;
+            return;
+        }
+        if (!std.mem.eql(u8, value, "publish")) return Error.BadDirective;
+        const hash = tokens.next();
+        if (hash == null) {
+            try requireNoTrailingTokens(tokens);
+            self.zonemd_mode = .sha384;
+            self.has_zonemd = true;
+            return;
+        }
+        if (std.mem.eql(u8, hash.?, "sha384")) {
+            try requireNoTrailingTokens(tokens);
+            self.zonemd_mode = .sha384;
+            self.has_zonemd = true;
+            return;
+        }
+        if (std.mem.eql(u8, hash.?, "sha512")) {
+            try requireNoTrailingTokens(tokens);
+            self.zonemd_mode = .sha512;
+            self.has_zonemd = true;
+            return;
+        }
+        return Error.BadDirective;
     }
 
     fn parseMinimumFailureCacheTime(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
@@ -1222,6 +1338,41 @@ fn parseEndpoint(text: []const u8) !struct { address: []const u8, port: u16 } {
     _ = std.Io.net.IpAddress.parse(address, port) catch return Error.BadAddress;
     return .{ .address = address, .port = port };
 }
+fn parseEndpointOptional(text: []const u8) !struct { address: []const u8, port: u16 } {
+    if (text.len > 0 and text[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, text, ']') orelse return Error.BadAddress;
+        const address = text[1..close];
+        if (close + 1 == text.len) {
+            _ = std.Io.net.IpAddress.parse(address, 53) catch return Error.BadAddress;
+            return .{ .address = address, .port = 53 };
+        }
+        if (text[close + 1] != ':') return Error.BadAddress;
+        const port_text = text[close + 2 ..];
+        const port = std.fmt.parseInt(u16, port_text, 10) catch return Error.BadPort;
+        if (port == 0) return Error.BadPort;
+        _ = std.Io.net.IpAddress.parse(address, port) catch return Error.BadAddress;
+        return .{ .address = address, .port = port };
+    }
+    if (std.mem.indexOfScalar(u8, text, ':') == null) {
+        _ = std.Io.net.IpAddress.parse(text, 53) catch return Error.BadAddress;
+        return .{ .address = text, .port = 53 };
+    }
+    const colon = std.mem.lastIndexOfScalar(u8, text, ':') orelse return Error.BadDirective;
+    if (std.mem.indexOfScalarPos(u8, text, 0, ':') != colon) return Error.BadAddress;
+    const address = text[0..colon];
+    const port_start = colon + 1;
+    const port = std.fmt.parseInt(u16, text[port_start..], 10) catch return Error.BadPort;
+    if (port == 0) return Error.BadPort;
+    _ = std.Io.net.IpAddress.parse(address, port) catch return Error.BadAddress;
+    return .{ .address = address, .port = port };
+}
+
+fn zoneNamesEqual(a: []const u8, b: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(a, b)) return true;
+    const a_trim = if (std.mem.endsWith(u8, a, ".")) a[0 .. a.len - 1] else a;
+    const b_trim = if (std.mem.endsWith(u8, b, ".")) b[0 .. b.len - 1] else b;
+    return std.ascii.eqlIgnoreCase(a_trim, b_trim);
+}
 
 fn stripComment(line: []const u8) []const u8 {
     for (line, 0..) |byte, index| {
@@ -1277,10 +1428,44 @@ test "config parser loads strict forwarding policy" {
 }
 
 test "config parser rejects unsupported zone kinds and trailing tokens" {
-    try std.testing.expectError(error.BadDirective, Config.parse("zone home.arpa secondary /etc/zimdns/zones/home.arpa.zone\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("zone home.arpa tertiary /etc/zimdns/zones/home.arpa.zone\n"));
     try std.testing.expectError(error.BadDirective, Config.parse("listen dns udp 127.0.0.1:1053 extra\n"));
     try std.testing.expectError(error.BadDirective, Config.parse("zone home.arpa primary /etc/zimdns/zones/home.arpa.zone extra\n"));
     try std.testing.expectError(error.BadDirective, Config.parse("blocklist file /etc/zimdns/blocklists/ads.txt extra\n"));
+}
+
+test "config parser accepts secondary zones with an optional port" {
+    const with_port = try Config.parse("zone one.example. secondary 192.0.2.1:5353\n");
+    try std.testing.expectEqual(@as(usize, 1), with_port.zones.len);
+    try std.testing.expectEqualStrings("one.example.", with_port.zones.items[0].nameText());
+    try std.testing.expectEqualStrings("secondary", with_port.zones.items[0].kindText());
+    try std.testing.expectEqualStrings("192.0.2.1", with_port.zones.items[0].addressText());
+    try std.testing.expectEqual(@as(u16, 5353), with_port.zones.items[0].port);
+    const default_v4 = try Config.parse("zone one.example secondary 192.0.2.1\n");
+    try std.testing.expectEqual(@as(u16, 53), default_v4.zones.items[0].port);
+    const default_v6 = try Config.parse("zone one.example. secondary [2001:db8::1]\n");
+    try std.testing.expectEqualStrings("2001:db8::1", default_v6.zones.items[0].addressText());
+    try std.testing.expectEqual(@as(u16, 53), default_v6.zones.items[0].port);
+    const with_v6_port = try Config.parse("zone one.example. secondary [2001:db8::1]:5353\n");
+    try std.testing.expectEqual(@as(u16, 5353), with_v6_port.zones.items[0].port);
+    const primary = try Config.parse("zone one.example primary one.zone\n");
+    try std.testing.expectEqualStrings("primary", primary.zones.items[0].kindText());
+    try std.testing.expectEqualStrings("one.zone", primary.zones.items[0].fileText());
+}
+
+test "config parser rejects bad secondary zones" {
+    try std.testing.expectError(error.BadDirective, Config.parse("zone one.example. secondary\n"));
+    try std.testing.expectError(error.BadAddress, Config.parse("zone one.example. secondary not-an-ip\n"));
+    try std.testing.expectError(error.BadAddress, Config.parse("zone one.example. secondary not-an-ip:5353\n"));
+    try std.testing.expectError(error.BadAddress, Config.parse("zone one.example. secondary 999.0.0.1:5353\n"));
+    try std.testing.expectError(error.BadAddress, Config.parse("zone one.example. secondary 2001:db8::1\n"));
+    try std.testing.expectError(error.BadAddress, Config.parse("zone one.example. secondary /etc/zimdns/zones/one.zone\n"));
+    try std.testing.expectError(error.BadPort, Config.parse("zone one.example. secondary 192.0.2.1:notaport\n"));
+    try std.testing.expectError(error.BadPort, Config.parse("zone one.example. secondary 192.0.2.1:0\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("zone one.example. secondary 192.0.2.1:5353 extra\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("zone one.example primary one.zone\nzone one.example primary other.zone\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("zone one.example primary one.zone\nzone ONE.example. secondary 192.0.2.1:5353\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("zone one.example. secondary 192.0.2.1\nzone one.example secondary 192.0.2.2\n"));
 }
 
 test "catalog-consumer names one catalog and its primary" {
@@ -1870,6 +2055,24 @@ test "config parser takes one signed chain and refuses every other shape" {
         "dnssec-chain nsec\ndnssec-chain nsec3 0 -\n",
     ));
     try std.testing.expectError(error.UnknownDirective, Config.parse("dnssec-chain-kind nsec\n"));
+}
+
+test "config parser takes one zonemd publish and refuses every other shape" {
+    try std.testing.expectEqual(ZonemdMode.off, (try Config.parse("zone one.example primary one.zone\n")).zonemd_mode);
+    try std.testing.expectEqual(ZonemdMode.sha384, (try Config.parse("zonemd publish\n")).zonemd_mode);
+    try std.testing.expectEqual(ZonemdMode.sha384, (try Config.parse("zonemd publish sha384\n")).zonemd_mode);
+    try std.testing.expectEqual(ZonemdMode.sha512, (try Config.parse("zonemd publish sha512\n")).zonemd_mode);
+    try std.testing.expectEqual(ZonemdMode.off, (try Config.parse("zonemd off\n")).zonemd_mode);
+    for ([_][]const u8{
+        "zonemd\n",
+        "zonemd publish sha1\n",
+        "zonemd publish sha384 extra\n",
+        "zonemd off extra\n",
+        "zonemd bogus\n",
+    }) |text| {
+        try std.testing.expectError(error.BadDirective, Config.parse(text));
+    }
+    try std.testing.expectError(error.BadDirective, Config.parse("zonemd off\nzonemd publish sha384\n"));
 }
 
 test "forwarder names a TLS server and its certificate name" {

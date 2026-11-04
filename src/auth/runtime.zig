@@ -30,6 +30,7 @@ const zone_update = @import("../zone/update.zig");
 const catalog_mod = @import("../zone/catalog.zig");
 const zonemd = @import("../zone/zonemd.zig");
 const xfr_client = @import("../zone/xfr_client.zig");
+const tcp_deadline = @import("../platform/tcp_deadline.zig");
 
 /// Scratch memory for one answer. Nothing parsed or built for a response
 /// outlives the encoded bytes, so one arena per thread is reset and reused
@@ -360,7 +361,6 @@ pub const Runtime = struct {
         return runtime;
     }
 
-
     pub fn maybeRefreshSecondaries(self: *Runtime, now_ns: u64, fetch: SecondaryFetch, fetch_ctx: *anyopaque) !void {
         for (self.secondary_zones.items) |*secondary| {
             if (secondary.expired) continue;
@@ -380,9 +380,8 @@ pub const Runtime = struct {
                 },
                 .refresh_due, .retry_due => {
                     secondary.last_attempt_ns = @intCast(now_ns);
-                    const text = fetch(fetch_ctx, self.allocator, secondary.apex) catch |err| {
+                    const text = fetch(fetch_ctx, self.allocator, secondary.apex) catch {
                         secondary.last_attempt_failed = true;
-                        _ = err;
                         continue;
                     };
                     if (text) |zone_text| {
@@ -396,12 +395,14 @@ pub const Runtime = struct {
                             secondary.last_attempt_failed = true;
                             continue;
                         };
-                        defer new_zone.deinit();
+                        var installed = false;
+                        defer if (!installed) new_zone.deinit();
                         // swap zone in zones
                         for (self.zones.items) |*zone| {
                             if (std.ascii.eqlIgnoreCase(zone.originText(), secondary.apex)) {
                                 zone.deinit();
-                                zone.* = try zone_index.Zone.fromZoneFile(&zone_file);
+                                zone.* = new_zone;
+                                installed = true;
                                 break;
                             }
                         }
@@ -413,6 +414,26 @@ pub const Runtime = struct {
                 },
             }
         }
+    }
+
+    pub fn fetchSecondaryViaXfr(ctx: *anyopaque, allocator: std.mem.Allocator, zone_name: []const u8) anyerror!?[]const u8 {
+        const self: *Runtime = @ptrCast(@alignCast(ctx));
+        for (self.secondary_zones.items) |secondary| {
+            if (std.ascii.eqlIgnoreCase(secondary.apex, zone_name)) {
+                const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } };
+                // A served copy asks for only the difference the primary still
+                // holds; without one, or when the primary answers with the
+                // full zone, fall back to AXFR.
+                for (self.zones.items) |*zone| {
+                    if (std.ascii.eqlIgnoreCase(zone.originText(), zone_name)) {
+                        return xfr_client.fetchIxfr(allocator, self.io, &secondary.primary, zone_name, zone, timeout) catch return null;
+                    }
+                }
+                const text = xfr_client.fetch(allocator, self.io, &secondary.primary, zone_name, timeout) catch return null;
+                return text;
+            }
+        }
+        return null;
     }
 
     pub fn deinit(self: *Runtime) void {
@@ -442,6 +463,9 @@ pub const Runtime = struct {
         for (self.notify_targets.items) |target| self.allocator.free(target.apex);
         self.notify_targets.deinit(self.allocator);
         self.notify_targets = .empty;
+        for (self.secondary_zones.items) |*secondary| self.allocator.free(secondary.apex);
+        self.secondary_zones.deinit(self.allocator);
+        self.secondary_zones = .empty;
         for (self.ddr_rdatas.items) |rdata| self.allocator.free(rdata);
         self.ddr_rdatas.deinit(self.allocator);
         self.ddr_rdatas = .empty;
@@ -873,6 +897,57 @@ pub const Runtime = struct {
             };
         }
         member_zones.deinit(self.allocator);
+        // Track each provisioned member as a secondary for periodic refresh.
+        // Standalone secondaries (not catalog members) survive a catalog refresh.
+        var saved_secondary_zones = self.secondary_zones;
+        self.secondary_zones = .empty;
+        for (consumer.members.items) |member| {
+            var preserved: ?i64 = null;
+            for (saved_secondary_zones.items) |old| {
+                if (std.ascii.eqlIgnoreCase(old.apex, member.name)) {
+                    preserved = old.last_success_ns;
+                    break;
+                }
+            }
+            var refresh_sec: u32 = 3600;
+            var retry_sec: u32 = 900;
+            var expire_sec: u32 = 1209600;
+            if (self.zoneIndexForOrigin(member.name)) |zone_index_value| {
+                const soa_rec = self.zones.items[zone_index_value].soa;
+                if (soa_rec) |rec| {
+                    if (zone_parser.parseRData(.SOA, rec.rdataText())) |soa_rdata| {
+                        if (soa_rdata == .SOA) {
+                            refresh_sec = soa_rdata.SOA.refresh;
+                            retry_sec = soa_rdata.SOA.retry;
+                            expire_sec = soa_rdata.SOA.expire;
+                        }
+                    } else |_| {}
+                }
+            }
+            self.secondary_zones.append(self.allocator, .{
+                .apex = self.allocator.dupe(u8, member.name) catch return .failed,
+                .primary = consumer.primary,
+                .last_success_ns = if (preserved) |value| value else @as(i64, @intCast(std.Io.Clock.awake.now(io).nanoseconds)),
+                .refresh_sec = refresh_sec,
+                .retry_sec = retry_sec,
+                .expire_sec = expire_sec,
+            }) catch return .failed;
+        }
+        for (saved_secondary_zones.items) |old| {
+            var is_member = false;
+            for (consumer.members.items) |member| {
+                if (std.ascii.eqlIgnoreCase(old.apex, member.name)) {
+                    is_member = true;
+                    break;
+                }
+            }
+            if (is_member) {
+                self.allocator.free(old.apex);
+            } else {
+                self.secondary_zones.append(self.allocator, old) catch self.allocator.free(old.apex);
+            }
+        }
+        saved_secondary_zones.deinit(self.allocator);
         reportReload(io, "reloaded the catalog {s}: {d} member(s)", .{ consumer.apex, consumer.members.items.len });
         return .updated;
     }
@@ -956,6 +1031,12 @@ pub const Runtime = struct {
     fn updatePolicyFor(self: *const Runtime, origin: []const u8) ?*const UpdatePolicy {
         for (self.update_policies.items) |*policy| {
             if (sameDnsName(policy.origin, origin)) return policy;
+        }
+        return null;
+    }
+    fn secondaryFor(self: *const Runtime, origin: []const u8) ?*const SecondaryState {
+        for (self.secondary_zones.items) |*secondary| {
+            if (sameDnsName(secondary.apex, origin)) return secondary;
         }
         return null;
     }
@@ -1519,7 +1600,7 @@ pub const Runtime = struct {
             return err;
         };
         if (parsed == .incoming and parsed.incoming.query.header.opcode == .update) {
-            return self.answerUpdate(allocator, output, parsed.incoming) catch |err| {
+            return self.answerUpdate(allocator, output, parsed.incoming, query_bytes) catch |err| {
                 countAnswerError(counters, err);
                 return err;
             };
@@ -1568,23 +1649,34 @@ pub const Runtime = struct {
     /// first, then the operator's policy and the request's TSIG, then the
     /// prerequisite and update sections are applied, the new zone text is
     /// persisted to the zone file, and only then does the served zone swap.
+    /// A zone with no local policy that this server serves as a secondary is
+    /// forwarded to its primary instead (RFC 2136 section 3.1.1): the primary
+    /// owns the write, so nothing is applied here and no serial moves.
     fn answerUpdate(
         self: *Runtime,
         allocator: std.mem.Allocator,
         output: []u8,
         incoming: Incoming,
+        query_bytes: []const u8,
     ) ![]const u8 {
         const query = incoming.query;
         // Nothing is enabled: the opcode is not implemented by policy, and the
         // message body is not inspected.
-        if (self.update_policies.items.len == 0) return self.encodeUpdateReply(query, incoming.auth, .notimp, output);
+        if (self.update_policies.items.len == 0 and self.secondary_zones.items.len == 0) return self.encodeUpdateReply(query, incoming.auth, .notimp, output);
         const q = query.question orelse return self.encodeUpdateReply(query, incoming.auth, .formerr, output);
         if (!q.qtype.eql(.SOA) or !q.qclass.eql(dns_types.Class.IN)) {
             return self.encodeUpdateReply(query, incoming.auth, .formerr, output);
         }
         var apex_buffer: [512]u8 = undefined;
         const apex = q.name.toText(&apex_buffer) catch return self.encodeUpdateReply(query, incoming.auth, .formerr, output);
-        const policy = self.updatePolicyFor(apex) orelse return self.encodeUpdateReply(query, incoming.auth, .notimp, output);
+        if (self.updatePolicyFor(apex) == null) {
+            if (self.secondaryFor(apex)) |secondary| {
+                const primary = secondary.primary;
+                return self.forwardUpdateToPrimary(&primary, query_bytes, incoming, output);
+            }
+            return self.encodeUpdateReply(query, incoming.auth, .notimp, output);
+        }
+        const policy = self.updatePolicyFor(apex).?;
         const auth = incoming.auth orelse return self.encodeUpdateReply(query, incoming.auth, .refused, output);
         var key_buffer: [512]u8 = undefined;
         const key_name = auth.key.name.toText(&key_buffer) catch return self.encodeUpdateReply(query, incoming.auth, .refused, output);
@@ -1626,6 +1718,35 @@ pub const Runtime = struct {
             else => self.encodeUpdateReply(query, incoming.auth, .servfail, output),
         };
     }
+    /// RFC 2136 section 3.1.1: the original UPDATE wire message is sent to
+    /// the zone's primary over DNS/TCP in one two-octet frame, and the
+    /// primary's response frame is relayed to the client unchanged. Any
+    /// transport failure is SERVFAIL; relaying a partial or oversized frame
+    /// would corrupt the response, so it is never truncated.
+    fn forwardUpdateToPrimary(
+        self: *Runtime,
+        primary: *const std.Io.net.IpAddress,
+        query_bytes: []const u8,
+        incoming: Incoming,
+        output: []u8,
+    ) ![]const u8 {
+        const query = incoming.query;
+        if (query_bytes.len == 0 or query_bytes.len > 65535) return self.encodeUpdateReply(query, incoming.auth, .servfail, output);
+        const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } };
+        var stream = std.Io.net.IpAddress.connect(primary, self.io, .{ .mode = .stream, .protocol = .tcp }) catch return self.encodeUpdateReply(query, incoming.auth, .servfail, output);
+        defer stream.close(self.io);
+        const deadline = tcp_deadline.deadlineFromTimeout(self.io, timeout) orelse return self.encodeUpdateReply(query, incoming.auth, .servfail, output);
+        var prefix: [2]u8 = undefined;
+        std.mem.writeInt(u16, &prefix, @intCast(query_bytes.len), .big);
+        tcp_deadline.writeExact(stream.socket.handle, self.io, &prefix, deadline) catch return self.encodeUpdateReply(query, incoming.auth, .servfail, output);
+        tcp_deadline.writeExact(stream.socket.handle, self.io, query_bytes, deadline) catch return self.encodeUpdateReply(query, incoming.auth, .servfail, output);
+        var length_bytes: [2]u8 = undefined;
+        tcp_deadline.readExact(stream.socket.handle, self.io, &length_bytes, deadline) catch return self.encodeUpdateReply(query, incoming.auth, .servfail, output);
+        const length = std.mem.readInt(u16, &length_bytes, .big);
+        if (length == 0 or @as(usize, length) > output.len) return self.encodeUpdateReply(query, incoming.auth, .servfail, output);
+        tcp_deadline.readExact(stream.socket.handle, self.io, output[0..length], deadline) catch return self.encodeUpdateReply(query, incoming.auth, .servfail, output);
+        return output[0..length];
+    }
 
     /// RFC 2136 section 3.5: the change is committed before the response. The
     /// zone file is rewritten through a temporary file in the same directory
@@ -1653,7 +1774,10 @@ pub const Runtime = struct {
         rcode: dns_header.Rcode,
         output: []u8,
     ) ![]const u8 {
-        var message = response.buildNotImplementedResponse(query) catch return Error.EncodeFailed;
+        var message = (if (rcode == .notimp)
+            response.buildNotSupportedResponse(query)
+        else
+            response.buildNotImplementedResponse(query)) catch return Error.EncodeFailed;
         message.header.rcode = rcode;
         if (auth) |value| return self.encodeSignedMessage(message, output, value, 0, &.{}, null);
         return self.encodeMessage(message, output);
@@ -1925,7 +2049,7 @@ pub const Runtime = struct {
             return self.encodeMessage(try self.buildMessage(query, over_tcp, client), output);
         }
         if (query.header.opcode != .query) {
-            return self.encodeMessage(try response.buildNotImplementedResponse(query), output);
+            return self.encodeMessage(try response.buildNotSupportedResponse(query), output);
         }
         if (query.edns) |edns| if (edns.version != dns_message.EDNS_VERSION) {
             return self.encodeMessage(try response.buildBadVersionResponse(query, q), output);
@@ -2077,7 +2201,7 @@ pub const Runtime = struct {
         // and section 3.4.1.3 lets it carry no zone section, so the
         // refusal is built before a question is required.
         if (query.header.opcode != .query and query.header.opcode != .notify) {
-            return response.buildNotImplementedResponse(query);
+            return response.buildNotSupportedResponse(query);
         }
         const q = query.question orelse return response.Error.MissingQuestion;
         if (query.header.opcode == .notify) {
@@ -2103,6 +2227,18 @@ pub const Runtime = struct {
                 if (std.ascii.eqlIgnoreCase(consumer.apex, notify_name)) {
                     const from_master = if (notify_source) |source| sameIp(source, &consumer.primary) else false;
                     if (from_master) @constCast(self).requestCatalogRefresh();
+                }
+            }
+            // RFC 1996 section 3.10: a NOTIFY for a served secondary asks
+            // it to check its master now rather than at the next SOA
+            // refresh. A null `last_success_ns` is the `refreshDecision`
+            // input that is always due, so the next tick fetches instead
+            // of idling or expiring; clearing `expired` keeps that tick
+            // from being skipped.
+            for (@constCast(self).secondary_zones.items) |*secondary| {
+                if (std.ascii.eqlIgnoreCase(secondary.apex, notify_name)) {
+                    secondary.last_success_ns = null;
+                    secondary.expired = false;
                 }
             }
             return transfer.buildNotifyResponse(query.allocator, &query, zone, notify_serial) catch return Error.EncodeFailed;
@@ -3636,6 +3772,62 @@ test "authoritative runtime returns NOTIMP for non-IN queries outside a zone" {
     try std.testing.expectEqual(@as(u16, 3), parsed.question.?.qclass.code());
 }
 
+test "an unsupported opcode is NOTIMP with EDE 21 when the query had EDNS" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var runtime = try Runtime.fromZoneText(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
+        \\
+    );
+    defer runtime.deinit();
+
+    var output: [512]u8 = undefined;
+    const response_bytes = try runtime.answer(&.{
+        0x12, 0x34, 0x18, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        4,    'h',  'o',  'm',  'e',  4,    'a',  'r',  'p',  'a',  0,    0x00,
+        0x06, 0x00, 0x01, 0x00, 0x00, 0x29, 0x04, 0xd0, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00,
+    }, &output);
+    const parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@import("../dns/header.zig").Rcode.notimp, parsed.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.additional_count);
+    const opt = parsed.additionals.items[0];
+    try std.testing.expect(opt.rrtype.eql(.OPT));
+    // RFC 8914 section 4.22: INFO-CODE 21 is "Not Supported".
+    const ede = @import("../dns/rdata.zig").findOption(opt.rdata.OPT.bytes(), 15);
+    try std.testing.expect(ede != null);
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x15 }, ede.?[0..2]);
+    try std.testing.expectEqualStrings("operation not supported", ede.?[2..]);
+}
+
+test "an unsupported opcode without EDNS is NOTIMP without an EDE option" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var runtime = try Runtime.fromZoneText(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
+        \\
+    );
+    defer runtime.deinit();
+
+    var output: [512]u8 = undefined;
+    const response_bytes = try runtime.answer(&.{
+        0x12, 0x35, 0x18, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        4,    'h',  'o',  'm',  'e',  4,    'a',  'r',  'p',  'a',  0,    0x00,
+        0x06, 0x00, 0x01,
+    }, &output);
+    const parsed = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@import("../dns/header.zig").Rcode.notimp, parsed.header.rcode);
+    try std.testing.expectEqual(@as(u16, 0), parsed.header.additional_count);
+}
+
 test "authoritative runtime drops response packets instead of answering them" {
     var runtime = try Runtime.fromZoneText(
         \\$ORIGIN home.arpa.
@@ -4173,6 +4365,118 @@ test "authoritative runtime answers RFC 2136 UPDATE with NOTIMP" {
     try std.testing.expectEqual(@as(@TypeOf(zoneless_parsed.header.rcode), .notimp), zoneless_parsed.header.rcode);
     try std.testing.expectEqual(@as(u16, 0), zoneless_parsed.header.question_count);
 }
+test "a secondary forwards a signed RFC 2136 update to its primary" {
+    // The fixture runs a primary on its own thread. The two sides get
+    // separate threaded Io backends so a blocked accept and a blocked client
+    // poll cannot starve each other under a loaded test gate.
+    var server_threaded = std.Io.Threaded.init(std.heap.page_allocator, .{ .concurrent_limit = .limited(8) });
+    defer server_threaded.deinit();
+    const server_io = server_threaded.io();
+    var client_threaded = std.Io.Threaded.init(std.heap.page_allocator, .{ .concurrent_limit = .limited(8) });
+    defer client_threaded.deinit();
+    const io = client_threaded.io();
+    const now = 1_700_000_000;
+    const zone_text =
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
+        \\
+    ;
+    var primary_keyring = try keyring_mod.Keyring.parse("key \"key.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };");
+    var primary = try Runtime.fromZoneTextWithKeyring(zone_text, &primary_keyring);
+    defer primary.deinit();
+    primary.io = server_io;
+    primary.setTsigNow(now);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try primary.setUpdatePolicy(tmp.dir, "home.arpa.", "key.", "zone.db");
+    var listen_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var listener = try std.Io.net.IpAddress.listen(&listen_address, server_io, .{ .mode = .stream, .protocol = .tcp, .kernel_backlog = 4 });
+    defer listener.deinit(server_io);
+    const port = switch (listener.socket.address) {
+        .ip4 => |ip4| ip4.port,
+        .ip6 => |ip6| ip6.port,
+    };
+    var secondary_keyring = try keyring_mod.Keyring.parse("key \"key.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };");
+    var secondary = try Runtime.fromZoneTextWithKeyring(zone_text, &secondary_keyring);
+    defer secondary.deinit();
+    secondary.io = io;
+    secondary.setTsigNow(now);
+    try secondary.secondary_zones.append(secondary.allocator, .{
+        .apex = try secondary.allocator.dupe(u8, "home.arpa."),
+        .primary = try std.Io.net.IpAddress.parse("127.0.0.1", port),
+    });
+    const ServerArgs = struct {
+        io: std.Io,
+        listener: *std.Io.net.Server,
+        runtime: *Runtime,
+        ready: *std.atomic.Value(bool),
+    };
+    const Server = struct {
+        fn run(args: ServerArgs) void {
+            args.ready.store(true, .release);
+            var connection = args.listener.accept(args.io) catch return;
+            defer connection.close(args.io);
+            var length_bytes: [2]u8 = undefined;
+            readExact(connection, args.io, &length_bytes) catch return;
+            const length = std.mem.readInt(u16, &length_bytes, .big);
+            var request_buffer: [65535]u8 = undefined;
+            readExact(connection, args.io, request_buffer[0..length]) catch return;
+            var response_buffer: [65535]u8 = undefined;
+            const response_bytes = args.runtime.answerFromTcp(request_buffer[0..length], &response_buffer, &connection.socket.address, null) catch return;
+            var prefix: [2]u8 = undefined;
+            std.mem.writeInt(u16, &prefix, @intCast(response_bytes.len), .big);
+            writeAll(connection, args.io, &prefix) catch return;
+            writeAll(connection, args.io, response_bytes) catch return;
+        }
+        fn readExact(stream: std.Io.net.Stream, stream_io: std.Io, buffer: []u8) !void {
+            var read_buffer: [4096]u8 = undefined;
+            var reader = stream.reader(stream_io, &read_buffer);
+            try reader.interface.readSliceAll(buffer);
+        }
+        fn writeAll(stream: std.Io.net.Stream, stream_io: std.Io, bytes: []const u8) !void {
+            var write_buffer: [4096]u8 = undefined;
+            var writer = stream.writer(stream_io, &write_buffer);
+            try writer.interface.writeAll(bytes);
+            try writer.interface.flush();
+        }
+    };
+    var ready = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, Server.run, .{ServerArgs{ .io = server_io, .listener = &listener, .runtime = &primary, .ready = &ready }});
+    defer thread.join();
+    while (!ready.load(.acquire)) std.Thread.yield() catch {};
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var request_buffer: [1024]u8 = undefined;
+    var updates = [_]dns_record_mod.ResourceRecord{.{
+        .owner = try dns_name_mod.Name.fromText("www.home.arpa."),
+        .rrtype = dns_types.RecordType.A,
+        .class = dns_types.Class.IN,
+        .ttl = 60,
+        .rdata = .{ .A = .{ 192, 168, 1, 9 } },
+    }};
+    const request = try encodeSignedUpdateRequest(arena.allocator(), &request_buffer, "home.arpa.", &.{}, &updates, now, .{
+        .algorithm = "hmac-sha256.",
+        .secret = "01234567890123456789012345678901",
+    });
+    var output: [1024]u8 = undefined;
+    const response_bytes = try secondary.answer(request, &output);
+    const forwarded = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@as(@TypeOf(forwarded.header.rcode), .no_error), forwarded.header.rcode);
+    try std.testing.expect((try tsig.parseFinalAdditional(response_bytes)) != null);
+    // The primary owns the write: its serial moved and it serves the record.
+    try std.testing.expectEqual(@as(u32, 2), primary.zones.items[0].soaSerial().?);
+    var primary_lookup = primary.zones.items[0].lookup(std.testing.allocator, "www.home.arpa.", .A);
+    defer primary_lookup.deinit(std.testing.allocator);
+    try std.testing.expectEqual(zone_index.LookupKind.answer, primary_lookup.kind);
+    // The secondary's served copy is unchanged until refresh.
+    try std.testing.expectEqual(@as(u32, 1), secondary.zones.items[0].soaSerial().?);
+    var secondary_lookup = secondary.zones.items[0].lookup(std.testing.allocator, "www.home.arpa.", .A);
+    defer secondary_lookup.deinit(std.testing.allocator);
+    try std.testing.expect(secondary_lookup.kind != zone_index.LookupKind.answer);
+}
 
 test "authoritative runtime applies configured Cookie validation" {
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -4522,6 +4826,78 @@ test "a catalog NOTIFY is honored only from the configured primary" {
     var master = try std.Io.net.IpAddress.parse("192.0.2.1", 40000);
     _ = try runtime.answerFrom(request, &output, &master);
     try std.testing.expect(runtime.catalog_refresh_requested.load(.acquire));
+}
+
+const SecondaryFetchStub = struct {
+    calls: usize = 0,
+    last_zone_name: ?[]const u8 = null,
+
+    fn fetch(ctx: *anyopaque, allocator: std.mem.Allocator, zone_name: []const u8) anyerror!?[]const u8 {
+        const stub: *SecondaryFetchStub = @ptrCast(@alignCast(ctx));
+        stub.calls += 1;
+        stub.last_zone_name = zone_name;
+        const text = try allocator.dupe(u8,
+            \\$ORIGIN example.
+            \\$TTL 3600
+            \\@ IN SOA ns.example. hostmaster.example. 11 3600 900 1209600 3600
+            \\@ IN NS ns.example.
+            \\www IN A 192.0.2.1
+            \\
+        );
+        return text;
+    }
+};
+
+test "a NOTIFY for a secondary marks it due for the next refresh tick" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var runtime = try Runtime.fromZoneTexts(&.{
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 10 3600 900 1209600 3600
+        \\@ IN NS ns.example.
+        \\www IN A 192.0.2.1
+        \\
+        ,
+        \\$ORIGIN primary.example.
+        \\$TTL 3600
+        \\@ IN SOA ns.primary.example. hostmaster.primary.example. 10 3600 900 1209600 3600
+        \\@ IN NS ns.primary.example.
+        \\
+        ,
+    });
+    defer runtime.deinit();
+    try runtime.secondary_zones.append(runtime.allocator, .{
+        .apex = try runtime.allocator.dupe(u8, "example."),
+        .primary = try std.Io.net.IpAddress.parse("192.0.2.1", 53),
+        .last_success_ns = 5_000_000_000,
+        .refresh_sec = 3600,
+        .retry_sec = 900,
+        .expire_sec = 1209600,
+    });
+    var stub: SecondaryFetchStub = .{};
+    // One second after the last success the refresh interval has not
+    // elapsed, so the tick is idle before any NOTIFY.
+    try runtime.maybeRefreshSecondaries(6_000_000_000, SecondaryFetchStub.fetch, &stub);
+    try std.testing.expectEqual(@as(usize, 0), stub.calls);
+
+    var output: [1024]u8 = undefined;
+    var request_buffer: [512]u8 = undefined;
+    // A NOTIFY for a zone that is not a tracked secondary does not mark
+    // the secondary due.
+    const primary_request = try encodeNotifyRequest(arena.allocator(), &request_buffer, "primary.example.", 11, .SOA);
+    _ = try runtime.answer(primary_request, &output);
+    try runtime.maybeRefreshSecondaries(6_000_000_000, SecondaryFetchStub.fetch, &stub);
+    try std.testing.expectEqual(@as(usize, 0), stub.calls);
+
+    // A NOTIFY for the tracked secondary marks it due, so the next tick
+    // fetches it even though the refresh interval has not elapsed.
+    const secondary_request = try encodeNotifyRequest(arena.allocator(), &request_buffer, "example.", 11, .SOA);
+    _ = try runtime.answer(secondary_request, &output);
+    try runtime.maybeRefreshSecondaries(6_000_000_000, SecondaryFetchStub.fetch, &stub);
+    try std.testing.expectEqual(@as(usize, 1), stub.calls);
+    try std.testing.expectEqualStrings("example.", stub.last_zone_name.?);
+    try std.testing.expectEqual(@as(?i64, 6_000_000_000), runtime.secondary_zones.items[0].last_success_ns);
 }
 
 test "runtime answers NOTIFY by comparing the serial and refuses transfers singly" {

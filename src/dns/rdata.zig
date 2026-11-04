@@ -37,16 +37,33 @@ pub const max_unknown_len = 2048;
 /// from the message it was parsed from.
 pub const max_opaque_rdata_len: usize = 65535;
 
-/// RFC 1035 section 4.2.2: a DNS message is prefixed with a two-octet length
-/// field, so a message is at most 65535 octets. The answer that carries a
-/// record also carries the 12-octet header, the echoed question (a 255-octet
-/// name, QTYPE, and QCLASS), the record's own fields (a 255-octet owner
-/// name, TYPE, CLASS, TTL, and the two-octet RDLENGTH), and the 11-octet
-/// EDNS OPT record, so this is the longest RDATA an answer can carry when
-/// the message carries nothing else: an answer that also carries the zone
-/// SOA in its authority section, or the RRSIGs of a signed zone, carries
-/// less. A zone that holds more holds a record no answer can carry.
-pub const max_message_rdata_len: usize = 65535 - 12 - (255 + 2 + 2) - (255 + 2 + 2 + 4 + 2) - 11;
+/// RFC 1035 section 3.3.2: SOA RDATA is MNAME, RNAME, and five 32-bit
+/// fields, so the longest SOA an answer can carry is two 255-octet names
+/// plus 20 octets.
+pub const max_soa_rdata_len: usize = 255 + 255 + 5 * 4;
+
+/// The longest RRSIG RDATA this server can emit. An RRSIG (RFC 4034
+/// section 3.1: 18 fixed octets, the signer name, and the signature) is
+/// served opaque under the bounded profile above: the signer builds it
+/// inside `max_unknown_len`, and a zone file's RRSIG is held in the same
+/// bound, so that bound covers the largest signature any key here
+/// produces, a 4096-bit RSA signature included, with room to spare.
+pub const max_rrsig_rdata_len: usize = max_unknown_len;
+
+/// RFC 1035 section 4.2.2: a DNS message is at most 65535 octets, and the
+/// 16-bit TCP length prefix carries the same ceiling, so a record whose
+/// RDATA is longer than this bound can never be carried. A signed answer
+/// carries more than the record itself: the 12-octet header, the echoed
+/// question (a 255-octet name, QTYPE, and QCLASS), the record's own
+/// fields (a 255-octet owner name, TYPE, CLASS, TTL, and the two-octet
+/// RDLENGTH), an RRSIG over the answer, the zone SOA in the authority
+/// section, an RRSIG over that SOA, and the 11-octet EDNS OPT record a
+/// signed (DO=1) answer must carry. Each name is charged at its 255-octet
+/// wire maximum and each RRSIG at `max_rrsig_rdata_len`, so a record at
+/// this bound plus the whole signed envelope fits 65535 octets even with
+/// no compression. A zone that holds more holds a record no signed
+/// answer can carry.
+pub const max_message_rdata_len: usize = 65535 - 12 - (255 + 2 + 2) - (255 + 2 + 2 + 4 + 2) - (255 + 2 + 2 + 4 + 2 + max_rrsig_rdata_len) - (255 + 2 + 2 + 4 + 2 + max_soa_rdata_len) - (255 + 2 + 2 + 4 + 2 + max_rrsig_rdata_len) - 11;
 
 const max_opt_data_len = 512;
 const max_caa_payload_len = max_unknown_len - 2;

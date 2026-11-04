@@ -1899,6 +1899,22 @@ fn zoneWithGenericRecord(length: usize) !std.Io.Writer.Allocating {
     return text;
 }
 
+/// A 255-octet wire name whose every label is `fill`, so two names built
+/// this way share no suffix and compression cannot shrink either one.
+fn maxWireName(fill: u8) !dns_name.Name {
+    var text: [254]u8 = undefined;
+    var offset: usize = 0;
+    for ([_]usize{ 63, 63, 63, 61 }) |label_len| {
+        @memset(text[offset..][0..label_len], fill);
+        offset += label_len;
+        text[offset] = '.';
+        offset += 1;
+    }
+    const name = try dns_name.Name.fromText(text[0..offset]);
+    std.debug.assert(name.asWire().len == 255);
+    return name;
+}
+
 test "zone parser keeps a generic record whole" {
     // RFC 3597 section 3: the RDATA of a type this server does not implement
     // is unstructured binary data, stored and transmitted without change, so
@@ -1992,6 +2008,81 @@ test "zone parser serves a record at the message bound" {
     const rdata = zone.records.items[2].rdataText();
     try std.testing.expectEqual(@as(usize, bound), rdata.len);
     try std.testing.expectEqualSlices(u8, rdata, wire[wire.len - bound ..]);
+}
+
+test "zone parser serves a signed answer at the message bound within 65535 octets" {
+    // RFC 4035 section 3.1: a signed answer carries the answer RRset, its
+    // RRSIG, the zone SOA in the authority section, and the RRSIG over
+    // that SOA, in the OPT-bearing (DO=1) message the query asked for. The
+    // bound reserves all of it, so a record at the bound plus the whole
+    // envelope encodes inside 65535 octets.
+    const bound = dns_rdata.max_message_rdata_len;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const answer_payload = try allocator.alloc(u8, bound);
+    @memset(answer_payload, 0x5a);
+    const rrsig_payload = try allocator.alloc(u8, dns_rdata.max_rrsig_rdata_len);
+    @memset(rrsig_payload, 0x5a);
+
+    var message = dns_message.Message{
+        .allocator = allocator,
+        .header = .{ .id = 0x1234, .qr = true, .authoritative = true, .question_count = 1, .answer_count = 2, .authority_count = 2, .additional_count = 1 },
+        .question = .{ .name = try maxWireName('a'), .qtype = RecordType.fromCode(65280), .qclass = Class.IN },
+        .answers = try dns_message.RecordSection.init(allocator, 0),
+        .authorities = try dns_message.RecordSection.init(allocator, 0),
+        .additionals = try dns_message.RecordSection.init(allocator, 0),
+    };
+    defer message.deinit();
+    try message.answers.append(.{
+        .owner = try maxWireName('b'),
+        .rrtype = RecordType.fromCode(65280),
+        .class = Class.IN,
+        .ttl = 3600,
+        .rdata = .{ .Unknown = .{ .len = @intCast(answer_payload.len), .borrowed = answer_payload } },
+    });
+    try message.answers.append(.{
+        .owner = try maxWireName('c'),
+        .rrtype = .RRSIG,
+        .class = Class.IN,
+        .ttl = 3600,
+        .rdata = .{ .Unknown = .{ .len = @intCast(rrsig_payload.len), .borrowed = rrsig_payload } },
+    });
+    try message.authorities.append(.{
+        .owner = try maxWireName('d'),
+        .rrtype = .SOA,
+        .class = Class.IN,
+        .ttl = 3600,
+        .rdata = .{ .SOA = .{
+            .mname = try maxWireName('e'),
+            .rname = try maxWireName('f'),
+            .serial = 1,
+            .refresh = 3600,
+            .retry = 900,
+            .expire = 1209600,
+            .minimum = 3600,
+        } },
+    });
+    try message.authorities.append(.{
+        .owner = try maxWireName('g'),
+        .rrtype = .RRSIG,
+        .class = Class.IN,
+        .ttl = 3600,
+        .rdata = .{ .Unknown = .{ .len = @intCast(rrsig_payload.len), .borrowed = rrsig_payload } },
+    });
+    try message.additionals.append(.{
+        .owner = dns_name.Name.root(),
+        .rrtype = .OPT,
+        .class = Class.fromCode(1232),
+        .ttl = 0x8000,
+        .rdata = .{ .OPT = .{} },
+    });
+
+    var buffer: [65535]u8 = undefined;
+    var writer = dns_writer.Writer.init(&buffer);
+    try message.encode(&writer);
+    try std.testing.expect(writer.written().len <= 65535);
 }
 
 test "zone parser refuses an unknown type that is not in the generic form" {
