@@ -92,6 +92,7 @@ pub const CatalogConsumer = struct {
     apex: []const u8,
     primary: std.Io.net.IpAddress,
     members: std.ArrayList(CatalogMember) = .empty,
+    group_selector: ?[]const u8 = null,
 };
 
 /// One provisioned member: the `<unique>` label of the catalog node and the
@@ -100,6 +101,7 @@ pub const CatalogConsumer = struct {
 pub const CatalogMember = struct {
     label: []const u8,
     name: []const u8,
+    properties: []const catalog_mod.Property = &.{},
 };
 
 /// What one catalog refresh did.
@@ -189,6 +191,20 @@ const IncomingResult = union(enum) {
     failure: Failure,
 };
 
+pub const SecondaryState = struct {
+    apex: []const u8,
+    primary: std.Io.net.IpAddress,
+    last_success_ns: ?i64 = null,
+    last_attempt_ns: ?i64 = null,
+    last_attempt_failed: bool = false,
+    refresh_sec: u32 = 0,
+    retry_sec: u32 = 0,
+    expire_sec: u32 = 0,
+    expired: bool = false,
+};
+
+pub const SecondaryFetch = *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, zone_name: []const u8) anyerror!?[]const u8;
+
 pub const Runtime = struct {
     allocator: std.mem.Allocator = std.heap.page_allocator,
     zones: std.ArrayList(zone_index.Zone) = .empty,
@@ -229,6 +245,8 @@ pub const Runtime = struct {
     /// RFC 1996 secondaries to notify when one of the listed zones changes.
     /// Empty unless `notify` is configured. The apex string is heap-owned.
     notify_targets: std.ArrayList(NotifyTarget) = .empty,
+    /// Secondary-zone refresh state (last success/failure/expired). Empty unless configured.
+    secondary_zones: std.ArrayList(SecondaryState) = .empty,
     /// The TTL of the service-binding records. RFC 9461 sets none; an hour is
     /// the answer's own lifetime, not the zone's.
     ddr_ttl: u32 = 3600,
@@ -342,6 +360,61 @@ pub const Runtime = struct {
         return runtime;
     }
 
+
+    pub fn maybeRefreshSecondaries(self: *Runtime, now_ns: u64, fetch: SecondaryFetch, fetch_ctx: *anyopaque) !void {
+        for (self.secondary_zones.items) |*secondary| {
+            if (secondary.expired) continue;
+            const action = xfr_client.refreshDecision(.{
+                .now_ns = @intCast(now_ns),
+                .last_success_ns = secondary.last_success_ns,
+                .refresh_sec = secondary.refresh_sec,
+                .retry_sec = secondary.retry_sec,
+                .expire_sec = secondary.expire_sec,
+                .last_attempt_failed = secondary.last_attempt_failed,
+                .last_attempt_ns = secondary.last_attempt_ns,
+            });
+            switch (action) {
+                .idle => {},
+                .expired => {
+                    secondary.expired = true;
+                },
+                .refresh_due, .retry_due => {
+                    secondary.last_attempt_ns = @intCast(now_ns);
+                    const text = fetch(fetch_ctx, self.allocator, secondary.apex) catch |err| {
+                        secondary.last_attempt_failed = true;
+                        _ = err;
+                        continue;
+                    };
+                    if (text) |zone_text| {
+                        defer self.allocator.free(zone_text);
+                        var zone_file = zone_parser.ZoneFile.parse(zone_text) catch {
+                            secondary.last_attempt_failed = true;
+                            continue;
+                        };
+                        defer zone_file.deinit();
+                        var new_zone = zone_index.Zone.fromZoneFile(&zone_file) catch {
+                            secondary.last_attempt_failed = true;
+                            continue;
+                        };
+                        defer new_zone.deinit();
+                        // swap zone in zones
+                        for (self.zones.items) |*zone| {
+                            if (std.ascii.eqlIgnoreCase(zone.originText(), secondary.apex)) {
+                                zone.deinit();
+                                zone.* = try zone_index.Zone.fromZoneFile(&zone_file);
+                                break;
+                            }
+                        }
+                        secondary.last_success_ns = @intCast(now_ns);
+                        secondary.last_attempt_failed = false;
+                    } else {
+                        secondary.last_attempt_failed = true;
+                    }
+                },
+            }
+        }
+    }
+
     pub fn deinit(self: *Runtime) void {
         self.lockExclusive();
         defer self.unlockExclusive();
@@ -376,9 +449,15 @@ pub const Runtime = struct {
         self.ddr_targets = .empty;
         if (self.catalog_consumer) |*consumer| {
             self.allocator.free(consumer.apex);
+            if (consumer.group_selector) |value| self.allocator.free(value);
             for (consumer.members.items) |member| {
                 self.allocator.free(member.label);
                 self.allocator.free(member.name);
+                for (member.properties) |property| {
+                    self.allocator.free(property.key);
+                    self.allocator.free(property.value);
+                }
+                self.allocator.free(member.properties);
             }
             consumer.members.deinit(self.allocator);
             self.catalog_consumer = null;
@@ -478,7 +557,7 @@ pub const Runtime = struct {
 
     /// Records the RFC 9432 catalog this server is provisioned from. The
     /// apex is copied.
-    pub fn setCatalogConsumer(self: *Runtime, apex: []const u8, primary: std.Io.net.IpAddress) !void {
+    pub fn setCatalogConsumer(self: *Runtime, apex: []const u8, primary: std.Io.net.IpAddress, group_selector: ?[]const u8) !void {
         const owned = try self.allocator.dupe(u8, apex);
         errdefer self.allocator.free(owned);
         if (self.catalog_consumer) |*consumer| {
@@ -487,9 +566,13 @@ pub const Runtime = struct {
             self.allocator.free(consumer.apex);
             consumer.apex = owned;
             consumer.primary = primary;
+            if (consumer.group_selector) |value| self.allocator.free(value);
+            consumer.group_selector = if (group_selector) |value| try self.allocator.dupe(u8, value) else null;
             return;
         }
-        self.catalog_consumer = .{ .apex = owned, .primary = primary };
+        const owned_group = if (group_selector) |value| try self.allocator.dupe(u8, value) else null;
+        errdefer if (owned_group) |value| self.allocator.free(value);
+        self.catalog_consumer = .{ .apex = owned, .primary = primary, .group_selector = owned_group };
     }
 
     /// Records the members the catalog currently names.
@@ -507,7 +590,22 @@ pub const Runtime = struct {
             errdefer self.allocator.free(label);
             const name = try self.allocator.dupe(u8, member.name);
             errdefer self.allocator.free(name);
-            try list.append(self.allocator, .{ .label = label, .name = name });
+            var property_list: std.ArrayList(catalog_mod.Property) = .empty;
+            errdefer {
+                for (property_list.items) |property| {
+                    self.allocator.free(property.key);
+                    self.allocator.free(property.value);
+                }
+                property_list.deinit(self.allocator);
+            }
+            for (member.properties) |property| {
+                const key = try self.allocator.dupe(u8, property.key);
+                errdefer self.allocator.free(key);
+                const value = try self.allocator.dupe(u8, property.value);
+                try property_list.append(self.allocator, .{ .key = key, .value = value });
+            }
+            const properties = try property_list.toOwnedSlice(self.allocator);
+            try list.append(self.allocator, .{ .label = label, .name = name, .properties = properties });
         }
         const consumer = if (self.catalog_consumer) |*value| value else {
             for (list.items) |member| {
@@ -606,6 +704,11 @@ pub const Runtime = struct {
         // failed transfer or a broken zone leaves the served set whole.
         var member_zones: std.ArrayList(zone_index.Zone) = .empty;
         for (new_members) |member| {
+            var is_coo = false;
+            for (member.properties) |property| if (std.ascii.eqlIgnoreCase(property.key, "coo")) {
+                is_coo = true;
+            };
+            if (is_coo) continue;
             const text = xfr_client.fetch(self.allocator, io, &consumer.primary, member.name, timeout) catch {
                 reportReload(io, "error: cannot fetch the catalog member {s}", .{member.name});
                 for (member_zones.items) |*zone| zone.deinit();
@@ -693,10 +796,23 @@ pub const Runtime = struct {
             self.removeZoneLocked(old.name);
             self.allocator.free(old.label);
             self.allocator.free(old.name);
+            for (old.properties) |property| {
+                self.allocator.free(property.key);
+                self.allocator.free(property.value);
+            }
+            self.allocator.free(old.properties);
             _ = consumer.members.orderedRemove(index);
         }
-        for (new_members, 0..) |member, zone_index_value| {
-            var member_zone = member_zones.items[zone_index_value];
+        var member_zone_index: usize = 0;
+        for (new_members) |member| {
+            // coo members are not provisioned here.
+            var coo_member = false;
+            for (member.properties) |property| if (std.ascii.eqlIgnoreCase(property.key, "coo")) {
+                coo_member = true;
+            };
+            if (coo_member) continue;
+            var member_zone = member_zones.items[member_zone_index];
+            member_zone_index += 1;
             if (self.zoneIndexForOrigin(member.name) != null) {
                 const installed = self.installZoneLocked(io, member.name, &member_zone);
                 if (installed != .replaced) member_zone.deinit();
@@ -707,14 +823,53 @@ pub const Runtime = struct {
                 };
                 self.transfer_delta_logs.append(self.allocator, .{}) catch {};
             }
+            // RFC 9432 section 4.3: a member whose `coo` property points at
+            // another catalog belongs to that catalog, not this one; this
+            // consumer skips provisioning it.
+            var is_coo = false;
+            for (member.properties) |property| {
+                if (std.ascii.eqlIgnoreCase(property.key, "coo")) is_coo = true;
+            }
+            if (is_coo) continue;
             const label = self.allocator.dupe(u8, member.label) catch continue;
             const name = self.allocator.dupe(u8, member.name) catch {
                 self.allocator.free(label);
                 continue;
             };
-            consumer.members.append(self.allocator, .{ .label = label, .name = name }) catch {
+            var property_list: std.ArrayList(catalog_mod.Property) = .empty;
+            for (member.properties) |property| {
+                const key = self.allocator.dupe(u8, property.key) catch {
+                    self.allocator.free(label);
+                    self.allocator.free(name);
+                    for (property_list.items) |owned_property| {
+                        self.allocator.free(owned_property.key);
+                        self.allocator.free(owned_property.value);
+                    }
+                    property_list.deinit(self.allocator);
+                    continue;
+                };
+                const value = self.allocator.dupe(u8, property.value) catch {
+                    self.allocator.free(key);
+                    self.allocator.free(label);
+                    self.allocator.free(name);
+                    for (property_list.items) |owned_property| {
+                        self.allocator.free(owned_property.key);
+                        self.allocator.free(owned_property.value);
+                    }
+                    property_list.deinit(self.allocator);
+                    continue;
+                };
+                property_list.append(self.allocator, .{ .key = key, .value = value }) catch {};
+            }
+            const properties = property_list.toOwnedSlice(self.allocator) catch &.{};
+            consumer.members.append(self.allocator, .{ .label = label, .name = name, .properties = properties }) catch {
                 self.allocator.free(label);
                 self.allocator.free(name);
+                for (properties) |property| {
+                    self.allocator.free(property.key);
+                    self.allocator.free(property.value);
+                }
+                self.allocator.free(properties);
             };
         }
         member_zones.deinit(self.allocator);
@@ -4350,7 +4505,7 @@ test "a catalog NOTIFY is honored only from the configured primary" {
         \\
     );
     defer runtime.deinit();
-    try runtime.setCatalogConsumer("catalog.example.", try std.Io.net.IpAddress.parse("192.0.2.1", 53));
+    try runtime.setCatalogConsumer("catalog.example.", try std.Io.net.IpAddress.parse("192.0.2.1", 53), null);
 
     var output: [1024]u8 = undefined;
     var request_buffer: [512]u8 = undefined;

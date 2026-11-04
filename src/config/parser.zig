@@ -374,6 +374,8 @@ pub const CatalogConsumer = struct {
     apex: Text = .{},
     address: Text = .{},
     port: u16 = 0,
+    group: Text = .{},
+    has_group: bool = false,
 
     pub fn apexText(self: *const CatalogConsumer) []const u8 {
         return self.apex.text();
@@ -381,6 +383,11 @@ pub const CatalogConsumer = struct {
 
     pub fn addressText(self: *const CatalogConsumer) []const u8 {
         return self.address.text();
+    }
+
+    pub fn groupText(self: *const CatalogConsumer) ?[]const u8 {
+        if (!self.has_group) return null;
+        return self.group.text();
     }
 };
 
@@ -531,10 +538,17 @@ pub const Config = struct {
     /// `catalog-zone <apex>`.
     catalog_zone: Text = .{},
     has_catalog_zone: bool = false,
+    catalog_zone_properties: Text = .{},
+    has_catalog_zone_properties: bool = false,
 
     pub fn catalogZoneText(self: *const Config) ?[]const u8 {
         if (!self.has_catalog_zone) return null;
         return self.catalog_zone.text();
+    }
+
+    pub fn catalogZonePropertiesText(self: *const Config) ?[]const u8 {
+        if (!self.has_catalog_zone_properties) return null;
+        return self.catalog_zone_properties.text();
     }
 
     pub fn tlsCertFileText(self: *const Config) ?[]const u8 {
@@ -765,6 +779,11 @@ pub const Config = struct {
         const parsed = try parseEndpoint(tokens.next() orelse return Error.BadDirective);
         try consumer.address.set(parsed.address);
         consumer.port = parsed.port;
+        if (tokens.next()) |token| {
+            if (!std.mem.eql(u8, token, "group")) return Error.BadDirective;
+            try consumer.group.set(tokens.next() orelse return Error.BadDirective);
+            consumer.has_group = true;
+        }
         try requireNoTrailingTokens(tokens);
         self.catalog_consumer = consumer;
     }
@@ -822,9 +841,27 @@ pub const Config = struct {
         if (self.has_catalog_zone) return Error.BadDirective;
         var apex = Text{};
         try apex.set(tokens.next() orelse return Error.BadDirective);
-        try requireNoTrailingTokens(tokens);
+        var joined: [512]u8 = undefined;
+        var joined_len: usize = 0;
+        var has_properties = false;
+        while (tokens.next()) |token| {
+            if (has_properties) {
+                joined[joined_len] = ' ';
+                joined_len += 1;
+            }
+            if (joined_len + token.len > joined.len) return Error.TextTooLong;
+            @memcpy(joined[joined_len .. joined_len + token.len], token);
+            joined_len += token.len;
+            has_properties = true;
+        }
+        var properties = Text{};
+        if (has_properties) try properties.set(joined[0..joined_len]);
         self.catalog_zone = apex;
         self.has_catalog_zone = true;
+        if (has_properties) {
+            self.catalog_zone_properties = properties;
+            self.has_catalog_zone_properties = true;
+        }
     }
 
     fn parseAllowUpdate(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
@@ -1300,7 +1337,6 @@ test "catalog-zone names one catalog apex" {
     const plain = try Config.parse("zone one.example primary one.zone\n");
     try std.testing.expect(plain.catalogZoneText() == null);
     try std.testing.expectError(error.BadDirective, Config.parse("catalog-zone\n"));
-    try std.testing.expectError(error.BadDirective, Config.parse("catalog-zone a.example. extra\n"));
     try std.testing.expectError(error.BadDirective, Config.parse("catalog-zone a.example.\ncatalog-zone b.example.\n"));
 }
 

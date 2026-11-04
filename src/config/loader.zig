@@ -62,6 +62,7 @@ pub const CatalogConsumerState = struct {
     apex: []const u8,
     primary: std.Io.net.IpAddress,
     members: []const catalog_mod.Member,
+    group: ?[]const u8 = null,
 };
 
 pub const ServerContext = struct {
@@ -223,7 +224,7 @@ pub const ServerContext = struct {
             for (context.config.zones.items[0..context.config.zones.len]) |*configured| {
                 if (zoneNamesEqual(catalog_apex, configured.nameText())) return Error.BadCatalogZone;
             }
-            const catalog_zone_text = try synthesizeCatalogZoneText(allocator, catalog_apex, context.config.zones.items[0..context.config.zones.len]);
+            const catalog_zone_text = try synthesizeCatalogZoneText(allocator, catalog_apex, context.config.zones.items[0..context.config.zones.len], context.config.catalogZonePropertiesText());
             defer allocator.free(catalog_zone_text);
             try loadZoneText(
                 &context,
@@ -432,7 +433,7 @@ pub const ServerContext = struct {
             journal_mod.activate(journal);
         }
         if (self.catalog_consumer_state) |*state| {
-            runtime.setCatalogConsumer(state.apex, state.primary) catch {
+            runtime.setCatalogConsumer(state.apex, state.primary, state.group) catch {
                 runtime.deinit();
                 return error.BadConfiguration;
             };
@@ -442,6 +443,7 @@ pub const ServerContext = struct {
             };
             // The runtime holds its own copies.
             self.allocator.free(state.apex);
+            if (state.group) |value| self.allocator.free(value);
             for (state.members) |member| {
                 self.allocator.free(member.label);
                 self.allocator.free(member.name);
@@ -467,6 +469,7 @@ pub const ServerContext = struct {
         self.keyring.deinit();
         if (self.catalog_consumer_state) |*state| {
             self.allocator.free(state.apex);
+            if (state.group) |value| self.allocator.free(value);
             for (state.members) |member| {
                 self.allocator.free(member.label);
                 self.allocator.free(member.name);
@@ -814,6 +817,7 @@ fn consumeCatalog(
         .apex = try allocator.dupe(u8, apex),
         .primary = primary,
         .members = owned_members,
+        .group = if (consumer.groupText()) |value| try allocator.dupe(u8, value) else null,
     };
 }
 
@@ -825,6 +829,7 @@ fn synthesizeCatalogZoneText(
     allocator: std.mem.Allocator,
     apex: []const u8,
     members: []const parser.Zone,
+    properties_text: ?[]const u8,
 ) ![]u8 {
     // The SOA serial is a digest of the membership: a restart with the same
     // zones keeps its serial, and a changed list advances it (RFC 1982
@@ -862,6 +867,12 @@ fn synthesizeCatalogZoneText(
             name,
             if (dotted) "" else ".",
         }));
+        if (properties_text) |props| {
+            var token_it = std.mem.tokenizeAny(u8, props, " ");
+            while (token_it.next()) |token| {
+                try out.appendSlice(allocator, try std.fmt.bufPrint(&line, "m{d}.zones IN TXT \"{s}\"\n", .{ number, token }));
+            }
+        }
     }
     return out.toOwnedSlice(allocator);
 }

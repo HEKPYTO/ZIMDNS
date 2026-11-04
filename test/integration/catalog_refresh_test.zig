@@ -159,7 +159,7 @@ test "a catalog consumer adds, replaces, and drops members on refresh" {
 
     var consumer = try Runtime.fromZoneTexts(&.{boot_text});
     defer consumer.deinit();
-    try consumer.setCatalogConsumer(catalog_apex, first_server.socket.address);
+    try consumer.setCatalogConsumer(catalog_apex, first_server.socket.address, null);
     consumer.requestCatalogRefresh();
     try std.testing.expectEqual(@as(?zimdns.auth_runtime.CatalogRefreshOutcome, .updated), consumer.refreshCatalogIfRequested(io));
     try joinPrimary(first_args, &first_joined);
@@ -182,7 +182,7 @@ test "a catalog consumer adds, replaces, and drops members on refresh" {
         std.testing.allocator.destroy(second_args);
     }
 
-    try consumer.setCatalogConsumer(catalog_apex, second_server.socket.address);
+    try consumer.setCatalogConsumer(catalog_apex, second_server.socket.address, null);
     try sendNotify(io, &consumer);
     try std.testing.expectEqual(@as(?zimdns.auth_runtime.CatalogRefreshOutcome, .updated), consumer.refreshCatalogIfRequested(io));
     try expectAddress(io, &consumer, "www.two.example.", 192, 0, 2, 2);
@@ -210,7 +210,7 @@ test "a catalog consumer adds, replaces, and drops members on refresh" {
         if (!third_joined) third_args.thread.join();
         std.testing.allocator.destroy(third_args);
     }
-    try consumer.setCatalogConsumer(catalog_apex, third_server.socket.address);
+    try consumer.setCatalogConsumer(catalog_apex, third_server.socket.address, null);
     try sendNotify(io, &consumer);
     try std.testing.expectEqual(@as(?zimdns.auth_runtime.CatalogRefreshOutcome, .updated), consumer.refreshCatalogIfRequested(io));
     try expectAddress(io, &consumer, "www.two.example.", 192, 0, 2, 2);
@@ -230,7 +230,7 @@ test "a catalog consumer adds, replaces, and drops members on refresh" {
         if (!fourth_joined) fourth_args.thread.join();
         std.testing.allocator.destroy(fourth_args);
     }
-    try consumer.setCatalogConsumer(catalog_apex, fourth_server.socket.address);
+    try consumer.setCatalogConsumer(catalog_apex, fourth_server.socket.address, null);
     try sendNotify(io, &consumer);
     try std.testing.expectEqual(@as(?zimdns.auth_runtime.CatalogRefreshOutcome, .failed), consumer.refreshCatalogIfRequested(io));
     try expectAddress(io, &consumer, "www.two.example.", 192, 0, 2, 2);

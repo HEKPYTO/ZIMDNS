@@ -221,7 +221,7 @@ test "the authoritative answer classes are reachable through server run and quer
     return error.ServerExitFailed;
 }
 
-test "the TCP query command reaches the same answer through server run" {
+test "the TCP query command reaches every answer class through server run" {
     // `spawn` and `run` build an argv, which `global_single_threaded` cannot do
     // because it allocates from `.failing`.
     var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{ .concurrent_limit = .limited(8) });
@@ -239,9 +239,15 @@ test "the TCP query command reaches the same answer through server run" {
 
     const port = try pickPort(io, tcp_port_base, .stream, .tcp);
     const port_text = try std.fmt.allocPrint(allocator, "{d}", .{port});
+    const quota_text = try std.fmt.allocPrint(allocator, "{d}", .{cases.len});
+    // `--serve-tcp` takes its address from the configuration; `--once-tcp`
+    // serves exactly one query and would need one server per case.
+    const config_text = try std.fmt.allocPrint(allocator, "listen dns tcp 127.0.0.1:{d}\n", .{port});
+    try tmp.dir.writeFile(io, .{ .sub_path = "server.gdns", .data = config_text });
+    const config_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/server.gdns", .{&tmp.sub_path});
     const server_argv = [_][]const u8{
-        build_options.exe_path, "server",  "run",           "--zone-file", zone_path,
-        "--once-tcp",           port_text, "--max-queries", "1",
+        build_options.exe_path, "server",  "run",         "--config",       config_path,
+        "--zone-file",          zone_path, "--serve-tcp", "--max-requests", quota_text,
     };
 
     var out_file = try tmp.dir.createFile(io, "tcp-out", .{});
@@ -257,31 +263,22 @@ test "the TCP query command reaches the same answer through server run" {
     var reaped = false;
     defer if (!reaped) child.kill(io);
 
-    const query_argv = [_][]const u8{
-        build_options.exe_path, "query", "--tcp", "@127.0.0.1", "-p", port_text, cases[0].name, cases[0].qtype,
-    };
-    const answer = cases[0].required[0];
+    const query_argv = try tcpQueryArgv(allocator, port_text, cases[0]);
 
-    // `--once-tcp` serves one frame, so the first accepted connection must be
-    // the query under test. A connect before the bind is refused without
-    // consuming the quota, so the query itself is retried; a served answer
-    // exits 0 and ends the wait rather than being probed again.
+    // `--once-tcp` serves one frame per connection, so the first accepted
+    // connection must be the query under test. A connect before the bind is
+    // refused without consuming the quota, so the query itself is retried; a
+    // served answer exits 0 and ends the wait rather than being probed again.
     const ready_deadline = std.Io.Clock.Timestamp.fromNow(io, .{ .raw = .fromSeconds(ready_window_seconds), .clock = .awake });
     var attempt_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer attempt_state.deinit();
     while (true) {
-        const result = std.process.run(attempt_state.allocator(), io, .{ .argv = &query_argv, .timeout = child_deadline }) catch |err| {
-            std.debug.print("\n--- query did not terminate\nargv: {s}\nerror: {t}\n", .{ try joinArgv(allocator, &query_argv), err });
+        const result = std.process.run(attempt_state.allocator(), io, .{ .argv = query_argv, .timeout = child_deadline }) catch |err| {
+            std.debug.print("\n--- query did not terminate\nargv: {s}\nerror: {t}\n", .{ try joinArgv(allocator, query_argv), err });
             return err;
         };
         if (exitCode(result.term) == 0) {
-            if (std.mem.indexOf(u8, result.stdout, answer) == null) {
-                std.debug.print(
-                    "\n--- the TCP response does not carry the answer the zone holds\nargv: {s}\nrequired: {s}\nrendered:\n{s}\n",
-                    .{ try joinArgv(allocator, &query_argv), answer, result.stdout },
-                );
-                return error.AnswerClassMissing;
-            }
+            try check(0, result.stdout);
             break;
         }
         if (expired(io, ready_deadline)) {
@@ -289,7 +286,7 @@ test "the TCP query command reaches the same answer through server run" {
             const stderr = try tmp.dir.readFileAlloc(io, "tcp-err", allocator, .limited(1024 * 1024));
             std.debug.print(
                 "\n--- the TCP query never reached the server within {d}s\nargv: {s}\nport: {d}\nquery stdout: {s}\nquery stderr: {s}\nserver stdout: {s}\nserver stderr: {s}\n",
-                .{ ready_window_seconds, try joinArgv(allocator, &query_argv), port, result.stdout, result.stderr, stdout, stderr },
+                .{ ready_window_seconds, try joinArgv(allocator, query_argv), port, result.stdout, result.stderr, stdout, stderr },
             );
             return error.ServerNeverAnswered;
         }
@@ -299,19 +296,35 @@ test "the TCP query command reaches the same answer through server run" {
         std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
     }
 
+    for (cases[1..], 1..) |case, index| {
+        const argv = try tcpQueryArgv(allocator, port_text, case);
+        const result = std.process.run(allocator, io, .{ .argv = argv, .timeout = child_deadline }) catch |err| {
+            std.debug.print("\n--- TCP query did not terminate\nargv: {s}\nerror: {t}\n", .{ try joinArgv(allocator, argv), err });
+            return err;
+        };
+        if (exitCode(result.term) != 0) {
+            std.debug.print(
+                "\n--- TCP query exited nonzero\nargv: {s}\nstdout: {s}\nstderr: {s}\n",
+                .{ try joinArgv(allocator, argv), result.stdout, result.stderr },
+            );
+            return error.QueryFailed;
+        }
+        try check(index, result.stdout);
+    }
+
     // Every query got its answer, so the server has served its quota and must
     // leave on its own with the success code.
     const term = try reapBounded(&child, io);
     reaped = true;
     if (exitCode(term) == 0) {
-        std.debug.print("tcp-cli guard: 1 tcp answer through query --tcp, 0 failures\n", .{});
+        std.debug.print("tcp-cli guard: {d} tcp answer classes, 0 failures\n", .{cases.len});
         return;
     }
 
     const stdout = try tmp.dir.readFileAlloc(io, "tcp-out", allocator, .limited(1024 * 1024));
     const stderr = try tmp.dir.readFileAlloc(io, "tcp-err", allocator, .limited(1024 * 1024));
     std.debug.print(
-        "\n--- the server did not exit 0 after its one-query TCP quota\nargv: {s}\nterm: {?d}\nstdout: {s}\nstderr: {s}\n",
+        "\n--- the server did not exit 0 after its TCP quota\nargv: {s}\nterm: {?d}\nstdout: {s}\nstderr: {s}\n",
         .{ try joinArgv(allocator, &server_argv), exitCode(term), stdout, stderr },
     );
     return error.ServerExitFailed;
@@ -337,6 +350,12 @@ fn pickPort(io: std.Io, base: u16, mode: std.Io.net.Socket.Mode, protocol: std.I
 fn queryArgv(allocator: std.mem.Allocator, port_text: []const u8, case: Case) ![]const []const u8 {
     return allocator.dupe([]const u8, &.{
         build_options.exe_path, "query", "@127.0.0.1", "-p", port_text, case.name, case.qtype,
+    });
+}
+
+fn tcpQueryArgv(allocator: std.mem.Allocator, port_text: []const u8, case: Case) ![]const []const u8 {
+    return allocator.dupe([]const u8, &.{
+        build_options.exe_path, "query", "--tcp", "@127.0.0.1", "-p", port_text, case.name, case.qtype,
     });
 }
 

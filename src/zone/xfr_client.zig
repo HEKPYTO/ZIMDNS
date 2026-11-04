@@ -129,7 +129,12 @@ fn writeRecord(writer: *std.Io.Writer, record: dns_record.ResourceRecord) Error!
 }
 
 test "an AXFR over DNS/TCP returns the transferred zone as text" {
-    const io = std.Io.Threaded.global_single_threaded.io();
+    // The fixture runs a real loopback server on its own thread, so it needs a
+    // threaded Io; the single-threaded test instance is not safe to drive from
+    // two threads.
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{ .concurrent_limit = .limited(8) });
+    defer threaded.deinit();
+    const io = threaded.io();
     const transfer = @import("transfer.zig");
     const zone_index = @import("index.zig");
     const zone_parser = @import("parser.zig");
@@ -207,7 +212,10 @@ test "an AXFR over DNS/TCP returns the transferred zone as text" {
     defer thread.join();
 
     const primary = try std.Io.net.IpAddress.parse("127.0.0.1", port);
-    const fetched = try fetch(std.testing.allocator, io, &primary, "transferred.example.", .{ .duration = .{ .raw = .fromMilliseconds(2000), .clock = .awake } });
+    // Five seconds matches the server's TCP frame deadline and leaves room for
+    // the parallel test gate to schedule the loopback primary; the AXFR
+    // assertions below are about the transfer, not about a tight timeout.
+    const fetched = try fetch(std.testing.allocator, io, &primary, "transferred.example.", .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
     defer std.testing.allocator.free(fetched);
 
     var fetched_file = try zone_parser.ZoneFile.parse(fetched);
@@ -220,4 +228,83 @@ test "an AXFR over DNS/TCP returns the transferred zone as text" {
     try std.testing.expectEqual(zone_index.LookupKind.answer, lookup.kind);
     const answer = try @import("parser.zig").parseRData(.A, lookup.records.items[0].rdataText());
     try std.testing.expectEqualSlices(u8, &.{ 192, 0, 2, 80 }, &answer.A);
+}
+
+
+
+pub const RefreshAction = enum {
+    idle,
+    refresh_due,
+    retry_due,
+    expired,
+};
+
+pub const RefreshInput = struct {
+    now_ns: i64,
+    last_success_ns: ?i64,
+    refresh_sec: u32,
+    retry_sec: u32,
+    expire_sec: u32,
+    last_attempt_failed: bool = false,
+    last_attempt_ns: ?i64 = null,
+};
+
+fn secondsToNs(seconds: u32) i64 {
+    if (seconds == 0) return 0;
+    // Conservative: cap at i64 max to avoid overflow; zero timers mean
+    // "never due by this clock" rather than wrap-around.
+    const product = @as(i128, seconds) * @as(i128, std.time.ns_per_s);
+    if (product > std.math.maxInt(i64)) return std.math.maxInt(i64);
+    return @intCast(product);
+}
+
+/// Pure RFC 1034/1035 SOA refresh schedule for one secondary zone. Pure
+/// function with no I/O; the runtime drives it on each serve loop tick.
+pub fn refreshDecision(input: RefreshInput) RefreshAction {
+    const last_success = input.last_success_ns orelse return .refresh_due;
+    if (input.now_ns < last_success) return .idle; // clock moved backwards
+    const elapsed = input.now_ns - last_success;
+
+    const refresh_ns = secondsToNs(input.refresh_sec);
+    const retry_ns = secondsToNs(input.retry_sec);
+    const expire_ns = secondsToNs(input.expire_sec);
+
+    // Conservative: an unset (zero) expire means never expire.
+    if (expire_ns != 0 and elapsed >= expire_ns) return .expired;
+
+    if (input.last_attempt_failed) {
+        const attempt = input.last_attempt_ns orelse return .retry_due;
+        if (input.now_ns < attempt) return .idle;
+        if (input.now_ns - attempt >= retry_ns) return .retry_due;
+        return .idle;
+    }
+    if (refresh_ns != 0 and elapsed >= refresh_ns) return .refresh_due;
+    return .idle;
+}
+
+test "refresh decision: never fetched means refresh due" {
+    try std.testing.expectEqual(RefreshAction.refresh_due, refreshDecision(.{ .now_ns = 100, .last_success_ns = null, .refresh_sec = 60, .retry_sec = 30, .expire_sec = 3600 }));
+}
+
+test "refresh decision: refresh interval" {
+    try std.testing.expectEqual(RefreshAction.idle, refreshDecision(.{ .now_ns = 10, .last_success_ns = 0, .refresh_sec = 60, .retry_sec = 30, .expire_sec = 3600 }));
+    try std.testing.expectEqual(RefreshAction.refresh_due, refreshDecision(.{ .now_ns = 60000000000, .last_success_ns = 0, .refresh_sec = 60, .retry_sec = 30, .expire_sec = 3600 }));
+}
+
+test "refresh decision: retry after failure" {
+    try std.testing.expectEqual(RefreshAction.retry_due, refreshDecision(.{ .now_ns = 0, .last_success_ns = 0, .refresh_sec = 60, .retry_sec = 30, .expire_sec = 3600, .last_attempt_failed = true, .last_attempt_ns = null }));
+    try std.testing.expectEqual(RefreshAction.idle, refreshDecision(.{ .now_ns = 10, .last_success_ns = 0, .refresh_sec = 60, .retry_sec = 30, .expire_sec = 3600, .last_attempt_failed = true, .last_attempt_ns = 0 }));
+    try std.testing.expectEqual(RefreshAction.retry_due, refreshDecision(.{ .now_ns = 30000000000, .last_success_ns = 0, .refresh_sec = 60, .retry_sec = 30, .expire_sec = 3600, .last_attempt_failed = true, .last_attempt_ns = 0 }));
+}
+
+test "refresh decision: expired" {
+    try std.testing.expectEqual(RefreshAction.expired, refreshDecision(.{ .now_ns = 3600000000000, .last_success_ns = 0, .refresh_sec = 60, .retry_sec = 30, .expire_sec = 3600 }));
+}
+
+test "refresh decision: clock backwards is idle" {
+    try std.testing.expectEqual(RefreshAction.idle, refreshDecision(.{ .now_ns = -5, .last_success_ns = 0, .refresh_sec = 60, .retry_sec = 30, .expire_sec = 3600 }));
+}
+
+test "refresh decision: zero timers conservative" {
+    try std.testing.expectEqual(RefreshAction.idle, refreshDecision(.{ .now_ns = 100, .last_success_ns = 0, .refresh_sec = 0, .retry_sec = 30, .expire_sec = 0 }));
 }
