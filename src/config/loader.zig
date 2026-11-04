@@ -98,6 +98,12 @@ pub const ServerContext = struct {
     managed: ?*managed_mod.ManagedAnchors = null,
     managed_dir: ?std.Io.Dir = null,
     managed_path: []u8 = &.{},
+    /// RFC 9462 section 4: the PEM trust-anchor file the forwarder's
+    /// TLS/DDR certificate verifies against (`forwarder-ca-file`), with the
+    /// configuration directory it lives in. Moved into the policy by
+    /// `takeRuntime`.
+    forwarder_ca_dir: ?std.Io.Dir = null,
+    forwarder_ca_path: []u8 = &.{},
     /// The RFC 1995 delta journal the operator asked for. Null when the
     /// configuration names no journal file, and the delta log then lives in
     /// memory only.
@@ -241,6 +247,22 @@ pub const ServerContext = struct {
             context.managed = managed;
             context.managed_dir = dir;
             context.managed_path = owned_path;
+        }
+        // RFC 9462 section 4: the DDR client discovers designated
+        // resolvers through a plaintext forwarder, so `ddr-client on`
+        // requires that forwarder and the recursion ACL that lets clients
+        // through it; anything else is a startup refusal.
+        if (context.config.ddr_client) {
+            const forwarder = context.config.forwarder orelse return Error.BadConfiguration;
+            if (forwarder.transport != .udp) return Error.BadConfiguration;
+            if (context.config.recursion_allow.len == 0) return Error.BadConfiguration;
+        }
+        if (context.config.forwarderCaFileText()) |ca_path| {
+            const ca_text = try readReferencedFile(dir, io, ca_path, allocator);
+            defer allocator.free(ca_text);
+            const owned_path = try allocator.dupe(u8, ca_path);
+            context.forwarder_ca_dir = dir;
+            context.forwarder_ca_path = owned_path;
         }
         const now_seconds: u32 = @intCast(@divTrunc(
             std.Io.Clock.real.now(io).nanoseconds,
@@ -421,6 +443,10 @@ pub const ServerContext = struct {
         self.managed_dir = null;
         policy.managed_path = self.managed_path;
         self.managed_path = &.{};
+        policy.forwarder_ca_dir = self.forwarder_ca_dir;
+        self.forwarder_ca_dir = null;
+        policy.forwarder_ca_path = self.forwarder_ca_path;
+        self.forwarder_ca_path = &.{};
         policy.anchors_owned = policy.managed == null;
         if (policy.managed) |managed| managed.liveAnchors(&policy.anchors);
         // RFC 2136: an update is accepted only for a configured zone, with a
@@ -618,6 +644,11 @@ pub const ServerContext = struct {
             self.managed_path = &.{};
         }
         self.managed_dir = null;
+        if (self.forwarder_ca_path.len != 0) {
+            self.allocator.free(self.forwarder_ca_path);
+            self.forwarder_ca_path = &.{};
+        }
+        self.forwarder_ca_dir = null;
     }
 };
 
@@ -1192,6 +1223,79 @@ test "server context carries the TCP idle timeout to the listener and the answer
     try std.testing.expect(listener.tcpLimits().idle_timeout == null);
     try std.testing.expectEqual(@as(u32, 5), listener.tcpIdleTimeout().seconds);
     try std.testing.expectEqual(@as(u16, 50), plain_runtime.answer_policy.tcp_keepalive_timeout);
+}
+
+test "ddr-client on requires a plaintext forwarder and a recursion ACL" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{ .sub_path = "ononly.gdns", .data = "ddr-client on\n" });
+    try std.testing.expectError(Error.BadConfiguration, ServerContext.load(dir.dir, io, "ononly.gdns", std.testing.allocator));
+
+    try dir.dir.writeFile(io, .{ .sub_path = "tls.gdns", .data =
+        \\recursion allow 127.0.0.0/8
+        \\forwarder 127.0.0.1:853 tls dns.example
+        \\ddr-client on
+        \\
+    });
+    try std.testing.expectError(Error.BadConfiguration, ServerContext.load(dir.dir, io, "tls.gdns", std.testing.allocator));
+
+    try dir.dir.writeFile(io, .{ .sub_path = "doh.gdns", .data =
+        \\recursion allow 127.0.0.0/8
+        \\forwarder 127.0.0.1:443 doh dns.example /dns-query
+        \\ddr-client on
+        \\
+    });
+    try std.testing.expectError(Error.BadConfiguration, ServerContext.load(dir.dir, io, "doh.gdns", std.testing.allocator));
+
+    try dir.dir.writeFile(io, .{ .sub_path = "noacl.gdns", .data =
+        \\forwarder 127.0.0.1:53
+        \\ddr-client on
+        \\
+    });
+    try std.testing.expectError(Error.BadConfiguration, ServerContext.load(dir.dir, io, "noacl.gdns", std.testing.allocator));
+
+    try dir.dir.writeFile(io, .{ .sub_path = "ok.gdns", .data =
+        \\recursion allow 127.0.0.0/8
+        \\forwarder 127.0.0.1:53
+        \\ddr-client on
+        \\
+    });
+    var context = try ServerContext.load(dir.dir, io, "ok.gdns", std.testing.allocator);
+    defer context.deinit();
+}
+
+test "forwarder-ca-file must name a confined file that exists" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{ .sub_path = "missing.gdns", .data =
+        \\recursion allow 127.0.0.0/8
+        \\forwarder 127.0.0.1:53
+        \\forwarder-ca-file missing.pem
+        \\
+    });
+    try std.testing.expectError(Error.MissingReferencedFile, ServerContext.load(dir.dir, io, "missing.gdns", std.testing.allocator));
+
+    try dir.dir.writeFile(io, .{ .sub_path = "escape.gdns", .data =
+        \\recursion allow 127.0.0.0/8
+        \\forwarder 127.0.0.1:53
+        \\forwarder-ca-file ../outside.pem
+        \\
+    });
+    try std.testing.expectError(Error.InvalidReferencedPath, ServerContext.load(dir.dir, io, "escape.gdns", std.testing.allocator));
+
+    try dir.dir.writeFile(io, .{ .sub_path = "ca.pem", .data = "bundle-bytes" });
+    try dir.dir.writeFile(io, .{ .sub_path = "good.gdns", .data =
+        \\recursion allow 127.0.0.0/8
+        \\forwarder 127.0.0.1:53
+        \\forwarder-ca-file ca.pem
+        \\
+    });
+    var good = try ServerContext.load(dir.dir, io, "good.gdns", std.testing.allocator);
+    defer good.deinit();
 }
 
 test "a signed zone carries an RRSIG over its ZONEMD RRset" {

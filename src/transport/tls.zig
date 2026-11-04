@@ -14,8 +14,10 @@ const std = @import("std");
 
 pub const dot_port: u16 = 853;
 pub const doh_port: u16 = 443;
+pub const doq_port: u16 = 853;
 pub const dot_alpn = "dot";
 pub const doh_alpn_http11 = "http/1.1";
+pub const doq_alpn = "doq";
 
 pub const Error = error{
     TlsDisabled,
@@ -30,6 +32,8 @@ pub const Transport = enum {
     dot,
     /// DNS over HTTPS, served on the doh port.
     doh,
+    /// DNS over QUIC, served on the doq port.
+    doq,
     /// The strict-TLS zone transfer channel.
     xfr,
 };
@@ -46,10 +50,11 @@ pub fn alpnFor(transport: Transport) []const u8 {
     return switch (transport) {
         .dot, .xfr => dot_alpn,
         .doh => doh_alpn_http11,
+        .doq => doq_alpn,
     };
 }
 
-/// Opt-in gate: dot/doh listeners require the explicit encrypted-dns flag.
+/// Opt-in gate: dot/doh/doq listeners require the explicit encrypted-dns flag.
 pub fn requireEnabled(enabled: bool) Error!void {
     if (!enabled) return Error.TlsDisabled;
 }
@@ -76,6 +81,8 @@ test "each transport names the ALPN token it speaks" {
     try std.testing.expectEqualStrings("dot", alpnFor(.xfr));
     // DoH speaks HTTP/1.1 only, because that is what doh.zig implements.
     try std.testing.expectEqualStrings("http/1.1", alpnFor(.doh));
+    // DoQ speaks the IANA "doq" token (RFC 9250 §4.2).
+    try std.testing.expectEqualStrings("doq", alpnFor(.doq));
 }
 
 test "encrypted listeners require the opt-in flag" {

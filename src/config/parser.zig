@@ -18,7 +18,7 @@ pub const Error = error{
     TooManyItems,
 };
 
-pub const Transport = enum { udp, tcp, dot, doh };
+pub const Transport = enum { udp, tcp, dot, doh, doq };
 
 /// The chain a signed zone publishes: the RFC 4034 NSEC chain or the
 /// RFC 5155 NSEC3 chain.
@@ -442,6 +442,9 @@ pub const Config = struct {
     notifies: List(NotifyTarget) = .{},
     blacklist_zones: List(BlacklistZone) = .{},
     ddr_records: List(DdrRecord) = .{},
+    /// RFC 9461 section 4.2: operator-authorized ports beyond the two
+    /// encrypted-DNS defaults the DDR client may reach.
+    ddr_client_ports: List(u16) = .{},
     root_hints: List(RootHint) = .{},
     root_zone: Text = .{},
     has_root_zone: bool = false,
@@ -487,6 +490,14 @@ pub const Config = struct {
     has_tls_key_file: bool = false,
     encrypted_dns: bool = false,
     has_encrypted_dns: bool = false,
+    /// RFC 9462 section 4: DDR client discovery for the plaintext
+    /// forwarder. Off unless `ddr-client on`.
+    ddr_client: bool = false,
+    has_ddr_client: bool = false,
+    /// Path to the PEM trust-anchor file the forwarder's TLS/DDR
+    /// certificate verifies against; see `forwarder-ca-file` in the loader.
+    forwarder_ca_file: Text = .{},
+    has_forwarder_ca_file: bool = false,
     /// RFC 6303/6761/7793/8375 locally served zones. Default on; `off` is the
     /// RFC 6303 section 3 mechanism to disable them.
     local_zones: bool = true,
@@ -594,6 +605,11 @@ pub const Config = struct {
         return self.tls_key_file.text();
     }
 
+    pub fn forwarderCaFileText(self: *const Config) ?[]const u8 {
+        if (!self.has_forwarder_ca_file) return null;
+        return self.forwarder_ca_file.text();
+    }
+
     pub fn tsigKeyFileText(self: *const Config) ?[]const u8 {
         if (!self.has_tsig_key_file) return null;
         return self.tsig_key_file.text();
@@ -686,6 +702,9 @@ pub const Config = struct {
         if (std.mem.eql(u8, first, "tls-cert-file")) return self.parseTlsCertFile(&tokens);
         if (std.mem.eql(u8, first, "tls-key-file")) return self.parseTlsKeyFile(&tokens);
         if (std.mem.eql(u8, first, "encrypted-dns")) return self.parseEncryptedDns(&tokens);
+        if (std.mem.eql(u8, first, "ddr-client")) return self.parseDdrClient(&tokens);
+        if (std.mem.eql(u8, first, "ddr-client-port")) return self.parseDdrClientPort(&tokens);
+        if (std.mem.eql(u8, first, "forwarder-ca-file")) return self.parseForwarderCaFile(&tokens);
         if (std.mem.eql(u8, first, "local-zones")) return self.parseLocalZones(&tokens);
         if (std.mem.eql(u8, first, "nsid")) return self.parseNsid(&tokens);
         if (std.mem.eql(u8, first, "error-report-agent")) return self.parseErrorReportAgent(&tokens);
@@ -848,7 +867,8 @@ pub const Config = struct {
         try record.target.set(tokens.next() orelse return Error.BadDirective);
         const alpn = tokens.next() orelse return Error.BadDirective;
         if (!(std.mem.eql(u8, alpn, "dot") or std.mem.eql(u8, alpn, "doq") or
-            std.mem.eql(u8, alpn, "h2") or std.mem.eql(u8, alpn, "h3")))
+            std.mem.eql(u8, alpn, "h2") or std.mem.eql(u8, alpn, "h3") or
+            std.mem.eql(u8, alpn, "http/1.1")))
         {
             return Error.BadDirective;
         }
@@ -860,11 +880,11 @@ pub const Config = struct {
             // RFC 9461 section 5: the DoH path is required with an HTTP ALPN
             // and carries the {?dns} variable; a non-HTTP transport carries
             // none.
-            if (!(std.mem.eql(u8, alpn, "h2") or std.mem.eql(u8, alpn, "h3"))) return Error.BadDirective;
+            if (!(std.mem.eql(u8, alpn, "h2") or std.mem.eql(u8, alpn, "h3") or std.mem.eql(u8, alpn, "http/1.1"))) return Error.BadDirective;
             if (std.mem.indexOf(u8, path, "{?dns}") == null) return Error.BadDirective;
             try record.dohpath.set(path);
             record.has_dohpath = true;
-        } else if (std.mem.eql(u8, alpn, "h2") or std.mem.eql(u8, alpn, "h3")) {
+        } else if (std.mem.eql(u8, alpn, "h2") or std.mem.eql(u8, alpn, "h3") or std.mem.eql(u8, alpn, "http/1.1")) {
             return Error.BadDirective;
         }
         try requireNoTrailingTokens(tokens);
@@ -1039,6 +1059,40 @@ pub const Config = struct {
             return Error.BadDirective;
         }
         self.has_encrypted_dns = true;
+    }
+
+    fn parseDdrClient(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        if (self.has_ddr_client) return Error.BadDirective;
+        const value = tokens.next() orelse return Error.BadDirective;
+        try requireNoTrailingTokens(tokens);
+        if (std.mem.eql(u8, value, "on")) {
+            self.ddr_client = true;
+        } else if (std.mem.eql(u8, value, "off")) {
+            self.ddr_client = false;
+        } else {
+            return Error.BadDirective;
+        }
+        self.has_ddr_client = true;
+    }
+
+    fn parseDdrClientPort(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        const text = tokens.next() orelse return Error.BadDirective;
+        try requireNoTrailingTokens(tokens);
+        const port = std.fmt.parseInt(u16, text, 10) catch return Error.BadPort;
+        if (port == 0) return Error.BadPort;
+        for (self.ddr_client_ports.items[0..self.ddr_client_ports.len]) |seen| {
+            if (seen == port) return Error.BadDirective;
+        }
+        try self.ddr_client_ports.append(port);
+    }
+
+    fn parseForwarderCaFile(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        if (self.has_forwarder_ca_file) return Error.BadDirective;
+        const path = tokens.next() orelse return Error.BadDirective;
+        try requireNoTrailingTokens(tokens);
+        if (path.len == 0) return Error.BadDirective;
+        try self.forwarder_ca_file.set(path);
+        self.has_forwarder_ca_file = true;
     }
 
     fn parseLocalZones(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
@@ -1336,6 +1390,7 @@ fn parseTransport(text: []const u8) !Transport {
     if (std.mem.eql(u8, text, "tcp")) return .tcp;
     if (std.mem.eql(u8, text, "dot")) return .dot;
     if (std.mem.eql(u8, text, "doh")) return .doh;
+    if (std.mem.eql(u8, text, "doq")) return .doq;
     return Error.BadDirective;
 }
 
@@ -1430,6 +1485,13 @@ test "config parser rejects unknown and malformed directives" {
     try std.testing.expectError(error.BadPort, Config.parse("listen dns udp 0.0.0.0:notaport\n"));
 }
 
+test "config parser accepts the doq listener transport" {
+    const config = try Config.parse("listen dns doq 127.0.0.1:853\n");
+    try std.testing.expectEqual(@as(usize, 1), config.listeners.len);
+    try std.testing.expectEqual(Transport.doq, config.listeners.items[0].transport);
+    try std.testing.expectEqual(@as(u16, 853), config.listeners.items[0].port);
+}
+
 test "config parser loads strict forwarding policy" {
     const config = try Config.parse(
         \\recursion allow 127.0.0.0/8
@@ -1507,6 +1569,9 @@ test "ddr names the SVCB record for an encrypted endpoint" {
     try std.testing.expectEqual(@as(u16, 853), config.ddr_records.items[0].port);
     try std.testing.expect(config.ddr_records.items[1].has_dohpath);
     try std.testing.expectError(error.BadDirective, Config.parse("ddr dns.example. h2 443\n"));
+    const http = try Config.parse("ddr dns.example. http/1.1 443 /dns-query{?dns}\n");
+    try std.testing.expectEqualStrings("http/1.1", http.ddr_records.items[0].alpnText());
+    try std.testing.expectError(error.BadDirective, Config.parse("ddr dns.example. http/1.1 443\n"));
     try std.testing.expectError(error.BadDirective, Config.parse("ddr dns.example. dot 853 /dns-query{?dns}\n"));
     try std.testing.expectError(error.BadDirective, Config.parse("ddr dns.example. h3 443 /plain\n"));
     try std.testing.expectError(error.BadDirective, Config.parse("ddr dns.example. quic 853\n"));
@@ -2136,4 +2201,40 @@ test "forwarder names a DoH server, its certificate name, and its path" {
 test "a DoH forwarder needs a path that starts at the root" {
     try std.testing.expectError(Error.BadDirective, Config.parse("forwarder 9.9.9.9:443 doh dns.quad9.net\n"));
     try std.testing.expectError(Error.BadDirective, Config.parse("forwarder 9.9.9.9:443 doh dns.quad9.net dns-query\n"));
+}
+
+test "ddr-client takes on and off and nothing else, once" {
+    const config = try Config.parse("ddr-client on\n");
+    try std.testing.expect(config.ddr_client);
+    const off = try Config.parse("ddr-client off\n");
+    try std.testing.expect(!off.ddr_client);
+    const plain = try Config.parse("forwarder 127.0.0.1:53\n");
+    try std.testing.expect(!plain.ddr_client);
+    try std.testing.expectError(Error.BadDirective, Config.parse("ddr-client on\nddr-client off\n"));
+    try std.testing.expectError(Error.BadDirective, Config.parse("ddr-client yes\n"));
+    try std.testing.expectError(Error.BadDirective, Config.parse("ddr-client\n"));
+    try std.testing.expectError(Error.BadDirective, Config.parse("ddr-client on extra\n"));
+    try std.testing.expectError(Error.UnknownDirective, Config.parse("ddrclient on\n"));
+}
+
+test "ddr-client-port authorizes one port, once" {
+    const config = try Config.parse("ddr-client-port 8443\nddr-client-port 1053\n");
+    try std.testing.expectEqual(@as(usize, 2), config.ddr_client_ports.len);
+    try std.testing.expectEqual(@as(u16, 8443), config.ddr_client_ports.items[0]);
+    try std.testing.expectError(Error.BadDirective, Config.parse("ddr-client-port 8443\nddr-client-port 8443\n"));
+    try std.testing.expectError(Error.BadPort, Config.parse("ddr-client-port 0\n"));
+    try std.testing.expectError(Error.BadPort, Config.parse("ddr-client-port 65536\n"));
+    try std.testing.expectError(Error.BadDirective, Config.parse("ddr-client-port\n"));
+    try std.testing.expectError(Error.BadDirective, Config.parse("ddr-client-port 8443 extra\n"));
+    try std.testing.expectError(Error.UnknownDirective, Config.parse("ddr-client-ports 8443\n"));
+}
+
+test "forwarder-ca-file takes one path and nothing else" {
+    const config = try Config.parse("forwarder-ca-file ca.pem\n");
+    try std.testing.expectEqualStrings("ca.pem", config.forwarderCaFileText().?);
+    try std.testing.expect((try Config.parse("forwarder 127.0.0.1:53\n")).forwarderCaFileText() == null);
+    try std.testing.expectError(Error.BadDirective, Config.parse("forwarder-ca-file a.pem\nforwarder-ca-file b.pem\n"));
+    try std.testing.expectError(Error.BadDirective, Config.parse("forwarder-ca-file\n"));
+    try std.testing.expectError(Error.BadDirective, Config.parse("forwarder-ca-file a.pem b.pem\n"));
+    try std.testing.expectError(Error.UnknownDirective, Config.parse("forwarder-ca ca.pem\n"));
 }

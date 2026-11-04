@@ -9,6 +9,7 @@ pub const Counters = struct {
     encode_failures_total: std.atomic.Value(u64) = .init(0),
     dot_queries_total: std.atomic.Value(u64) = .init(0),
     doh_queries_total: std.atomic.Value(u64) = .init(0),
+    doq_queries_total: std.atomic.Value(u64) = .init(0),
     xfr_transfers_total: std.atomic.Value(u64) = .init(0),
     /// Queries received with the reserved Z bit set, which RFC 1035 section
     /// 4.1.1 says must be zero in all queries and responses.
@@ -40,6 +41,8 @@ pub fn formatPrometheus(counters: Counters, writer: *std.Io.Writer) !void {
         \\zimdns_dot_queries_total {d}
         \\# TYPE zimdns_doh_queries_total counter
         \\zimdns_doh_queries_total {d}
+        \\# TYPE zimdns_doq_queries_total counter
+        \\zimdns_doq_queries_total {d}
         \\# TYPE zimdns_xfr_transfers_total counter
         \\zimdns_xfr_transfers_total {d}
         \\# TYPE zimdns_reserved_bit_queries_total counter
@@ -54,6 +57,7 @@ pub fn formatPrometheus(counters: Counters, writer: *std.Io.Writer) !void {
         counters.encode_failures_total.load(.monotonic),
         counters.dot_queries_total.load(.monotonic),
         counters.doh_queries_total.load(.monotonic),
+        counters.doq_queries_total.load(.monotonic),
         counters.xfr_transfers_total.load(.monotonic),
         counters.reserved_bit_queries_total.load(.monotonic),
         counters.ad_bit_queries_total.load(.monotonic),
@@ -86,6 +90,8 @@ test "metrics format emits prometheus counters" {
         \\zimdns_dot_queries_total 0
         \\# TYPE zimdns_doh_queries_total counter
         \\zimdns_doh_queries_total 0
+        \\# TYPE zimdns_doq_queries_total counter
+        \\zimdns_doq_queries_total 0
         \\# TYPE zimdns_xfr_transfers_total counter
         \\zimdns_xfr_transfers_total 0
         \\# TYPE zimdns_reserved_bit_queries_total counter
@@ -110,6 +116,7 @@ test "metrics text is not bounded by a fixed buffer" {
         .encode_failures_total = .init(widest),
         .dot_queries_total = .init(widest),
         .doh_queries_total = .init(widest),
+        .doq_queries_total = .init(widest),
         .xfr_transfers_total = .init(widest),
         .reserved_bit_queries_total = .init(widest),
         .ad_bit_queries_total = .init(widest),

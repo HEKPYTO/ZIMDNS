@@ -29,9 +29,13 @@ pub const transport_tls_client = @import("transport/tls_client.zig");
 pub const transport_doh_client = @import("transport/doh_client.zig");
 pub const transport_dot = @import("transport/dot.zig");
 pub const transport_doh = @import("transport/doh.zig");
+pub const transport_doq = @import("transport/doq.zig");
 /// The pinned TLS dependency, exported so the CLI guard can drive a DoH
 /// exchange over the same client the server side uses.
 pub const tls = @import("tls");
+/// The pinned QUIC dependency, exported so the CLI guard can drive a DoQ
+/// exchange over the same library the server side uses.
+pub const quic = @import("quic");
 pub const transfer_axfr = @import("transfer/axfr.zig");
 pub const transfer_xfr_tls = @import("transfer/xfr_tls.zig");
 pub const blocklist = @import("blocklist.zig");
@@ -40,7 +44,7 @@ pub const local_zone = @import("local_zone.zig");
 pub const zone_zonemd = @import("zone/zonemd.zig");
 pub const zone_signer = @import("zone/signer.zig");
 
-const ServerRunMode = enum { none, udp_once, tcp_once, udp_loop, tcp_loop, dot_loop, doh_loop, xfr_loop };
+const ServerRunMode = enum { none, udp_once, tcp_once, udp_loop, tcp_loop, dot_loop, doh_loop, doq_loop, xfr_loop };
 
 /// The runtime a SIGHUP asks to reload its zone. A signal handler cannot
 /// take user data, so the running server is a process-wide pointer.
@@ -95,6 +99,7 @@ test {
     _ = transport_doh_client;
     _ = transport_dot;
     _ = transport_doh;
+    _ = transport_doq;
     _ = transfer_axfr;
     _ = transfer_xfr_tls;
     _ = cli_query;
@@ -173,6 +178,7 @@ fn printHelp(writer: *std.Io.Writer) !void {
         \\  zimdns server run --config examples/config.gdns --serve-udp --max-requests 2
         \\  zimdns server run --zone-file examples/zones/home.arpa.zone --serve-tcp
         \\  zimdns server run --zone-file examples/zones/home.arpa.zone --serve-doh
+        \\  zimdns server run --zone-file examples/zones/home.arpa.zone --serve-doq
         \\  zimdns query @127.0.0.1 -p 1055 --dnssec signed.example. A
         \\  zimdns query @127.0.0.1 -p 1055 --zoneversion example.com A
         \\  zimdns query @127.0.0.1 -p 1055 --nsid example.com A
@@ -209,7 +215,8 @@ fn printHelp(writer: *std.Io.Writer) !void {
         \\
         \\  --serve-dot serves DNS over TLS (RFC 7858) with the "dot" ALPN
         \\  token, --serve-doh serves DNS over HTTPS (RFC 8484) with the
-        \\  "http/1.1" token, and --serve-xfr serves zone transfers over TLS
+        \\  "http/1.1" token, --serve-doq serves DNS over QUIC (RFC 9250)
+        \\  with the "doq" token, and --serve-xfr serves zone transfers over TLS
         \\  with the "dot" token (RFC 9103 section 7.1): each listener
         \\  terminates the handshake before it speaks DNS, so the port never
         \\  answers in cleartext. They need --enable-encrypted-dns and a
@@ -464,6 +471,8 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
             mode = .dot_loop;
         } else if (std.mem.eql(u8, arg, "--serve-doh")) {
             mode = .doh_loop;
+        } else if (std.mem.eql(u8, arg, "--serve-doq")) {
+            mode = .doq_loop;
         } else if (std.mem.eql(u8, arg, "--serve-xfr")) {
             mode = .xfr_loop;
         } else if (std.mem.eql(u8, arg, "--enable-encrypted-dns")) {
@@ -526,7 +535,7 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
     }
 
     if (mode == .none) {
-        try writer.writeAll("error: server run currently requires --once-udp, --once-tcp, --serve-udp, --serve-tcp, --serve-dot, --serve-doh, or --serve-xfr\n");
+        try writer.writeAll("error: server run currently requires --once-udp, --once-tcp, --serve-udp, --serve-tcp, --serve-dot, --serve-doh, --serve-doq, or --serve-xfr\n");
         try exitUsage(writer);
     }
 
@@ -534,9 +543,11 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
     // bound: a broken identity refuses the run instead of leaving a port
     // open.
     var tls_identity: ?transport_tls_server.Server = null;
+    var encrypted_cert_path: ?[]const u8 = null;
+    var encrypted_key_path: ?[]const u8 = null;
     defer if (tls_identity) |*server| server.deinit();
 
-    if (mode == .dot_loop or mode == .doh_loop or mode == .xfr_loop) {
+    if (mode == .dot_loop or mode == .doh_loop or mode == .doq_loop or mode == .xfr_loop) {
         const cert_path = tls_cert_file orelse (if (server_context) |*context| context.config.tlsCertFileText() else null);
         const key_path = tls_key_file orelse (if (server_context) |*context| context.config.tlsKeyFileText() else null);
         const enabled = encrypted_dns_flag or (if (server_context) |*context| context.config.encrypted_dns else false);
@@ -544,11 +555,14 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
             try writer.writeAll("error: encrypted listeners require --enable-encrypted-dns or 'encrypted-dns on'\n");
             try exitUsage(writer);
         };
+        encrypted_cert_path = cert_path;
+        encrypted_key_path = key_path;
         // Every encrypted transport this build accepts has a listener of its
         // own, so the transport decides the ALPN token the handshake selects.
         const transport: transport_tls.Transport = switch (mode) {
             .dot_loop => .dot,
             .doh_loop => .doh,
+            .doq_loop => .doq,
             .xfr_loop => .xfr,
             else => unreachable,
         };
@@ -575,13 +589,17 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
             try exitUsage(writer);
         };
         // The identity is loaded before the bind, so a certificate or key
-        // that cannot be loaded refuses the run and binds no port.
-        var server: transport_tls_server.Server = undefined;
-        server.init(allocator, io, std.Io.Dir.cwd(), cert_path.?, key_path.?, transport_tls.alpnFor(transport)) catch {
-            try writer.writeAll("error: cannot load the TLS certificate and key\n");
-            try exitUsage(writer);
-        };
-        tls_identity = server;
+        // that cannot be loaded refuses the run and binds no port. DoQ
+        // loads its own identity inside quic-zig from the same two paths,
+        // so it needs the validation above but no TCP TLS server object.
+        if (mode != .doq_loop) {
+            var server: transport_tls_server.Server = undefined;
+            server.init(allocator, io, std.Io.Dir.cwd(), cert_path.?, key_path.?, transport_tls.alpnFor(transport)) catch {
+                try writer.writeAll("error: cannot load the TLS certificate and key\n");
+                try exitUsage(writer);
+            };
+            tls_identity = server;
+        }
     }
 
     var runtime: auth_runtime.Runtime = undefined;
@@ -761,6 +779,21 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
                 try transport_doh.serveDohLoopOnAddress(doh_io, &runtime, &address, &server, max_requests, &counters);
             }
         },
+        .doq_loop => {
+            const cert_path = encrypted_cert_path orelse return error.MissingTlsIdentity;
+            const key_path = encrypted_key_path orelse return error.MissingTlsIdentity;
+            // The DoQ server runs on its own thread with its own event loop,
+            // joined inside serveDoqLoopOnAddress before it returns, so the
+            // runtime outlives every use of it. The counters reach the port,
+            // so the DoQ query counter moves in a metrics run.
+            const doq_counters: ?*metrics.Counters = if (print_metrics) &counters else null;
+            if (configured_address) |*address| {
+                try transport_doq.serveDoqLoopOnAddress(io, &runtime, address, cert_path, key_path, max_requests, doq_counters);
+            } else {
+                var address = defaultListenerAddress(port);
+                try transport_doq.serveDoqLoopOnAddress(io, &runtime, &address, cert_path, key_path, max_requests, doq_counters);
+            }
+        },
         // The strict-TLS transfer channel: the same handshake and the same
         // worker bound as the other encrypted listeners.
         .xfr_loop => {
@@ -791,6 +824,7 @@ fn findListenerAddress(config: *const config_parser.Config, mode: ServerRunMode)
         .tcp_once, .tcp_loop => .tcp,
         .dot_loop, .xfr_loop => .dot,
         .doh_loop => .doh,
+        .doq_loop => .doq,
         .none => return null,
     };
     var index: usize = 0;
@@ -828,6 +862,7 @@ test "configured loop modes use their transport listener endpoint" {
         \\listen dns tcp 127.0.0.1:12054
         \\listen dns dot 127.0.0.1:12055
         \\listen dns doh 127.0.0.1:12056
+        \\listen dns doq 127.0.0.1:12057
         \\
     );
     const expected_udp = try std.Io.net.IpAddress.parse("127.0.0.1", 12053);
@@ -847,6 +882,10 @@ test "configured loop modes use their transport listener endpoint" {
     const expected_doh = try std.Io.net.IpAddress.parse("127.0.0.1", 12056);
     const doh = try findListenerAddress(&config, .doh_loop) orelse return error.TestExpectedEqual;
     try std.testing.expect(doh.eql(&expected_doh));
+
+    const expected_doq = try std.Io.net.IpAddress.parse("127.0.0.1", 12057);
+    const doq = try findListenerAddress(&config, .doq_loop) orelse return error.TestExpectedEqual;
+    try std.testing.expect(doq.eql(&expected_doq));
 }
 
 test "no-config listener default is loopback" {
@@ -861,6 +900,7 @@ test "the encrypted listeners exist and each speaks its own ALPN token" {
     //    byte is written.
     try std.testing.expect(@hasDecl(transport_dot, "serveDotLoopOnAddress"));
     try std.testing.expect(@hasDecl(transport_doh, "serveDohLoopOnAddress"));
+    try std.testing.expect(@hasDecl(transport_doq, "serveDoqLoopOnAddress"));
     try std.testing.expect(@hasDecl(transfer_xfr_tls, "serveXfrLoopOnAddress"));
 
     // 2. The zone-transfer channel speaks "dot", which RFC 9103 section 7.1
@@ -874,6 +914,8 @@ test "the encrypted listeners exist and each speaks its own ALPN token" {
     //    src/transport/doh.zig, not here.
     try std.testing.expectEqualStrings("dot", transport_tls.alpnFor(.dot));
     try std.testing.expectEqualStrings("http/1.1", transport_tls.alpnFor(.doh));
+    try std.testing.expectEqualStrings("doq", transport_tls.alpnFor(.doq));
+    try std.testing.expectEqualStrings("doq", transport_doq.DOQ_ALPN);
 }
 
 fn exitUsage(writer: *std.Io.Writer) !noreturn {

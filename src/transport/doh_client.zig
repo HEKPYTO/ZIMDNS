@@ -62,6 +62,15 @@ pub const Client = struct {
         self.roots_loaded = self.roots.map.count() != 0;
     }
 
+    /// A client whose trust anchors are one PEM bundle inside the caller
+    /// supplied directory: RFC 9462 DDR trust stores resolve through the
+    /// confined configuration directory, never through an absolute path.
+    pub fn initFromCaFile(self: *Client, allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8) !void {
+        self.* = .{ .allocator = allocator, .io = io };
+        try self.roots.addCertsFromFilePath(allocator, io, std.Io.Clock.real.now(io), dir, path);
+        self.roots_loaded = self.roots.map.count() != 0;
+    }
+
     pub fn deinit(self: *Client) void {
         self.roots.deinit(self.allocator);
         self.* = undefined;
@@ -83,6 +92,20 @@ pub const Client = struct {
         query: []const u8,
         response_buffer: []u8,
     ) ![]const u8 {
+        return self.postWithVerification(stream, host, host, path, query, response_buffer);
+    }
+
+    /// One POST whose certificate verification host differs from the SNI
+    /// on the wire. An empty `sni` sends no SNI: RFC 9462 section 6.3.
+    pub fn postWithVerification(
+        self: *Client,
+        stream: std.Io.net.Stream,
+        host: []const u8,
+        sni: []const u8,
+        path: []const u8,
+        query: []const u8,
+        response_buffer: []u8,
+    ) ![]const u8 {
         if (!self.roots_loaded) return Error.TrustStoreEmpty;
         var input_buffer: [tls.input_buffer_len]u8 = undefined;
         var output_buffer: [tls.output_buffer_len]u8 = undefined;
@@ -94,6 +117,7 @@ pub const Client = struct {
             .rng = rng.interface(),
             .now = std.Io.Clock.real.now(self.io),
             .host = host,
+            .sni = sni,
             .root_ca = self.roots,
             .alpn_protocols = &alpn,
         }) catch return Error.HandshakeFailed;
@@ -103,9 +127,16 @@ pub const Client = struct {
         }
 
         var head_buffer: [512]u8 = undefined;
+        // An IPv6 literal is bracketed in the Host authority; the
+        // unbracketed text is only a certificate-verification name.
+        var authority_buffer: [64]u8 = undefined;
+        const authority = if (std.mem.indexOfScalar(u8, host, ':') != null and (host.len == 0 or host[0] != '['))
+            std.fmt.bufPrint(&authority_buffer, "[{s}]", .{host}) catch host
+        else
+            host;
         const head = std.fmt.bufPrint(&head_buffer, "POST {s} HTTP/1.1\r\nHost: {s}\r\nContent-Type: {s}\r\nAccept: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{
             path,
-            host,
+            authority,
             media_type,
             media_type,
             query.len,

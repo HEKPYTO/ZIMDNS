@@ -16,8 +16,13 @@ The resolver also *speaks* DoT as a client: a `forwarder <address>:853 tls
 chain fetches it needs to validate an answer, over one TLS connection
 (`tls_client.zig`). The handshake offers the `dot` ALPN token and accepts a
 server that negotiates none, refuses a server that selects a different token,
-verifies the certificate against the platform trust store and the operator's
-configured name, and never falls back to a cleartext exchange.
+verifies the certificate against the platform trust store (or the
+`forwarder-ca-file` bundle when the operator configured one) and the
+operator's name, and never falls back to a cleartext exchange. Under
+`ddr-client on` the same client is reused for a verified DDR designation: it
+verifies the designating resolver's IP in the certificate's iPAddress SAN
+with no SNI on the wire (RFC 9462 §6.3), and the DoH client gains the same
+`postWithVerification` split for its DDR path.
 
 A `forwarder <address>:443 doh <name> <path>` configuration speaks DoH as a
 client (`doh_client.zig`): one RFC 8484 §4.1 POST per query with
@@ -47,7 +52,25 @@ and then speaks the RFC 7858 framing over that channel, so a secondary can
 pull an AXFR or IXFR over an encrypted session. Section 7.3 recommends port
 853; this build binds 1053 by default, like the other two encrypted
 listeners, and an operator reaches 853 with a `listen dns dot
-<address>:853` line, the same endpoint the DoT port uses. DoQ (RFC 9250) is deferred with a typed error.
+<address>:853` line.
+
+DNS-over-QUIC (RFC 9250) is served: `--serve-doq` terminates the QUIC
+handshake with the `doq` ALPN token (RFC 9250 §4.2) over one UDP port and
+then speaks RFC 9250 §4.1 framing: one client-initiated bidirectional
+stream per query, carrying a single DNS message behind the same two-octet
+length prefix as DNS-over-TCP. A second query on one stream (§4.3) and a
+zero-length frame (§4.1) are protocol errors closed with
+DOQ_PROTOCOL_ERROR (0x2). The IANA-registered DoQ port is 853/UDP; this
+build binds 1053 by default like the other encrypted listeners, and an
+operator reaches 853 with a `listen dns doq <address>:853` line. The port
+never answers non-QUIC traffic: a cleartext DNS/UDP or DNS/TCP frame gets
+no DNS answer.
+
+The QUIC stack is `quic-zig` (<https://github.com/endel/quic-zig>, MIT),
+pinned to v0.6.0 at commit `e7dc3eee3086fc460db37a01535f2c1a4c0f023f` in
+`build.zig.zon` (it brings its own pinned `libxev`); this repository owns
+the operator's identity paths, the `doq` ALPN token, the opt-in gate, and
+the RFC 9250 §4 framing.
 
 The invariants that hold whichever transport is served: no cleartext on a
 port the operator configured as encrypted, ALPN `dot` selected on a

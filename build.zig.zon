@@ -4,11 +4,17 @@
     .fingerprint = 0x3bb9b0b5ba8c89dd,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
-        // DNS-over-TLS server: inic/tls.zig, MIT licensed, pinned to one
-        // commit. The hash is the Zig package hash of that exact archive.
+        // DNS-over-TLS server: vendored tls.zig, MIT licensed (see
+        // third_party/tls/README.md). Path dependency so the patched tree is
+        // what the build uses.
         .tls = .{
-            .url = "https://github.com/ianic/tls.zig/archive/bd22bcb73f423389441a1de80bf031ef1b623cce.tar.gz",
-            .hash = "tls-0.1.0-ER2e0l6qBgDEYo6RBkVZw5UrxOqtI6-OqLwyFJvEr3RK",
+            .path = "third_party/tls",
+        },
+        // DNS-over-QUIC server: endel/quic-zig, MIT licensed, pinned to one
+        // commit. The hash is the Zig package hash of that exact archive.
+        .quic = .{
+            .url = "https://github.com/endel/quic-zig/archive/e7dc3eee3086fc460db37a01535f2c1a4c0f023f.tar.gz",
+            .hash = "quic-0.6.0-TPyrNHx9NgAM-bAqex5ofX5r4czA8uKl72316fgY693v",
         },
     },
     .paths = .{

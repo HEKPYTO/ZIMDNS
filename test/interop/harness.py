@@ -592,6 +592,219 @@ zone "example.test" {{
         proc.terminate()
         proc.wait(timeout=5)
 
+    def check_ddr_doh(self, work, plain_port, doh_port):
+        """RFC 9462: a plaintext resolver designates a DoH endpoint.
+
+        The client can speak HTTP/1.1, so the SVCB record carries that ALPN
+        and a `dohpath`; the plaintext server has no example.test zone, so
+        only a verified DoH upgrade answers.
+        """
+        cert, key = self.make_cert(work)
+        with open(os.path.join(work, "doh2.gdns"), "w") as f:
+            f.write(f"listen dns doh 127.0.0.1:{doh_port}\n")
+            f.write("zone example.test primary authoritative.zone\n")
+            f.write("local-zones off\n")
+        designated = self.spawn(
+            [
+                self.zimdns, "server", "run", "--config", "doh2.gdns",
+                "--serve-doh", "--enable-encrypted-dns",
+                "--tls-cert-file", cert, "--tls-key-file", key,
+            ],
+            cwd=work,
+        )
+        try:
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                if designated.poll() is not None:
+                    out, err = designated.communicate()
+                    raise Failure(f"designated DoH server exited: {out} {err}")
+                probe = self.run(
+                    [
+                        TOOLS["curl"], "-sk", "-o", os.devnull, "-w", "%{http_code}",
+                        f"https://127.0.0.1:{doh_port}/dns-query",
+                    ],
+                    check=False,
+                )
+                if probe.returncode == 0 and probe.stdout.strip():
+                    break
+                time.sleep(0.1)
+            else:
+                raise Failure(f"designated DoH server did not answer:\n{probe.stdout}\n{probe.stderr}")
+
+            with open(os.path.join(work, "plain2.zone"), "w") as f:
+                f.write(
+                    "$ORIGIN plain.invalid.\n$TTL 3600\n"
+                    "@ IN SOA ns.plain.invalid. hostmaster.plain.invalid. 1 3600 900 604800 3600\n"
+                    "@ IN NS ns.plain.invalid.\nns IN A 127.0.0.1\n"
+                )
+            designator = self.start_zimdns(
+                work, plain_port, "--serve-udp", zone=False,
+                extra=(
+                    "zone plain.invalid primary plain2.zone\n"
+                    f"ddr dot.example.test. http/1.1 {doh_port} /dns-query{{?dns}}\n"
+                ),
+            )
+            try:
+                extra = (
+                    "recursion allow 127.0.0.0/8\n"
+                    f"forwarder 127.0.0.1:{plain_port}\n"
+                    "ddr-client on\n"
+                    f"ddr-client-port {doh_port}\n"
+                    f"forwarder-ca-file {os.path.basename(cert)}\n"
+                )
+                resolver_port = self.free_port()
+                resolver = self.start_resolver(work, resolver_port, extra)
+                try:
+                    answer = self.dig(resolver_port, "www.example.test.", "A")
+                    if "192.0.2.80" not in answer:
+                        raise Failure(
+                            f"DDR client did not upgrade to the designated DoH endpoint:\n{answer[:1600]}"
+                        )
+                finally:
+                    self.stop(resolver)
+            finally:
+                self.stop(designator)
+        finally:
+            self.stop(designated)
+
+    def check_ddr(self, work, plain_port, dot_port):
+        """RFC 9462: a plaintext resolver designates a DoT endpoint.
+
+        The designating server publishes `_dns.resolver.arpa` with an SVCB
+        whose TargetName is not the client's IP and whose certificate SAN is
+        that IP. The client must discover it, verify the certificate against
+        the designating resolver IP without sending SNI, and carry the query
+        over DoT; the plaintext server has no example.test zone, so only a
+        successful upgrade answers 192.0.2.80.
+        """
+        cert, key = self.make_cert(work)
+        with open(os.path.join(work, "dot.gdns"), "w") as f:
+            f.write(f"listen dns dot 127.0.0.1:{dot_port}\n")
+            f.write("zone example.test primary authoritative.zone\n")
+            f.write("local-zones off\n")
+        designated = self.spawn(
+            [
+                self.zimdns, "server", "run", "--config", "dot.gdns",
+                "--serve-dot", "--enable-encrypted-dns",
+                "--tls-cert-file", cert, "--tls-key-file", key,
+            ],
+            cwd=work,
+        )
+        try:
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                if designated.poll() is not None:
+                    out, err = designated.communicate()
+                    raise Failure(f"designated DoT server exited: {out} {err}")
+                probe = self.run(
+                    [
+                        TOOLS["kdig"], "@127.0.0.1", "-p", str(dot_port),
+                        "+tls", f"+tls-ca={cert}", "+tls-hostname=localhost",
+                        "+short", "www.example.test.", "A",
+                    ],
+                    check=False,
+                )
+                if "192.0.2.80" in probe.stdout:
+                    break
+                time.sleep(0.1)
+            else:
+                raise Failure(f"designated DoT server did not answer:\n{probe.stdout}\n{probe.stderr}")
+
+            with open(os.path.join(work, "plain.zone"), "w") as f:
+                f.write(
+                    "$ORIGIN plain.invalid.\n$TTL 3600\n"
+                    "@ IN SOA ns.plain.invalid. hostmaster.plain.invalid. 1 3600 900 604800 3600\n"
+                    "@ IN NS ns.plain.invalid.\nns IN A 127.0.0.1\n"
+                )
+            designator = self.start_zimdns(
+                work, plain_port, "--serve-udp", zone=False,
+                extra=(
+                    "zone plain.invalid primary plain.zone\n"
+                    f"ddr dot.example.test. dot {dot_port}\n"
+                ),
+            )
+            try:
+                extra = (
+                    "recursion allow 127.0.0.0/8\n"
+                    f"forwarder 127.0.0.1:{plain_port}\n"
+                    "ddr-client on\n"
+                    f"ddr-client-port {dot_port}\n"
+                    f"forwarder-ca-file {os.path.basename(cert)}\n"
+                )
+                resolver_port = self.free_port()
+                resolver = self.start_resolver(work, resolver_port, extra)
+                try:
+                    answer = self.dig(resolver_port, "www.example.test.", "A")
+                    if "192.0.2.80" not in answer:
+                        raise Failure(
+                            f"DDR client did not upgrade to the designated DoT endpoint:\n{answer[:1600]}"
+                        )
+                finally:
+                    self.stop(resolver)
+            finally:
+                self.stop(designator)
+        finally:
+            self.stop(designated)
+
+    def check_doq(self, work, port):
+        cert, key = self.make_cert(work)
+        with open(os.path.join(work, "doq.gdns"), "w") as f:
+            f.write(f"listen dns doq 127.0.0.1:{port}\n")
+            f.write("zone example.test primary authoritative.zone\n")
+            f.write("local-zones off\n")
+        proc = self.spawn(
+            [
+                self.zimdns, "server", "run", "--config", "doq.gdns",
+                "--serve-doq", "--enable-encrypted-dns",
+                "--tls-cert-file", cert, "--tls-key-file", key,
+            ],
+            cwd=work,
+        )
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                out, err = proc.communicate()
+                raise Failure(f"DoQ server exited: {out} {err}")
+            result = self.run(
+                [
+                    TOOLS["kdig"], "@127.0.0.1", "-p", str(port),
+                    "+quic", f"+tls-ca={cert}", "+tls-hostname=localhost",
+                    "+short", "www.example.test.", "A",
+                ],
+                check=False,
+            )
+            if "192.0.2.80" in result.stdout:
+                break
+            time.sleep(0.1)
+        else:
+            raise Failure(f"kdig did not get a DoQ answer:\n{result.stdout}\n{result.stderr}")
+
+        # The same port must not answer cleartext DNS over TCP or UDP.
+        for transport, options in (("TCP", ["+tcp"]), ("UDP", [])):
+            cleartext = self.run(
+                [TOOLS["kdig"], "@127.0.0.1", "-p", str(port), "+timeout=2", "+retry=1"]
+                + options
+                + ["www.example.test.", "A"],
+                check=False,
+                timeout=8,
+            )
+            if "192.0.2.80" in cleartext.stdout:
+                raise Failure(f"the DoQ port answered cleartext DNS over {transport}")
+
+        # The DoQ listener is query-only: a transfer question on it is refused.
+        refused = self.run(
+            [
+                TOOLS["kdig"], "@127.0.0.1", "-p", str(port),
+                "+quic", f"+tls-ca={cert}", "+tls-hostname=localhost",
+                "example.test.", "AXFR", "+noall", "+answer",
+            ],
+            check=False,
+        )
+        if "REFUSED" not in refused.stderr and "SOA" in refused.stdout:
+            raise Failure(f"DoQ answered an AXFR instead of refusing it:\n{refused.stdout}")
+        proc.terminate()
+        proc.wait(timeout=5)
+
         # The strict-TLS transfer listener is the transfer channel; it serves
         # the same zone over TLS, and an outside checker must accept it.
         xfr_port = self.free_port()
@@ -845,6 +1058,32 @@ zone "example.test" {{
             doh_port = self.free_port()
             self.check("external client: curl DoH GET and POST", lambda: self.check_doh(doh_work, doh_port))
             shutil.rmtree(doh_work, ignore_errors=True)
+
+            ddr_work = self.make_workdir()
+            ddr_plain = self.free_port()
+            ddr_dot = self.free_port()
+            self.check(
+                "external client: RFC 9462 DDR upgrade to DoT",
+                lambda: self.check_ddr(ddr_work, ddr_plain, ddr_dot),
+            )
+            self.cleanup()
+            shutil.rmtree(ddr_work, ignore_errors=True)
+
+            ddr_doh_work = self.make_workdir()
+            ddr_doh_plain = self.free_port()
+            ddr_doh_port = self.free_port()
+            self.check(
+                "external client: RFC 9462 DDR upgrade to DoH",
+                lambda: self.check_ddr_doh(ddr_doh_work, ddr_doh_plain, ddr_doh_port),
+            )
+            self.cleanup()
+            shutil.rmtree(ddr_doh_work, ignore_errors=True)
+
+            doq_work = self.make_workdir()
+            doq_port = self.free_port()
+            self.check("external client: kdig DoQ", lambda: self.check_doq(doq_work, doq_port))
+            self.cleanup()
+            shutil.rmtree(doq_work, ignore_errors=True)
         finally:
             self.cleanup()
             shutil.rmtree(work, ignore_errors=True)

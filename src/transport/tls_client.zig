@@ -51,6 +51,15 @@ pub const Client = struct {
         self.roots_loaded = self.roots.map.count() != 0;
     }
 
+    /// A client whose trust anchors are one PEM bundle inside the caller
+    /// supplied directory: RFC 9462 DDR trust stores resolve through the
+    /// confined configuration directory, never through an absolute path.
+    pub fn initFromCaFile(self: *Client, allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8) !void {
+        self.* = .{ .allocator = allocator, .io = io };
+        try self.roots.addCertsFromFilePath(allocator, io, std.Io.Clock.real.now(io), dir, path);
+        self.roots_loaded = self.roots.map.count() != 0;
+    }
+
     pub fn deinit(self: *Client) void {
         self.roots.deinit(self.allocator);
         self.* = undefined;
@@ -72,6 +81,21 @@ pub const Client = struct {
         request: []const u8,
         response_buffer: []u8,
     ) ![]const u8 {
+        return self.exchangeWithVerification(stream, host, host, request, response_buffer);
+    }
+
+    /// One exchange whose certificate verification host differs from the SNI
+    /// sent on the wire. An empty `sni` sends no SNI at all: that is the RFC
+    /// 9462 section 6.3 case, where a resolver verifies an IP SAN without
+    /// offering an IP-literal or `resolver.arpa` SNI.
+    pub fn exchangeWithVerification(
+        self: *Client,
+        stream: std.Io.net.Stream,
+        verify_host: []const u8,
+        sni: []const u8,
+        request: []const u8,
+        response_buffer: []u8,
+    ) ![]const u8 {
         if (!self.roots_loaded) return Error.TrustStoreEmpty;
         if (request.len == 0 or request.len > max_frame_len) return Error.FrameTooLarge;
 
@@ -84,7 +108,8 @@ pub const Client = struct {
         var connection = tls.client(&reader.interface, &writer.interface, .{
             .rng = rng.interface(),
             .now = std.Io.Clock.real.now(self.io),
-            .host = host,
+            .host = verify_host,
+            .sni = sni,
             .root_ca = self.roots,
             .alpn_protocols = &alpn,
         }) catch return Error.HandshakeFailed;
@@ -218,4 +243,65 @@ test "RFC 7858 section 3.3: a DoT client frames a DNS message over the dot ALPN"
     try std.testing.expectEqual(query_bytes[3], response_bytes[3]);
     try std.testing.expectEqualSlices(u8, query_bytes[4..], response_bytes[4..]);
     try std.testing.expect(args.answered);
+}
+
+test "RFC 9462 section 6.3: a client verifies an IP SAN without sending SNI" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "cert.pem", .data = tls_server.test_identity_ip.cert_pem });
+    try tmp.dir.writeFile(io, .{ .sub_path = "key.pem", .data = tls_server.test_identity_ip.key_pem });
+    var server: tls_server.Server = undefined;
+    try server.init(allocator, io, tmp.dir, "cert.pem", "key.pem", dot_alpn);
+    defer server.deinit();
+
+    var listen_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var listener = try std.Io.net.IpAddress.listen(&listen_address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer listener.deinit(io);
+    const bound = listener.socket.address;
+
+    var args = ServeArgs{ .io = io, .listener = &listener, .server = &server };
+    var reject_args = ServeArgs{ .io = io, .listener = &listener, .server = &server };
+    const thread = try std.Thread.spawn(.{}, serveOne, .{&args});
+    defer thread.join();
+    const reject_thread = try std.Thread.spawn(.{}, serveOne, .{&reject_args});
+    defer reject_thread.join();
+
+    var cert_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const cert_len = try tmp.dir.realPathFile(io, "cert.pem", &cert_path_buffer);
+    var client: Client = undefined;
+    try Client.initFromCertFile(&client, allocator, io, cert_path_buffer[0..cert_len]);
+    defer client.deinit();
+
+    var stream = try std.Io.net.IpAddress.connect(&bound, io, .{ .mode = .stream, .protocol = .tcp, .timeout = .none });
+    defer stream.close(io);
+
+    var query: [512]u8 = undefined;
+    var question_arena = std.heap.ArenaAllocator.init(allocator);
+    defer question_arena.deinit();
+    const built = dns_message.Message{
+        .allocator = question_arena.allocator(),
+        .header = .{ .id = 0x4343, .question_count = 1, .recursion_desired = true },
+        .question = .{ .name = try dns_name.Name.fromText("example.com."), .qtype = .A, .qclass = .IN },
+        .answers = try dns_message.RecordSection.init(question_arena.allocator(), 0),
+        .authorities = try dns_message.RecordSection.init(question_arena.allocator(), 0),
+        .additionals = try dns_message.RecordSection.init(question_arena.allocator(), 0),
+    };
+    var writer = dns_writer.Writer.init(&query);
+    try built.encode(&writer);
+    const query_bytes = writer.written();
+
+    var response_buffer: [512]u8 = undefined;
+    const response_bytes = try client.exchangeWithVerification(stream, "127.0.0.1", "", query_bytes, &response_buffer);
+    const response = try dns_message.Message.parse(question_arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@as(u16, 0x4343), response.header.id);
+    try std.testing.expect(response.header.qr);
+    try std.testing.expect(args.answered);
+
+    var reject_stream = try std.Io.net.IpAddress.connect(&bound, io, .{ .mode = .stream, .protocol = .tcp, .timeout = .none });
+    defer reject_stream.close(io);
+    var reject_response: [512]u8 = undefined;
+    try std.testing.expectError(Error.HandshakeFailed, client.exchangeWithVerification(reject_stream, "127.0.0.2", "", query_bytes, &reject_response));
 }

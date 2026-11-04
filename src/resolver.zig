@@ -99,6 +99,21 @@ const UpstreamReport = struct {
     ede_code: u16,
 };
 
+/// RFC 9461 section 4: the DDR discovery name and the SVCB type it is
+/// queried with.
+const DDR_DISCOVERY_NAME = "_dns.resolver.arpa.";
+/// RFC 9462 section 6.3: the discovery response bound.
+pub const DDR_MAX_RESPONSE_LEN: usize = 1232;
+/// RFC 9462 section 4: a failed discovery is retried no sooner than one
+/// second and no later than one hour after the attempt; with no SVCB
+/// answer the retry is due in one hour.
+const DDR_MIN_RETRY_SECONDS: u32 = 1;
+const DDR_MAX_RETRY_SECONDS: u32 = 60 * 60;
+/// RFC 7858 section 3.1: the default DoT port of a designation.
+const DDR_DOT_DEFAULT_PORT: u16 = 853;
+/// RFC 8484 section 4.1: the default DoH port of a designation.
+const DDR_DOH_DEFAULT_PORT: u16 = 443;
+
 /// RFC 8914 EXTRA-TEXT purpose string for a locally generated EDE INFO-CODE.
 pub fn edeText(code: u16) []const u8 {
     return switch (code) {
@@ -189,6 +204,26 @@ pub const Policy = struct {
     forwarder_doh_path: [256]u8 = undefined,
     forwarder_doh_path_len: usize = 0,
 
+    /// RFC 9462 section 4: DDR client discovery for the plaintext
+    /// forwarder. Off unless `ddr-client on`.
+    ddr_client: bool = false,
+    /// RFC 9461 section 4.2: the operator-authorized ports beyond 443/853
+    /// the DDR client may reach.
+    ddr_extra_ports: [8]u16 = undefined,
+    ddr_extra_ports_len: usize = 0,
+    /// RFC 9462 section 6.3: the forwarder's encrypted endpoint must not
+    /// carry SNI (the designated resolver verifies an IP SAN without
+    /// offering an IP-literal or `resolver.arpa` SNI).
+    forwarder_no_sni: bool = false,
+    /// RFC 9462 section 4: the PEM trust-anchor file the forwarder's
+    /// TLS/DDR certificate verifies against (`forwarder-ca-file`), with
+    /// the configuration directory it lives in.
+    forwarder_ca_dir: ?std.Io.Dir = null,
+    forwarder_ca_path: []u8 = &.{},
+    /// RFC 9462 section 4: when the next discovery attempt is due
+    /// (unix seconds); zero means due now.
+    ddr_next_attempt: i64 = 0,
+
     /// RFC 4035 section 5.2 trust anchors. Empty unless `trust-anchor-file`
     /// named one, so a forwarder with no configured anchor validates nothing
     /// and never sets AD. Owned here because the Policy is copied into the
@@ -247,6 +282,10 @@ pub const Policy = struct {
             policy.dns64_excluded.items[index] = value.dns64_excluded.items[index];
         }
         policy.dns64_excluded.len = value.dns64_excluded.len;
+        policy.ddr_client = value.ddr_client;
+        if (value.ddr_client_ports.len > policy.ddr_extra_ports.len) return error.TooManyItems;
+        @memcpy(policy.ddr_extra_ports[0..value.ddr_client_ports.len], value.ddr_client_ports.items[0..value.ddr_client_ports.len]);
+        policy.ddr_extra_ports_len = value.ddr_client_ports.len;
         if (value.minimum_failure_cache_time) |seconds| policy.failure_cache_seconds = seconds;
         if (value.deny_ports.len > policy.deny_ports.len) return error.TooManyItems;
         index = 0;
@@ -1596,6 +1635,11 @@ pub const Resolver = struct {
             self.policy.managed_path = &.{};
         }
         self.policy.managed_dir = null;
+        if (self.policy.forwarder_ca_path.len != 0) {
+            self.allocator.free(self.policy.forwarder_ca_path);
+            self.policy.forwarder_ca_path = &.{};
+        }
+        self.policy.forwarder_ca_dir = null;
         if (self.tls_ready) self.tls_client_state.deinit();
         if (self.doh_ready) self.doh_client_state.deinit();
         for (self.chain_entries[0..self.chain_len]) |entry| self.allocator.free(entry.records);
@@ -2758,6 +2802,14 @@ pub const Resolver = struct {
         // RFC 7858 section 3.1 and RFC 8484 section 4.1: an encrypted
         // forwarder carries every upstream query over its channel; there is
         // no cleartext fallback.
+        // RFC 9462 section 4: DDR client discovery for the plaintext
+        // forwarder runs before the first forwarded query, and again only
+        // after a failed discovery's retry interval. A verified designation
+        // carries the current query over the encrypted endpoint and
+        // switches every later query with it.
+        if (try self.discoverDdr(query_bytes, query, scope)) |verified| {
+            return .{ .response = verified, .scope = scope };
+        }
         if (self.policy.forwarder_tls) {
             return .{ .response = try self.queryUpstreamTls(query_bytes, query, scope), .scope = scope };
         }
@@ -2800,15 +2852,15 @@ pub const Resolver = struct {
         @memcpy(query_buffer[0..2], &randomized_id);
         const expected_id = std.mem.readInt(u16, &randomized_id, .big);
 
-        if (!self.tls_ready) {
-            try self.tls_client_state.init(self.allocator, self.io);
-            self.tls_ready = true;
-        }
+        try self.ensureTlsClient();
         var stream = try self.dialTcp(upstream);
         defer stream.close(self.io);
         setTcpIoTimeout(stream);
+        // RFC 9462 section 6.3: a DDR-designated endpoint verifies the
+        // iPAddress SAN without an IP-literal or `resolver.arpa` SNI.
+        const sni = if (self.policy.forwarder_no_sni) "" else host;
         var response_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
-        const response_bytes = self.tls_client_state.exchange(stream, host, query_buffer[0..upstream_query.len], &response_buffer) catch |err| switch (err) {
+        const response_bytes = self.tls_client_state.exchangeWithVerification(stream, host, sni, query_buffer[0..upstream_query.len], &response_buffer) catch |err| switch (err) {
             tls_client.Error.FrameTooLarge, tls_client.Error.HandshakeFailed => return Error.UpstreamFailure,
             tls_client.Error.BadFrame => return Error.BadUpstreamResponse,
             // RFC 7858 section 3.1: without a verified certificate for the
@@ -2841,15 +2893,15 @@ pub const Resolver = struct {
         @memcpy(query_buffer[0..2], &randomized_id);
         const expected_id = std.mem.readInt(u16, &randomized_id, .big);
 
-        if (!self.doh_ready) {
-            try self.doh_client_state.init(self.allocator, self.io);
-            self.doh_ready = true;
-        }
+        try self.ensureDohClient();
         var stream = try self.dialTcp(upstream);
         defer stream.close(self.io);
         setTcpIoTimeout(stream);
+        // RFC 9462 section 6.3: a DDR-designated endpoint verifies the
+        // iPAddress SAN without an IP-literal or `resolver.arpa` SNI.
+        const sni = if (self.policy.forwarder_no_sni) "" else host;
         var response_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
-        const body = self.doh_client_state.post(stream, host, path, query_buffer[0..upstream_query.len], &response_buffer) catch |err| switch (err) {
+        const body = self.doh_client_state.postWithVerification(stream, host, sni, path, query_buffer[0..upstream_query.len], &response_buffer) catch |err| switch (err) {
             doh_client.Error.BadStatus,
             doh_client.Error.BadHeaders,
             doh_client.Error.BadContentType,
@@ -3114,6 +3166,441 @@ pub const Resolver = struct {
             defer primed.deinit();
             if (self.adoptRootServers(primed, now)) return;
         }
+    }
+
+    /// RFC 9462 section 4: DDR discovery for one due period, returning
+    /// the verified answer to the query that triggered it, or null to keep
+    /// the plaintext forwarder. A designation is adopted only when the
+    /// designated endpoint answers over its encrypted channel with a
+    /// certificate whose iPAddress SAN carries this resolver's IP.
+    fn discoverDdr(self: *Resolver, query_bytes: []const u8, query: dns_message.Message, scope: ?EcsScope) !?dns_message.Message {
+        if (!self.policy.ddr_client) return null;
+        if (self.policy.forwarder_tls or self.policy.forwarder_doh) return null;
+        const upstream = self.upstream orelse return null;
+        const now: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(self.io).nanoseconds, std.time.ns_per_s));
+        if (now < self.policy.ddr_next_attempt) return null;
+
+        var response = self.discoveryExchange(upstream) catch {
+            self.policy.ddr_next_attempt = now + DDR_MAX_RETRY_SECONDS;
+            return null;
+        };
+        defer response.deinit();
+
+        const designation = Resolver.selectDdrDesignation(response.answers.slice(), self.policy.ddr_extra_ports[0..self.policy.ddr_extra_ports_len]);
+        if (designation == null) {
+            self.policy.ddr_next_attempt = now + Resolver.ddrRetrySeconds(discTtl(response));
+            return null;
+        }
+        const chosen = designation.?;
+
+        const verified = self.verifiedDdrExchange(upstream, chosen, query_bytes, query, scope) catch {
+            self.policy.ddr_next_attempt = now + Resolver.ddrRetrySeconds(discTtl(response));
+            return null;
+        };
+
+        self.applyDdrDesignation(upstream, chosen);
+        return verified;
+    }
+
+    /// One DDR discovery exchange over the plaintext resolver, bounded to
+    /// the 1232-octet discovery response. The exchange never re-enters
+    /// `queryUpstream`, so the discovery query itself is never discovered.
+    fn discoveryExchange(self: *Resolver, upstream: std.Io.net.IpAddress) !dns_message.Message {
+        const discovery_name = dns_name.Name.fromText(DDR_DISCOVERY_NAME) catch return Error.UpstreamFailure;
+        var request = dns_message.Message{
+            .allocator = self.allocator,
+            .header = .{ .id = 0, .question_count = 1, .recursion_desired = true },
+            .question = .{ .name = discovery_name, .qtype = .SVCB, .qclass = .IN },
+            .answers = dns_message.RecordSection.init(self.allocator, 0) catch return Error.UpstreamFailure,
+            .authorities = dns_message.RecordSection.init(self.allocator, 0) catch return Error.UpstreamFailure,
+            .additionals = dns_message.RecordSection.init(self.allocator, 0) catch return Error.UpstreamFailure,
+            .edns = .{
+                .udp_payload_size = DDR_MAX_RESPONSE_LEN,
+                .extended_rcode = 0,
+                .version = dns_message.EDNS_VERSION,
+                .dnssec_ok = false,
+            },
+        };
+        defer request.deinit();
+        var id_bytes: [2]u8 = undefined;
+        self.io.randomSecure(&id_bytes) catch return Error.UpstreamFailure;
+        request.header.id = std.mem.readInt(u16, &id_bytes, .big);
+        try appendOpt(&request, .{
+            .udp_payload_size = DDR_MAX_RESPONSE_LEN,
+            .extended_rcode = 0,
+            .version = dns_message.EDNS_VERSION,
+            .dnssec_ok = false,
+        });
+        const now: u32 = @intCast(@divTrunc(std.Io.Clock.real.now(self.io).nanoseconds, std.time.ns_per_s));
+        const cookie = try self.outgoingCookie(upstream, now);
+        if (cookie.len != 0) try appendOption(&request, COOKIE_OPTION_CODE, cookie);
+        var bytes: [512]u8 = undefined;
+        var writer = dns_writer.Writer.init(&bytes);
+        request.encode(&writer) catch return Error.UpstreamFailure;
+        const expected_id = request.header.id;
+
+        var socket = try self.bindSourceSocket(upstream);
+        defer socket.close(self.io);
+        socket.send(self.io, &upstream, writer.written()) catch return Error.UpstreamFailure;
+        var response_buffer: [DDR_MAX_RESPONSE_LEN]u8 = undefined;
+        var truncated = false;
+        while (true) {
+            const incoming = socket.receiveTimeout(self.io, &response_buffer, UDP_TIMEOUT) catch break;
+            if (!incoming.from.eql(&upstream)) continue;
+            switch (classifyUpstreamPacket(self.allocator, request, expected_id, incoming.data, null, cookie[0..8].*)) {
+                .ignore => continue,
+                .truncated => truncated = true,
+                .ready => |message| return message,
+            }
+            break;
+        }
+        if (!truncated) return Error.UpstreamFailure;
+        return self.discoveryTcp(upstream, writer.written(), request, expected_id);
+    }
+
+    /// The TCP half of the DDR discovery exchange, for a truncated UDP
+    /// answer. The frame is capped at the discovery response bound before
+    /// the body is read.
+    fn discoveryTcp(self: *Resolver, upstream: std.Io.net.IpAddress, query_bytes: []const u8, query: dns_message.Message, expected_id: u16) !dns_message.Message {
+        var stream = try self.dialTcp(upstream);
+        defer stream.close(self.io);
+        const frame_deadline = tcp_deadline.deadlineFromTimeout(self.io, TCP_TIMEOUT) orelse return Error.UpstreamFailure;
+        setTcpIoTimeout(stream);
+
+        var prefix: [2]u8 = undefined;
+        if (query_bytes.len == 0 or query_bytes.len > MAX_UPSTREAM_MESSAGE) return Error.UpstreamFailure;
+        std.mem.writeInt(u16, &prefix, @intCast(query_bytes.len), .big);
+        tcp_deadline.writeExact(stream.socket.handle, self.io, &prefix, frame_deadline) catch return Error.UpstreamFailure;
+        tcp_deadline.writeExact(stream.socket.handle, self.io, query_bytes, frame_deadline) catch return Error.UpstreamFailure;
+
+        var len_bytes: [2]u8 = undefined;
+        tcp_deadline.readExact(stream.socket.handle, self.io, &len_bytes, frame_deadline) catch return Error.UpstreamFailure;
+        const len = std.mem.readInt(u16, &len_bytes, .big);
+        if (len == 0 or len > DDR_MAX_RESPONSE_LEN) return Error.BadUpstreamResponse;
+        var body: [DDR_MAX_RESPONSE_LEN]u8 = undefined;
+        tcp_deadline.readExact(stream.socket.handle, self.io, body[0..len], frame_deadline) catch return Error.UpstreamFailure;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const response = dns_message.Message.parse(arena.allocator(), body[0..len]) catch return Error.BadUpstreamResponse;
+        if (!validUpstreamResponse(response, query, expected_id, null)) return Error.BadUpstreamResponse;
+        return cloneMessage(self.allocator, response);
+    }
+
+    /// The verified exchange that adopts a DDR designation: the current
+    /// query over the designated endpoint with the original IP as the
+    /// certificate name and no SNI on the wire. Only a verified answer
+    /// switches the resolver; anything else stays on plaintext.
+    fn verifiedDdrExchange(self: *Resolver, upstream: std.Io.net.IpAddress, designation: DdrDesignation, query_bytes: []const u8, query: dns_message.Message, scope: ?EcsScope) !dns_message.Message {
+        var ip_buffer: [64]u8 = undefined;
+        const ip_text = try formatIpAddress(upstream, &ip_buffer);
+        var target = upstream;
+        switch (target) {
+            .ip4 => |*ip4| ip4.port = designation.port,
+            .ip6 => |*ip6| ip6.port = designation.port,
+        }
+        var query_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
+        if (query_bytes.len < 2 or query_bytes.len > query_buffer.len) return Error.UpstreamFailure;
+        var randomized_id: [2]u8 = undefined;
+        self.io.randomSecure(&randomized_id) catch return Error.UpstreamFailure;
+        const now: u32 = @intCast(@divTrunc(std.Io.Clock.real.now(self.io).nanoseconds, std.time.ns_per_s));
+        const upstream_query = try buildUpstreamQuery(query_bytes, query, &query_buffer, &self.policy.anchors, scope, true, try self.outgoingCookie(target, now));
+        @memcpy(query_buffer[0..2], &randomized_id);
+        const expected_id = std.mem.readInt(u16, &randomized_id, .big);
+        const request_bytes = query_buffer[0..upstream_query.len];
+
+        if (designation.is_doh) {
+            try self.ensureDohClient();
+            var stream = try self.dialTcp(target);
+            defer stream.close(self.io);
+            setTcpIoTimeout(stream);
+            var response_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
+            const body = self.doh_client_state.postWithVerification(stream, ip_text, "", designation.doh_path[0..designation.doh_path_len], request_bytes, &response_buffer) catch |err| switch (err) {
+                doh_client.Error.BadStatus,
+                doh_client.Error.BadHeaders,
+                doh_client.Error.BadContentType,
+                doh_client.Error.BadContentLength,
+                doh_client.Error.BadChunk,
+                doh_client.Error.ResponseTooLarge,
+                doh_client.Error.TruncatedBody,
+                => return Error.BadUpstreamResponse,
+                else => return Error.UpstreamFailure,
+            };
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const response = dns_message.Message.parse(arena.allocator(), body) catch return Error.BadUpstreamResponse;
+            if (!validUpstreamResponse(response, query, expected_id, scope)) return Error.BadUpstreamResponse;
+            if (findOption(response, COOKIE_OPTION_CODE)) |option| {
+                if (option.len >= self.client_cookie.len and !std.mem.eql(u8, option[0..8], &self.client_cookie)) return Error.BadUpstreamResponse;
+            }
+            self.learnServerCookie(target, response, now);
+            return cloneMessage(self.allocator, response);
+        }
+
+        try self.ensureTlsClient();
+        var stream = try self.dialTcp(target);
+        defer stream.close(self.io);
+        setTcpIoTimeout(stream);
+        var response_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
+        const response_bytes = self.tls_client_state.exchangeWithVerification(stream, ip_text, "", request_bytes, &response_buffer) catch |err| switch (err) {
+            tls_client.Error.FrameTooLarge, tls_client.Error.HandshakeFailed => return Error.UpstreamFailure,
+            tls_client.Error.BadFrame => return Error.BadUpstreamResponse,
+            else => return Error.UpstreamFailure,
+        };
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const response = dns_message.Message.parse(arena.allocator(), response_bytes) catch return Error.BadUpstreamResponse;
+        if (!validUpstreamResponse(response, query, expected_id, scope)) return Error.BadUpstreamResponse;
+        self.learnServerCookie(target, response, now);
+        return cloneMessage(self.allocator, response);
+    }
+
+    /// Loads the DoT client's trust anchors exactly once: the operator's
+    /// confined bundle when `forwarder-ca-file` named one, the platform
+    /// store otherwise.
+    fn ensureTlsClient(self: *Resolver) !void {
+        if (self.tls_ready) return;
+        if (self.policy.forwarder_ca_dir) |dir| {
+            try self.tls_client_state.initFromCaFile(self.allocator, self.io, dir, self.policy.forwarder_ca_path);
+        } else {
+            try self.tls_client_state.init(self.allocator, self.io);
+        }
+        self.tls_ready = true;
+    }
+
+    /// The DoH counterpart of `ensureTlsClient`.
+    fn ensureDohClient(self: *Resolver) !void {
+        if (self.doh_ready) return;
+        if (self.policy.forwarder_ca_dir) |dir| {
+            try self.doh_client_state.initFromCaFile(self.allocator, self.io, dir, self.policy.forwarder_ca_path);
+        } else {
+            try self.doh_client_state.init(self.allocator, self.io);
+        }
+        self.doh_ready = true;
+    }
+
+    /// The verified designation takes over the resolver: the designated
+    /// endpoint becomes the upstream for this and every later query, with
+    /// no SNI on the wire and the original IP as the certificate name.
+    fn applyDdrDesignation(self: *Resolver, upstream: std.Io.net.IpAddress, designation: DdrDesignation) void {
+        var ip_buffer: [64]u8 = undefined;
+        const ip_text = formatIpAddress(upstream, &ip_buffer) catch return;
+        if (ip_text.len > self.policy.forwarder_tls_name.len) return;
+        @memcpy(self.policy.forwarder_tls_name[0..ip_text.len], ip_text);
+        self.policy.forwarder_tls_name_len = ip_text.len;
+        self.policy.forwarder_tls = !designation.is_doh;
+        self.policy.forwarder_doh = designation.is_doh;
+        if (designation.is_doh) {
+            @memcpy(self.policy.forwarder_doh_path[0..designation.doh_path_len], designation.doh_path[0..designation.doh_path_len]);
+            self.policy.forwarder_doh_path_len = designation.doh_path_len;
+        }
+        self.policy.forwarder_no_sni = true;
+        var target = upstream;
+        switch (target) {
+            .ip4 => |*ip4| ip4.port = designation.port,
+            .ip6 => |*ip6| ip6.port = designation.port,
+        }
+        self.upstream = target;
+        if (self.policy.forwarder) |*endpoint| endpoint.address = target;
+    }
+
+    /// One DDR designation a discovery answer names: a supported encrypted
+    /// endpoint at the plaintext resolver's IP.
+    const DdrDesignation = struct {
+        priority: u16,
+        target: dns_name.Name,
+        port: u16,
+        is_doh: bool,
+        doh_path: [256]u8 = undefined,
+        doh_path_len: usize = 0,
+    };
+
+    /// RFC 9462 section 4: one second is the tightest retry a failed
+    /// discovery may impose, and one hour the loosest.
+    fn ddrRetrySeconds(ttl: u32) u32 {
+        return @min(@max(ttl, DDR_MIN_RETRY_SECONDS), DDR_MAX_RETRY_SECONDS);
+    }
+
+    /// The discovery answer's smallest SVCB TTL, or the loose one-hour bound
+    /// when there is no SVCB answer to name one.
+    fn discTtl(response: dns_message.Message) u32 {
+        var ttl: ?u32 = null;
+        for (response.answers.slice()) |record| {
+            if (!record.rrtype.eql(.SVCB)) continue;
+            ttl = if (ttl) |seen| @min(seen, record.ttl) else record.ttl;
+        }
+        return ttl orelse DDR_MAX_RETRY_SECONDS;
+    }
+
+    /// RFC 9462 sections 4 and 4.1: the lowest-priority usable designation in
+    /// the answer, ties broken by target then port. Only ServiceMode SVCB
+    /// answers count, with a usable TargetName, a `mandatory` list this client
+    /// understands, and a supported ALPN this build has a client for.
+    fn selectDdrDesignation(answers: []const dns_record.ResourceRecord, extra_ports: []const u16) ?DdrDesignation {
+        var best: ?DdrDesignation = null;
+        for (answers) |record| {
+            if (!record.rrtype.eql(.SVCB)) continue;
+            if (record.rdata != .SVCB) continue;
+            const discovery_name = dns_name.Name.fromText(DDR_DISCOVERY_NAME) catch continue;
+            if (!record.owner.eql(&discovery_name)) continue;
+            const svcb = record.rdata.SVCB;
+            if (svcb.priority == 0) continue;
+            if (svcb.target.eql(&dns_name.Name.root())) continue;
+            const arpa_name = dns_name.Name.fromText("resolver.arpa.") catch continue;
+            if (svcb.target.eql(&arpa_name)) continue;
+            const params = DdrParams.parse(svcb.paramsBytes());
+            if (params.invalid) continue;
+            if (!params.has_alpn) continue;
+            var is_doh: ?bool = if (params.has_dot) false else null;
+            if (params.has_http11) is_doh = true;
+            if (is_doh == null) continue;
+            var doh_path: [256]u8 = undefined;
+            var doh_path_len: usize = 0;
+            if (is_doh.?) {
+                if (params.doh_path == null) continue;
+                const raw = params.doh_path.?;
+                var path_end: usize = raw.len;
+                if (std.mem.indexOf(u8, raw, "{?dns}")) |brace| path_end = brace;
+                if (path_end == 0 or path_end > doh_path.len) continue;
+                // RFC 8484 section 4.1: the path is an origin-form request
+                // target. A plaintext SVCB answer is unauthenticated, so a
+                // CR, LF, space, or control byte here must never reach the
+                // HTTP request head.
+                if (raw[0] != '/') continue;
+                var unsafe = false;
+                for (raw[0..path_end]) |byte| if (byte <= 0x20 or byte == 0x7f) {
+                    unsafe = true;
+                    break;
+                };
+                if (unsafe) continue;
+                @memcpy(doh_path[0..path_end], raw[0..path_end]);
+                doh_path_len = path_end;
+            }
+            const port = params.port orelse if (is_doh.?) DDR_DOH_DEFAULT_PORT else DDR_DOT_DEFAULT_PORT;
+            // RFC 9461 section 4.2: a client that supports the `port` key
+            // must restrict the ports it will use. The designated resolver
+            // is known only by its designating IP, so the client reaches it
+            // on the two encrypted-DNS ports and no other.
+            if (port != DDR_DOT_DEFAULT_PORT and port != DDR_DOH_DEFAULT_PORT and !std.mem.containsAtLeastScalar(u16, extra_ports, port, 1)) continue;
+            const candidate = DdrDesignation{
+                .priority = svcb.priority,
+                .target = svcb.target,
+                .port = port,
+                .is_doh = is_doh.?,
+                .doh_path = doh_path,
+                .doh_path_len = doh_path_len,
+            };
+            if (best == null or ddrDesignationLess(candidate, best.?)) best = candidate;
+        }
+        return best;
+    }
+
+    fn ddrDesignationLess(a: DdrDesignation, b: DdrDesignation) bool {
+        if (a.priority != b.priority) return a.priority < b.priority;
+        const by_target = std.ascii.orderIgnoreCase(a.target.asWire(), b.target.asWire());
+        if (by_target != .eq) return by_target == .lt;
+        return a.port < b.port;
+    }
+
+    /// The SvcParams a DDR client reads (RFC 9460): `mandatory` (0), `alpn`
+    /// (1), `port` (3), and `dohpath` (7). A record is invalid when its
+    /// `mandatory` list names a key outside that set, or a value does not
+    /// parse.
+    const DdrParams = struct {
+        invalid: bool = false,
+        has_alpn: bool = false,
+        has_dot: bool = false,
+        has_http11: bool = false,
+        port: ?u16 = null,
+        doh_path: ?[]const u8 = null,
+
+        fn parse(params: []const u8) DdrParams {
+            var out = DdrParams{};
+            var offset: usize = 0;
+            while (offset < params.len) {
+                if (params.len - offset < 4) {
+                    out.invalid = true;
+                    return out;
+                }
+                const key = std.mem.readInt(u16, params[offset..][0..2], .big);
+                const value_len = std.mem.readInt(u16, params[offset + 2 ..][0..2], .big);
+                if (value_len > params.len - offset - 4) {
+                    out.invalid = true;
+                    return out;
+                }
+                const value = params[offset + 4 .. offset + 4 + value_len];
+                switch (key) {
+                    0 => {
+                        if (value.len == 0 or value.len % 2 != 0) {
+                            out.invalid = true;
+                            return out;
+                        }
+                        var index: usize = 0;
+                        while (index < value.len) : (index += 2) {
+                            const required = std.mem.readInt(u16, value[index..][0..2], .big);
+                            if (required != 0 and required != 1 and required != 3 and required != 7) {
+                                out.invalid = true;
+                                return out;
+                            }
+                        }
+                    },
+                    1 => {
+                        if (value.len == 0) {
+                            out.invalid = true;
+                            return out;
+                        }
+                        var cursor: usize = 0;
+                        while (cursor < value.len) {
+                            const id_len: usize = value[cursor];
+                            if (id_len == 0 or id_len > value.len - cursor - 1) {
+                                out.invalid = true;
+                                return out;
+                            }
+                            const id = value[cursor + 1 .. cursor + 1 + id_len];
+                            out.has_alpn = true;
+                            if (std.mem.eql(u8, id, "dot")) out.has_dot = true;
+                            if (std.mem.eql(u8, id, "http/1.1")) out.has_http11 = true;
+                            cursor += 1 + id_len;
+                        }
+                    },
+                    3 => {
+                        if (value.len != 2) {
+                            out.invalid = true;
+                            return out;
+                        }
+                        out.port = std.mem.readInt(u16, value[0..2], .big);
+                    },
+                    7 => {
+                        if (std.mem.indexOf(u8, value, "{?dns}") == null) {
+                            out.invalid = true;
+                            return out;
+                        }
+                        out.doh_path = value;
+                    },
+                    else => {},
+                }
+                offset += 4 + value_len;
+            }
+            return out;
+        }
+    };
+
+    /// The resolver IP in the literal form the certificate verifies against.
+    /// `formatIpAddress` renders into the caller's buffer and returns the
+    /// text; an unrenderable address is an upstream failure.
+    fn formatIpAddress(address: std.Io.net.IpAddress, buffer: []u8) ![]const u8 {
+        return switch (address) {
+            .ip4 => |ip4| std.fmt.bufPrint(buffer, "{d}.{d}.{d}.{d}", .{ ip4.bytes[0], ip4.bytes[1], ip4.bytes[2], ip4.bytes[3] }),
+            .ip6 => |ip6| std.fmt.bufPrint(buffer, "{x}:{x}:{x}:{x}:{x}:{x}:{x}:{x}", .{
+                std.mem.readInt(u16, ip6.bytes[0..2], .big),
+                std.mem.readInt(u16, ip6.bytes[2..4], .big),
+                std.mem.readInt(u16, ip6.bytes[4..6], .big),
+                std.mem.readInt(u16, ip6.bytes[6..8], .big),
+                std.mem.readInt(u16, ip6.bytes[8..10], .big),
+                std.mem.readInt(u16, ip6.bytes[10..12], .big),
+                std.mem.readInt(u16, ip6.bytes[12..14], .big),
+                std.mem.readInt(u16, ip6.bytes[14..16], .big),
+            }),
+        } catch Error.UpstreamFailure;
     }
 
     /// The root servers a priming answer names, with the addresses the answer
@@ -11982,6 +12469,145 @@ fn makeTestQuery(allocator: std.mem.Allocator, id: u16, name_text: []const u8, w
         message.header.additional_count = 1;
     }
     return message;
+}
+
+fn makeDdrSv(cb: struct { prio: u16, target: []const u8, params: []const u8, ttl: u32 }) !dns_record.ResourceRecord {
+    const owner = try dns_name.Name.fromText(DDR_DISCOVERY_NAME);
+    const target = try dns_name.Name.fromText(cb.target);
+    const svcb = try dns_rdata.Svcb.init(cb.prio, target, cb.params);
+    return .{ .owner = owner, .rrtype = .SVCB, .class = .IN, .ttl = cb.ttl, .rdata = .{ .SVCB = svcb } };
+}
+
+fn ddrParamsWire(out: []u8, mandatory: ?[]const u16, alpn_ids: []const []const u8, port: ?u16, doh_path: ?[]const u8) ![]const u8 {
+    var cursor: usize = 0;
+    const put = struct {
+        fn put(buffer: []u8, index: *usize, key: u16, value: []const u8) !void {
+            std.mem.writeInt(u16, buffer[index.*..][0..2], key, .big);
+            std.mem.writeInt(u16, buffer[index.* + 2 ..][0..2], @intCast(value.len), .big);
+            @memcpy(buffer[index.* + 4 ..][0..value.len], value);
+            index.* += 4 + value.len;
+        }
+    };
+    if (mandatory) |keys| {
+        var value: [32]u8 = undefined;
+        var len: usize = 0;
+        for (keys) |key| {
+            std.mem.writeInt(u16, value[len..][0..2], key, .big);
+            len += 2;
+        }
+        try put.put(out, &cursor, 0, value[0..len]);
+    }
+    if (alpn_ids.len != 0) {
+        var value: [128]u8 = undefined;
+        var len: usize = 0;
+        for (alpn_ids) |id| {
+            value[len] = @intCast(id.len);
+            out[len + 1 ..][0..0].* = .{};
+            @memcpy(value[len + 1 ..][0..id.len], id);
+            len += 1 + id.len;
+        }
+        try put.put(out, &cursor, 1, value[0..len]);
+    }
+    if (port) |p| {
+        var value: [2]u8 = undefined;
+        std.mem.writeInt(u16, &value, p, .big);
+        try put.put(out, &cursor, 3, &value);
+    }
+    if (doh_path) |path| {
+        try put.put(out, &cursor, 7, path);
+    }
+    return out[0..cursor];
+}
+
+test "ddr selection picks the lowest usable priority" {
+    var buffer: [512]u8 = undefined;
+    const high = try ddrParamsWire(&buffer, null, &.{"dot"}, 853, null);
+    var b2: [512]u8 = undefined;
+    const low = try ddrParamsWire(&b2, null, &.{"dot"}, null, null);
+    const a = try makeDdrSv(.{ .prio = 5, .target = "a.example.", .params = high, .ttl = 3600 });
+    const b = try makeDdrSv(.{ .prio = 2, .target = "b.example.", .params = low, .ttl = 3600 });
+    const picked = Resolver.selectDdrDesignation(&.{ a, b }, &.{}).?;
+    try std.testing.expectEqual(@as(u16, 2), picked.priority);
+    try std.testing.expectEqual(@as(u16, 853), picked.port);
+    try std.testing.expect(!picked.is_doh);
+}
+
+test "ddr selection refuses alias, bad target, and unknown mandatory" {
+    var buffer: [512]u8 = undefined;
+    const alias = try ddrParamsWire(&buffer, null, &.{}, null, null);
+    var b2: [512]u8 = undefined;
+    const root_t = try ddrParamsWire(&b2, null, &.{"dot"}, null, null);
+    var b3: [512]u8 = undefined;
+    const arpa_t = try ddrParamsWire(&b3, null, &.{"dot"}, null, null);
+    var b4: [512]u8 = undefined;
+    const unknown_m = try ddrParamsWire(&b4, &.{5}, &.{"dot"}, null, null);
+    // RFC 9460 section 8: every key in `mandatory` must be present, so the
+    // unknown key 5 carries a value the client does not understand.
+    std.mem.writeInt(u16, b4[unknown_m.len..][0..2], 5, .big);
+    std.mem.writeInt(u16, b4[unknown_m.len + 2 ..][0..2], 4, .big);
+    @memset(b4[unknown_m.len + 4 ..][0..4], 0);
+    const unknown_m_wire = b4[0 .. unknown_m.len + 8];
+    var b5: [512]u8 = undefined;
+    const no_alpn = try ddrParamsWire(&b5, null, &.{}, null, null);
+    var b6: [512]u8 = undefined;
+    const h2_only = try ddrParamsWire(&b6, null, &.{"h2"}, null, null);
+    const alias_rec = try makeDdrSv(.{ .prio = 0, .target = "a.example.", .params = alias, .ttl = 3600 });
+    const root_rec = try makeDdrSv(.{ .prio = 1, .target = ".", .params = root_t, .ttl = 3600 });
+    const arpa_rec = try makeDdrSv(.{ .prio = 1, .target = "resolver.arpa.", .params = arpa_t, .ttl = 3600 });
+    const mand_rec = try makeDdrSv(.{ .prio = 1, .target = "a.example.", .params = unknown_m_wire, .ttl = 3600 });
+    const noalpn_rec = try makeDdrSv(.{ .prio = 1, .target = "a.example.", .params = no_alpn, .ttl = 3600 });
+    const h2_rec = try makeDdrSv(.{ .prio = 1, .target = "a.example.", .params = h2_only, .ttl = 3600 });
+    try std.testing.expect(Resolver.selectDdrDesignation(&.{alias_rec}, &.{}) == null);
+    try std.testing.expect(Resolver.selectDdrDesignation(&.{root_rec}, &.{}) == null);
+    try std.testing.expect(Resolver.selectDdrDesignation(&.{arpa_rec}, &.{}) == null);
+    try std.testing.expect(Resolver.selectDdrDesignation(&.{mand_rec}, &.{}) == null);
+    try std.testing.expect(Resolver.selectDdrDesignation(&.{noalpn_rec}, &.{}) == null);
+    try std.testing.expect(Resolver.selectDdrDesignation(&.{h2_rec}, &.{}) == null);
+}
+
+test "ddr selection ties by target then port and honors dohpath" {
+    var buffer: [512]u8 = undefined;
+    const p1 = try ddrParamsWire(&buffer, null, &.{"dot"}, 853, null);
+    var b2: [512]u8 = undefined;
+    const p2 = try ddrParamsWire(&b2, null, &.{"dot"}, 443, null);
+    var b3: [512]u8 = undefined;
+    const doh = try ddrParamsWire(&b3, null, &.{"http/1.1"}, null, "/dns-query{?dns}");
+    const a = try makeDdrSv(.{ .prio = 1, .target = "b.example.", .params = p1, .ttl = 3600 });
+    const b = try makeDdrSv(.{ .prio = 1, .target = "a.example.", .params = p2, .ttl = 3600 });
+    const picked = Resolver.selectDdrDesignation(&.{ a, b }, &.{}).?;
+    try std.testing.expectEqual(@as(u16, 443), picked.port);
+    // RFC 9461 section 4.2: a port outside the two encrypted-DNS ports is
+    // not used, even when it is the only designation.
+    var b5: [512]u8 = undefined;
+    const odd_port = try ddrParamsWire(&b5, null, &.{"dot"}, 8443, null);
+    const odd = try makeDdrSv(.{ .prio = 1, .target = "a.example.", .params = odd_port, .ttl = 3600 });
+    try std.testing.expect(Resolver.selectDdrDesignation(&.{odd}, &.{}) == null);
+    try std.testing.expectEqual(@as(u16, 8443), Resolver.selectDdrDesignation(&.{odd}, &.{8443}).?.port);
+    // A plaintext SVCB answer is unauthenticated: a control byte or a
+    // relative path never reaches the HTTP request head.
+    var b6: [512]u8 = undefined;
+    const injected = try ddrParamsWire(&b6, null, &.{"http/1.1"}, null, "/dns-query\r\nX: y{?dns}");
+    const injected_rec = try makeDdrSv(.{ .prio = 1, .target = "h.example.", .params = injected, .ttl = 3600 });
+    try std.testing.expect(Resolver.selectDdrDesignation(&.{injected_rec}, &.{}) == null);
+    var b7: [512]u8 = undefined;
+    const relative = try ddrParamsWire(&b7, null, &.{"http/1.1"}, null, "dns-query{?dns}");
+    const relative_rec = try makeDdrSv(.{ .prio = 1, .target = "h.example.", .params = relative, .ttl = 3600 });
+    try std.testing.expect(Resolver.selectDdrDesignation(&.{relative_rec}, &.{}) == null);
+    const use_doh = try makeDdrSv(.{ .prio = 1, .target = "h.example.", .params = doh, .ttl = 3600 });
+    const picked_doh = Resolver.selectDdrDesignation(&.{use_doh}, &.{}).?;
+    try std.testing.expect(picked_doh.is_doh);
+    try std.testing.expectEqualStrings("/dns-query", picked_doh.doh_path[0..picked_doh.doh_path_len]);
+    try std.testing.expectEqual(@as(u16, 443), picked_doh.port);
+    var b4: [512]u8 = undefined;
+    const no_brace = try ddrParamsWire(&b4, null, &.{"http/1.1"}, null, "/dns-query");
+    const bad = try makeDdrSv(.{ .prio = 1, .target = "h.example.", .params = no_brace, .ttl = 3600 });
+    try std.testing.expect(Resolver.selectDdrDesignation(&.{bad}, &.{}) == null);
+}
+
+test "ddr retry interval clamps the discovery ttl" {
+    try std.testing.expectEqual(@as(u32, 1), Resolver.ddrRetrySeconds(0));
+    try std.testing.expectEqual(@as(u32, 3600), Resolver.ddrRetrySeconds(7200));
+    try std.testing.expectEqual(@as(u32, 120), Resolver.ddrRetrySeconds(120));
 }
 
 fn setCookieOption(message: *dns_message.Message, cookie: []const u8) !void {

@@ -61,8 +61,12 @@ pub fn build(b: *std.Build) void {
     // build.zig.zon. Its module is named "tls".
     const tls_dep = b.dependency("tls", .{ .target = target, .optimize = optimize });
     const tls_module = tls_dep.module("tls");
+    // The DNS-over-QUIC server: endel/quic-zig, pinned to one commit in
+    // build.zig.zon. Its module is named "quic".
+    const quic_dep = b.dependency("quic", .{ .target = target, .optimize = optimize });
+    const quic_module = quic_dep.module("quic");
 
-    const app_module = mainModule(b, target, optimize, build_options, tls_module);
+    const app_module = mainModule(b, target, optimize, build_options, tls_module, quic_module);
 
     const exe = b.addExecutable(.{
         .name = "zimdns",
@@ -94,7 +98,7 @@ pub fn build(b: *std.Build) void {
 
     // groups[0] is the unit group: the unit tests embedded in src/main.zig
     // stay the root module of the main test artifact and share that step.
-    const unit_test_module = mainModule(b, target, optimize, build_options, tls_module);
+    const unit_test_module = mainModule(b, target, optimize, build_options, tls_module, quic_module);
     const unit_tests = b.addTest(.{
         .root_module = unit_test_module,
     });
@@ -110,7 +114,10 @@ pub fn build(b: *std.Build) void {
                 .target = target,
                 .optimize = optimize,
             });
-            module.addImport("zimdns", mainModule(b, target, optimize, build_options, tls_module));
+            module.addImport("zimdns", mainModule(b, target, optimize, build_options, tls_module, quic_module));
+            // A CLI test drives a real DoQ client against the built server,
+            // so the root needs the same quic module the server uses.
+            module.addImport("quic", quic_module);
             switch (group.extra) {
                 .none => {},
                 .fuzz => module.addOptions("fuzz_options", fuzz_options),
@@ -128,7 +135,7 @@ pub fn build(b: *std.Build) void {
 
 /// Every artifact above compiles `src/main.zig`, so the build options it reads
 /// are attached here once instead of at every call site.
-fn mainModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, build_options: *std.Build.Step.Options, tls_module: *std.Build.Module) *std.Build.Module {
+fn mainModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, build_options: *std.Build.Step.Options, tls_module: *std.Build.Module, quic_module: *std.Build.Module) *std.Build.Module {
     const module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -136,6 +143,7 @@ fn mainModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     });
     module.addOptions("build_options", build_options);
     module.addImport("tls", tls_module);
+    module.addImport("quic", quic_module);
     return module;
 }
 

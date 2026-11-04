@@ -107,3 +107,31 @@ pub const test_identity = struct {
         \\
     ;
 };
+
+/// A throwaway self-signed identity whose certificate carries an IP SAN
+/// for 127.0.0.1 (plus the DNS name localhost), for the split
+/// SNI/verification test: a client verifies the IP literal while sending
+/// no SNI at all, as RFC 9462 section 6.3 asks.
+pub const test_identity_ip = struct {
+    pub const cert_pem =
+        \\-----BEGIN CERTIFICATE-----
+        \\MIIBeTCCAR6gAwIBAgIUGLiDMexJsqCjmNlhRTTIELePjo8wCgYIKoZIzj0EAwIw
+        \\FDESMBAGA1UEAwwJMTI3LjAuMC4xMB4XDTI2MTEwNDE0NDEzMFoXDTI3MTEwNDE0
+        \\NDEzMFowFDESMBAGA1UEAwwJMTI3LjAuMC4xMFkwEwYHKoZIzj0CAQYIKoZIzj0D
+        \\AQcDQgAE7prOPqOrYJVH0A6IE/dwxRE5OP3K0cVqYJCn2x3t/h2PFJH4RB7Ru0Zb
+        \\BlBMIcx4KItUrv0pwflwd3PX1DdFGaNOMEwwHQYDVR0OBBYEFGFo6eePp4+C7DDu
+        \\JyRzVkPFEUeXMA8GA1UdEwEB/wQFMAMBAf8wGgYDVR0RBBMwEYcEfwAAAYIJbG9j
+        \\YWxob3N0MAoGCCqGSM49BAMCA0kAMEYCIQCdMXkDd9qR5p9mkDVFwf4ppTuAGxki
+        \\EV+2WGXneRVapQIhAKSyciDv7YYD23QbQ4Tfei8+EKZ4wgASaTfw1tiNBI1l
+        \\-----END CERTIFICATE-----
+        \\
+    ;
+    pub const key_pem =
+        \\-----BEGIN PRIVATE KEY-----
+        \\MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg2xh8z4p0z9nPFn18
+        \\I7pSNoR6RfjfURb+AYEUUGgI7kuhRANCAATums4+o6tglUfQDogT93DFETk4/crR
+        \\xWpgkKfbHe3+HY8UkfhEHtG7RlsGUEwhzHgoi1Su/SnB+XB3c9fUN0UZ
+        \\-----END PRIVATE KEY-----
+        \\
+    ;
+};

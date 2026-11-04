@@ -35,6 +35,11 @@ evidence, not to skip when the evidence is unavailable.
   `dig IXFR`, `named-checkzone` and `kzonecheck` over the transferred zone.
 - DoH: `curl` GET and POST against the encrypted listener with a
   self-signed certificate.
+- DDR: a plaintext resolver designates a real DoT endpoint through
+  `_dns.resolver.arpa.`; the client must verify the endpoint certificate
+  against the designating resolver's IP SAN with no SNI before it upgrades,
+  and the plaintext server has no zone for the test name, so only a verified
+  upgrade answers.
 
 The harness uses temporary directories and free ports; it does not modify the
 repository.

@@ -30,3 +30,15 @@ The configuration grammar and the loader that reads it.
   and certificate name and the path must start at the root. This client
   speaks HTTP/1.1, so a provider whose DoH endpoint requires HTTP/2 answers
   with a non-200 status and the hop fails closed.
+- `forwarder-ca-file <path>` replaces the platform trust store for that
+  forwarder's DoT and DoH certificate verification with one PEM bundle
+  inside the configuration directory. Without it the platform store is used.
+- `ddr-client on` (RFC 9462 §4) turns the plaintext forwarder into a DDR
+  bootstrap: discovery queries `_dns.resolver.arpa.` over that plaintext
+  channel, and a verified designation switches the resolver's own upstream
+  to the designated DoT or DoH endpoint. It requires a plaintext `forwarder`
+  and at least one `recursion allow` entry. The client supports the `dot`
+  and `http/1.1` ALPNs and the `port` values 853 and 443; a designation that
+  asks for anything else is ignored. `ddr-client-port <port>` (repeatable)
+  adds an operator-authorized port to that set, for an endpoint that cannot
+  use the registered ones; up to eight ports are accepted.

@@ -58,7 +58,7 @@ const child_deadline = std.Io.Timeout{ .duration = .{
     .clock = .awake,
 } };
 
-const Transport = enum { udp, tcp, dot, doh, xfr };
+const Transport = enum { udp, tcp, dot, doh, doq, xfr };
 
 const Kind = enum {
     /// `--help`, `--version`: runs and exits 0.
@@ -273,7 +273,7 @@ fn buildCases(allocator: std.mem.Allocator, io: std.Io, tmp_prefix: []const u8, 
 }
 
 const mode_flags = [_][]const u8{
-    "--once-udp", "--once-tcp", "--serve-udp", "--serve-tcp", "--serve-dot", "--serve-doh", "--serve-xfr",
+    "--once-udp", "--once-tcp", "--serve-udp", "--serve-tcp", "--serve-dot", "--serve-doh", "--serve-doq", "--serve-xfr",
 };
 
 fn hasFlag(argv: []const []const u8, flag: []const u8) bool {
@@ -320,6 +320,9 @@ fn classify(allocator: std.mem.Allocator, io: std.Io, tmp_prefix: []const u8, ar
         // The DoT port is served now, so the case runs the real listener and
         // drives one DoT exchange over the handshake.
         if (hasFlag(argv, "--serve-dot")) return classifyDot(allocator, argv, tls_cert, tls_key);
+        // The DoQ port is served too, so the case runs the real listener and
+        // drives one raw-QUIC exchange.
+        if (hasFlag(argv, "--serve-doq")) return classifyDoq(allocator, argv, tls_cert, tls_key);
 
         // The transports this build cannot serve refuse; the encrypted ones
         // are served, so their refusal has to come from the identity.
@@ -365,6 +368,29 @@ fn classify(allocator: std.mem.Allocator, io: std.Io, tmp_prefix: []const u8, ar
     }
 
     return error.UndocumentedInvocation;
+}
+/// `--serve-doq` is served: the case runs the real listener with a loadable
+/// identity and drives one DoQ exchange over QUIC. The documented invocation
+/// names no listener, so the port is the CLI default.
+fn classifyDoq(allocator: std.mem.Allocator, argv: []const []const u8, tls_cert: []const u8, tls_key: []const u8) !Case {
+    var out: std.ArrayList([]const u8) = .empty;
+    try out.appendSlice(allocator, argv);
+    try out.append(allocator, "--enable-encrypted-dns");
+    try out.append(allocator, "--tls-cert-file");
+    try out.append(allocator, tls_cert);
+    try out.append(allocator, "--tls-key-file");
+    try out.append(allocator, tls_key);
+    // One connection is the whole quota, so the server stops on its own.
+    try out.append(allocator, "--max-requests");
+    try out.append(allocator, "1");
+    return .{
+        .documented = argv,
+        .executed = try out.toOwnedSlice(allocator),
+        .kind = .serve,
+        .transport = .doq,
+        .quota = 1,
+        .port = documented_port,
+    };
 }
 
 /// `--serve-doh` is served: the case runs the real listener with a loadable
@@ -425,6 +451,10 @@ fn classifyProseFlag(allocator: std.mem.Allocator, flag: []const u8, tls_cert: [
     if (std.mem.eql(u8, flag, "--serve-xfr")) {
         const argv = [_][]const u8{ "server", "run", "--zone-file", "examples/zones/home.arpa.zone", "--serve-xfr" };
         return classifyXfr(allocator, &argv, tls_cert, tls_key);
+    }
+    if (std.mem.eql(u8, flag, "--serve-doq")) {
+        const argv = [_][]const u8{ "server", "run", "--zone-file", "examples/zones/home.arpa.zone", "--serve-doq" };
+        return classifyDoq(allocator, &argv, tls_cert, tls_key);
     }
     if (std.mem.eql(u8, flag, "--serve-dot")) {
         const argv = [_][]const u8{ "server", "run", "--zone-file", "examples/zones/home.arpa.zone", "--serve-dot" };
@@ -681,6 +711,7 @@ fn runServe(allocator: std.mem.Allocator, io: std.Io, case: Case, argv: []const 
         .tcp => driveTcp(allocator, io, address, case.quota),
         .dot => driveDot(allocator, io, address, case.quota),
         .doh => driveDoh(allocator, io, address, case.quota),
+        .doq => driveDoq(allocator, io, address, case.quota),
         .xfr => driveXfr(allocator, io, address, case.quota),
     };
     const served = drive.served;
@@ -892,6 +923,95 @@ fn driveDoh(allocator: std.mem.Allocator, io: std.Io, address: std.Io.net.IpAddr
     const deadline = readyDeadline(io);
     while (drive.served < quota and !expired(io, deadline)) {
         exchangeDohOnce(allocator, io, address) catch |err| {
+            drive.last_error = @errorName(err);
+            continue;
+        };
+        drive.served += 1;
+    }
+    return drive;
+}
+
+/// One DoQ exchange over raw QUIC: the handshake with the "doq" ALPN token
+/// (RFC 9250 §4.2), a query in the RFC 9250 two-octet framing on one
+/// bidirectional stream, and the framed answer. Verification is skipped
+/// because the identity is the project's own throwaway certificate, the
+/// same way the DoT and DoH drivers skip it.
+fn exchangeDoqOnce(allocator: std.mem.Allocator, io: std.Io, address: std.Io.net.IpAddress) !void {
+    const quic = zimdns.quic;
+    const event_loop = quic.event_loop;
+    const Client = event_loop.Client(DoqClientHandler);
+
+    var packet: [512]u8 = undefined;
+    const query = try cli_query.buildQueryPacket(&packet, 0x5eed, "dns.home.arpa.", .A, false);
+    var framed: [2 + 512]u8 = undefined;
+    std.mem.writeInt(u16, framed[0..2], @intCast(query.len), .big);
+    @memcpy(framed[2 .. 2 + query.len], query);
+
+    var handler = DoqClientHandler{
+        .query = framed[0 .. 2 + query.len],
+    };
+    var client = try Client.init(std.heap.page_allocator, &handler, .{
+        .address = "127.0.0.1",
+        .port = address.getPort(),
+        .server_name = "localhost",
+        .alpn = "doq",
+        .skip_cert_verify = true,
+    });
+    defer client.deinit();
+
+    var thread = try std.Thread.spawn(.{}, runDoqClient, .{&client});
+    const deadline = readyDeadline(io);
+    while (!handler.done and !handler.failed and !expired(io, deadline)) {
+        std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+    }
+    client.requestStop();
+    thread.join();
+    if (!handler.done) return error.DoqNoAnswer;
+    if (handler.response_len < 2) return error.DoqNoAnswer;
+    const message = try zimdns.dns_message.Message.parse(allocator, handler.response[2..handler.response_len]);
+    if (message.header.answer_count != 1) return error.DoqNoAnswer;
+}
+
+const DoqClientHandler = struct {
+    pub const protocol = @import("quic").event_loop.Protocol.quic;
+    query: []const u8,
+    response: [70000]u8 = undefined,
+    response_len: usize = 0,
+    done: bool = false,
+    failed: bool = false,
+
+    pub fn onConnected(self: *DoqClientHandler, session: *@import("quic").event_loop.ClientSession) void {
+        const stream_id = session.openStream() catch {
+            self.failed = true;
+            return;
+        };
+        session.writeStream(stream_id, self.query) catch {
+            self.failed = true;
+            return;
+        };
+        session.closeQuicStream(stream_id);
+    }
+
+    pub fn onStreamData(self: *DoqClientHandler, session: *@import("quic").event_loop.ClientSession, _: u64, data: []const u8, fin: bool) void {
+        const n = @min(data.len, self.response.len - self.response_len);
+        @memcpy(self.response[self.response_len .. self.response_len + n], data[0..n]);
+        self.response_len += n;
+        if (fin) {
+            self.done = true;
+            session.closeConnection();
+        }
+    }
+};
+
+fn runDoqClient(client: *zimdns.quic.event_loop.Client(DoqClientHandler)) void {
+    client.run() catch {};
+}
+
+fn driveDoq(allocator: std.mem.Allocator, io: std.Io, address: std.Io.net.IpAddress, quota: usize) Drive {
+    var drive: Drive = .{};
+    const deadline = readyDeadline(io);
+    while (drive.served < quota and !expired(io, deadline)) {
+        exchangeDoqOnce(allocator, io, address) catch |err| {
             drive.last_error = @errorName(err);
             continue;
         };
