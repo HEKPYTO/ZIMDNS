@@ -84,8 +84,11 @@ hints lives in `src/iterate.zig` and runs when `recursion allow` is configured
 without a `forwarder`; its hops carry DO=1 and validate through the DS/DNSKEY
 chain up to the configured anchor. Root priming is implemented (RFC 9609 §2):
 the walk primes the root with the `. NS` query and reuses the addresses until
-their TTL expires, falling back to the built-in hints. Still deferred by decision
-or open work: RFC 5011 automated anchor rollover (the operator's anchor file is
-the trust configuration), the parent-side half of a key-signing key rollover,
-and the zone-signing key rollover tooling. Matrix rows 51, 91, 92, 117, and 126
-describe the shipped split.
+their TTL expires, falling back to the built-in hints. RFC 5011 automated
+trust-anchor rollover is implemented beside the static store: `managed-anchor-file`
+persists the SEP-key state table, the resolver refreshes each due trust point,
+applies the add/remove hold-downs and the §2.1 revocation rules, and rebuilds
+the live anchor set (`src/dns/managed_anchors.zig`). Still deferred by decision:
+the parent-side DS change that starts a key-signing rollover (it belongs to the
+parent zone's operator, not this server) and the zone-signing key rollover
+tooling. Matrix rows 51, 91, 92, 117, and 126 describe the shipped split.

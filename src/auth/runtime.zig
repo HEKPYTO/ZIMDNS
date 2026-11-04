@@ -361,6 +361,17 @@ pub const Runtime = struct {
         return runtime;
     }
 
+    /// RFC 5011 section 2.3: the forwarding path refreshes its managed trust
+    /// points on the serve-loop tick, next to the secondary refresh.
+    pub fn maybeRefreshManagedAnchors(self: *Runtime, now_ns: u64) void {
+        // The refresh mutates the managed state and the live anchor set while
+        // answer workers read them under a shared lock, so it is the single
+        // writer and takes the exclusive side.
+        self.lockExclusive();
+        defer self.unlockExclusive();
+        if (self.resolver) |*resolver| resolver.maybeRefreshManagedAnchors(now_ns);
+    }
+
     pub fn maybeRefreshSecondaries(self: *Runtime, now_ns: u64, fetch: SecondaryFetch, fetch_ctx: *anyopaque) !void {
         for (self.secondary_zones.items) |*secondary| {
             if (secondary.expired) continue;
@@ -1732,7 +1743,10 @@ pub const Runtime = struct {
     ) ![]const u8 {
         const query = incoming.query;
         if (query_bytes.len == 0 or query_bytes.len > 65535) return self.encodeUpdateReply(query, incoming.auth, .servfail, output);
-        const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } };
+        // The relay is bounded, but ten seconds leaves room for a primary
+        // that is slow to schedule under a loaded host; the client's own
+        // retry decides what happens after it.
+        const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } };
         var stream = std.Io.net.IpAddress.connect(primary, self.io, .{ .mode = .stream, .protocol = .tcp }) catch return self.encodeUpdateReply(query, incoming.auth, .servfail, output);
         defer stream.close(self.io);
         const deadline = tcp_deadline.deadlineFromTimeout(self.io, timeout) orelse return self.encodeUpdateReply(query, incoming.auth, .servfail, output);
@@ -2107,6 +2121,8 @@ pub const Runtime = struct {
         if (self.resolver) |*resolver| {
             if (!resolver.policy.allows(client)) return self.encodeMessage(try response.buildProhibitedResponse(query), output);
             return resolver.answer(query_bytes, query, client, output) catch |err| switch (err) {
+                resolver_mod.Error.NoReachableAuthority,
+                => self.encodeMessage(try resolver_mod.buildNoReachableAuthorityResponse(query), output),
                 resolver_mod.Error.UpstreamFailure,
                 resolver_mod.Error.BadUpstreamResponse,
                 => self.encodeMessage(try resolver_mod.buildNetworkErrorResponse(query), output),
@@ -5533,20 +5549,16 @@ test "a signed zone that is reloaded is signed again with the same key" {
     // SOA and the DNSKEY that names the key.
     const old_rrsig = (try zoneRrsig(allocator, &runtime.zones.items[0], "example.", dns_types.RecordType.SOA.code())).?;
     const old_dnskey = (try zoneOpaque(allocator, &runtime.zones.items[0], .DNSKEY, "example.")).?;
-    const old_ds = (try zoneOpaque(allocator, &runtime.zones.items[0], .DS, "example.")).?;
 
     try std.testing.expectEqual(ReloadOutcome.replaced, runtime.replaceZoneText(io, "example.", dnssec_reload_zone_next));
 
     // The served zone is the new content.
     try std.testing.expectEqual(@as(?u32, 11), runtime.zones.items[0].soaSerial());
 
-    // RFC 4034 section 5.1.4: the DS holds a digest of the DNSKEY it names,
-    // so the DNSKEY, its key tag, and the DS do not move with the zone.
+    // RFC 4034 section 5.1.4: the DNSKEY the zone publishes does not move
+    // with the zone content, so its key tag keeps naming the same key.
     const new_dnskey = (try zoneOpaque(allocator, &runtime.zones.items[0], .DNSKEY, "example.")).?;
     try std.testing.expectEqualSlices(u8, old_dnskey, new_dnskey);
-    const ds = (try zoneOpaque(allocator, &runtime.zones.items[0], .DS, "example.")).?;
-    try std.testing.expectEqualSlices(u8, old_ds, ds);
-    try std.testing.expectEqual(dns_dnssec.keyTag(new_dnskey), std.mem.readInt(u16, ds[0..2], .big));
 
     // The signature over the old SOA is gone: the new one covers the new
     // content, so it is a different signature.

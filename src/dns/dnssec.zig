@@ -27,6 +27,7 @@ pub const EDE_SIGNATURE_EXPIRED: u16 = 7;
 pub const EDE_SIGNATURE_NOT_YET_VALID: u16 = 8;
 pub const EDE_DNSKEY_MISSING: u16 = 9;
 pub const EDE_RRSIGS_MISSING: u16 = 10;
+pub const EDE_NSEC_MISSING: u16 = 12;
 /// RFC 8914 section 4.2: the zone's DNSKEY RRset held only algorithms this
 /// server cannot verify with.
 pub const EDE_UNSUPPORTED_DNSKEY_ALGORITHM: u16 = 1;
@@ -50,6 +51,7 @@ pub fn edeText(code: u16) []const u8 {
         EDE_SIGNATURE_NOT_YET_VALID => "signature not yet valid",
         EDE_DNSKEY_MISSING => "dnskey missing",
         EDE_RRSIGS_MISSING => "rrsigs missing",
+        EDE_NSEC_MISSING => "nsec missing",
         EDE_UNSUPPORTED_DNSKEY_ALGORITHM => "unsupported dnskey algorithm",
         EDE_UNSUPPORTED_DS_DIGEST_TYPE => "unsupported ds digest type",
         EDE_DNSSEC_INDETERMINATE => "dnssec indeterminate",

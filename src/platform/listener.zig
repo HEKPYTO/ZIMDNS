@@ -102,7 +102,12 @@ fn serveUdpOnceWithTimeout(socket: *const std.Io.net.Socket, io: std.Io, runtime
     // so the answer that follows a reload always comes from the new zone.
     _ = runtime.reloadZoneIfRequested(io);
     _ = runtime.refreshCatalogIfRequested(io);
-    _ = runtime.maybeRefreshSecondaries(@intCast(std.Io.Clock.awake.now(io).nanoseconds), Runtime.fetchSecondaryViaXfr, runtime) catch {};
+    const tick_ns: u64 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
+    _ = runtime.maybeRefreshSecondaries(tick_ns, Runtime.fetchSecondaryViaXfr, runtime) catch {};
+    // RFC 5011 section 2.3 refresh timers are compared with RRSIG
+    // inception/expiration times, so they live in wall-clock seconds; the
+    // monotonic tick above must not leak into the managed store.
+    runtime.maybeRefreshManagedAnchors(@intCast(std.Io.Clock.real.now(io).nanoseconds));
     var request_buffer: [UDP_REQUEST_BUFFER_SIZE]u8 = undefined;
     const incoming = try socket.receiveTimeout(io, &request_buffer, timeout);
     // A NOTIFY handled by the last answer set the catalog flag; its fetch
@@ -124,7 +129,12 @@ fn serveUdpOnceWithMetricsTimeout(socket: *const std.Io.net.Socket, io: std.Io, 
     // its zone on the same trigger.
     _ = runtime.reloadZoneIfRequested(io);
     _ = runtime.refreshCatalogIfRequested(io);
-    _ = runtime.maybeRefreshSecondaries(@intCast(std.Io.Clock.awake.now(io).nanoseconds), Runtime.fetchSecondaryViaXfr, runtime) catch {};
+    const tick_ns: u64 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
+    _ = runtime.maybeRefreshSecondaries(tick_ns, Runtime.fetchSecondaryViaXfr, runtime) catch {};
+    // RFC 5011 section 2.3 refresh timers are compared with RRSIG
+    // inception/expiration times, so they live in wall-clock seconds; the
+    // monotonic tick above must not leak into the managed store.
+    runtime.maybeRefreshManagedAnchors(@intCast(std.Io.Clock.real.now(io).nanoseconds));
     var request_buffer: [UDP_REQUEST_BUFFER_SIZE]u8 = undefined;
     const incoming = try socket.receiveTimeout(io, &request_buffer, timeout);
     // A NOTIFY handled by the last answer set the catalog flag; its fetch
@@ -235,7 +245,12 @@ fn serveTcpStreamOnceWithTimeout(stream: std.Io.net.Stream, io: std.Io, runtime:
     // the new zone.
     _ = runtime.reloadZoneIfRequested(io);
     _ = runtime.refreshCatalogIfRequested(io);
-    _ = runtime.maybeRefreshSecondaries(@intCast(std.Io.Clock.awake.now(io).nanoseconds), Runtime.fetchSecondaryViaXfr, runtime) catch {};
+    const tick_ns: u64 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
+    _ = runtime.maybeRefreshSecondaries(tick_ns, Runtime.fetchSecondaryViaXfr, runtime) catch {};
+    // RFC 5011 section 2.3 refresh timers are compared with RRSIG
+    // inception/expiration times, so they live in wall-clock seconds; the
+    // monotonic tick above must not leak into the managed store.
+    runtime.maybeRefreshManagedAnchors(@intCast(std.Io.Clock.real.now(io).nanoseconds));
     return unix_tcp_deadlines.serve(stream, io, runtime, timeout, counters);
 }
 

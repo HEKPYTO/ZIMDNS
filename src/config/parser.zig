@@ -471,6 +471,11 @@ pub const Config = struct {
     /// against; see `trust-anchor-file` in the loader.
     trust_anchor_file: Text = .{},
     has_trust_anchor_file: bool = false,
+    /// Path to the RFC 5011 managed trust-anchor state. When set, the
+    /// forwarding path maintains the DNSKEY anchors itself; see
+    /// `managed-anchor-file` in the loader.
+    managed_anchor_file: Text = .{},
+    has_managed_anchor_file: bool = false,
     /// Path to the file that keeps the RFC 1995 IXFR delta log across a
     /// restart. Null when the operator did not ask for a durable log; see
     /// `ixfr-journal-file` in the loader.
@@ -620,6 +625,11 @@ pub const Config = struct {
         return self.trust_anchor_file.text();
     }
 
+    pub fn managedAnchorFileText(self: *const Config) ?[]const u8 {
+        if (!self.has_managed_anchor_file) return null;
+        return self.managed_anchor_file.text();
+    }
+
     pub fn ixfrJournalFileText(self: *const Config) ?[]const u8 {
         if (!self.has_ixfr_journal_file) return null;
         return self.ixfr_journal_file.text();
@@ -671,6 +681,7 @@ pub const Config = struct {
         if (std.mem.eql(u8, first, "dnssec-ksk-file")) return self.parseDnssecKskFile(&tokens);
         if (std.mem.eql(u8, first, "dnssec-new-ksk-file")) return self.parseDnssecNewKskFile(&tokens);
         if (std.mem.eql(u8, first, "trust-anchor-file")) return self.parseTrustAnchorFile(&tokens);
+        if (std.mem.eql(u8, first, "managed-anchor-file")) return self.parseManagedAnchorFile(&tokens);
         if (std.mem.eql(u8, first, "ixfr-journal-file")) return self.parseIxfrJournalFile(&tokens);
         if (std.mem.eql(u8, first, "tls-cert-file")) return self.parseTlsCertFile(&tokens);
         if (std.mem.eql(u8, first, "tls-key-file")) return self.parseTlsKeyFile(&tokens);
@@ -978,6 +989,15 @@ pub const Config = struct {
         if (path.len == 0) return Error.BadDirective;
         try self.trust_anchor_file.set(path);
         self.has_trust_anchor_file = true;
+    }
+
+    fn parseManagedAnchorFile(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        if (self.has_managed_anchor_file) return Error.BadDirective;
+        const path = tokens.next() orelse return Error.BadDirective;
+        try requireNoTrailingTokens(tokens);
+        if (path.len == 0) return Error.BadDirective;
+        try self.managed_anchor_file.set(path);
+        self.has_managed_anchor_file = true;
     }
 
     fn parseIxfrJournalFile(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
@@ -1637,6 +1657,18 @@ test "config parser accepts one DNSSEC trust-anchor path and rejects every other
     try std.testing.expectError(error.BadDirective, Config.parse("trust-anchor-file\n"));
     try std.testing.expectError(error.BadDirective, Config.parse("trust-anchor-file a.anchor b.anchor\n"));
     try std.testing.expectError(error.UnknownDirective, Config.parse("trust-anchor ed25519-key\n"));
+}
+
+test "config parser takes one RFC 5011 state path and rejects every other shape" {
+    const config = try Config.parse("managed-anchor-file managed.txt\n");
+    try std.testing.expectEqualStrings("managed.txt", config.managedAnchorFileText().?);
+    try std.testing.expect((try Config.parse("zone one.example primary one.zone\n")).managedAnchorFileText() == null);
+    try std.testing.expectError(error.BadDirective, Config.parse(
+        "managed-anchor-file a.txt\nmanaged-anchor-file b.txt\n",
+    ));
+    try std.testing.expectError(error.BadDirective, Config.parse("managed-anchor-file\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("managed-anchor-file a.txt b.txt\n"));
+    try std.testing.expectError(error.UnknownDirective, Config.parse("managed-anchor managed.txt\n"));
 }
 
 test "config parser takes one IXFR journal path and rejects every other shape" {

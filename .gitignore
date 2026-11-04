@@ -10,3 +10,6 @@ tls/cert.pem
 tls/key.pem
 data/
 /config/
+
+# External interop suite virtualenv
+.interop-venv/

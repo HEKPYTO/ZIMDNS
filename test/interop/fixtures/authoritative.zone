@@ -1,0 +1,24 @@
+$ORIGIN example.test.
+$TTL 300
+@       IN SOA  ns1.example.test. hostmaster.example.test. 1 3600 900 604800 300
+@       IN NS   ns1.example.test.
+@       IN NS   ns2.example.org.
+@       IN NSEC3PARAM 1 0 0 -
+ns1     IN A    192.0.2.53
+www     IN A    192.0.2.80
+www     IN AAAA 2001:db8::80
+nodata  IN TXT  "only-txt"
+*.wild  IN A    192.0.2.99
+alias   IN CNAME www.example.test.
+chain   IN CNAME alias.example.test.
+dn      IN DNAME target.example.test.
+target  IN A    192.0.2.30
+child   IN NS   ns.child.example.test.
+ns.child IN A   192.0.2.40
+deep.child IN A 192.0.2.41
+txt     IN TXT  "hello world"
+mx      IN MX   10 mail.example.test.
+mail    IN A    192.0.2.25
+srv     IN SRV  0 5 443 www.example.test.
+svc     IN SVCB 1 . alpn=h2
+caa     IN CAA  0 issue "letsencrypt.org"

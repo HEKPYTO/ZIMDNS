@@ -71,6 +71,7 @@ test {
     _ = @import("dns/rdata.zig");
     _ = @import("dns/dnssec.zig");
     _ = @import("dns/validate.zig");
+    _ = @import("dns/managed_anchors.zig");
     _ = @import("dns/record.zig");
     _ = @import("dns/question.zig");
     _ = @import("dns/message.zig");
@@ -221,6 +222,7 @@ fn printHelp(writer: *std.Io.Writer) !void {
 }
 
 fn handleQuery(args: []const []const u8, io: std.Io, allocator: std.mem.Allocator, writer: *std.Io.Writer) !void {
+    if (try printHelpIfRequested(args, writer)) return;
     var server_text: []const u8 = "127.0.0.1";
     var use_dnssec = false;
     var use_zoneversion = false;
@@ -379,7 +381,22 @@ fn queryTcp(allocator: std.mem.Allocator, io: std.Io, server: *const std.Io.net.
     return cli_query.exchangeTcpQuery(allocator, io, server, query, response_buffer);
 }
 
+/// A `--help` anywhere after the subcommand prints the same usage a bare
+/// `zimdns --help` prints. Without this, `query --help` parsed the flag as the
+/// query name and failed with BadName.
+fn printHelpIfRequested(args: []const []const u8, writer: *std.Io.Writer) !bool {
+    if (args.len <= 2) return false;
+    for (args[2..]) |arg| {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            try printHelp(writer);
+            return true;
+        }
+    }
+    return false;
+}
+
 fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocator, writer: *std.Io.Writer) !void {
+    if (try printHelpIfRequested(args, writer)) return;
     if (args.len < 3) {
         try writer.writeAll("error: expected 'server run'\n");
         try exitUsage(writer);
@@ -788,6 +805,21 @@ fn findListenerAddress(config: *const config_parser.Config, mode: ServerRunMode)
 
 fn defaultListenerAddress(port: u16) std.Io.net.IpAddress {
     return .{ .ip4 = .loopback(port) };
+}
+
+test "query and server run accept --help without treating it as an operand" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const query_args = [_][]const u8{ "zimdns", "query", "--help" };
+    var query_output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer query_output.deinit();
+    try handleQuery(&query_args, io, std.testing.allocator, &query_output.writer);
+    try std.testing.expect(std.mem.indexOf(u8, query_output.written(), "Usage:") != null);
+
+    const server_args = [_][]const u8{ "zimdns", "server", "run", "--help" };
+    var server_output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer server_output.deinit();
+    try handleServer(&server_args, io, std.testing.allocator, &server_output.writer);
+    try std.testing.expect(std.mem.indexOf(u8, server_output.written(), "Usage:") != null);
 }
 
 test "configured loop modes use their transport listener endpoint" {

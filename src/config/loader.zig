@@ -23,6 +23,7 @@ const signer = @import("../zone/signer.zig");
 const journal_mod = @import("../zone/journal.zig");
 
 const validate_mod = @import("../dns/validate.zig");
+const managed_mod = @import("../dns/managed_anchors.zig");
 const dns_name = @import("../dns/name.zig");
 const RecordType = @import("../dns/types.zig").RecordType;
 const tsig = @import("../dns/tsig.zig");
@@ -48,6 +49,8 @@ pub const Error = error{
     ZonemdPublishRequiresSigning,
     BadDnssecKey,
     BadTrustAnchorFile,
+    /// The RFC 5011 state file is unreadable or malformed.
+    BadManagedAnchorFile,
     /// The RFC 9432 catalog zone names a zone the server also serves, so the
     /// synthesized catalog and the configuration would contradict.
     BadCatalogZone,
@@ -89,6 +92,12 @@ pub const ServerContext = struct {
     /// no `trust-anchor-file` is configured, which is what keeps the forwarder
     /// a non-validating one.
     anchors: validate_mod.Anchors = .{},
+    /// RFC 5011 managed state layered over the DNSKEY anchors. Null when no
+    /// `managed-anchor-file` is configured. Moved into the runtime by
+    /// `takeRuntime`.
+    managed: ?*managed_mod.ManagedAnchors = null,
+    managed_dir: ?std.Io.Dir = null,
+    managed_path: []u8 = &.{},
     /// The RFC 1995 delta journal the operator asked for. Null when the
     /// configuration names no journal file, and the delta log then lives in
     /// memory only.
@@ -194,6 +203,44 @@ pub const ServerContext = struct {
             const anchor_text = try readReferencedFile(dir, io, anchor_path, allocator);
             defer allocator.free(anchor_text);
             context.anchors = validate_mod.Anchors.parse(context.allocator, anchor_text) catch return Error.BadTrustAnchorFile;
+        }
+        // RFC 5011 section 2: a managed trust point starts from the configured
+        // DNSKEY anchors and then rolls itself over. The state file is the
+        // resolver's own record, so a read failure is a startup failure: a
+        // half-parsed store would silently change the trust domain.
+        if (context.config.managedAnchorFileText()) |managed_path| {
+            if (!isConfinedPath(managed_path) or std.mem.indexOfScalar(u8, managed_path, '/') != null) {
+                return Error.InvalidReferencedPath;
+            }
+            const managed = try context.allocator.create(managed_mod.ManagedAnchors);
+            errdefer context.allocator.destroy(managed);
+            managed.* = managed_mod.ManagedAnchors.init(context.allocator, context.anchors);
+            // The store owns the configured anchors from here: the live view
+            // borrows their slices, so exactly one owner frees them.
+            managed.owns_static = true;
+            context.anchors = .{};
+            errdefer managed.deinit();
+            if (dir.readFileAlloc(io, managed_path, context.allocator, .limited(managed_mod.max_state_bytes))) |state_text| {
+                defer context.allocator.free(state_text);
+                managed.parseState(state_text) catch return Error.BadManagedAnchorFile;
+            } else |err| switch (err) {
+                error.FileNotFound => {},
+                else => return Error.BadManagedAnchorFile,
+            }
+            // A state file can name an owner whose static anchor the operator
+            // has since removed; those points must not outlive the configured
+            // trust statement.
+            managed.retainConfiguredOwners();
+            managed.bootstrap() catch return Error.BadManagedAnchorFile;
+            const state_text = try managed.serialize(context.allocator);
+            defer context.allocator.free(state_text);
+            managed_mod.writeFile(io, dir, context.allocator, managed_path, state_text) catch return Error.BadManagedAnchorFile;
+            // Publish the owning pointer only after every allocation the
+            // context's deinit would free has succeeded.
+            const owned_path = try context.allocator.dupe(u8, managed_path);
+            context.managed = managed;
+            context.managed_dir = dir;
+            context.managed_path = owned_path;
         }
         const now_seconds: u32 = @intCast(@divTrunc(
             std.Io.Clock.real.now(io).nanoseconds,
@@ -365,6 +412,17 @@ pub const ServerContext = struct {
         // owner frees them and no reload path exists to double-free.
         policy.anchors = self.anchors;
         self.anchors = .{};
+        // RFC 5011: the managed store borrows the same anchor slices, so it
+        // moves beside them. The live set is the static anchors minus a
+        // proven revocation plus every managed valid key.
+        policy.managed = self.managed;
+        self.managed = null;
+        policy.managed_dir = self.managed_dir;
+        self.managed_dir = null;
+        policy.managed_path = self.managed_path;
+        self.managed_path = &.{};
+        policy.anchors_owned = policy.managed == null;
+        if (policy.managed) |managed| managed.liveAnchors(&policy.anchors);
         // RFC 2136: an update is accepted only for a configured zone, with a
         // TSIG key the keyring holds, and is persisted to that zone's file.
         // The policy is validated before the runtime is built, so a bad line
@@ -550,6 +608,16 @@ pub const ServerContext = struct {
         // dropped without takeRuntime) are still owned here.
         self.anchors.deinit(self.allocator);
         self.anchors = .{};
+        if (self.managed) |managed| {
+            managed.deinit();
+            self.allocator.destroy(managed);
+            self.managed = null;
+        }
+        if (self.managed_path.len != 0) {
+            self.allocator.free(self.managed_path);
+            self.managed_path = &.{};
+        }
+        self.managed_dir = null;
     }
 };
 
@@ -1687,15 +1755,19 @@ fn countRrsigCovering(zone: zone_index.Zone, owner: []const u8, covered: u16) us
     return total;
 }
 
-/// The DNSKEY RDATA the zone publishes, which a validator anchors on. The
-/// record is served opaque, so the bytes are copied out of the parser's
-/// value.
+/// The zone-signing DNSKEY RDATA the zone publishes, which a data answer is
+/// validated against. The record is served opaque, so the bytes are copied
+/// out of the parser's value.
 fn zoneDnskeyRdata(allocator: std.mem.Allocator, zone: zone_index.Zone) ![]const u8 {
     for (zone.records.items[0..zone.records.len]) |record| {
         if (!record.rrtype.eql(.DNSKEY)) continue;
         const rdata = try zone_parser.parseRData(.DNSKEY, record.rdataText());
         switch (rdata) {
-            .Unknown => |unknown| return allocator.dupe(u8, unknown.bytes()),
+            .Unknown => |unknown| {
+                const bytes = unknown.bytes();
+                if (std.mem.readInt(u16, bytes[0..2], .big) & 0x0001 != 0) continue;
+                return allocator.dupe(u8, bytes);
+            },
             else => return error.TestUnexpectedResult,
         }
     }
@@ -1759,20 +1831,6 @@ test "a signed zone served by the runtime answers a DO=1 ANY query with a valid 
     try std.testing.expect(std.mem.indexOf(u8, response_bytes, &secret) == null);
 }
 
-/// The key tag the zone's DS states, which is the key tag of the key the
-/// parent points at.
-fn dsKeyTag(zone: zone_index.Zone) !u16 {
-    for (zone.records.items[0..zone.records.len]) |record| {
-        if (!record.rrtype.eql(.DS)) continue;
-        const rdata = try zone_parser.parseRData(.DS, record.rdataText());
-        switch (rdata) {
-            .Unknown => |unknown| return std.mem.readInt(u16, unknown.bytes()[0..2], .big),
-            else => return error.TestUnexpectedResult,
-        }
-    }
-    return error.TestUnexpectedResult;
-}
-
 /// The DNSKEY flags the zone publishes for the key of `algorithm`. RFC 5011
 /// section 3 puts the REVOKE bit in the flags of the key being revoked.
 fn dnskeyFlags(zone: zone_index.Zone, algorithm: u8) !u16 {
@@ -1807,8 +1865,11 @@ test "server context signs every zone named by the configured DNSSEC key file" {
     defer context.deinit();
 
     const zone = context.zones.items[0];
-    try std.testing.expectEqual(@as(usize, 1), countType(zone, .DNSKEY));
-    try std.testing.expectEqual(@as(usize, 1), countType(zone, .DS));
+    // RFC 4035 section 2.2: the DS belongs to the parent, so a signed zone
+    // publishes its DNSKEY and no DS of its own. One key is published as the
+    // 256/257 pair the external verifiers require.
+    try std.testing.expectEqual(@as(usize, 2), countType(zone, .DNSKEY));
+    try std.testing.expectEqual(@as(usize, 0), countType(zone, .DS));
     // Apex, ns1, www, and the wildcard owner are authoritative, so each joins
     // the NSEC chain with one record.
     try std.testing.expectEqual(@as(usize, 4), countType(zone, .NSEC));
@@ -1834,12 +1895,11 @@ test "server context signs a zone with a key-signing key beside the zone-signing
     var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
     defer context.deinit();
 
-    // RFC 6781 section 3.1: the zone publishes both keys, and the one DS it
-    // publishes states the key-signing key.
+    // RFC 6781 section 3.1: the zone publishes both keys; the DS that names
+    // the key-signing key belongs to the parent (RFC 4035 section 2.2).
     const zone = context.zones.items[0];
     try std.testing.expectEqual(@as(usize, 2), countType(zone, .DNSKEY));
-    try std.testing.expectEqual(@as(usize, 1), countType(zone, .DS));
-    try std.testing.expectEqual(@as(u16, 55648), try dsKeyTag(zone));
+    try std.testing.expectEqual(@as(usize, 0), countType(zone, .DS));
     // The DNSKEY RRset is signed by the key-signing key, and the rest of the
     // zone by the zone-signing key.
     try std.testing.expect(hasRrsigCovering(zone, "signed.example.", RecordType.DNSKEY.code()));
@@ -1861,12 +1921,10 @@ test "a zone with a second key-signing key publishes both DNSKEYs at the apex" {
     defer context.deinit();
 
     // RFC 6781 section 4.1.2: the zone publishes the zone-signing key and
-    // both key-signing keys, and the one DS it publishes states the key the
-    // parent's DS points at.
+    // both key-signing keys; the parent's DS points at the first of them.
     const zone = context.zones.items[0];
     try std.testing.expectEqual(@as(usize, 3), countType(zone, .DNSKEY));
-    try std.testing.expectEqual(@as(usize, 1), countType(zone, .DS));
-    try std.testing.expectEqual(@as(u16, 55648), try dsKeyTag(zone));
+    try std.testing.expectEqual(@as(usize, 0), countType(zone, .DS));
     // The DNSKEY RRset carries one signature per key-signing key.
     try std.testing.expectEqual(@as(usize, 2), countRrsigCovering(zone, "signed.example.", RecordType.DNSKEY.code()));
     try std.testing.expectEqual(@as(usize, 1), countRrsigCovering(zone, "signed.example.", RecordType.SOA.code()));
@@ -1893,9 +1951,7 @@ test "a revoked second key-signing key is published with the REVOKE bit" {
     try std.testing.expectEqual(@as(usize, 3), countType(zone, .DNSKEY));
     try std.testing.expectEqual(@as(u16, 385), try dnskeyFlags(zone, 14));
     try std.testing.expectEqual(@as(u16, 257), try dnskeyFlags(zone, 13));
-    // The DS still states the key `dnssec-ksk-file` names, and the DNSKEY
-    // RRset is still covered by one signature per key-signing key.
-    try std.testing.expectEqual(@as(u16, 55648), try dsKeyTag(zone));
+    // The DNSKEY RRset is still covered by one signature per key-signing key.
     try std.testing.expectEqual(@as(usize, 2), countRrsigCovering(zone, "signed.example.", RecordType.DNSKEY.code()));
 }
 
@@ -2332,6 +2388,43 @@ const dnssec_test_anchor =
 const dnssec_test_other_anchor =
     \\example. DNSKEY 257 3 13 GojIhhXUN/u4v54ZQqGSnyhWJwaubCvTmeexv7bR6edbkrSqQpF64cYbcB7wNcP+e+MAnLr+Wi9xMWyQLc8NAA==
 ;
+
+test "server context seeds RFC 5011 managed state from the trust-anchor file" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{ .sub_path = "anchors.txt", .data = dnssec_test_anchor });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "trust-anchor-file anchors.txt\nmanaged-anchor-file managed.txt\n" });
+
+    var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+    defer context.deinit();
+    const managed = context.managed orelse return error.TestUnexpectedResult;
+    // RFC 5011 section 2: the configured DNSKEY is the initial trust anchor.
+    try std.testing.expectEqual(@as(usize, 1), managed.points.items.len);
+    try std.testing.expectEqual(@as(usize, 1), managed.points.items[0].keys.items.len);
+    try std.testing.expectEqual(managed_mod.State.valid, managed.points.items[0].keys.items[0].state);
+
+    // The state the loader wrote is what the next start reads.
+    const text = try dir.dir.readFileAlloc(io, "managed.txt", std.testing.allocator, .limited(managed_mod.max_state_bytes));
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, " valid ") != null);
+}
+
+test "server context refuses a malformed RFC 5011 state file" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{ .sub_path = "anchors.txt", .data = dnssec_test_anchor });
+    try dir.dir.writeFile(io, .{ .sub_path = "managed.txt", .data = "this is not a state file\n" });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "trust-anchor-file anchors.txt\nmanaged-anchor-file managed.txt\n" });
+
+    try std.testing.expectError(
+        Error.BadManagedAnchorFile,
+        ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator),
+    );
+}
 
 test "server context accepts a signed zone whose apex ZONEMD chains to the trust anchor" {
     const io = std.Io.Threaded.global_single_threaded.io();

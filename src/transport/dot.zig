@@ -65,6 +65,9 @@ pub fn serveDotStreamOnceWithMetrics(
 /// DoT port never uses this path; it exists for the framing tests.
 fn serveDotStream(stream: std.Io.net.Stream, io: std.Io, runtime: *Runtime, counters: ?*metrics.Counters) !void {
     if (comptime !listener.TCP_DEADLINES_SUPPORTED) return listener.Error.UnsupportedPlatform;
+    // RFC 5011 timers live in wall-clock seconds, and a DoT-only server
+    // otherwise never runs the managed-anchor refresh.
+    runtime.maybeRefreshManagedAnchors(@intCast(std.Io.Clock.real.now(io).nanoseconds));
 
     var read_buffer: [STREAM_BUFFER_SIZE]u8 = undefined;
     var write_buffer: [STREAM_BUFFER_SIZE]u8 = undefined;

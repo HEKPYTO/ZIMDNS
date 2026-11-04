@@ -19,6 +19,7 @@ const dns_types = @import("dns/types.zig");
 const dns_writer = @import("dns/writer.zig");
 const dnssec = @import("dns/dnssec.zig");
 const validate = @import("dns/validate.zig");
+const managed_mod = @import("dns/managed_anchors.zig");
 const iterate_mod = @import("iterate.zig");
 const zone = @import("zone/index.zig");
 const zone_parser = @import("zone/parser.zig");
@@ -72,6 +73,8 @@ pub const EDE_STALE_ANSWER: u16 = 3;
 /// the upstream was unreachable, not the answer served from cache.
 pub const EDE_STALE_NXDOMAIN: u16 = 19;
 pub const EDE_NETWORK_ERROR: u16 = 23;
+/// RFC 8914 section 4.23: the walk reached no authority that could answer.
+pub const EDE_NO_REACHABLE_AUTHORITY: u16 = 22;
 /// RFC 8914 section 4.14: the resolver is returning an error from its cache.
 pub const EDE_CACHED_ERROR: u16 = 13;
 /// RFC 8914 DNSSEC-bogus INFO-CODEs (see dns/dnssec.zig for purpose text).
@@ -102,6 +105,7 @@ pub fn edeText(code: u16) []const u8 {
         EDE_STALE_ANSWER => "stale answer",
         EDE_STALE_NXDOMAIN => "stale nxdomain",
         EDE_NETWORK_ERROR => "network error",
+        EDE_NO_REACHABLE_AUTHORITY => "no reachable authority",
         EDE_CACHED_ERROR => "cached error",
         // The DNSSEC codes the validator produces (6-10 on a bogus answer,
         // 1, 2, 5 and 11 on an answer the server could not verify) carry
@@ -113,6 +117,7 @@ pub fn edeText(code: u16) []const u8 {
 pub const Error = error{
     NoForwarder,
     UpstreamFailure,
+    NoReachableAuthority,
     BadUpstreamResponse,
     ResponseTooLarge,
     UnsupportedOpcode,
@@ -189,6 +194,15 @@ pub const Policy = struct {
     /// and never sets AD. Owned here because the Policy is copied into the
     /// Resolver that outlives the config load.
     anchors: validate.Anchors = .{},
+
+    /// RFC 5011 managed trust anchors. Null unless `managed-anchor-file`
+    /// named one. The Resolver owns and frees the store.
+    managed: ?*managed_mod.ManagedAnchors = null,
+    /// False when `anchors` is a view over slices the managed store owns.
+    anchors_owned: bool = true,
+    /// The configuration directory and the state file inside it.
+    managed_dir: ?std.Io.Dir = null,
+    managed_path: []u8 = &.{},
 
     pub fn fromConfig(value: *const config.Config) !Policy {
         var policy = Policy{};
@@ -1364,9 +1378,12 @@ fn stripOptions(message: *dns_message.Message) void {
 pub const Resolver = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    // policy: one forward at a time; split the cache from the aggressive
-    // cache and lock each if concurrent forwarding throughput matters.
+    // One forward at a time keeps the cache and the aggressive cache under a
+    // single lock; split them if concurrent forwarding throughput matters.
     mutex: std.Io.Mutex = .init,
+    /// True when a managed-state write failed or the state moved after the
+    /// last successful write; the next tick retries before doing any work.
+    managed_state_dirty: bool = false,
     policy: Policy,
     upstream: ?std.Io.net.IpAddress,
     /// The root hint addresses the iterative path starts from; the test seam
@@ -1568,10 +1585,133 @@ pub const Resolver = struct {
     pub fn deinit(self: *Resolver) void {
         self.cache.deinit();
         self.policy.cookies.deinit();
-        self.policy.anchors.deinit(self.allocator);
+        if (self.policy.anchors_owned) self.policy.anchors.deinit(self.allocator);
+        if (self.policy.managed) |managed| {
+            managed.deinit();
+            self.allocator.destroy(managed);
+            self.policy.managed = null;
+        }
+        if (self.policy.managed_path.len != 0) {
+            self.allocator.free(self.policy.managed_path);
+            self.policy.managed_path = &.{};
+        }
+        self.policy.managed_dir = null;
         if (self.tls_ready) self.tls_client_state.deinit();
         if (self.doh_ready) self.doh_client_state.deinit();
         for (self.chain_entries[0..self.chain_len]) |entry| self.allocator.free(entry.records);
+    }
+
+    /// RFC 5011 section 2.3: queries every managed trust point whose refresh
+    /// is due. The call is bounded by the trust-point count, and a failed
+    /// fetch only moves that point's retry timer. A caller that cannot reach
+    /// the network yet simply leaves the timers running.
+    pub fn maybeRefreshManagedAnchors(self: *Resolver, now_ns: u64) void {
+        const managed = self.policy.managed orelse return;
+        const now: u64 = now_ns / std.time.ns_per_s;
+        var rounds: usize = 0;
+        var refreshed = false;
+        while (rounds < managed_mod.max_points) : (rounds += 1) {
+            const index = managed.refreshDue(now) orelse break;
+            refreshed = true;
+            self.refreshManagedPoint(managed, index, now) catch {
+                managed.noteFailure(index, now);
+            };
+        }
+        // A failed write is retried on the next tick even when no point is
+        // due; the in-memory revocation stays effective meanwhile.
+        if (refreshed or self.managed_state_dirty) {
+            self.persistManagedAnchors(managed) catch {
+                self.managed_state_dirty = true;
+                return;
+            };
+            self.managed_state_dirty = false;
+        }
+    }
+
+    fn refreshManagedPoint(self: *Resolver, managed: *managed_mod.ManagedAnchors, index: usize, now: u64) !void {
+        const point = &managed.points.items[index];
+        var response = try self.fetchManagedDnskey(point.owner);
+        defer response.deinit();
+
+        var keys: std.ArrayList([]const u8) = .empty;
+        defer keys.deinit(self.allocator);
+        var signatures: std.ArrayList([]const u8) = .empty;
+        defer signatures.deinit(self.allocator);
+        var ttl: u32 = std.math.maxInt(u32);
+        var expiration: u32 = 0;
+        for ([_][]const dns_record.ResourceRecord{ response.answers.slice(), response.authorities.slice() }) |section| {
+            // By pointer: an inline opaque RDATA lives in the record, and a
+            // copy would leave `raw` pointing at the loop's reused slot.
+            for (section) |*record| {
+                if (!record.owner.eql(&point.owner)) continue;
+                // Address the live field: capturing the payload by value
+                // copies the inline buffer, and `raw` would then point into
+                // the temporary instead of the response.
+                if (record.rdata != .Unknown) continue;
+                const raw = record.rdata.Unknown.bytes();
+                if (record.rrtype.eql(.DNSKEY)) {
+                    try keys.append(self.allocator, raw);
+                    ttl = @min(ttl, record.ttl);
+                } else if (record.rrtype.eql(.RRSIG) and raw.len >= 18 and
+                    std.mem.readInt(u16, raw[0..2], .big) == dns_types.RecordType.DNSKEY.code())
+                {
+                    try signatures.append(self.allocator, raw);
+                    const candidate = std.mem.readInt(u32, raw[8..12], .big);
+                    if (expiration == 0 or candidate < expiration) expiration = candidate;
+                }
+            }
+        }
+        if (keys.items.len == 0 or signatures.items.len == 0) return Error.UpstreamFailure;
+        if (ttl == std.math.maxInt(u32)) ttl = 3600;
+
+        const verified = try validate.verifiedDnskeySignatures(
+            self.allocator,
+            point.owner,
+            keys.items,
+            signatures.items,
+            @intCast(now),
+        );
+        defer self.allocator.free(verified);
+        if (verified.len == 0) return Error.UpstreamFailure;
+
+        const result = try managed.observe(index, keys.items, verified, ttl, now);
+        switch (result) {
+            .untrusted => return Error.UpstreamFailure,
+            .unchanged => {},
+            .changed => managed.liveAnchors(&self.policy.anchors),
+        }
+        managed.noteSuccess(index, ttl, expiration, now);
+    }
+
+    /// One DNSKEY query for a trust point, with DO set so the answer carries
+    /// the RRSIGs the RFC 5011 state machine verifies.
+    fn fetchManagedDnskey(self: *Resolver, apex: dns_name.Name) !dns_message.Message {
+        var request = dns_message.Message{
+            .allocator = self.allocator,
+            .header = .{ .id = 0, .question_count = 1, .recursion_desired = true },
+            .question = .{ .name = apex, .qtype = .DNSKEY, .qclass = .IN },
+            .answers = try dns_message.RecordSection.init(self.allocator, 0),
+            .authorities = try dns_message.RecordSection.init(self.allocator, 0),
+            .additionals = try dns_message.RecordSection.init(self.allocator, 0),
+        };
+        defer request.deinit();
+        var base_buffer: [512]u8 = undefined;
+        var writer = dns_writer.Writer.init(&base_buffer);
+        try request.encode(&writer);
+        var parsed = try dns_message.Message.parse(self.allocator, writer.written());
+        defer parsed.deinit();
+        // `queryUpstream` composes the upstream query (DO bit, cookie, key
+        // tags) from the client bytes, so the raw query is what it gets.
+        const upstream_answer = try self.queryUpstream(writer.written(), parsed, null, .udp);
+        return upstream_answer.response;
+    }
+
+    fn persistManagedAnchors(self: *Resolver, managed: *managed_mod.ManagedAnchors) !void {
+        const dir = self.policy.managed_dir orelse return;
+        if (self.policy.managed_path.len == 0) return;
+        const text = try managed.serialize(self.allocator);
+        defer self.allocator.free(text);
+        try managed_mod.writeFile(self.io, dir, self.allocator, self.policy.managed_path, text);
     }
 
     const max_chain_entries: usize = 48;
@@ -1744,12 +1884,14 @@ pub const Resolver = struct {
         }
         const exchange = self.queryUpstream(query_bytes, query, scope, transport) catch |err| switch (err) {
             Error.UpstreamFailure,
+            Error.NoReachableAuthority,
             Error.BadUpstreamResponse,
             => {
                 // RFC 9520 section 3.2: an upstream that sends no usable
                 // answer is a resolution failure, and the next client for the
                 // same question is answered from the cache.
-                self.cache.failures.put(key, .{ .rcode = .servfail, .ede = EDE_NETWORK_ERROR }, now);
+                const ede: u16 = if (err == Error.NoReachableAuthority) EDE_NO_REACHABLE_AUTHORITY else EDE_NETWORK_ERROR;
+                self.cache.failures.put(key, .{ .rcode = .servfail, .ede = ede }, now);
                 if (try self.cache.lookup(&key, query, now, output, true)) |stale| {
                     if (cookie == .valid) return self.addCachedCookie(output, query, cookie.valid);
                     return stale.bytes;
@@ -2877,6 +3019,17 @@ pub const Resolver = struct {
     /// One iterative resolution of `query`'s question from the root hints.
     /// A hop that cannot be completed is the resolver's upstream failure,
     /// so the failure cache and the stale-answer path treat it alike.
+    /// RFC 8914 section 4.23: a walk that reached no authority is a different
+    /// condition from one upstream socket failing, so the two get their own
+    /// INFO-CODEs and the cached failure keeps the one it was produced with.
+    fn mapIterateError(err: anyerror) anyerror {
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            iterate_mod.Error.NoReachableServer => Error.NoReachableAuthority,
+            else => Error.UpstreamFailure,
+        };
+    }
+
     fn iterate(self: *Resolver, query: dns_message.Message) !dns_message.Message {
         const question = query.question orelse return Error.UpstreamFailure;
         const now: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(self.io).nanoseconds, std.time.ns_per_s));
@@ -2892,10 +3045,7 @@ pub const Resolver = struct {
             .zone_out = &answer_zone,
             .qname_minimization = true,
         };
-        const resolved = iterate_mod.resolve(self.allocator, .{ .context = self, .send = iterateSend }, self.rootServers(now), question, options) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return Error.UpstreamFailure,
-        };
+        const resolved = iterate_mod.resolve(self.allocator, .{ .context = self, .send = iterateSend }, self.rootServers(now), question, options) catch |err| return mapIterateError(err);
         self.iterate_zone = answer_zone;
         return resolved;
     }
@@ -3990,7 +4140,24 @@ fn cloneMessage(allocator: std.mem.Allocator, source: dns_message.Message) !dns_
     var writer_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
     var writer = dns_writer.Writer.init(&writer_buffer);
     source.encode(&writer) catch return Error.BadUpstreamResponse;
-    return dns_message.Message.parse(allocator, writer.written());
+    // A parsed record's opaque RDATA borrows from the bytes it was parsed
+    // from, and `writer_buffer` dies with this call. Move every opaque RDATA
+    // into the record's inline storage before returning the message.
+    var message = dns_message.Message.parse(allocator, writer.written()) catch return Error.BadUpstreamResponse;
+    errdefer message.deinit();
+    inline for (.{ &message.answers, &message.authorities, &message.additionals }) |section| {
+        for (section.items[0..section.len]) |*record| switch (record.rdata) {
+            .Unknown => |*unknown| {
+                const borrowed = unknown.borrowed orelse continue;
+                if (borrowed.len > unknown.data.len) return Error.BadUpstreamResponse;
+                @memcpy(unknown.data[0..borrowed.len], borrowed);
+                unknown.len = @intCast(borrowed.len);
+                unknown.borrowed = null;
+            },
+            else => {},
+        };
+    }
+    return message;
 }
 
 fn validUpstreamResponse(response: dns_message.Message, query: dns_message.Message, expected_id: u16, scope: ?EcsScope) bool {
@@ -4348,6 +4515,10 @@ fn errorResponse(request: dns_message.Message, rcode: dns_header.Rcode, ede_code
 
 pub fn buildNetworkErrorResponse(request: dns_message.Message) !dns_message.Message {
     return errorResponse(request, .servfail, EDE_NETWORK_ERROR);
+}
+
+pub fn buildNoReachableAuthorityResponse(request: dns_message.Message) !dns_message.Message {
+    return errorResponse(request, .servfail, EDE_NO_REACHABLE_AUTHORITY);
 }
 
 fn appendEde(message: *dns_message.Message, code: u16) !void {
@@ -5035,6 +5206,29 @@ test "network failures add EDE only when the query has EDNS" {
     var classic_response = try buildNetworkErrorResponse(classic_query);
     defer classic_response.deinit();
     try std.testing.expect(findOption(classic_response, EDE_OPTION_CODE) == null);
+}
+
+test "a walk with no reachable authority carries EDE 22, not the network-error 23" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var edns_query = try makeTestQuery(arena.allocator(), 0x2504, "example.com.", true);
+    defer edns_query.deinit();
+    var response = try buildNoReachableAuthorityResponse(edns_query);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(@TypeOf(response.header.rcode), .servfail), response.header.rcode);
+    try expectEde(response, EDE_NO_REACHABLE_AUTHORITY, "no reachable authority");
+
+    var classic_query = try makeTestQuery(arena.allocator(), 0x2505, "example.com.", false);
+    defer classic_query.deinit();
+    var classic_response = try buildNoReachableAuthorityResponse(classic_query);
+    defer classic_response.deinit();
+    try std.testing.expect(findOption(classic_response, EDE_OPTION_CODE) == null);
+
+    // The walk's own errors map to distinct conditions: no authority is 22,
+    // every other walk failure is the upstream network error.
+    try std.testing.expect(Resolver.mapIterateError(iterate_mod.Error.NoReachableServer) == Error.NoReachableAuthority);
+    try std.testing.expect(Resolver.mapIterateError(iterate_mod.Error.TooManyHops) == Error.UpstreamFailure);
+    try std.testing.expect(Resolver.mapIterateError(error.OutOfMemory) == error.OutOfMemory);
 }
 
 test "TC fallback is fail closed without deadline support" {
@@ -13166,4 +13360,115 @@ test "RFC 8806: a query under a TLD reaches that TLD server, not a root server" 
     try std.testing.expectEqualSlices(u8, &.{ 192, 0, 2, 1 }, &answer.answers.items[0].rdata.A);
     try std.testing.expectEqual(@as(usize, 0), stub.root_queries);
     try std.testing.expect(stub.tld_queries > 0);
+}
+
+/// One DNSKEY RRset the RFC 5011 refresh stub answers with: the configured
+/// anchor and one new SEP key, signed by the anchor.
+const ManagedDnskeyUpstream = struct {
+    io: std.Io,
+    udp: *std.Io.net.Socket,
+    dnskey: [2][]const u8,
+    rrsig: []const u8,
+    max_requests: usize,
+    requests: usize = 0,
+};
+
+fn serveManagedDnskeyUpstream(args: *ManagedDnskeyUpstream) void {
+    const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(2), .clock = .awake } };
+    var request_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
+    while (args.requests < args.max_requests) {
+        const incoming = args.udp.receiveTimeout(args.io, &request_buffer, timeout) catch return;
+        args.requests += 1;
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const query = dns_message.Message.parseQuery(arena.allocator(), incoming.data) catch return;
+        const question = query.question orelse return;
+        var answers: [3]dns_record.ResourceRecord = undefined;
+        for (args.dnskey, 0..) |rdata, index| {
+            answers[index] = .{
+                .owner = question.name,
+                .rrtype = .DNSKEY,
+                .class = .IN,
+                .ttl = 3600,
+                .rdata = .{ .Unknown = .{ .len = @intCast(rdata.len), .borrowed = rdata } },
+            };
+        }
+        answers[2] = .{
+            .owner = question.name,
+            .rrtype = .RRSIG,
+            .class = .IN,
+            .ttl = 3600,
+            .rdata = .{ .Unknown = .{ .len = @intCast(args.rrsig.len), .borrowed = args.rrsig } },
+        };
+        var response_buffer: [2048]u8 = undefined;
+        const bytes = buildUpstreamAnswer(&response_buffer, query, &answers, &.{}, &.{}, .no_error, null) catch return;
+        args.udp.send(args.io, &incoming.from, bytes) catch return;
+    }
+}
+
+test "RFC 5011 section 2.2: the resolver adopts a new SEP key only after the hold-down" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var anchor_key = try zone_signer.parseKey("ed25519 DSSF3o0s0f+ElWzj9E/Osxw8hLpk55chkmx0LYN5WiY=\n");
+    defer anchor_key.deinit();
+    var new_key = try zone_signer.parseKey("ecdsap256sha256 GU6SnQ/Ou+xC5RumuIUIuJZteXT2z0O/ok1s38Et6mQ=\n");
+    defer new_key.deinit();
+
+    const anchor_dnskey = try anchor_key.dnskeyRdataWithFlags(allocator, zone_signer.key_signing_flags);
+    const new_dnskey = try new_key.dnskeyRdataWithFlags(allocator, zone_signer.key_signing_flags);
+    const rdatas = [_][]const u8{ anchor_dnskey, new_dnskey };
+    const window = zone_signer.Options{ .inception = 1_000_000_000, .expiration = 2_000_000_000 };
+    const apex = try dns_name.Name.fromText("example.com.");
+    const rrsig = try zone_signer.signRrset(allocator, apex, apex, dns_types.RecordType.DNSKEY.code(), &rdatas, 3600, &anchor_key, window);
+
+    // The stub answers on its own thread, so it gets its own threaded Io
+    // backend: sharing one across a blocked receive and the resolver's poll
+    // can starve the poll under a loaded test gate.
+    var stub_threaded = std.Io.Threaded.init(std.heap.page_allocator, .{ .concurrent_limit = .limited(8) });
+    defer stub_threaded.deinit();
+    const stub_io = stub_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, stub_io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(stub_io);
+    var upstream = ManagedDnskeyUpstream{
+        .io = stub_io,
+        .udp = &upstream_socket,
+        .dnskey = rdatas,
+        .rrsig = rrsig,
+        .max_requests = 2,
+    };
+    const thread = try std.Thread.spawn(.{}, serveManagedDnskeyUpstream, .{&upstream});
+
+    var resolver = try Resolver.init(allocator, io, .{ .forwarder = .{ .address = upstream_socket.address } });
+    defer resolver.deinit();
+    // The trust anchor is the key that signs the RRset above, so its key tag
+    // matches the tag the verification reports.
+    var anchor_text_buffer: [128]u8 = undefined;
+    const anchor_key_text = std.base64.standard.Encoder.encode(&anchor_text_buffer, anchor_dnskey[4..]);
+    const anchor_text = try std.fmt.allocPrint(allocator, "example.com. DNSKEY 257 3 15 {s}\n", .{anchor_key_text});
+    const anchors = try validate.Anchors.parse(allocator, anchor_text);
+    try std.testing.expectEqual(@as(usize, 1), anchors.len);
+    try std.testing.expectEqualSlices(u8, anchor_dnskey, anchors.items[0].rdata);
+    resolver.policy.anchors = anchors;
+    const managed = try allocator.create(managed_mod.ManagedAnchors);
+    managed.* = managed_mod.ManagedAnchors.init(allocator, anchors);
+    try managed.bootstrap();
+    resolver.policy.managed = managed;
+    managed.liveAnchors(&resolver.policy.anchors);
+
+    // The first validated RRset starts the hold-down.
+    resolver.maybeRefreshManagedAnchors(1_500_000_000 * std.time.ns_per_s);
+    try std.testing.expectEqual(@as(usize, 1), managed.points.items.len);
+    try std.testing.expectEqual(managed_mod.State.valid, managed.points.items[0].keys.items[0].state);
+    try std.testing.expectEqual(managed_mod.State.add_pending, managed.points.items[0].keys.items[1].state);
+    try std.testing.expectEqual(@as(usize, 1), resolver.policy.anchors.len);
+
+    // After the hold-down a validated RRset with the key accepts it.
+    resolver.maybeRefreshManagedAnchors((1_500_000_000 + managed_mod.add_hold_down_seconds) * std.time.ns_per_s);
+    try std.testing.expectEqual(managed_mod.State.valid, managed.points.items[0].keys.items[1].state);
+    try std.testing.expectEqual(@as(usize, 2), resolver.policy.anchors.len);
+    thread.join();
 }

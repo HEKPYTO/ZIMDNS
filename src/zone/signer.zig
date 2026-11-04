@@ -94,6 +94,11 @@ const secure_entry_point_flag: u16 = 0x0001;
 /// single-type signing scheme, which is why every example key file uses 257,
 /// the value RFC 8080 section 6.1 publishes.
 const dnskey_flags: u16 = zone_key_flag | secure_entry_point_flag;
+/// The two DNSKEY forms the signer publishes. A zone signs its data with
+/// `zone_key_flags` and its DNSKEY RRset with `key_signing_flags`; the
+/// signature's key tag is over the RDATA of the form it names.
+pub const zone_key_flags: u16 = zone_key_flag;
+pub const key_signing_flags: u16 = dnskey_flags;
 /// RFC 5011 section 3: bit 8 of the DNSKEY Flags field is the REVOKE flag.
 const revoke_flag: u16 = 0x0080;
 /// RFC 4034 section 2.1.2 fixes protocol at 3; other values MUST NOT be used.
@@ -197,21 +202,6 @@ pub const Key = struct {
     ) Error![]const u8 {
         return dnskeyRdataOf(self.material, allocator, flags);
     }
-
-    /// RFC 4034 section 5.1.4:
-    ///   digest = digest_algorithm( DNSKEY owner name in canonical form
-    ///                              | DNSKEY RDATA )
-    /// The owner arrives as a parameter so this stays a function of its
-    /// arguments, and the key tag in the DS RDATA is computed over the same
-    /// DNSKEY RDATA (RFC 4034 Appendix B).
-    fn dsRdata(
-        self: *const Key,
-        allocator: std.mem.Allocator,
-        owner_wire: []const u8,
-        dnskey_rdata: []const u8,
-    ) Error![]const u8 {
-        return dsRdataOf(self.material, allocator, owner_wire, dnskey_rdata);
-    }
 };
 
 /// RFC 6781 section 3.1: the key-signing key of a zone that separates the
@@ -313,41 +303,6 @@ fn dnskeyRdataOf(material: Material, allocator: std.mem.Allocator, flags: u16) E
         },
     }
     return allocator.dupe(u8, buffer[0..len]);
-}
-
-/// The DS RDATA of one key over the DNSKEY RDATA the zone publishes
-/// (RFC 4034 section 5.1.4).
-fn dsRdataOf(
-    material: Material,
-    allocator: std.mem.Allocator,
-    owner_wire: []const u8,
-    dnskey_rdata: []const u8,
-) Error![]const u8 {
-    var digest: [std.crypto.hash.sha2.Sha384.digest_length]u8 = undefined;
-    var digest_len: usize = undefined;
-    switch (DigestType.forAlgorithm(material)) {
-        .sha256 => {
-            var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-            hasher.update(owner_wire);
-            hasher.update(dnskey_rdata);
-            hasher.final(digest[0..std.crypto.hash.sha2.Sha256.digest_length]);
-            digest_len = std.crypto.hash.sha2.Sha256.digest_length;
-        },
-        .sha384 => {
-            var hasher = std.crypto.hash.sha2.Sha384.init(.{});
-            hasher.update(owner_wire);
-            hasher.update(dnskey_rdata);
-            hasher.final(&digest);
-            digest_len = std.crypto.hash.sha2.Sha384.digest_length;
-        },
-    }
-
-    var buffer: [4 + digest.len]u8 = undefined;
-    std.mem.writeInt(u16, buffer[0..2], dns_dnssec.keyTag(dnskey_rdata), .big);
-    buffer[2] = @backingInt(material);
-    buffer[3] = @backingInt(DigestType.forAlgorithm(material));
-    @memcpy(buffer[4..][0..digest_len], digest[0..digest_len]);
-    return allocator.dupe(u8, buffer[0 .. 4 + digest_len]);
 }
 
 /// Signs with one key's material.
@@ -738,15 +693,20 @@ pub fn signZone(
     //
     // RFC 6781 section 3.1: a zone that separates the roles publishes both
     // keys, and the DS states the key-signing key, the key the parent points
-    // at. A zone with one key publishes that key and its DS, as it always did.
-    const zsk_dnskey = try zoneSigningDnskey(key, work);
+    // at. A zone with one key publishes that key twice: once with the Zone
+    // Key flag alone, which signs the zone data, and once with the Secure
+    // Entry Point flag, which signs the DNSKEY RRset and is the key a parent's
+    // DS names. External verifiers (BIND `dnssec-verify`) require a ZSK
+    // beside the KSK and reject a zone whose only key carries flags 257.
+    const zsk_dnskey = try key.dnskeyRdataWithFlags(work, zone_key_flag);
+    const ksk_rdata = if (key.ksk) |*ksk|
+        try dnskeyRdataOf(ksk.material, work, dnskey_flags)
+    else
+        try key.dnskeyRdataWithFlags(work, dnskey_flags);
     var key_rdata: [3][]const u8 = undefined;
     key_rdata[0] = zsk_dnskey;
-    var key_count: usize = 1;
-    if (key.ksk) |*ksk| {
-        key_rdata[1] = try dnskeyRdataOf(ksk.material, work, dnskey_flags);
-        key_count = 2;
-    }
+    key_rdata[1] = ksk_rdata;
+    var key_count: usize = 2;
     // RFC 6781 section 4.1.2: the second key-signing key of a
     // Double-Signature rollover is published beside the first and signs the
     // DNSKEY RRset with it.
@@ -761,12 +721,11 @@ pub fn signZone(
         key_count += 1;
     }
     try appendDnskeys(work, origin_wire, soa_ttl, key_rdata[0..key_count], &rrsets);
-    const ksk_tag: u16 = if (key.ksk != null) dns_dnssec.keyTag(key_rdata[1]) else 0;
-    const ds_rdata = if (key.ksk) |*ksk|
-        try dsRdataOf(ksk.material, work, origin_wire, key_rdata[1])
-    else
-        try key.dsRdata(work, origin_wire, zsk_dnskey);
-    try appendSingle(work, origin_wire, RecordType.DS.code(), soa_ttl, ds_rdata, &rrsets);
+    const ksk_tag: u16 = dns_dnssec.keyTag(ksk_rdata);
+    // RFC 4035 section 2.2: the DS RRset that authorizes this zone's key
+    // lives in the parent zone, not at the child apex. The signer publishes
+    // the DNSKEY and leaves the DS to the parent; an apex DS would be data
+    // this zone cannot vouch for, and external verifiers reject it.
     std.mem.sort(Rrset, rrsets.items, {}, rrsetLessThan);
     // RFC 8976 ZONEMD publishing: the placeholder RRset is present before the
     // chain is built so the denial bitmap names type 63. Its digest is zero;
@@ -819,7 +778,7 @@ pub fn signZone(
         real_rdata[5] = @backingInt(hash);
         @memcpy(real_rdata[6..], digest[0..hash.digestLen()]);
         const zonemd_record = try genericRecord(allocator, origin_wire, RecordType.ZONEMD.code(), soa_ttl, real_rdata);
-        const rrsig_rdata = try signRrset(allocator, origin, origin, RecordType.ZONEMD.code(), &.{real_rdata}, soa_ttl, key, options);
+        const rrsig_rdata = try signDataRrset(allocator, origin, origin, RecordType.ZONEMD.code(), &.{real_rdata}, soa_ttl, key, options);
         defer allocator.free(rrsig_rdata);
         const rrsig_record = try genericRecord(allocator, origin_wire, RecordType.RRSIG.code(), soa_ttl, rrsig_rdata);
         try appendGenerated(allocator, zone, &.{ zonemd_record, rrsig_record });
@@ -960,12 +919,41 @@ pub fn signRrset(
     key: *const Key,
     options: Options,
 ) Error![]const u8 {
+    return signRrsetWithFlags(allocator, owner, signer, rrtype, rdatas, ttl, key, key_signing_flags, options);
+}
+
+/// Signs a data RRset with the zone-signing form, the key the zone publishes
+/// over its ordinary records and the tag those RRSIGs name.
+pub fn signDataRrset(
+    allocator: std.mem.Allocator,
+    owner: Name,
+    signer: Name,
+    rrtype: u16,
+    rdatas: []const []const u8,
+    ttl: u32,
+    key: *const Key,
+    options: Options,
+) Error![]const u8 {
+    return signRrsetWithFlags(allocator, owner, signer, rrtype, rdatas, ttl, key, zone_key_flags, options);
+}
+
+fn signRrsetWithFlags(
+    allocator: std.mem.Allocator,
+    owner: Name,
+    signer: Name,
+    rrtype: u16,
+    rdatas: []const []const u8,
+    ttl: u32,
+    key: *const Key,
+    key_flags: u16,
+    options: Options,
+) Error![]const u8 {
     var scratch = std.heap.ArenaAllocator.init(allocator);
     defer scratch.deinit();
     const work = scratch.allocator();
 
     const order = try work.dupe([]const u8, rdatas);
-    const dnskey_rdata = try zoneSigningDnskey(key, work);
+    const dnskey_rdata = try key.dnskeyRdataWithFlags(work, key_flags);
     const signed = try signedData(
         work,
         .{ .owner_wire = owner.asWire(), .rrtype = rrtype, .ttl = ttl, .rdata = order },
@@ -1178,7 +1166,12 @@ fn claimZone(comptime T: type, key: *T, origin: Name) Error!void {
 /// 3.2.3 sets the Secure Entry Point bit on the key-signing key and not on
 /// the zone-signing key.
 fn zoneSigningDnskey(key: *const Key, allocator: std.mem.Allocator) Error![]const u8 {
-    const flags: u16 = if (key.ksk == null) dnskey_flags else zone_key_flag;
+    // A zone with no separate key-signing key publishes this key as a
+    // zone-signing key: RFC 4034 section 2.1.1's Secure Entry Point bit says
+    // "this key is a key-signing key", and this one signs the zone data.
+    // External verifiers (BIND dnssec-verify) require a ZSK for the data
+    // RRsets and reject a zone whose only key is flagged as a KSK.
+    const flags: u16 = zone_key_flag;
     return key.dnskeyRdataWithFlags(allocator, flags);
 }
 
@@ -1399,10 +1392,16 @@ fn appendNsec3Chain(
         }
         // RFC 5155 section 7.1: an Opt-Out chain leaves the owner name of an
         // unsigned delegation out, and the record that covers its hash
-        // carries the Opt-Out bit instead.
-        if (opt_out and has_ns and !has_ds) continue;
-        // The RRSIG over every RRset at the name is a type present at the name.
-        try codes.append(allocator, RecordType.RRSIG.code());
+        // carries the Opt-Out bit instead. The apex is not a delegation even
+        // though it carries NS, and it keeps its NSEC3.
+        if (opt_out and has_ns and !has_ds and !std.mem.eql(u8, owner_wire, origin_wire)) continue;
+        // The RRSIG over every RRset at the name is a type present at the
+        // name. A delegation whose NS RRset is left unsigned (RFC 4035
+        // section 2.2) carries no signature at that owner, so its NSEC3
+        // names NS alone; the RRSIG over the NSEC3 lives at the hashed
+        // owner, which RFC 5155 section 7.1 excludes.
+        const unsigned_delegation = has_ns and !has_ds and !std.mem.eql(u8, owner_wire, origin_wire);
+        if (!unsigned_delegation) try codes.append(allocator, RecordType.RRSIG.code());
         try entries.append(allocator, .{
             .hash = try nsec3HashOf(owner_wire, params),
             .codes = try allocator.dupe(u16, codes.items),
@@ -1598,6 +1597,10 @@ fn emit(
             else => {},
         }
         if (skip_zonemd and rrset.rrtype == RecordType.ZONEMD.code()) continue;
+        // RFC 4035 section 2.2: a delegation's NS RRset is not signed by the
+        // parent. It is still published and transferred, but it carries no
+        // RRSIG, and external verifiers reject one that does.
+        if (rrset.rrtype == RecordType.NS.code() and !std.mem.eql(u8, rrset.owner_wire, signer_wire)) continue;
 
         // RFC 6781 section 3.1: the key-signing key signs the DNSKEY RRset
         // and nothing else; the zone-signing key signs every other RRset. A
@@ -1612,8 +1615,11 @@ fn emit(
         // the RRset is done.
         defer std.crypto.secureZero(u8, std.mem.sliceAsBytes(signers[0..signer_count]));
         signers[0] = .{ .material = key.material, .tag = key_tag };
-        if (rrset.rrtype == RecordType.DNSKEY.code() and ksk != null) {
-            signers[0] = .{ .material = ksk.?.material, .tag = ksk_tag };
+        // The apex DS states this zone's own key-signing key, so it is key
+        // material rather than ordinary zone data and is signed by that key.
+        const own_ds = rrset.rrtype == RecordType.DS.code() and std.mem.eql(u8, rrset.owner_wire, signer_wire);
+        if ((rrset.rrtype == RecordType.DNSKEY.code() or own_ds) and ksk_tag != 0) {
+            signers[0] = .{ .material = if (ksk) |value| value.material else key.material, .tag = ksk_tag };
             if (published_ksk) |second| {
                 signers[1] = .{ .material = second.material, .tag = published_ksk_tag };
                 signer_count = 2;
@@ -1731,7 +1737,6 @@ fn appendGenerated(allocator: std.mem.Allocator, zone: *zone_index.Zone, extra: 
 
 const rfc8080_ed25519_key = "ed25519 DSSF3o0s0f+ElWzj9E/Osxw8hLpk55chkmx0LYN5WiY=\n";
 const rfc8080_ed25519_dnskey = "zPnZ/QwEe7S8C5SPz2OfS5RR40ATk2/rYnE9xHIEijs=";
-const rfc8080_ed25519_ds = "401781b934e392de492ec77ae2e15d70f6575a1c0bc59c5275c04ebe80c6614c";
 const rfc8080_ed25519_key_tag: u16 = 35217;
 /// RFC 8032 section 7.4 blank-message secret, base64-encoded so the key file
 /// can carry it. It is a test secret, not a published DNSSEC vector.
@@ -1743,12 +1748,10 @@ const rfc8080_mx_rrsig_hex =
 
 const rfc6605_p256_key = "ecdsap256sha256 GU6SnQ/Ou+xC5RumuIUIuJZteXT2z0O/ok1s38Et6mQ=\n";
 const rfc6605_p256_dnskey = "GojIhhXUN/u4v54ZQqGSnyhWJwaubCvTmeexv7bR6edbkrSqQpF64cYbcB7wNcP+e+MAnLr+Wi9xMWyQLc8NAA==";
-const rfc6605_p256_ds = "b4c8c1fe2e7477127b27115656ad6256f424625bf5c1e2770ce6d6e37df61d17";
 const rfc6605_p256_key_tag: u16 = 55648;
 
 const rfc6605_p384_key = "ecdsap384sha384 WURgWHCcYIYUPWgeLmiPY2DJJk02vgrmTfitxgqcL4vwW7BOrbawVmVe0d9V94SR\n";
 const rfc6605_p384_dnskey = "xKYaNhWdGOfJ+nPrL8/arkwf2EY3MDJ+SErKivBVSum1w/egsXvSADtNJhyem5RCOpgQ6K8X1DRSEkrbYQ+OB+v8/uX45NBwY8rp65F6Glur8I/mlVNgF6W/qTI37m40";
-const rfc6605_p384_ds = "72d7b62976ce06438e9c0bf319013cf801f09ecc84b8d7e9495f27e305c6a9b0563a9b5f4d288405c3008a946df983d6";
 const rfc6605_p384_key_tag: u16 = 10771;
 
 const rfc5702_zone =
@@ -1965,6 +1968,7 @@ fn hasRecord(zone: *const zone_index.Zone, owner_text: []const u8, rrtype: Recor
 /// begins with `type_covered`, so an RRSIG is picked by what it covers rather
 /// than by its position in the generated list.
 fn findOpaque(
+    allocator: std.mem.Allocator,
     zone: *const zone_index.Zone,
     owner_text: []const u8,
     rrtype: RecordType,
@@ -1980,7 +1984,7 @@ fn findOpaque(
                 if (type_covered) |covered| {
                     if (bytes.len < 2 or std.mem.readInt(u16, bytes[0..2], .big) != covered) continue;
                 }
-                return bytes;
+                return try allocator.dupe(u8, bytes);
             },
             else => return error.TestUnexpectedResult,
         }
@@ -2033,9 +2037,14 @@ fn rrsigsCovering(
     return out.toOwnedSlice(allocator);
 }
 
-/// The DNSKEY the zone publishes for the key of `algorithm`.
+/// The DNSKEY the zone publishes for the key of `algorithm`. A single-key
+/// zone publishes the key twice, 256 and 257; the chain anchor is the 257
+/// form, so that one is preferred.
 fn publishedKey(allocator: std.mem.Allocator, zone: *const zone_index.Zone, algorithm: u8) ![]const u8 {
     const keys = try apexDnskeys(allocator, zone);
+    for (keys) |rdata| {
+        if (rdata[3] == algorithm and std.mem.readInt(u16, rdata[0..2], .big) & 0x0001 != 0) return rdata;
+    }
     for (keys) |rdata| {
         if (rdata[3] == algorithm) return rdata;
     }
@@ -2076,45 +2085,6 @@ fn expectSignedBy(
         if (bytes.len < 18) continue;
         if (std.mem.readInt(u16, bytes[0..2], .big) != RecordType.DNSKEY.code()) continue;
         if (std.mem.readInt(u16, bytes[16..18], .big) != key_tag) continue;
-        try response.answers.append(try (@import("../auth/response.zig")).zoneRecordToResourceRecord(record, null));
-    }
-    response.header.answer_count = @intCast(response.answers.len);
-    const request = try doBitQuery(allocator, zone.originText(), .DNSKEY);
-    const result = try dns_validate.validate(allocator, &anchors, request, response, &.{}, rfc8080_window.inception + 1);
-    try std.testing.expectEqual(dns_validate.Status.secure, result.status);
-}
-
-/// The apex DNSKEY RRset validated the way a validator that trusts the
-/// parent's DS does: the DS is the trust anchor, and the RRset must verify
-/// with the key the DS names. A secure verdict says the DS still names a
-/// key the zone signs with.
-fn expectSecureThroughDs(
-    allocator: std.mem.Allocator,
-    zone: *const zone_index.Zone,
-    ds_rdata: []const u8,
-) !void {
-    const apex = try Name.fromText(zone.originText());
-    var anchors = dns_validate.Anchors{};
-    anchors.items[0] = .{ .owner = apex, .rrtype = .DS, .rdata = try allocator.dupe(u8, ds_rdata) };
-    anchors.len = 1;
-
-    var response = dns_message.Message{
-        .allocator = allocator,
-        .header = .{ .id = 0x4413, .qr = true, .rcode = .no_error },
-        .question = .{ .name = apex, .qtype = .DNSKEY, .qclass = dns_types.Class.IN },
-    };
-    for (zone.records.items[0..zone.records.len]) |record| {
-        if (record.rrtype.eql(.DNSKEY)) {
-            try response.answers.append(try (@import("../auth/response.zig")).zoneRecordToResourceRecord(record, null));
-            continue;
-        }
-        if (!record.rrtype.eql(.RRSIG)) continue;
-        const rdata = try zone_parser.parseRData(.RRSIG, record.rdataText());
-        const bytes = switch (rdata) {
-            .Unknown => |*unknown| unknown.bytes(),
-            else => continue,
-        };
-        if (bytes.len < 2 or std.mem.readInt(u16, bytes[0..2], .big) != RecordType.DNSKEY.code()) continue;
         try response.answers.append(try (@import("../auth/response.zig")).zoneRecordToResourceRecord(record, null));
     }
     response.header.answer_count = @intCast(response.answers.len);
@@ -2169,29 +2139,16 @@ test "RFC 6781 section 3.1: a zone that separates the roles publishes both keys 
     try std.testing.expect(saw_ksk);
     try std.testing.expect(saw_zsk);
 
-    // The DS states the key-signing key: its key tag, its algorithm, and the
-    // digest RFC 8080 section 6.1 publishes for that key.
-    const ds = (try findOpaque(&zone, "example.com.", .DS, null)).?;
-    try std.testing.expectEqual(rfc8080_ed25519_key_tag, std.mem.readInt(u16, ds[0..2], .big));
-    try std.testing.expectEqual(@as(u8, 15), ds[2]);
-    try std.testing.expectEqual(@as(u8, 2), ds[3]);
-    try std.testing.expect(hexEquals(rfc8080_ed25519_ds, ds[4..]));
-    // RFC 4034 section 5.1.4: the digest is over the DNSKEY RDATA of the
-    // key the DS names, which is the key-signing key.
-    const ksk_dnskey = keys[if (keys[0][3] == 15) 0 else 1];
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update((try Name.fromText("example.com.")).asWire());
-    hasher.update(ksk_dnskey);
-    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    hasher.final(&digest);
-    try std.testing.expectEqualSlices(u8, &digest, ds[4 .. 4 + digest.len]);
+    // RFC 4035 section 2.2: the DS lives in the parent zone, so the child
+    // publishes its DNSKEY and no DS of its own.
+    try std.testing.expect((try findOpaque(allocator, &zone, "example.com.", .DS, null)) == null);
 
     // The DNSKEY RRset is signed by the key-signing key, and every other
     // RRset by the zone-signing key (RFC 6781 section 3.1).
-    const dnskey_rrsig = (try findOpaque(&zone, "example.com.", .RRSIG, RecordType.DNSKEY.code())).?;
+    const dnskey_rrsig = (try findOpaque(allocator, &zone, "example.com.", .RRSIG, RecordType.DNSKEY.code())).?;
     try std.testing.expectEqual(@as(u8, 15), dnskey_rrsig[2]);
     try std.testing.expectEqual(rfc8080_ed25519_key_tag, std.mem.readInt(u16, dnskey_rrsig[16..18], .big));
-    const soa_rrsig = (try findOpaque(&zone, "example.com.", .RRSIG, RecordType.SOA.code())).?;
+    const soa_rrsig = (try findOpaque(allocator, &zone, "example.com.", .RRSIG, RecordType.SOA.code())).?;
     try std.testing.expectEqual(@as(u8, 13), soa_rrsig[2]);
     const zsk_tag = dns_dnssec.keyTag(keys[if (keys[0][3] == 13) 0 else 1]);
     try std.testing.expectEqual(zsk_tag, std.mem.readInt(u16, soa_rrsig[16..18], .big));
@@ -2260,13 +2217,9 @@ test "RFC 6781 section 4.1.2: a double-signature KSK rollover publishes both key
     try expectSignedBy(allocator, &zone, ksk_dnskey, rfc8080_ed25519_key_tag);
     try expectSignedBy(allocator, &zone, new_ksk_dnskey, rfc6605_p384_key_tag);
 
-    // The one DS the zone publishes states the key the parent's DS points
-    // at, and not the second key-signing key (RFC 6781 section 4.1.2, the
-    // Double-Signature scheme). The bytes are copied out of the parser's
-    // value, which lives no longer than the call that made it.
-    const ds = try allocator.dupe(u8, (try findOpaque(&zone, "example.com.", .DS, null)).?);
-    try std.testing.expectEqual(rfc8080_ed25519_key_tag, std.mem.readInt(u16, ds[0..2], .big));
-    try std.testing.expect(std.mem.readInt(u16, ds[0..2], .big) != rfc6605_p384_key_tag);
+    // RFC 4035 section 2.2: the DS lives in the parent zone, so the child
+    // publishes no DS and the rollover does not move one.
+    try std.testing.expect((try findOpaque(allocator, &zone, "example.com.", .DS, null)) == null);
 
     // Every other RRset is still signed by the zone-signing key alone.
     const zsk_dnskey = try publishedKey(allocator, &zone, 13);
@@ -2275,36 +2228,12 @@ test "RFC 6781 section 4.1.2: a double-signature KSK rollover publishes both key
     try std.testing.expectEqual(@as(u8, 13), soa_sigs[0][2]);
     try std.testing.expectEqual(dns_dnssec.keyTag(zsk_dnskey), std.mem.readInt(u16, soa_sigs[0][16..18], .big));
 
-    // The project's own validator accepts the zone: the DS the parent holds
-    // authenticates the key-signing key, and the zone-signing key signs the
-    // rest of the zone.
+    // The project's own validator accepts the zone: each key-signing key
+    // authenticates the DNSKEY RRset with its own signature, and the
+    // zone-signing key signs the rest of the zone.
     const apex = try Name.fromText("example.com.");
-    var ds_anchors = dns_validate.Anchors{};
-    ds_anchors.items[0] = .{ .owner = apex, .rrtype = .DS, .rdata = try allocator.dupe(u8, ds) };
-    ds_anchors.len = 1;
-    var dnskey_response = dns_message.Message{
-        .allocator = allocator,
-        .header = .{ .id = 0x4411, .qr = true, .rcode = .no_error },
-        .question = .{ .name = apex, .qtype = .DNSKEY, .qclass = dns_types.Class.IN },
-    };
-    for (zone.records.items[0..zone.records.len]) |record| {
-        if (record.rrtype.eql(.DNSKEY)) {
-            try dnskey_response.answers.append(try (@import("../auth/response.zig")).zoneRecordToResourceRecord(record, null));
-            continue;
-        }
-        if (!record.rrtype.eql(.RRSIG)) continue;
-        const rdata = try zone_parser.parseRData(.RRSIG, record.rdataText());
-        const bytes = switch (rdata) {
-            .Unknown => |*unknown| unknown.bytes(),
-            else => continue,
-        };
-        if (bytes.len < 2 or std.mem.readInt(u16, bytes[0..2], .big) != RecordType.DNSKEY.code()) continue;
-        try dnskey_response.answers.append(try (@import("../auth/response.zig")).zoneRecordToResourceRecord(record, null));
-    }
-    dnskey_response.header.answer_count = @intCast(dnskey_response.answers.len);
-    const dnskey_request = try doBitQuery(allocator, "example.com.", .DNSKEY);
-    const dnskey_result = try dns_validate.validate(allocator, &ds_anchors, dnskey_request, dnskey_response, &.{}, rfc8080_window.inception + 1);
-    try std.testing.expectEqual(dns_validate.Status.secure, dnskey_result.status);
+    try expectSignedBy(allocator, &zone, ksk_dnskey, rfc8080_ed25519_key_tag);
+    try expectSignedBy(allocator, &zone, new_ksk_dnskey, rfc6605_p384_key_tag);
 
     var zsk_anchors = dns_validate.Anchors{};
     zsk_anchors.items[0] = .{ .owner = apex, .rrtype = .DNSKEY, .rdata = try allocator.dupe(u8, try publishedKey(allocator, &zone, 13)) };
@@ -2391,20 +2320,14 @@ test "RFC 6781 section 4.1.2.1: a revoked key-signing key is published with the 
     try std.testing.expect(saw_revoked_tag);
     try std.testing.expect(saw_ksk_tag);
 
-    // The one DS the zone publishes still states the key `dnssec-ksk-file`
-    // names, and not the revoked one: RFC 5011 section 2.1 notes that a
-    // DNSKEY with the REVOKE bit set has a different fingerprint, so a
-    // revoked key no longer matches a DS that names it.
-    const ds = try allocator.dupe(u8, (try findOpaque(&zone, "example.com.", .DS, null)).?);
-    try std.testing.expectEqual(ksk_tag, std.mem.readInt(u16, ds[0..2], .big));
-    try std.testing.expect(std.mem.readInt(u16, ds[0..2], .big) != revoked_tag);
-
-    // The project's own validator accepts the zone through that DS, so the
-    // revoked key's presence in the RRset does not break the chain.
-    try expectSecureThroughDs(allocator, &zone, ds);
+    // RFC 4035 section 2.2: the DS lives in the parent zone. The revoked
+    // key's presence in the RRset does not break the chain a validator
+    // builds from the key-signing key itself.
+    try std.testing.expect((try findOpaque(allocator, &zone, "example.com.", .DS, null)) == null);
+    try expectSignedBy(allocator, &zone, ksk_dnskey, ksk_tag);
 }
 
-test "a zone with one key publishes one DNSKEY and one DS, and the bytes it publishes are the ones it always published" {
+test "a zone with one key publishes the key as a 256/257 pair and signs data with the 256 form" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -2416,25 +2339,30 @@ test "a zone with one key publishes one DNSKEY and one DS, and the bytes it publ
     defer zone.deinit();
     try signZone(allocator, &zone, &key, rfc8080_window);
 
-    // One key is the single-type signing scheme (RFC 6781 section 3.1): one
-    // DNSKEY, one DS, and the Secure Entry Point flag on that key.
+    // One key is the single-type signing scheme (RFC 6781 section 3.1): the
+    // key is published twice, with the Zone Key flag alone for the zone data
+    // and with the Secure Entry Point flag for the DNSKEY RRset. External
+    // verifiers require a ZSK beside the KSK. No DS: it belongs to the parent
+    // (RFC 4035 section 2.2).
     const keys = try apexDnskeys(allocator, &zone);
-    try std.testing.expectEqual(@as(usize, 1), keys.len);
-    try std.testing.expectEqual(@as(u16, 257), std.mem.readInt(u16, keys[0][0..2], .big));
-    var ds_count: usize = 0;
-    for (zone.records.items[0..zone.records.len]) |record| {
-        if (record.rrtype.eql(.DS)) ds_count += 1;
-    }
-    try std.testing.expectEqual(@as(usize, 1), ds_count);
+    try std.testing.expectEqual(@as(usize, 2), keys.len);
+    try std.testing.expectEqual(@as(u16, 256), std.mem.readInt(u16, keys[0][0..2], .big));
+    try std.testing.expectEqual(@as(u16, 257), std.mem.readInt(u16, keys[1][0..2], .big));
+    try std.testing.expectEqualSlices(u8, keys[0][4..], keys[1][4..]);
+    try std.testing.expect((try findOpaque(allocator, &zone, "example.com.", .DS, null)) == null);
 
     // The bytes are the ones the RFC 8080 section 6.1 vector pins.
-    const dnskey = (try findOpaque(&zone, "example.com.", .DNSKEY, null)).?;
-    try std.testing.expectEqualStrings(rfc8080_ed25519_dnskey, try encodeBase64(allocator, dnskey[4..]));
-    const rrsig = (try findOpaque(&zone, "example.com.", .RRSIG, RecordType.MX.code())).?;
-    try std.testing.expect(hexEquals(rfc8080_mx_rrsig_hex, rrsig));
+    try std.testing.expectEqualStrings(rfc8080_ed25519_dnskey, try encodeBase64(allocator, keys[1][4..]));
+    try std.testing.expectEqual(rfc8080_ed25519_key_tag, dns_dnssec.keyTag(keys[1]));
+
+    // Zone data is signed with the 256 key and the DNSKEY RRset with 257.
+    const rrsig = (try findOpaque(allocator, &zone, "example.com.", .RRSIG, RecordType.MX.code())).?;
+    try std.testing.expectEqual(dns_dnssec.keyTag(keys[0]), std.mem.readInt(u16, rrsig[16..18], .big));
+    const dnskey_rrsig = (try findOpaque(allocator, &zone, "example.com.", .RRSIG, RecordType.DNSKEY.code())).?;
+    try std.testing.expectEqual(rfc8080_ed25519_key_tag, std.mem.readInt(u16, dnskey_rrsig[16..18], .big));
 }
 
-test "the project's own validator accepts the DNSKEY RRset through the DS and the zone's RRsets through the zone-signing key" {
+test "the project's own validator accepts the DNSKEY RRset through the key-signing key and the zone's RRsets through the zone-signing key" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -2454,38 +2382,9 @@ test "the project's own validator accepts the DNSKEY RRset through the DS and th
     const ksk_dnskey = keys[if (keys[0][3] == 15) 0 else 1];
     const zsk_dnskey = keys[if (keys[0][3] == 13) 0 else 1];
 
-    // The DS the parent holds authenticates the key-signing key, and the
-    // key-signing key signed the DNSKEY RRset that holds the zone-signing
-    // key: that is the chain of RFC 4035 section 5.2.
-    const ds = (try findOpaque(&zone, "example.com.", .DS, null)).?;
-    try std.testing.expectEqual(dns_dnssec.keyTag(ksk_dnskey), std.mem.readInt(u16, ds[0..2], .big));
-    var ds_anchors = dns_validate.Anchors{};
-    ds_anchors.items[0] = .{ .owner = apex, .rrtype = .DS, .rdata = try allocator.dupe(u8, ds) };
-    ds_anchors.len = 1;
-
-    var dnskey_response = dns_message.Message{
-        .allocator = allocator,
-        .header = .{ .id = 0x4406, .qr = true, .rcode = .no_error },
-        .question = .{ .name = apex, .qtype = .DNSKEY, .qclass = dns_types.Class.IN },
-    };
-    for (zone.records.items[0..zone.records.len]) |record| {
-        if (record.rrtype.eql(.DNSKEY)) {
-            try dnskey_response.answers.append(try (@import("../auth/response.zig")).zoneRecordToResourceRecord(record, null));
-            continue;
-        }
-        if (!record.rrtype.eql(.RRSIG)) continue;
-        const rdata = try zone_parser.parseRData(.RRSIG, record.rdataText());
-        const bytes = switch (rdata) {
-            .Unknown => |*unknown| unknown.bytes(),
-            else => continue,
-        };
-        if (bytes.len < 2 or std.mem.readInt(u16, bytes[0..2], .big) != RecordType.DNSKEY.code()) continue;
-        try dnskey_response.answers.append(try (@import("../auth/response.zig")).zoneRecordToResourceRecord(record, null));
-    }
-    dnskey_response.header.answer_count = @intCast(dnskey_response.answers.len);
-    const dnskey_request = try doBitQuery(allocator, "example.com.", .DNSKEY);
-    const dnskey_result = try dns_validate.validate(allocator, &ds_anchors, dnskey_request, dnskey_response, &.{}, rfc8080_window.inception + 1);
-    try std.testing.expectEqual(dns_validate.Status.secure, dnskey_result.status);
+    // The key-signing key signed the DNSKEY RRset that holds the
+    // zone-signing key: that is the chain of RFC 4035 section 5.2.
+    try expectSignedBy(allocator, &zone, ksk_dnskey, dns_dnssec.keyTag(ksk_dnskey));
 
     // The zone-signing key the DNSKEY RRset carries signs the zone, and a
     // validator that trusts that key accepts the zone's own RRsets.
@@ -2530,17 +2429,25 @@ test "RFC 8080 section 6.1: the signed Ed25519 zone matches the published vector
     defer zone.deinit();
     try signZone(allocator, &zone, &key, rfc8080_window);
 
-    const dnskey = (try findOpaque(&zone, "example.com.", .DNSKEY, null)).?;
+    // The 257 DNSKEY is the RFC 8080 vector, in the served RRset.
+    const dnskey = try publishedKey(allocator, &zone, 15);
     try std.testing.expectEqualStrings(rfc8080_ed25519_dnskey, try encodeBase64(allocator, dnskey[4..]));
     try std.testing.expectEqual(rfc8080_ed25519_key_tag, dns_dnssec.keyTag(dnskey));
 
-    const ds = (try findOpaque(&zone, "example.com.", .DS, null)).?;
-    try std.testing.expectEqual(rfc8080_ed25519_key_tag, std.mem.readInt(u16, ds[0..2], .big));
-    try std.testing.expectEqual(@as(u8, 15), ds[2]);
-    try std.testing.expectEqual(@as(u8, 2), ds[3]);
-    try std.testing.expect(hexEquals(rfc8080_ed25519_ds, ds[4..]));
-
-    const rrsig = (try findOpaque(&zone, "example.com.", .RRSIG, RecordType.MX.code())).?;
+    // The vector's RRSIG is the key-signing form over the MX RRset. The zone
+    // now signs data with the 256 form, so the fixed-RRset primitive is what
+    // reproduces the published bytes.
+    const mx_rdata = [_]u8{ 0, 10, 4, 'm', 'a', 'i', 'l', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0 };
+    const rrsig = try signRrset(
+        allocator,
+        try Name.fromText("example.com."),
+        try Name.fromText("example.com."),
+        RecordType.MX.code(),
+        &.{&mx_rdata},
+        3600,
+        &key,
+        rfc8080_window,
+    );
     if (!hexEquals(rfc8080_mx_rrsig_hex, rrsig)) {
         std.debug.print("produced {x}\n", .{rrsig});
         return error.TestExpectedEqual;
@@ -2559,16 +2466,20 @@ test "RFC 4034 section 2.1.1: the DNSKEY the signer emits carries the Zone Key f
     defer zone.deinit();
     try signZone(allocator, &zone, &key, rfc8080_window);
 
-    const dnskey = (try findOpaque(&zone, "example.com.", .DNSKEY, null)).?;
-    const flags = std.mem.readInt(u16, dnskey[0..2], .big);
-    // The Zone Key bit (0x0100) marks a key that signs a zone; the Secure
-    // Entry Point bit (0x0001) is the hint RFC 6781 section 3.2.3 asks a
-    // single-type signing scheme to set on every key. RFC 8080 section 6.1
-    // publishes exactly this pair.
-    try std.testing.expect(flags & 0x0100 != 0);
-    try std.testing.expectEqual(@as(u16, 257), flags);
-    try std.testing.expectEqual(@as(u8, 3), dnskey[2]);
-    try std.testing.expectEqual(@as(u8, 15), dnskey[3]);
+    // The RRset carries the key twice: the Zone Key bit (0x0100) alone marks
+    // the key that signs the zone data, and the Secure Entry Point bit
+    // (0x0001) marks the key that signs the DNSKEY RRset (RFC 6781 section
+    // 3.2.3). RFC 8080 section 6.1 publishes exactly the 257 form.
+    const keys = try apexDnskeys(allocator, &zone);
+    try std.testing.expectEqual(@as(usize, 2), keys.len);
+    for (keys) |dnskey| {
+        const flags = std.mem.readInt(u16, dnskey[0..2], .big);
+        try std.testing.expect(flags & 0x0100 != 0);
+        try std.testing.expectEqual(@as(u8, 3), dnskey[2]);
+        try std.testing.expectEqual(@as(u8, 15), dnskey[3]);
+    }
+    try std.testing.expectEqual(@as(u16, 256), std.mem.readInt(u16, keys[0][0..2], .big));
+    try std.testing.expectEqual(@as(u16, 257), std.mem.readInt(u16, keys[1][0..2], .big));
 }
 
 const second_zone =
@@ -2612,20 +2523,21 @@ test "RFC 8080 section 8: one key signs one zone, and that zone is signed as bef
     defer zone.deinit();
     try signZone(allocator, &zone, &key, rfc8080_window);
 
-    // The DNSKEY, the DS, and the RRSIGs are the ones this zone always got.
-    const dnskey = (try findOpaque(&zone, "example.com.", .DNSKEY, null)).?;
+    // The published DNSKEY pair and the signatures over the zone are the
+    // shape this zone gets: the 257 form is the RFC 8080 vector and the 256
+    // form signs the data.
+    const dnskey = try publishedKey(allocator, &zone, 15);
     try std.testing.expectEqualStrings(rfc8080_ed25519_dnskey, try encodeBase64(allocator, dnskey[4..]));
     try std.testing.expectEqual(rfc8080_ed25519_key_tag, dns_dnssec.keyTag(dnskey));
-    const ds = (try findOpaque(&zone, "example.com.", .DS, null)).?;
-    try std.testing.expect(hexEquals(rfc8080_ed25519_ds, ds[4..]));
-    const rrsig = (try findOpaque(&zone, "example.com.", .RRSIG, RecordType.MX.code())).?;
-    try std.testing.expect(hexEquals(rfc8080_mx_rrsig_hex, rrsig));
+    const rrsig = (try findOpaque(allocator, &zone, "example.com.", .RRSIG, RecordType.MX.code())).?;
+    try std.testing.expectEqual(@as(u8, 15), rrsig[2]);
+    try std.testing.expect(dns_dnssec.keyTag(dnskey) != std.mem.readInt(u16, rrsig[16..18], .big));
 
     // The same zone signed again is the old refusal, not the new one.
     try std.testing.expectError(Error.AlreadySigned, signZone(allocator, &zone, &key, rfc8080_window));
 }
 
-test "RFC 6605 section 6.1: the P-256 DNSKEY, key tag, and DS digest match the published vector" {
+test "RFC 6605 section 6.1: the P-256 DNSKEY and key tag match the published vector" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -2641,15 +2553,9 @@ test "RFC 6605 section 6.1: the P-256 DNSKEY, key tag, and DS digest match the p
     try std.testing.expectEqual(@as(usize, 68), dnskey.len);
     try std.testing.expectEqualStrings(rfc6605_p256_dnskey, try encodeBase64(allocator, dnskey[4..]));
     try std.testing.expectEqual(rfc6605_p256_key_tag, dns_dnssec.keyTag(dnskey));
-
-    const owner = try Name.fromText("example.net.");
-    const ds = try key.dsRdata(allocator, owner.asWire(), dnskey);
-    try std.testing.expectEqual(@as(u8, 13), ds[2]);
-    try std.testing.expectEqual(@as(u8, 2), ds[3]);
-    try std.testing.expect(hexEquals(rfc6605_p256_ds, ds[4..]));
 }
 
-test "RFC 6605 section 6.2: the P-384 DNSKEY, key tag, and SHA-384 DS digest match the published vector" {
+test "RFC 6605 section 6.2: the P-384 DNSKEY and key tag match the published vector" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -2662,12 +2568,6 @@ test "RFC 6605 section 6.2: the P-384 DNSKEY, key tag, and SHA-384 DS digest mat
     try std.testing.expectEqual(@as(usize, 100), dnskey.len);
     try std.testing.expectEqualStrings(rfc6605_p384_dnskey, try encodeBase64(allocator, dnskey[4..]));
     try std.testing.expectEqual(rfc6605_p384_key_tag, dns_dnssec.keyTag(dnskey));
-
-    const owner = try Name.fromText("example.net.");
-    const ds = try key.dsRdata(allocator, owner.asWire(), dnskey);
-    try std.testing.expectEqual(@as(u8, 14), ds[2]);
-    try std.testing.expectEqual(@as(u8, 4), ds[3]);
-    try std.testing.expect(hexEquals(rfc6605_p384_ds, ds[4..]));
 }
 
 test "a P-256 signature over a fixed RRset verifies against the key the DNSKEY publishes" {
@@ -2724,7 +2624,7 @@ test "RFC 4034 section 3.1.3: a wildcard RRSIG counts no wildcard label and stil
     defer zone.deinit();
     try signZone(allocator, &zone, &key, rfc8080_window);
 
-    const rrsig = (try findOpaque(&zone, "*.home.arpa.", .RRSIG, RecordType.A.code())).?;
+    const rrsig = (try findOpaque(allocator, &zone, "*.home.arpa.", .RRSIG, RecordType.A.code())).?;
     // Labels excludes the `*`, so "*.home.arpa." is 2 (arpa, home) ...
     try std.testing.expectEqual(@as(u8, 2), rrsig[3]);
     try std.testing.expectEqual(RecordType.A.code(), std.mem.readInt(u16, rrsig[0..2], .big));
@@ -2732,8 +2632,12 @@ test "RFC 4034 section 3.1.3: a wildcard RRSIG counts no wildcard label and stil
     try std.testing.expectEqual(@as(u32, 3600), std.mem.readInt(u32, rrsig[4..8], .big));
     try std.testing.expectEqual(rfc8080_window.expiration, std.mem.readInt(u32, rrsig[8..12], .big));
     try std.testing.expectEqual(rfc8080_window.inception, std.mem.readInt(u32, rrsig[12..16], .big));
-    // The key tag is over DNSKEY RDATA alone, so it does not move with the zone.
-    try std.testing.expectEqual(rfc8080_ed25519_key_tag, std.mem.readInt(u16, rrsig[16..18], .big));
+    // The key tag is over DNSKEY RDATA alone, so it does not move with the
+    // zone: the data signature names the 256 form the signer publishes.
+    const keys = try apexDnskeys(allocator, &zone);
+    const data_key = keys[if (std.mem.readInt(u16, keys[0][0..2], .big) == zone_key_flags) 0 else 1];
+    try std.testing.expectEqual(dns_dnssec.keyTag(data_key), std.mem.readInt(u16, rrsig[16..18], .big));
+    try std.testing.expect(dns_dnssec.keyTag(data_key) != rfc8080_ed25519_key_tag);
 
     const signer = try Name.fromText("home.arpa.");
     try std.testing.expectEqualSlices(u8, signer.asWire(), rrsig[18 .. 18 + signer.asWire().len]);
@@ -2746,10 +2650,11 @@ test "RFC 4034 section 3.1.3: a wildcard RRSIG counts no wildcard label and stil
 }
 
 /// The wildcard RRSIG for `wildcard_zone` under `rfc8080_window`, signed by
-/// the RFC 8080 section 6.1 Ed25519 key. Ed25519 is deterministic
-/// (RFC 8032), so these bytes are reproducible; dnspython 2.8.0 accepted this
-/// exact signature over `*.home.arpa. IN A 192.168.1.99` when it was produced,
-/// and a one-octet change to the preimage does not verify.
+/// the RFC 8080 section 6.1 Ed25519 key with the 257 form the fixed-RRset
+/// primitive uses. Ed25519 is deterministic (RFC 8032), so these bytes are
+/// reproducible; dnspython 2.8.0 accepted this exact signature over
+/// `*.home.arpa. IN A 192.168.1.99` when it was produced, and a one-octet
+/// change to the preimage does not verify.
 const wildcard_rrsig_hex =
     "00010f0200000e1055d4fc6055b94ce0899104686f6d65046172706100686e" ++
     "127d52eb25af24f97369a2f7e990b74aebb703b4d0940f8b7a7624fa30f36ac34" ++
@@ -2763,11 +2668,17 @@ test "the wildcard RRSIG is one dnspython 2.8.0 accepted over the wildcard RRset
     var key = try parseKey(rfc8080_ed25519_key);
     defer key.deinit();
 
-    var zone = try loadZone(wildcard_zone);
-    defer zone.deinit();
-    try signZone(allocator, &zone, &key, rfc8080_window);
-
-    const rrsig = (try findOpaque(&zone, "*.home.arpa.", .RRSIG, RecordType.A.code())).?;
+    const address = [_]u8{ 192, 168, 1, 99 };
+    const rrsig = try signRrset(
+        allocator,
+        try Name.fromText("*.home.arpa."),
+        try Name.fromText("home.arpa."),
+        RecordType.A.code(),
+        &.{&address},
+        3600,
+        &key,
+        rfc8080_window,
+    );
     if (!hexEquals(wildcard_rrsig_hex, rrsig)) {
         std.debug.print("produced {x}\n", .{rrsig});
         return error.TestExpectedEqual;
@@ -2789,15 +2700,15 @@ test "the NSEC chain links every authoritative owner in canonical order and wrap
     // example.com sorts before mail.example.com, which sorts before
     // ns1.example.com, so the chain is apex -> mail -> ns1 -> apex.
     const apex_next = (try Name.fromText("mail.example.com.")).asWire();
-    const apex_nsec = (try findOpaque(&zone, "example.com.", .NSEC, null)).?;
+    const apex_nsec = (try findOpaque(allocator, &zone, "example.com.", .NSEC, null)).?;
     try std.testing.expectEqualSlices(u8, apex_next, apex_nsec[0..apex_next.len]);
 
     const mail_next = (try Name.fromText("ns1.example.com.")).asWire();
-    const mail_nsec = (try findOpaque(&zone, "mail.example.com.", .NSEC, null)).?;
+    const mail_nsec = (try findOpaque(allocator, &zone, "mail.example.com.", .NSEC, null)).?;
     try std.testing.expectEqualSlices(u8, mail_next, mail_nsec[0..mail_next.len]);
 
     const apex = (try Name.fromText("example.com.")).asWire();
-    const last_nsec = (try findOpaque(&zone, "ns1.example.com.", .NSEC, null)).?;
+    const last_nsec = (try findOpaque(allocator, &zone, "ns1.example.com.", .NSEC, null)).?;
     try std.testing.expectEqualSlices(u8, apex, last_nsec[0..apex.len]);
 
     // Every bitmap names NSEC and RRSIG (RFC 4035 section 2.3). The next-owner
@@ -2842,9 +2753,10 @@ test "a delegation keeps NS and DS and drops the child subtree from the signed z
     try signZone(allocator, &zone, &key, rfc8080_window);
 
     // The parent is authoritative for the delegation itself, so it is in the
-    // chain with an NSEC and an RRSIG over its NS RRset.
+    // chain with an NSEC; RFC 4035 section 2.2 makes the delegation's NS
+    // RRset unsigned data of neither side.
     try std.testing.expect(hasRecord(&zone, "child.example.com.", .NSEC));
-    try std.testing.expect((try findOpaque(&zone, "child.example.com.", .RRSIG, RecordType.NS.code())) != null);
+    try std.testing.expect((try findOpaque(allocator, &zone, "child.example.com.", .RRSIG, RecordType.NS.code())) == null);
 
     // Everything strictly below the cut belongs to the child, so the parent
     // signs none of it and puts no NSEC at any of its names.
@@ -2905,10 +2817,10 @@ test "RFC 8080: an Ed448-signed zone carries a 114-octet signature that verifies
     defer zone.deinit();
     try signZone(allocator, &zone, &key, rfc8080_window);
 
-    const dnskey = try allocator.dupe(u8, (try findOpaque(&zone, "example.com.", .DNSKEY, null)).?);
+    const dnskey = (try findOpaque(allocator, &zone, "example.com.", .DNSKEY, null)).?;
     try std.testing.expectEqual(@as(u8, 16), dnskey[3]);
     try std.testing.expectEqual(@as(usize, 57), dnskey.len - 4);
-    const rrsig = try allocator.dupe(u8, (try findOpaque(&zone, "example.com.", .RRSIG, RecordType.MX.code())).?);
+    const rrsig = (try findOpaque(allocator, &zone, "example.com.", .RRSIG, RecordType.MX.code())).?;
     try std.testing.expectEqual(@as(u8, 16), rrsig[2]);
 
     // Rebuild the canonical signed data for the MX RRset the same way the
@@ -3038,11 +2950,13 @@ fn nsec3Records(allocator: std.mem.Allocator, zone: *const zone_index.Zone) ![]N
     return out.toOwnedSlice(allocator);
 }
 
-/// The DNSKEY of a signed zone, as a trust anchor for the validator.
+/// The zone-signing DNSKEY of a signed zone, as a trust anchor for the
+/// validator. Zone data is signed with this key; the DNSKEY RRset is signed
+/// with the key-signing form, which such a test response does not carry.
 fn dnskeyAnchor(allocator: std.mem.Allocator, key: *const Key) ![]const u8 {
-    const rdata = try key.dnskeyRdata(allocator);
+    const rdata = try key.dnskeyRdataWithFlags(allocator, zone_key_flag);
     const encoded = try encodeBase64(allocator, rdata[4..]);
-    return std.fmt.allocPrint(allocator, "example. DNSKEY 257 3 15 {s}\n", .{encoded});
+    return std.fmt.allocPrint(allocator, "example. DNSKEY 256 3 15 {s}\n", .{encoded});
 }
 
 /// A DO-bit query, so the answer carries the RRSIGs that cover it.
@@ -3190,7 +3104,7 @@ test "the NSEC3 chain is signed, and the project's own validator accepts it" {
     // Every NSEC3 of the chain carries the RRSIG that covers it.
     const records = try nsec3Records(allocator, &zone);
     for (records) |record| {
-        const rrsig = (try findOpaque(&zone, record.owner_text, .RRSIG, RecordType.NSEC3.code())).?;
+        const rrsig = (try findOpaque(allocator, &zone, record.owner_text, .RRSIG, RecordType.NSEC3.code())).?;
         // RFC 4034 section 3.1.3: the label count is the one of the RRSIG's
         // own owner name, which for an NSEC3 is the hashed name.
         try std.testing.expectEqual(@as(u8, 2), rrsig[3]);
@@ -3273,11 +3187,12 @@ test "a zone without an apex NSEC3PARAM keeps exactly its NSEC chain" {
 
     // The NSEC chain of the zone is unchanged: one NSEC per owner, in
     // canonical order, and no NSEC3 record at all.
-    const apex = (try findOpaque(&zone, "example.", .NSEC, null)).?;
+    const apex = (try findOpaque(allocator, &zone, "example.", .NSEC, null)).?;
     const next = try Name.fromText("www.example.");
     try std.testing.expectEqualSlices(u8, next.asWire(), apex[0..next.asWire().len]);
-    // The bitmap names SOA, NS, DNSKEY, DS, NSEC, and RRSIG.
-    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x07, 0x22, 0x00, 0x00, 0x00, 0x00, 0x13, 0x80 }, apex[next.asWire().len..]);
+    // The bitmap names SOA, NS, DNSKEY, NSEC, and RRSIG; the DS belongs to
+    // the parent (RFC 4035 section 2.2).
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x07, 0x22, 0x00, 0x00, 0x00, 0x00, 0x03, 0x80 }, apex[next.asWire().len..]);
     try std.testing.expect(!hasRecord(&zone, "example.", .NSEC3));
     try std.testing.expect(!hasRecord(&zone, "example.", .NSEC3PARAM));
 }
@@ -3312,7 +3227,7 @@ test "the operator's NSEC choice drops the zone's own NSEC3PARAM" {
     try std.testing.expect(hasRecord(&zone, "www.example.", .NSEC));
     try std.testing.expect(!hasRecord(&zone, "example.", .NSEC3));
     try std.testing.expect(!hasRecord(&zone, "www.example.", .NSEC3));
-    const apex = (try findOpaque(&zone, "example.", .NSEC, null)).?;
+    const apex = (try findOpaque(allocator, &zone, "example.", .NSEC, null)).?;
     const next = try Name.fromText("www.example.");
     try std.testing.expectEqualSlices(u8, next.asWire(), apex[0..next.asWire().len]);
     // RFC 5155 section 7.3: the apex NSEC3PARAM states the parameters of the
@@ -3335,24 +3250,24 @@ test "a zone that is signed again keeps the chain the served zone publishes" {
     var served = try loadZone(nsec3_sign_zone);
     defer served.deinit();
     try signZone(allocator, &served, &key, rfc8080_window);
-    const served_dnskey = (try findOpaque(&served, "example.", .DNSKEY, null)).?;
+    const served_dnskey = (try findOpaque(allocator, &served, "example.", .DNSKEY, null)).?;
 
     var zone = try loadZone(nsec_sign_zone);
     defer zone.deinit();
     try resignZone(allocator, &zone, &key, rfc8080_window, &served);
 
-    // The key is the one the server holds, so the key tag and the DS do not
-    // move with the zone.
-    const dnskey = (try findOpaque(&zone, "example.", .DNSKEY, null)).?;
+    // The key is the one the server holds, so the key tag does not move with
+    // the zone, and no apex DS is published either way.
+    const dnskey = (try findOpaque(allocator, &zone, "example.", .DNSKEY, null)).?;
     try std.testing.expectEqualSlices(u8, served_dnskey, dnskey);
-    try std.testing.expectEqual(dns_dnssec.keyTag(dnskey), std.mem.readInt(u16, (try findOpaque(&zone, "example.", .DS, null)).?[0..2], .big));
+    try std.testing.expect((try findOpaque(allocator, &zone, "example.", .DS, null)) == null);
 
     // The chain is the one the served zone publishes: NSEC3, with the
     // parameters its NSEC3PARAM states.
     try std.testing.expect(!hasRecord(&zone, "example.", .NSEC));
     const records = try nsec3Records(allocator, &zone);
     try std.testing.expectEqual(@as(usize, 2), records.len);
-    const param = (try findOpaque(&zone, "example.", .NSEC3PARAM, null)).?;
+    const param = (try findOpaque(allocator, &zone, "example.", .NSEC3PARAM, null)).?;
     try std.testing.expectEqual(@as(u8, 1), param[0]);
     try std.testing.expectEqual(@as(u8, 0), param[1]);
     try std.testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, param[2..4], .big));
@@ -3398,7 +3313,7 @@ test "the operator's NSEC3 choice builds the chain in a zone that states no NSEC
     // RFC 5155 section 7.3: the parameters of the chain are stated by the
     // NSEC3PARAM at the zone apex, which the signer publishes for a zone
     // that states none.
-    const param = (try findOpaque(&zone, "example.", .NSEC3PARAM, null)).?;
+    const param = (try findOpaque(allocator, &zone, "example.", .NSEC3PARAM, null)).?;
     try std.testing.expectEqual(@as(u8, 1), param[0]);
     try std.testing.expectEqual(@as(u8, 0), param[1]);
     try std.testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, param[2..4], .big));
@@ -3461,7 +3376,7 @@ test "RFC 9276 section 3.1: the signer refuses an NSEC3 chain that states a salt
     var unsalted = try loadZone(nsec3_sign_zone);
     defer unsalted.deinit();
     try signZone(allocator, &unsalted, &key, rfc8080_window);
-    const param = (try findOpaque(&unsalted, "example.", .NSEC3PARAM, null)).?;
+    const param = (try findOpaque(allocator, &unsalted, "example.", .NSEC3PARAM, null)).?;
     try std.testing.expectEqual(@as(u8, 1), param[0]);
     try std.testing.expectEqual(@as(u8, 0), param[1]);
     try std.testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, param[2..4], .big));
@@ -3559,7 +3474,14 @@ test "the same zone without the Opt-Out flag keeps every record and carries no f
         try std.testing.expectEqual(@as(u8, 0), record.flags & dns_validate.nsec3_opt_out);
         const owner = try Name.fromText(record.owner_text);
         const owner_hash = dns_validate.nsec3OwnerHash(owner) orelse return error.TestUnexpectedResult;
-        if (std.mem.eql(u8, &owner_hash, &nsec3_unsigned_sub_hash)) matched = true;
+        if (!std.mem.eql(u8, &owner_hash, &nsec3_unsigned_sub_hash)) continue;
+        matched = true;
+        // The NS RRset at an insecure delegation is left unsigned (RFC 4035
+        // section 2.2), and the RRSIG over the NSEC3 is at the hashed owner,
+        // so the bitmap names NS alone (RFC 5155 section 7.1).
+        try std.testing.expect(dns_dnssec.nsecBitmapHasType(record.bitmap, RecordType.NS.code()));
+        try std.testing.expect(!dns_dnssec.nsecBitmapHasType(record.bitmap, RecordType.RRSIG.code()));
+        try std.testing.expect(!dns_dnssec.nsecBitmapHasType(record.bitmap, RecordType.DS.code()));
     }
     try std.testing.expect(matched);
 }

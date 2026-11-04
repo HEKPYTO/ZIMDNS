@@ -140,6 +140,10 @@ pub fn writeQuestion(response: dns_message.Message, writer: *std.Io.Writer) !voi
 }
 
 pub fn writeResponse(response: dns_message.Message, writer: *std.Io.Writer) !void {
+    // RFC 1035 section 4.1.1: TC says the answer did not fit the transport,
+    // and RFC 7766 section 5 wants the client to retry over TCP. Printing the
+    // partial answer without the bit would hide that from an operator.
+    if (response.header.truncated) try writer.writeAll(";; TRUNCATED: retry over TCP\n");
     // RFC 6891 section 6.1.3: the OPT record is an EDNS(0) pseudo-record with
     // its own presentation, so it gets a pseudosection instead of being shown
     // as an RRset (which is why writeSection skips it).
@@ -1322,6 +1326,26 @@ test "query formatter streams multi-answer output beyond 4096 bytes" {
     defer output.deinit();
     try writeResponse(response, &output.writer);
     try std.testing.expect(output.written().len > 4096);
+}
+
+test "query formatter reports a truncated response" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var response_bytes: [512]u8 = undefined;
+    var writer = dns_writer.Writer.init(&response_bytes);
+    try writer.writeU16(0x1234);
+    try writer.writeU16(0x8200); // QR + TC
+    try writer.writeU16(0);
+    try writer.writeU16(0);
+    try writer.writeU16(0);
+    try writer.writeU16(0);
+    const response = try dns_message.Message.parse(arena.allocator(), writer.written());
+    try std.testing.expect(response.header.truncated);
+
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try writeResponse(response, &output.writer);
+    try std.testing.expectEqualStrings(";; TRUNCATED: retry over TCP\nno answers\n", output.written());
 }
 
 test "query formatter prints response code when there are no answers" {

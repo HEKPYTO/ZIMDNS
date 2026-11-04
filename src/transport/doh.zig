@@ -477,6 +477,9 @@ const DohChannel = struct {
 };
 
 fn serveDohStream(stream: std.Io.net.Stream, io: std.Io, runtime: *Runtime, counters: ?*metrics.Counters) !void {
+    // Same RFC 5011 tick as the plaintext and DoT paths: a DoH-only server
+    // must still observe revocation and the hold-downs.
+    runtime.maybeRefreshManagedAnchors(@intCast(std.Io.Clock.real.now(io).nanoseconds));
     if (comptime !listener.TCP_DEADLINES_SUPPORTED) return listener.Error.UnsupportedPlatform;
 
     var read_buffer: [MAX_HEADER_BYTES]u8 = undefined;

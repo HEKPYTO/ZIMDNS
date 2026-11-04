@@ -93,7 +93,9 @@ const max_labels = 128;
 
 // ------------------------------------------------------------------ anchors
 
-pub const max_anchors = 16;
+/// RFC 5011 section 2.4.3 requires five SEP keys per trust point; the live
+/// set holds the configured anchors plus every managed point's keys.
+pub const max_anchors = 64;
 
 /// One configured trust anchor: a DS or DNSKEY held in wire RDATA. The owner is
 /// the zone the anchor speaks for, and for a DNSKEY it is that zone's apex.
@@ -103,9 +105,9 @@ pub const Anchor = struct {
     rdata: []const u8,
 };
 
-/// A static trust-anchor store. This is the whole of Stage 3's anchor
-/// management: an operator names a file, the file names zones and holds DS or
-/// DNSKEY records, and nothing here rolls a key over (RFC 5011 is Stage 4).
+/// A static trust-anchor store. An operator names a file, the file names
+/// zones and holds DS or DNSKEY records, and RFC 5011 managed state layered
+/// over it can revoke a key but never invent one.
 pub const Anchors = struct {
     items: [max_anchors]Anchor = undefined,
     len: usize = 0,
@@ -601,6 +603,101 @@ fn dsDigestTypeSupported(ds_rdata: []const u8) bool {
     };
 }
 
+/// One RRSIG over a DNSKEY RRset whose signature verifies with a DNSKEY in
+/// that same RRset. RFC 5011 sections 2.1 and 3 make this the proof a
+/// revocation needs; it is also how a managed trust point knows which keys
+/// validated an RRset it is about to act on.
+pub const DnskeySignature = struct {
+    key_tag: u16,
+    algorithm: u8,
+    /// SHA-256 of the verifying DNSKEY RDATA with the RFC 5011 REVOKE bit
+    /// cleared. A 16-bit key tag is not unique (RFC 4034 section 5.1.4), so
+    /// the tag selects a candidate and this digest decides trust.
+    key_digest: [32]u8,
+};
+
+/// SHA-256 of a DNSKEY RDATA with the REVOKE bit cleared, so a key and its
+/// revoked form compare equal while a different key that shares a 16-bit tag
+/// does not.
+pub fn dnskeyDigest(rdata: []const u8) [32]u8 {
+    var flags = [2]u8{ 0, 0 };
+    if (rdata.len >= 2) {
+        flags = rdata[0..2].*;
+        // RFC 5011 section 3: REVOKE is bit 8 of the 16-bit Flags field,
+        // the high bit of its low byte in network order.
+        flags[1] &= 0x7f;
+    }
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(&flags);
+    if (rdata.len > 2) hasher.update(rdata[2..]);
+    var out: [32]u8 = undefined;
+    hasher.final(&out);
+    return out;
+}
+
+/// The signatures over a DNSKEY RRset that verify with a key in the RRset,
+/// inside their validity window, with the RRset owner as the signer. The
+/// caller owns the returned slice. A signature that does not verify, names
+/// another signer, or covers another type contributes nothing.
+pub fn verifiedDnskeySignatures(
+    allocator: std.mem.Allocator,
+    owner: Name,
+    dnskey_rdatas: []const []const u8,
+    rrsig_rdatas: []const []const u8,
+    now: u32,
+) ![]DnskeySignature {
+    var out: std.ArrayList(DnskeySignature) = .empty;
+    errdefer out.deinit(allocator);
+    if (dnskey_rdatas.len == 0) return out.toOwnedSlice(allocator);
+
+    const records = try allocator.alloc(dns_record.ResourceRecord, dnskey_rdatas.len);
+    defer allocator.free(records);
+    const pointers = try allocator.alloc(*const dns_record.ResourceRecord, dnskey_rdatas.len);
+    defer allocator.free(pointers);
+    for (dnskey_rdatas, 0..) |rdata, index| {
+        if (rdata.len > std.math.maxInt(u16)) return Error.MalformedDnskey;
+        records[index] = .{
+            .owner = owner,
+            .rrtype = .DNSKEY,
+            .class = .IN,
+            .ttl = 0,
+            .rdata = .{ .Unknown = .{ .len = @intCast(rdata.len), .borrowed = rdata } },
+        };
+        pointers[index] = &records[index];
+    }
+
+    for (rrsig_rdatas) |raw| {
+        const time_status = dnssec.rrsigTimeStatus(raw, now) catch continue;
+        if (time_status != .valid) continue;
+        const rrsig = Rrsig.at(raw, owner) catch continue;
+        if (rrsig.covered != RecordType.DNSKEY.code()) continue;
+        if (!rrsig.signer.eql(&owner)) continue;
+        for (records) |*record| record.ttl = rrsig.orig_ttl;
+        const data = signedData(allocator, pointers, rrsig) catch continue;
+        defer allocator.free(data);
+        var verified_key: ?[]const u8 = null;
+        for (dnskey_rdatas) |key| {
+            verifyWithKey(key, rrsig, data) catch continue;
+            verified_key = key;
+            break;
+        }
+        const key = verified_key orelse continue;
+        var known = false;
+        const digest = dnskeyDigest(key);
+        for (out.items) |existing| {
+            if (existing.key_tag == rrsig.key_tag and existing.algorithm == rrsig.algorithm and
+                std.mem.eql(u8, &existing.key_digest, &digest)) known = true;
+        }
+        if (known) continue;
+        try out.append(allocator, .{
+            .key_tag = rrsig.key_tag,
+            .algorithm = rrsig.algorithm,
+            .key_digest = dnskeyDigest(key),
+        });
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 /// Check one RRSIG over `data` against one DNSKEY. The key tag and algorithm
 /// are matched first so a key that cannot possibly have made the signature is
 /// never handed to the curve arithmetic.
@@ -930,6 +1027,9 @@ const Validator = struct {
     rrsigs: std.ArrayList(Rrsig) = .empty,
     rrsets: std.ArrayList(Rrset) = .empty,
     nsecs: std.ArrayList(Nsec) = .empty,
+    /// The response carried an NSEC or NSEC3 record, whether or not it also
+    /// carried the RRSIG that would let it be used as proof.
+    denial_present: bool = false,
     nsec3s: std.ArrayList(Nsec3) = .empty,
     chains: std.ArrayList(KeySet) = .empty,
     /// The zone whose parent published an authenticated DS but whose DNSKEY
@@ -974,6 +1074,7 @@ const Validator = struct {
         // RRSIGs were indexed by `addSignature`; they are not RRsets of their
         // own and never take part in the Answer-section decision.
         if (record.rrtype.eql(.RRSIG)) return;
+        if (record.rrtype.eql(.NSEC) or record.rrtype.eql(.NSEC3)) self.denial_present = true;
         if (raw) |bytes| {
             // RFC 4035 section 5.4: the RRsets that make up a denial proof
             // must themselves be authenticated, so a proof is collected as an
@@ -1542,7 +1643,7 @@ const Validator = struct {
             proof.used = true;
             return self.nsecWildcardEncloser(proof, name, qtype);
         }
-        return self.fail(dnssec.EDE_DNSSEC_BOGUS);
+        return self.fail(dnssec.EDE_NSEC_MISSING);
     }
 
     /// The proof a wildcard NODATA rests on: the closest encloser exists, the
@@ -1564,7 +1665,7 @@ const Validator = struct {
             if (isAncestorDelegation(candidate.bitmap, labelsCount(candidate.owner.asWire()), labelsCount(candidate.signer.asWire()))) return self.fail(dnssec.EDE_DNSSEC_BOGUS);
             if (deniesSubdomain(candidate.bitmap, candidate.owner, name)) return self.fail(dnssec.EDE_DNSSEC_BOGUS);
         }
-        if (!covered) return self.fail(dnssec.EDE_DNSSEC_BOGUS);
+        if (!covered) return self.fail(dnssec.EDE_NSEC_MISSING);
         // The record at the wildcard's own name shows the types the wildcard
         // holds, so a type it does not hold is proved absent (RFC 4035
         // section 3.1.3.4, and RFC 6840 section 4.3 for the CNAME bit).
@@ -1595,7 +1696,7 @@ const Validator = struct {
             // The delegation itself is proven; nothing below the cut is.
             return .insecure;
         }
-        return self.fail(dnssec.EDE_DNSSEC_BOGUS);
+        return self.fail(dnssec.EDE_NSEC_MISSING);
     }
 
     /// The exact-owner case. The bitmap must be strictly well-formed and must
@@ -1631,7 +1732,7 @@ const Validator = struct {
             next_closer = encloser;
             ancestor = parentName(encloser);
         }
-        return self.fail(dnssec.EDE_DNSSEC_BOGUS);
+        return self.fail(dnssec.EDE_NSEC_MISSING);
     }
 
     fn nsecEncloser(self: *Validator, proof: *const Nsec, next_closer: Name) Error!Outcome {
@@ -1644,8 +1745,16 @@ const Validator = struct {
         // covers the next closer name and another covers the wildcard at
         // the closest encloser. A response that carries only the encloser's
         // own NSEC proves neither.
-        if (try self.nsecCoversName(next_closer) != .covered) return self.fail(dnssec.EDE_DNSSEC_BOGUS);
-        if (try self.nsecCoversName(wildcard) != .covered) return self.fail(dnssec.EDE_DNSSEC_BOGUS);
+        switch (try self.nsecCoversName(next_closer)) {
+            .covered => {},
+            .uncovered => return self.fail(dnssec.EDE_NSEC_MISSING),
+            .bogus => return self.fail(dnssec.EDE_DNSSEC_BOGUS),
+        }
+        switch (try self.nsecCoversName(wildcard)) {
+            .covered => {},
+            .uncovered => return self.fail(dnssec.EDE_NSEC_MISSING),
+            .bogus => return self.fail(dnssec.EDE_DNSSEC_BOGUS),
+        }
         return if (try self.anchored(proof.signer)) .secure else .insecure;
     }
 
@@ -2004,7 +2113,10 @@ pub fn validate(
             try self.checkNsecDenial(question.name, question.qtype.code(), delegation, nxdomain)
         else if (anchors.covers(question.name))
             // RFC 4035 section 5.4: a signed zone must prove the absence.
-            self.fail(dnssec.EDE_DNSSEC_BOGUS)
+            // RFC 8914 section 4.13 names the response that carries no proof
+            // record at all; a proof that is present but unusable (an NSEC
+            // with no RRSIG over it) is the generic DNSSEC-bogus case.
+            self.fail(if (self.denial_present) dnssec.EDE_DNSSEC_BOGUS else dnssec.EDE_NSEC_MISSING)
         else
             // Nothing was expected to be signed, so the absence needs no
             // proof and the answer is insecure, not bogus.
@@ -2555,13 +2667,18 @@ const dname_zone_text =
 const SignedZone = struct {
     zone: zone_index.Zone,
     key: zone_signer.Key,
-    /// The public record an operator writes as a trust anchor.
+    /// The chain anchor an operator publishes: the key-signing form (257),
+    /// which authenticates the DNSKEY RRset.
     dnskey: []const u8,
+    /// The zone-signing form (256), which signs the zone data. A response
+    /// that carries no DNSKEY RRset can only be validated against this one.
+    data_dnskey: []const u8,
 
     fn deinit(self: *SignedZone, allocator: std.mem.Allocator) void {
         self.zone.deinit();
         self.key.deinit();
         allocator.free(self.dnskey);
+        allocator.free(self.data_dnskey);
     }
 };
 
@@ -2577,6 +2694,7 @@ fn signZoneText(allocator: std.mem.Allocator, text: []const u8, key_text: []cons
         .zone = zone,
         .key = key,
         .dnskey = try key.dnskeyRdata(allocator),
+        .data_dnskey = try key.dnskeyRdataWithFlags(allocator, 0x0100),
     };
 }
 
@@ -2773,6 +2891,15 @@ fn exchange(
     for (zone.records.items[0..zone.records.len]) |*record| {
         if (record.rrtype.eql(.OPT)) continue;
         const answered = std.ascii.eqlIgnoreCase(record.ownerText(), answer_owner);
+        // A positive answer does not carry an unrelated delegation's NS: the
+        // parent publishes that RRset unsigned (RFC 4035 section 2.2), so it
+        // may appear only when the question is at or below the cut.
+        if (!answered and record.rrtype.eql(.NS) and !std.mem.eql(u8, record.ownerText(), zone.originText())) {
+            const owner = try Name.fromText(record.ownerText());
+            const qname_name = try Name.fromText(qname);
+            const at_or_below = isSuffix(owner, qname_name);
+            if (!at_or_below) continue;
+        }
         // `include` narrows Authority only: the Answer section is whatever the
         // question named, which is the one thing a filter must not remove.
         if (!answered) {
@@ -3732,7 +3859,7 @@ test "RFC 6840 section 4.2: an ANY answer with no RRset at the QNAME is judged b
 
     const unproved_result = try validate(std.testing.allocator, &anchors, unproved.query, unproved.response, &.{}, now_seconds);
     try expectStatus(.bogus, unproved_result);
-    try std.testing.expectEqual(dnssec.EDE_DNSSEC_BOGUS, unproved_result.ede);
+    try std.testing.expectEqual(dnssec.EDE_NSEC_MISSING, unproved_result.ede);
 
     // The same answer outside the trust domain: nothing was expected to be
     // signed, so the absence needs no proof and the answer is insecure.
@@ -3770,7 +3897,7 @@ test "RFC 6672 section 3.1: a DNAME above the QNAME answers the query, it does n
 test "RFC 4035 section 5.4: an NSEC proof that verifies leaves the answer secure" {
     var signed = try signZoneText(std.testing.allocator, child_zone_text, ed25519_secret);
     defer signed.deinit(std.testing.allocator);
-    var anchors = try dnskeyAnchor(std.testing.allocator, "example.com.", signed.dnskey);
+    var anchors = try dnskeyAnchor(std.testing.allocator, "example.com.", signed.data_dnskey);
     defer anchors.deinit(std.testing.allocator);
 
     // The answer holds no RRset at the QNAME, so the absence of an MX record
@@ -3881,7 +4008,7 @@ fn appendUnauthenticatedNsec(
 test "RFC 4035 section 5.4: an extra NSEC with a broken signature does not judge the denial" {
     var signed = try signZoneText(std.testing.allocator, child_zone_text, ed25519_secret);
     defer signed.deinit(std.testing.allocator);
-    var anchors = try dnskeyAnchor(std.testing.allocator, "example.com.", signed.dnskey);
+    var anchors = try dnskeyAnchor(std.testing.allocator, "example.com.", signed.data_dnskey);
     defer anchors.deinit(std.testing.allocator);
 
     var pair = try exchange(std.testing.allocator, &signed.zone, "www.example.com.", .MX, .no_error, "nothing.example.com.", &.{"www.example.com."});
@@ -3901,7 +4028,7 @@ test "RFC 4035 section 5.4: an extra NSEC with a broken signature does not judge
 test "RFC 4035 section 5.4: an extra NSEC the validator cannot authenticate does not judge the denial" {
     var signed = try signZoneText(std.testing.allocator, child_zone_text, ed25519_secret);
     defer signed.deinit(std.testing.allocator);
-    var anchors = try dnskeyAnchor(std.testing.allocator, "example.com.", signed.dnskey);
+    var anchors = try dnskeyAnchor(std.testing.allocator, "example.com.", signed.data_dnskey);
     defer anchors.deinit(std.testing.allocator);
 
     var pair = try exchange(std.testing.allocator, &signed.zone, "www.example.com.", .MX, .no_error, "nothing.example.com.", &.{"www.example.com."});
@@ -3929,7 +4056,7 @@ test "RFC 4035 section 5.4: an extra NSEC the validator cannot authenticate does
 test "RFC 4035 section 5.4: the verified proof index is the used NSEC only" {
     var signed = try signZoneText(std.testing.allocator, child_zone_text, ed25519_secret);
     defer signed.deinit(std.testing.allocator);
-    var anchors = try dnskeyAnchor(std.testing.allocator, "example.com.", signed.dnskey);
+    var anchors = try dnskeyAnchor(std.testing.allocator, "example.com.", signed.data_dnskey);
     defer anchors.deinit(std.testing.allocator);
 
     var pair = try exchange(std.testing.allocator, &signed.zone, "www.example.com.", .MX, .no_error, "nothing.example.com.", &.{"www.example.com."});
@@ -4193,7 +4320,7 @@ test "RFC 4034 section 6.2 rule 3: a type outside the list keeps its RDATA as it
 test "RFC 6840 section 5.1: an NSEC proof published in upper case and signed over those octets is secure" {
     var signed = try signZoneText(std.testing.allocator, child_zone_text, ed25519_secret);
     defer signed.deinit(std.testing.allocator);
-    var anchors = try dnskeyAnchor(std.testing.allocator, "example.com.", signed.dnskey);
+    var anchors = try dnskeyAnchor(std.testing.allocator, "example.com.", signed.data_dnskey);
     defer anchors.deinit(std.testing.allocator);
 
     var pair = try exchange(std.testing.allocator, &signed.zone, "www.example.com.", .MX, .no_error, "nothing.example.com.", &.{"www.example.com."});
@@ -4218,7 +4345,7 @@ test "RFC 6840 section 5.1: an NSEC proof published in upper case and signed ove
 test "RFC 6840 section 5.1: an NSEC proof whose next name is published in mixed case and signed over those octets is secure" {
     var signed = try signZoneText(std.testing.allocator, child_zone_text, ed25519_secret);
     defer signed.deinit(std.testing.allocator);
-    var anchors = try dnskeyAnchor(std.testing.allocator, "example.com.", signed.dnskey);
+    var anchors = try dnskeyAnchor(std.testing.allocator, "example.com.", signed.data_dnskey);
     defer anchors.deinit(std.testing.allocator);
 
     var pair = try exchange(std.testing.allocator, &signed.zone, "www.example.com.", .MX, .no_error, "nothing.example.com.", &.{"www.example.com."});
@@ -4362,7 +4489,7 @@ test "RFC 4035 section 3.1.3.4: the NSEC at the wildcard owner name proves the N
     try std.testing.expectEqual(@as(u16, 0), result.ede);
 }
 
-test "RFC 4035 section 5.4: an NXDOMAIN proven only by the encloser's NSEC is bogus" {
+test "RFC 4035 section 5.4: an NXDOMAIN proven only by the encloser's NSEC is missing proof" {
     var key = try zone_signer.parseKey(ed25519_secret);
     defer key.deinit();
     const dnskey_rdata = try key.dnskeyRdata(std.testing.allocator);
@@ -4383,7 +4510,7 @@ test "RFC 4035 section 5.4: an NXDOMAIN proven only by the encloser's NSEC is bo
 
     const result = try validate(std.testing.allocator, &anchors, pair.query, pair.response, &.{}, now_seconds);
     try expectStatus(.bogus, result);
-    try std.testing.expectEqual(dnssec.EDE_DNSSEC_BOGUS, result.ede);
+    try std.testing.expectEqual(dnssec.EDE_NSEC_MISSING, result.ede);
 }
 
 test "RFC 4035 section 3.1.3.4: an NSEC that does not cover the query proves nothing" {
@@ -5076,7 +5203,7 @@ test "RFC 8976 section 4 step 3: a zone file carrying the publisher's own signat
     var zone = try zone_index.Zone.fromZoneFile(&zone_file);
     defer zone.deinit();
 
-    var anchors = try Anchors.parse(allocator, try dnskeyAnchorText(allocator, "example.com.", signed.dnskey));
+    var anchors = try Anchors.parse(allocator, try dnskeyAnchorText(allocator, "example.com.", signed.data_dnskey));
     defer anchors.deinit(allocator);
 
     try std.testing.expect(try zoneSignedToAnchor(allocator, &anchors, &zone, &zonemd_chain_types, now_seconds));

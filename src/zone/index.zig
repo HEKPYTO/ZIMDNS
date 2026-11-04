@@ -115,8 +115,20 @@ pub const Zone = struct {
         }
 
         var result = LookupResult{ .kind = .nxdomain, .soa = self.soa };
-        // Exact authoritative data (including CNAME/DNAME chains and glue
-        // published in this zone) wins over a zone cut below it.
+        // A zone cut refers for every QTYPE except DS at the cut itself, which
+        // stays authoritative in the parent (RFC 4035 section 3.1). The cut
+        // wins over any data the parent zone file happens to hold below it:
+        // glue is not authoritative data (RFC 1034 section 4.2.2), and a
+        // parent that answered it would claim authority it does not have.
+        if (self.findDelegation(qname)) |delegation| {
+            const ds_at_cut = qtype.eql(.DS) and std.ascii.eqlIgnoreCase(qname, delegation);
+            if (!ds_at_cut) {
+                result.kind = .referral;
+                result.soa = null;
+                self.appendDelegation(allocator, &result, delegation) catch return failResult(&result, allocator);
+                return result;
+            }
+        }
         var exact_nodata = false;
         if (self.lookupExact(allocator, qname, qtype, &result)) |exact_kind| {
             if (exact_kind == .servfail) {
@@ -128,17 +140,6 @@ pub const Zone = struct {
                 return result;
             }
             exact_nodata = true;
-        }
-
-        // A zone cut refers except for a DS query at the cut itself, which
-        // stays authoritative in the parent (RFC 4035 section 3.1).
-        if (self.findDelegation(qname)) |delegation| {
-            if (!(qtype.eql(.DS) and std.ascii.eqlIgnoreCase(qname, delegation))) {
-                result.kind = .referral;
-                result.soa = null;
-                self.appendDelegation(allocator, &result, delegation) catch return failResult(&result, allocator);
-                return result;
-            }
         }
 
         if (exact_nodata) {
@@ -904,7 +905,7 @@ test "zone index returns SERVFAIL after the shared CNAME hop cap" {
     try std.testing.expectEqual(LookupKind.servfail, result.kind);
 }
 
-test "zone index answers exact data before referring at a zone cut" {
+test "zone index refers at a zone cut before answering data below it" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -923,16 +924,19 @@ test "zone index answers exact data before referring at a zone cut" {
     var zone = try Zone.fromZoneFile(&zone_file);
     defer zone.deinit();
 
+    // The glue A below the cut is not authoritative data: a direct query for
+    // it gets the delegation, exactly as BIND does.
     var glue = zone.lookup(arena.allocator(), "ns.child.example.", .A);
     defer glue.deinit(arena.allocator());
-    try std.testing.expectEqual(LookupKind.answer, glue.kind);
-    try std.testing.expectEqual(@as(usize, 1), glue.records.len);
-    try std.testing.expectEqualStrings("192.0.2.10", glue.records.items[0].rdataText());
+    try std.testing.expectEqual(LookupKind.referral, glue.kind);
+    try std.testing.expectEqual(@as(usize, 2), glue.authorities.len);
+    try std.testing.expectEqual(@as(usize, 2), glue.additionals.len);
 
     var cut = zone.lookup(arena.allocator(), "child.example.", .NS);
     defer cut.deinit(arena.allocator());
-    try std.testing.expectEqual(LookupKind.answer, cut.kind);
-    try std.testing.expectEqual(@as(usize, 2), cut.records.len);
+    try std.testing.expectEqual(LookupKind.referral, cut.kind);
+    try std.testing.expectEqual(@as(usize, 2), cut.authorities.len);
+    try std.testing.expectEqual(@as(usize, 2), cut.additionals.len);
 
     var below = zone.lookup(arena.allocator(), "www.child.example.", .A);
     defer below.deinit(arena.allocator());

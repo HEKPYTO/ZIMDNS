@@ -750,7 +750,7 @@ fn appendMinimalAnyRrsig(
     // RRset, which is the zone that answered.
     const signer_name = dns_name.Name.fromText(zone.originText()) catch return Error.BadQName;
 
-    const rrsig_rdata = try zone_signer.signRrset(
+    const rrsig_rdata = try zone_signer.signDataRrset(
         response.allocator,
         answer.owner,
         signer_name,
@@ -3683,7 +3683,7 @@ test "RFC 8914 section 3: the RRSIGs over the records that remain still verify" 
 
     var key = try zone_signer.parseKey("ed25519 DSSF3o0s0f+ElWzj9E/Osxw8hLpk55chkmx0LYN5WiY=\n");
     defer key.deinit();
-    const dnskey_rdata = try key.dnskeyRdata(arena.allocator());
+    const dnskey_rdata = try key.dnskeyRdataWithFlags(arena.allocator(), 0x0100);
     try zone_signer.signZone(arena.allocator(), &zone, &key, .{ .inception = 1_000_000_000, .expiration = 2_000_000_000 });
 
     const query = try testDoQuery(arena.allocator(), 0x4a10, "www.example.", .A, true);
@@ -4389,7 +4389,7 @@ test "RFC 8482: a DO=1 ANY query on a signed zone answers the HINFO with a valid
     // repository and the DNSKEY it derives is the one the RFC pins.
     var key = try zone_signer.parseKey("ed25519 DSSF3o0s0f+ElWzj9E/Osxw8hLpk55chkmx0LYN5WiY=\n");
     defer key.deinit();
-    const dnskey_rdata = try key.dnskeyRdata(arena.allocator());
+    const dnskey_rdata = try key.dnskeyRdataWithFlags(arena.allocator(), 0x0100);
     const window = zone_signer.Options{ .inception = 1_000_000_000, .expiration = 2_000_000_000 };
     try zone_signer.signZone(arena.allocator(), &zone, &key, window);
     var session = zone_signer.Session.start(&key, window);
@@ -4627,7 +4627,7 @@ test "RFC 8482 section 4.1: a DO=1 ANY query on a signed zone signs every RRset 
     // repository and the DNSKEY it derives is the one the RFC pins.
     var key = try zone_signer.parseKey("ed25519 DSSF3o0s0f+ElWzj9E/Osxw8hLpk55chkmx0LYN5WiY=\n");
     defer key.deinit();
-    const dnskey_rdata = try key.dnskeyRdata(arena.allocator());
+    const dnskey_rdata = try key.dnskeyRdataWithFlags(arena.allocator(), 0x0100);
     const window = zone_signer.Options{ .inception = 1_000_000_000, .expiration = 2_000_000_000 };
     try zone_signer.signZone(arena.allocator(), &zone, &key, window);
     var session = zone_signer.Session.start(&key, window);
@@ -4693,7 +4693,7 @@ test "RFC 4035 section 5.3.1: the ANY answer carries no signature over a record 
     // repository and the DNSKEY it derives is the one the RFC pins.
     var key = try zone_signer.parseKey("ed25519 DSSF3o0s0f+ElWzj9E/Osxw8hLpk55chkmx0LYN5WiY=\n");
     defer key.deinit();
-    const dnskey_rdata = try key.dnskeyRdata(arena.allocator());
+    const dnskey_rdata = try key.dnskeyRdataWithFlags(arena.allocator(), 0x0100);
     const window = zone_signer.Options{ .inception = 1_000_000_000, .expiration = 2_000_000_000 };
     try zone_signer.signZone(arena.allocator(), &zone, &key, window);
     var session = zone_signer.Session.start(&key, window);
@@ -4751,7 +4751,7 @@ test "RFC 8482 section 4.1: the ANY answer signs every RRset it returns, one sig
 
     var key = try zone_signer.parseKey("ed25519 DSSF3o0s0f+ElWzj9E/Osxw8hLpk55chkmx0LYN5WiY=\n");
     defer key.deinit();
-    const dnskey_rdata = try key.dnskeyRdata(arena.allocator());
+    const dnskey_rdata = try key.dnskeyRdataWithFlags(arena.allocator(), 0x0100);
     const window = zone_signer.Options{ .inception = 1_000_000_000, .expiration = 2_000_000_000 };
     try zone_signer.signZone(arena.allocator(), &zone, &key, window);
     var session = zone_signer.Session.start(&key, window);
@@ -4924,7 +4924,7 @@ fn zoneWithOwnRrsigs(allocator: std.mem.Allocator, zone_text: []const u8, owner_
     // repository and the DNSKEY it derives is the one the RFC pins.
     var key = try zone_signer.parseKey("ed25519 DSSF3o0s0f+ElWzj9E/Osxw8hLpk55chkmx0LYN5WiY=\n");
     defer key.deinit();
-    const dnskey = try key.dnskeyRdata(allocator);
+    const dnskey = try key.dnskeyRdataWithFlags(allocator, zone_signer.zone_key_flags);
     const window = zone_signer.Options{ .inception = 1_000_000_000, .expiration = 2_000_000_000 };
     try zone_signer.signZone(allocator, &signed, &key, window);
 
@@ -5218,7 +5218,7 @@ test "an authoritative answer to a signed and valid zone never sets AD" {
 
     var key = try zone_signer.parseKey("ed25519 DSSF3o0s0f+ElWzj9E/Osxw8hLpk55chkmx0LYN5WiY=\n");
     defer key.deinit();
-    const dnskey_rdata = try key.dnskeyRdata(arena.allocator());
+    const dnskey_rdata = try key.dnskeyRdataWithFlags(arena.allocator(), 0x0100);
     try zone_signer.signZone(arena.allocator(), &zone, &key, .{ .inception = 1_000_000_000, .expiration = 2_000_000_000 });
 
     const query = try testDoQuery(arena.allocator(), 0x4a01, "www.example.", .A, true);
@@ -5949,7 +5949,7 @@ test "the referral that carries the matching NSEC3 carries the RRSIG over the NS
 
     var key = try zone_signer.parseKey("ed25519 DSSF3o0s0f+ElWzj9E/Osxw8hLpk55chkmx0LYN5WiY=\n");
     defer key.deinit();
-    const dnskey_rdata = try key.dnskeyRdata(arena.allocator());
+    const dnskey_rdata = try key.dnskeyRdataWithFlags(arena.allocator(), 0x0100);
     try zone_signer.signZone(arena.allocator(), &zone, &key, .{
         .inception = 1_000_000_000,
         .expiration = 2_000_000_000,
@@ -6474,7 +6474,7 @@ test "RFC 4035 section 3.1.3.3: a signed wildcard answer carries its expansion p
     anchors.items[0] = .{
         .owner = try dns_name.Name.fromText("example."),
         .rrtype = .DNSKEY,
-        .rdata = try key.dnskeyRdata(arena.allocator()),
+        .rdata = try key.dnskeyRdataWithFlags(arena.allocator(), 0x0100),
     };
     anchors.len = 1;
     defer anchors.deinit(arena.allocator());
