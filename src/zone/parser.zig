@@ -113,6 +113,16 @@ pub const ZoneFile = struct {
     }
 
     fn parseWithAllocator(zone: *ZoneFile, storage_allocator: std.mem.Allocator, text: []const u8, allocation_budget: usize) !void {
+        var index_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer index_arena.deinit();
+        const scratch = index_arena.allocator();
+        var index = OwnerIndex{
+            .arena = &index_arena,
+            .owners = std.StringHashMap(OwnerFlags).init(scratch),
+            .rrset_mins = std.HashMap(RrsetKey, u32, RrsetContext, std.hash_map.default_max_load_percentage).init(scratch),
+        };
+        defer index.owners.deinit();
+        defer index.rrset_mins.deinit();
         var saw_apex_soa = false;
         var saw_apex_ns = false;
 
@@ -143,7 +153,7 @@ pub const ZoneFile = struct {
             if (paren_depth != 0) continue;
 
             const logical = logical_buffer.items;
-            try zone.parseLogicalLine(storage_allocator, logical, &saw_apex_soa, &saw_apex_ns);
+            try zone.parseLogicalLine(storage_allocator, &index, logical, &saw_apex_soa, &saw_apex_ns);
             logical_buffer.clearRetainingCapacity();
         }
 
@@ -152,6 +162,16 @@ pub const ZoneFile = struct {
         if (zone.default_ttl == 0) return Error.MissingTtl;
         if (!saw_apex_soa) return Error.MissingSoa;
         if (!saw_apex_ns) return Error.MissingApexNs;
+
+        // RFC 2181 section 5.2: all RRs in an RRSet share one TTL, so each
+        // group normalizes to the lowest TTL listed. One pass over the index
+        // minima, written back in file order.
+        for (zone.records.items[0..zone.records.len]) |*record| {
+            if (record.rrtype.eql(.RRSIG)) continue;
+            const folded = try foldOwner(scratch, record.ownerText());
+            const key = RrsetKey{ .owner = folded, .rrtype = record.rrtype.code() };
+            if (index.rrset_mins.get(key)) |lowest| record.ttl = lowest;
+        }
     }
 
     pub fn deinit(self: *ZoneFile) void {
@@ -167,7 +187,47 @@ pub const ZoneFile = struct {
         return self.origin;
     }
 
-    fn parseLogicalLine(self: *ZoneFile, allocator: std.mem.Allocator, line: []const u8, saw_apex_soa: *bool, saw_apex_ns: *bool) !void {
+    const OwnerFlags = struct {
+        cname: bool = false,
+        other: bool = false,
+    };
+
+    const RrsetKey = struct {
+        owner: []const u8,
+        rrtype: u16,
+    };
+
+    const RrsetContext = struct {
+        pub fn hash(_: @This(), key: RrsetKey) u64 {
+            var hasher = std.hash.Wyhash.init(0);
+            hasher.update(key.owner);
+            var code: [2]u8 = undefined;
+            std.mem.writeInt(u16, &code, key.rrtype, .little);
+            hasher.update(&code);
+            return hasher.final();
+        }
+        pub fn eql(_: @This(), a: RrsetKey, b: RrsetKey) bool {
+            return a.rrtype == b.rrtype and std.mem.eql(u8, a.owner, b.owner);
+        }
+    };
+
+    /// Case-folded owner index keeping per-record parse linear: CNAME
+    /// co-ownership state per owner plus the running minimum TTL per
+    /// (owner, type) group. Keys live in a parse-scoped arena freed when the
+    /// parse finishes; record order in `records` is untouched.
+    const OwnerIndex = struct {
+        arena: *std.heap.ArenaAllocator,
+        owners: std.StringHashMap(OwnerFlags),
+        rrset_mins: std.HashMap(RrsetKey, u32, RrsetContext, std.hash_map.default_max_load_percentage),
+    };
+
+    fn foldOwner(scratch: std.mem.Allocator, owner: []const u8) ![]u8 {
+        const out = try scratch.alloc(u8, owner.len);
+        for (owner, 0..) |c, i| out[i] = std.ascii.toLower(c);
+        return out;
+    }
+
+    fn parseLogicalLine(self: *ZoneFile, allocator: std.mem.Allocator, index: *OwnerIndex, line: []const u8, saw_apex_soa: *bool, saw_apex_ns: *bool) !void {
         var tokens = Tokenizer.init(line);
         const first = tokens.next() orelse return;
 
@@ -227,9 +287,17 @@ pub const ZoneFile = struct {
         errdefer allocator.free(record.rdata);
         _ = try parseRData(record.rrtype, record.rdataText());
 
-        for (self.records.items[0..self.records.len]) |existing| {
-            if (!std.ascii.eqlIgnoreCase(existing.ownerText(), record.ownerText())) continue;
-            if (existing.rrtype.eql(.CNAME) or record.rrtype.eql(.CNAME)) return Error.CnameConflict;
+        const scratch = index.arena.allocator();
+        const folded = try foldOwner(scratch, record.ownerText());
+        const flags = try index.owners.getOrPut(folded);
+        // Arena keys outlive the parse; duplicate folds on hash hits are
+        // dropped with the arena at scope exit.
+        if (record.rrtype.eql(.CNAME)) {
+            if (flags.value_ptr.cname or flags.value_ptr.other) return Error.CnameConflict;
+            flags.value_ptr.cname = true;
+        } else {
+            if (flags.value_ptr.cname) return Error.CnameConflict;
+            flags.value_ptr.other = true;
         }
 
         if (record.rrtype.eql(.SOA)) {
@@ -240,21 +308,17 @@ pub const ZoneFile = struct {
 
         try self.records.append(allocator, record);
 
-        // RFC 2181 section 5.2: all RRs in an RRSet share one TTL, so
-        // same-owner, same-type records normalize to the lowest TTL listed.
-        // RRSIG records are exempt (RFC 4034 section 2.3: an RRSIG's TTL is
-        // the TTL of the RRSet it covers).
+        // RFC 2181 section 5.2: all RRs in an RRSet share one TTL, so track
+        // the running minimum per (owner, type) group; parseWithAllocator
+        // writes it back to every member in file order. RRSIG records are
+        // exempt (RFC 4034 section 2.3: an RRSIG's TTL is the TTL of the
+        // RRSet it covers).
         if (!record.rrtype.eql(.RRSIG)) {
-            var lowest = record.ttl;
-            for (self.records.items[0..self.records.len]) |existing| {
-                if (!std.ascii.eqlIgnoreCase(existing.ownerText(), record.ownerText())) continue;
-                if (!existing.rrtype.eql(record.rrtype)) continue;
-                lowest = @min(lowest, existing.ttl);
-            }
-            for (self.records.items[0..self.records.len]) |*existing| {
-                if (!std.ascii.eqlIgnoreCase(existing.ownerText(), record.ownerText())) continue;
-                if (!existing.rrtype.eql(record.rrtype)) continue;
-                existing.ttl = lowest;
+            const result = try index.rrset_mins.getOrPut(.{ .owner = folded, .rrtype = record.rrtype.code() });
+            if (!result.found_existing) {
+                result.value_ptr.* = record.ttl;
+            } else {
+                result.value_ptr.* = @min(result.value_ptr.*, record.ttl);
             }
         }
 
@@ -3625,4 +3689,67 @@ test "zone parser loads NSEC3 records with base32hex next hashes" {
     try std.testing.expectEqual(RecordType.NSEC3, zone.records.items[2].rrtype);
     const nsec3 = try parseRData(.NSEC3, zone.records.items[2].rdataText());
     try std.testing.expectEqual(@as(u8, 20), nsec3.Unknown.bytes()[9]);
+}
+
+test "zone parser normalizes a three-record RRSet to its lowest TTL" {
+    var zone = try ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns hostmaster 1 3600 900 1209600 300
+        \\@ IN NS ns
+        \\www 300 IN A 192.0.2.2
+        \\www 100 IN A 192.0.2.3
+        \\www 200 IN A 192.0.2.4
+        \\www 300 IN RRSIG A 8 2 300 2000000000 1000000000 1234 example. QUJD
+        \\
+    );
+    defer zone.deinit();
+    for (zone.records.items) |record| {
+        if (!std.mem.eql(u8, record.ownerText(), "www.example.")) continue;
+        if (record.rrtype.eql(.A)) try std.testing.expectEqual(@as(u32, 100), record.ttl);
+        if (record.rrtype.eql(.RRSIG)) try std.testing.expectEqual(@as(u32, 300), record.ttl);
+    }
+}
+
+test "zone parser treats mixed-case owners as one RRSet" {
+    var zone = try ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns hostmaster 1 3600 900 1209600 300
+        \\@ IN NS ns
+        \\WWW 300 IN A 192.0.2.2
+        \\www 100 IN A 192.0.2.3
+        \\
+    );
+    defer zone.deinit();
+    try std.testing.expectEqual(@as(u32, 100), zone.records.items[2].ttl);
+    try std.testing.expectEqual(@as(u32, 100), zone.records.items[3].ttl);
+    try std.testing.expectError(error.CnameConflict, ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns hostmaster 1 3600 900 1209600 300
+        \\@ IN NS ns
+        \\WWW IN CNAME target
+        \\www IN A 192.0.2.2
+        \\
+    ));
+}
+
+test "zone parser scales linearly to 20k distinct owners" {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    try buf.appendSlice(std.testing.allocator, "$ORIGIN example.\n$TTL 3600\n@ IN SOA ns hostmaster 1 3600 900 1209600 300\n@ IN NS ns\n");
+    var i: usize = 0;
+    while (i < 20000) : (i += 1) {
+        const line = try std.fmt.allocPrint(std.testing.allocator, "h{d} IN A 192.0.2.1\n", .{i});
+        defer std.testing.allocator.free(line);
+        try buf.appendSlice(std.testing.allocator, line);
+    }
+    const io = std.testing.io;
+    const start: i128 = std.Io.Clock.real.now(io).nanoseconds;
+    var zone = try ZoneFile.parse(buf.items);
+    defer zone.deinit();
+    const elapsed: i128 = std.Io.Clock.real.now(io).nanoseconds - start;
+    try std.testing.expectEqual(@as(usize, 20002), zone.records.len);
+    try std.testing.expect(elapsed < 10 * std.time.ns_per_s);
 }

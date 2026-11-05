@@ -13,3 +13,5 @@ data/
 
 # External interop suite virtualenv
 .interop-venv/
+__pycache__/
+*.pyc

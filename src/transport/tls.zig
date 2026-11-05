@@ -18,7 +18,9 @@ pub const doq_port: u16 = 853;
 pub const dot_alpn = "dot";
 pub const doh_alpn_http11 = "http/1.1";
 pub const doq_alpn = "doq";
-
+/// The IANA ALPN token for HTTP/3 (RFC 9114 section 3.1): the DoH/3 port
+/// speaks HTTP/3, so the handshake selects `h3`.
+pub const doh3_alpn = "h3";
 pub const Error = error{
     TlsDisabled,
     MissingCertificate,
@@ -34,6 +36,8 @@ pub const Transport = enum {
     doh,
     /// DNS over QUIC, served on the doq port.
     doq,
+    /// DNS over HTTPS over HTTP/3, served on the doh3 port.
+    doh3,
     /// The strict-TLS zone transfer channel.
     xfr,
 };
@@ -51,10 +55,11 @@ pub fn alpnFor(transport: Transport) []const u8 {
         .dot, .xfr => dot_alpn,
         .doh => doh_alpn_http11,
         .doq => doq_alpn,
+        .doh3 => doh3_alpn,
     };
 }
 
-/// Opt-in gate: dot/doh/doq listeners require the explicit encrypted-dns flag.
+/// Opt-in gate: dot/doh/doq/doh3 listeners require the explicit encrypted-dns flag.
 pub fn requireEnabled(enabled: bool) Error!void {
     if (!enabled) return Error.TlsDisabled;
 }
@@ -83,6 +88,8 @@ test "each transport names the ALPN token it speaks" {
     try std.testing.expectEqualStrings("http/1.1", alpnFor(.doh));
     // DoQ speaks the IANA "doq" token (RFC 9250 §4.2).
     try std.testing.expectEqualStrings("doq", alpnFor(.doq));
+    // DoH/3 speaks the IANA "h3" token (RFC 9114 section 3.1).
+    try std.testing.expectEqualStrings("h3", alpnFor(.doh3));
 }
 
 test "encrypted listeners require the opt-in flag" {

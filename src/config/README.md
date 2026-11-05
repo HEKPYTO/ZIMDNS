@@ -42,3 +42,14 @@ The configuration grammar and the loader that reads it.
   asks for anything else is ignored. `ddr-client-port <port>` (repeatable)
   adds an operator-authorized port to that set, for an endpoint that cannot
   use the registered ones; up to eight ports are accepted.
+- `odoh-target on|off` (default off, RFC 9230) enables this server as an
+  Oblivious DoH target. `odoh-key-file <path>` is required when on: 64 hex
+  characters (32 bytes) with surrounding whitespace allowed. `odoh-config-out
+  <path>` optionally writes the 46-byte `ObliviousDoHConfigs` at startup,
+  atomically (temp file + rename in the same directory). Both paths stay
+  confined to the configuration directory like every other loader path.
+  Startup refuses: on without a key file; a malformed key; an unconfined key
+  or config-out path; a key file set while the target is off (dead config
+  misleads the operator). Rotation is the operator's action: replace the key
+  file and restart. RFC 9230 §5 recommends daily rotation, not a MUST, so
+  there is no background rotation timer.

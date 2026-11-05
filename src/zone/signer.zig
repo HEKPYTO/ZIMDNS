@@ -1,7 +1,7 @@
 /// Contract: Signs one primary zone with a single DNSSEC key -- ECDSA P-256
 /// (RFC 6605 algorithm 13), ECDSA P-384 (RFC 6605 algorithm 14), Ed25519
 /// (RFC 8080 algorithm 15), or Ed448 (RFC 8080 algorithm 16) -- producing the
-/// apex DNSKEY and DS, an NSEC chain of denial, and one RRSIG per RRset
+/// apex DNSKEY, an NSEC chain of denial, and one RRSIG per RRset
 /// (RFC 4034 sections 3.1.8.1 and 5.1.4, RFC 4035 section 2.3).
 /// Ownership: every generated zone record, RDATA blob, and byte string is
 /// allocated from `allocator`, which the caller keeps alive for as long as it
@@ -113,6 +113,9 @@ const max_rdata_len = dns_rdata.max_unknown_len;
 /// copied by value into `Material` and wiped by `Key.deinit`.
 pub const max_rsa_modulus_bytes = 512;
 pub const max_rsa_exponent_bytes = 8;
+/// RRSIG RDATA is 18 fixed octets, the signer name (at most 255 wire
+/// octets), and the signature, whose widest form here is an RSA modulus.
+pub const max_rrsig_rdata_local_len = 18 + 255 + max_rsa_modulus_bytes;
 
 pub const RsaKey = struct {
     modulus: [max_rsa_modulus_bytes]u8 = undefined,
@@ -157,7 +160,7 @@ pub const Key = struct {
     ksk: ?Ksk = null,
     /// RFC 6781 section 4.1.2: the second key-signing key of a
     /// Double-Signature rollover. It is published at the apex and signs the
-    /// DNSKEY RRset beside the key the parent's DS points at, but the DS
+    /// DNSKEY RRset beside the key the parent's DS points at, but that DS
     /// states that one alone. Null when no rollover is in progress.
     published_ksk: ?Ksk = null,
 
@@ -627,7 +630,7 @@ pub const Session = struct {
     }
 };
 
-/// Signs `zone` in place: appends the apex DNSKEY and DS, one NSEC per
+/// Signs `zone` in place: appends the apex DNSKEY, one NSEC per
 /// authoritative owner name, and one RRSIG per RRset. The zone's SOA serial is
 /// left alone -- nothing is written back to disk, so the published zone is
 /// unchanged and a serial that moved on every restart would only churn
@@ -650,7 +653,7 @@ pub fn signZone(
     if (zone.soa == null) return Error.BadZoneRecord;
     if (alreadySigned(zone)) return Error.AlreadySigned;
     // RFC 6781 section 4.1.2: the second key-signing key signs the DNSKEY
-    // RRset beside the first, and the DS states the first, so a second key
+    // RRset beside the first, and the parent DS states the first, so a second key
     // with no first has nothing to sign beside.
     if (key.published_ksk != null and key.ksk == null) return Error.BadKeyFile;
 
@@ -692,7 +695,7 @@ pub fn signZone(
     // walk below relies on every owner occupying one contiguous run.
     //
     // RFC 6781 section 3.1: a zone that separates the roles publishes both
-    // keys, and the DS states the key-signing key, the key the parent points
+    // keys, and the parent DS states the key-signing key, the key the parent points
     // at. A zone with one key publishes that key twice: once with the Zone
     // Key flag alone, which signs the zone data, and once with the Secure
     // Entry Point flag, which signs the DNSKEY RRset and is the key a parent's
@@ -962,7 +965,7 @@ fn signRrsetWithFlags(
         signer.asWire(),
         options,
     );
-    var rdata_buffer: [18 + 255 + 128]u8 = undefined;
+    var rdata_buffer: [max_rrsig_rdata_local_len]u8 = undefined;
     @memcpy(rdata_buffer[0..signed.header_len], signed.bytes[0..signed.header_len]);
     const signature = try key.sign(signed.bytes, rdata_buffer[signed.header_len..]);
     return allocator.dupe(u8, rdata_buffer[0 .. signed.header_len + signature.len]);
@@ -1615,7 +1618,7 @@ fn emit(
         // the RRset is done.
         defer std.crypto.secureZero(u8, std.mem.sliceAsBytes(signers[0..signer_count]));
         signers[0] = .{ .material = key.material, .tag = key_tag };
-        // The apex DS states this zone's own key-signing key, so it is key
+        // The parent DS states this zone's own key-signing key, so it is key
         // material rather than ordinary zone data and is signed by that key.
         const own_ds = rrset.rrtype == RecordType.DS.code() and std.mem.eql(u8, rrset.owner_wire, signer_wire);
         if ((rrset.rrtype == RecordType.DNSKEY.code() or own_ds) and ksk_tag != 0) {
@@ -1629,8 +1632,8 @@ fn emit(
             const signed = try signedData(scratch, rrset, signing_key.material, signing_key.tag, signer_wire, options);
             // RRSIG RDATA is the RRSIG header followed by the Signature field. The
             // RRs that were signed go in neither: they are already published from
-            // the zone file. The widest signature this build produces is 96 octets.
-            var rdata_buffer: [18 + 255 + 128]u8 = undefined;
+            // the zone file.
+            var rdata_buffer: [max_rrsig_rdata_local_len]u8 = undefined;
             @memcpy(rdata_buffer[0..signed.header_len], signed.bytes[0..signed.header_len]);
             const signature = try signMaterial(&signing_key.material, signed.bytes, rdata_buffer[signed.header_len..]);
             try generated.append(scratch, try genericRecord(
@@ -1822,17 +1825,21 @@ fn decodeBase64Dynamic(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
 fn derInteger(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
     const pad: usize = if (bytes.len == 0 or (bytes[0] & 0x80) != 0) 1 else 0;
     const value_len = pad + bytes.len;
-    const header_len: usize = if (value_len < 128) 2 else 3;
+    const header_len: usize = if (value_len < 128) 2 else if (value_len < 256) 3 else 4;
     const out = try allocator.alloc(u8, header_len + value_len);
     out[0] = 0x02;
     var offset: usize = 1;
     if (value_len < 128) {
         out[1] = @intCast(value_len);
         offset = 2;
-    } else {
+    } else if (value_len < 256) {
         out[1] = 0x81;
         out[2] = @intCast(value_len);
         offset = 3;
+    } else {
+        out[1] = 0x82;
+        std.mem.writeInt(u16, out[2..4], @intCast(value_len), .big);
+        offset = 4;
     }
     if (pad == 1) {
         out[offset] = 0;
@@ -2847,6 +2854,67 @@ test "RFC 8080: an Ed448-signed zone carries a 114-octet signature that verifies
     ));
 }
 
+test "an RSA-3072 signature fills 384 octets and validates against its own DNSKEY" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const key_file = try rsaKeyFile(allocator, "RSASHA256", rsa3072_modulus, rsa3072_exponent, rsa3072_private);
+    var key = try parseKey(key_file);
+    defer key.deinit();
+
+    const signer = try Name.fromText("example.com.");
+    const rrsig = try signRrset(allocator, try Name.fromText("www.example.com."), signer, RecordType.A.code(), try oneRdata(allocator, &.{ 192, 0, 2, 1 }), 3600, &key, rfc5702_sha256_window);
+    const signature = rrsig[18 + signer.asWire().len ..];
+    // The old 128-octet tail could never hold this; the buffer was the bug.
+    try std.testing.expectEqual(@as(usize, 384), signature.len);
+    try std.testing.expect(signature.len > 128);
+    try std.testing.expectEqual(@as(usize, 18 + signer.asWire().len + 384), rrsig.len);
+
+    var zone = try loadZone(rsa_large_zone);
+    defer zone.deinit();
+    try signZone(allocator, &zone, &key, rfc5702_sha256_window);
+    const dnskey = try publishedKey(allocator, &zone, 8);
+    try expectSignedBy(allocator, &zone, dnskey, dns_dnssec.keyTag(dnskey));
+}
+
+test "an RSA-4096 signature fills 512 octets and validates against its own DNSKEY" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const key_file = try rsaKeyFile(allocator, "RSASHA512", rsa4096_modulus, rsa4096_exponent, rsa4096_private);
+    var key = try parseKey(key_file);
+    defer key.deinit();
+
+    const signer = try Name.fromText("example.com.");
+    const rrsig = try signRrset(allocator, try Name.fromText("www.example.com."), signer, RecordType.A.code(), try oneRdata(allocator, &.{ 192, 0, 2, 1 }), 3600, &key, rfc5702_sha512_window);
+    const signature = rrsig[18 + signer.asWire().len ..];
+    try std.testing.expectEqual(@as(usize, 512), signature.len);
+    try std.testing.expectEqual(@as(usize, 18 + signer.asWire().len + 512), rrsig.len);
+
+    var zone = try loadZone(rsa_large_zone);
+    defer zone.deinit();
+    try signZone(allocator, &zone, &key, rfc5702_sha512_window);
+    const dnskey = try publishedKey(allocator, &zone, 10);
+    try expectSignedBy(allocator, &zone, dnskey, dns_dnssec.keyTag(dnskey));
+}
+
+const rsa_large_zone =
+    \\$ORIGIN example.com.
+    \\$TTL 3600
+    \\@ IN SOA ns1.example.com. hostmaster.example.com. 1 3600 900 1209600 3600
+    \\@ IN NS ns1.example.com.
+    \\ns1 IN A 192.0.2.1
+;
+
+const rfc5702_sha512_window = Options{ .inception = 946684800, .expiration = 1893456000 };
+const rsa3072_exponent = "AQAB";
+const rsa3072_modulus = "pFcya5+2nEuBWvguun+YpfZpALwdwy7K+7UPZWzp6cAVnFZSAohTxSsjXz0zor62yk/kpmMHiQRQvkxrJMZEfFerT1pk8fOIxBUsUh6HY59+V0kM1jXjXqNYFrvX/+UOVXlZO1o7GBw6R//9mChvbKXICVklMG2mDmjpNa7z/Y5IgFEtd3SMHfaf9Ahikp8GIW7wG9LKFbD3ht04c6U5chdqLd9jczGUxjR8zhwHGJPNQRW3mKA/C9BKpsO9g2/8fv1G5hOnkPAcUkQxvEBs+wh7FlRVWeme74FlKrRBpK4TctTCKshzrT9A+DSR6SGoyWHhM2r57sKvVG56DFWRpHdFK02I8E5jpm/MpBu7bBG5U9DAWumOD6musRIXxj7VvUKvXK3r6Y8f5Ix5eNoMWEoa7W4S0Qe0DSMvnRRtDUTlSxm+8Jvdbh+v6Erk5EjmxJ6t/nq2mZN0reTCRPIT/aPSQuW5Nj96Sntf2hiHHzFHvoiCQIPuJdW9FPyrMqTh";
+const rsa3072_private = "GedMoT4pcHVOTGJ2KxtVmkM+xcjhABTuFcKyTJBgRmHqhhvtDU0jtx5Xkvl4nBxnf3gcWEWfuG8fsv8knEVMIjVHYVikNKboVc/ojoEVYhSPu35eMZ2I2y/wAJVXNJSML9jSwdI1IlXAsfydolAtT/jJkP+mJv4BgJ/0smuDNeIpd2BURFHwjACFsddogifitX5hBmGxTL36Jh3UehX++gbKy7Q8Xrnf82XujiZI0Azr+2hK6hnIFjqcqbCMvJz39KQK0uuT5d7uiQ5rKu2LnsTtPx7NWumMDQ+07l+z/KC3nfG97QB8HI/FPTd+1mF5cGj8viX0Ks3MBzLj/O4enc0CLt3dqAA4anAN/LdM5R+rlx6Gj+3aE6F78YQFhXdd4a+A2alSbZIIJBfjkeJ5xe5YYsnFiYbDCYh8INfAcFVIbMUMY5QOIoPdrO5bziePd0pXeSlrwi1pprfvx9dKBbP8I+gMf2I6nd5im048XbPecrVyRB6WLR3SOcGQg5bh";
+const rsa4096_exponent = "AQAB";
+const rsa4096_modulus = "30RU9zC9HWYGwHeaNOKEiuqru2gDNNW41tyOjBvPgHs3YiE7Meys2WLBrRf4D1F6p5iZthBfhRn4dJdfRMVAx9s9BTyE6hCNRZH54kxjPKLzP0KN6k+ADkLcuf3ov91yWzUEiko6T75kobcNno3B96t4S0QVIBeDbrTSbO4BabYoPg7vp/nB3weK+HEMNr4URrC4IhBHEJrKxP+rndrmldVi5GLY19qV9aGDY7CL/RGycr996mzBtBDoSHAV+Ihm27L6bz6oGdjoxMVIq7ObxgIdiNOk+BLrx8jvCHOvPS6bXTZbOygAYgyyEwd5XH4u3qsATSvJ71BBUTbRwLxinC+j1lC1Iz8MJTT2Yjql/FiX+dAYNRnyenhzZlIVUjCzpUELWs5a/L2YApUi/AXZ9xEn5OjOvm3FGZ4Xgh953qRW/zve+jF53Ctw07ZOxzy9DLgGCcFaHLSx3ZBtAmRVwxCAk/ep+ORkpYLG0uuluZutbS9jZIJHUHTEIN3DA1b1DFIPDpmAV0IRn/RPeB3VzQt7Z3AmLaTpE1uw9lQ8cb3ce8GQ99dWx1i7NMDWSerEMbj3FyZ41DbBqrty68aRJR1pAZan9xtHPTGGkMNGpLWMY2NWyRaLdbCfvf1pJWlRTZEncpzywD2gjQHEUCjK4ICRAurMBzXQPzVlj0o23J8=";
+const rsa4096_private = "F8IvwHZBSaWXxldz43jPXfEHAVRaMv8jQkoKKUK0XBnAlQKwR+nFowRtU7wfO5ISGU+V29f2MjXHSLDrBGhxMlNUNQBxrG7CecrE6p3yWXuFow+0BmEbYWkgD/LDF9e62ZXUu9qWRfIex06xdlPjdjWbAXdnQBkAdYFsewcAw30M3z27pwZe6RrmYPW2tQSZJ8Sac5WD2nJ+bWQ/oPawXvVsJp2WMbIjDxZ24t7gpreBY9CY159nJYA/F6ZF0ELDn1F2cOwb+1QnwPi1eQAN7Y5AElVjUrrAuGvbc+zLkxkok0y7fJoPIF/1eyzqbztGRY+w4oVsYbkKmlfZDkd9vqo0f1JyFFj6CWjZsYOWMfB4oH1pxbsuFNiigiQLE3x2slsiT3Tv3vhFcZISv4IadzcMTpm0siKHqDU1sPip+irqZ65In6WqBzWxQU1Z2zCVmNv10EnYJsgB0E6L6B2vOSrSxVl7bTSrtC/DWtQiaBi3T491juXoiZGi5XZSVj7VqYCFIE0hx8MaChIA0VkrVXnOW5GriGzcXku1y+hjs5h9taIc7Twu0tgiAWxWLKR2zYKetsIjkmw1ZuolSwlx2qjMslG4VCi1yw4Vqo+irkEkB5TlyVdjWyaU/4ah6QUYl17HKKcySMsztOFc5MXtkVlb0KpfKPISMmJ7CzfLxKE=";
 test "the key file accepts only one known algorithm and a correctly sized secret" {
     try std.testing.expectError(Error.BadKeyFile, parseKey("rsa-sha256 AAAA\n"));
     try std.testing.expectError(Error.BadSecret, parseKey("ed448 AAAA\n"));

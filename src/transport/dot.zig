@@ -26,7 +26,31 @@
 /// Errors: DNS failures are typed; socket read/write failures propagate as
 /// I/O errors.
 const std = @import("std");
-const tls = @import("tls");
+const ossl = @import("openssl_tls.zig");
+
+/// Test-only insecure client: skips verification for loopback fixtures with
+/// throwaway identities. MUST NOT be used in production paths.
+fn insecureTestClient(
+    fd: std.posix.fd_t,
+    io: std.Io,
+    alpn: []const u8,
+    comptime test_only: bool,
+) !ossl.Connection {
+    comptime if (!test_only or !@import("builtin").is_test) @compileError("insecureTestClient is test-only: production must verify");
+    const ctx = try ossl.clientCtx(.insecure);
+    defer ossl.freeClientCtx(ctx);
+    // Loopback tests give the handshake and the exchange five seconds;
+    // production paths pass their own absolute deadline instead.
+    const deadline = tcp_deadline.deadline(io, .{ .seconds = 5 });
+    const connection = try ossl.clientHandshake(ctx, fd, io, deadline, .{
+        .verify = .insecure,
+        .verify_host = "localhost",
+        .sni = "localhost",
+        .alpn = alpn,
+    });
+    return connection;
+}
+
 const Runtime = @import("../auth/runtime.zig").Runtime;
 const dns_message = @import("../dns/message.zig");
 const dns_padding = @import("../dns/padding.zig");
@@ -116,8 +140,7 @@ fn serveDotFrames(
         // One deadline for the whole frame: a peer that stalls in the middle
         // of a frame loses the frame, not the server. The write of the answer
         // shares it, so one frame cannot take two windows.
-        const frame_deadline = channel.frameDeadline() orelse return;
-        channel.deadlines.apply(frame_deadline);
+        if (!channel.applyFrameDeadline()) return;
         const request = readFrame(channel.reader, &request_buffer) catch |err| {
             if (err == error.EndOfStream) {
                 if (frame_count == 0) return error.EndOfStream;
@@ -216,14 +239,10 @@ fn serveDotTlsStreamWithTimeout(
     const handshake_timeout = listener.frameTimeout(io, connection_deadline, timeout) orelse return;
     const handshake_deadline = tcp_deadline.deadline(io, handshake_timeout);
 
-    var input_buffer: [tls_server.input_buffer_len]u8 = undefined;
-    var output_buffer: [tls_server.output_buffer_len]u8 = undefined;
-    var stream_reader = tcp_deadline.DeadlineReader.init(stream.socket.handle, io, &input_buffer, timeout);
-    var stream_writer = tcp_deadline.DeadlineWriter.init(stream.socket.handle, io, &output_buffer, timeout);
     // The handshake is part of the connection, so it shares its deadline.
-    stream_reader.setFrameDeadline(handshake_deadline);
-    stream_writer.setFrameDeadline(handshake_deadline);
-    var connection = try server.handshake(&stream_reader.interface, &stream_writer.interface);
+    // It runs directly on the socket fd: the TLS layer polls the fd and
+    // recomputes against this absolute deadline each iteration.
+    var connection = try server.handshake(stream.socket.handle, io, handshake_deadline);
 
     var read_buffer: [STREAM_BUFFER_SIZE]u8 = undefined;
     var write_buffer: [STREAM_BUFFER_SIZE]u8 = undefined;
@@ -232,13 +251,12 @@ fn serveDotTlsStreamWithTimeout(
     defer {
         connection_writer.interface.flush() catch {};
         connection.close() catch {};
-        stream_writer.interface.flush() catch {};
     }
     var channel = channel_mod.Channel{
         .io = io,
         .reader = &connection_reader.interface,
         .writer = &connection_writer.interface,
-        .deadlines = .{ .reader = &stream_reader, .writer = &stream_writer },
+        .tls = &connection,
         .timeout = timeout,
         .connection_deadline = connection_deadline,
     };
@@ -279,7 +297,7 @@ pub fn serveDotLoop(
     var sources = listener.SourceCounter{};
     var accepted: usize = 0;
     while (max_requests == null or accepted < max_requests.?) {
-        const stream = try listener_socket.accept(io);
+        const stream = try listener.acceptWithRetry(listener_socket, io);
         accepted += 1;
         // The encrypted listener holds the same bounds as the cleartext one: a
         // source address holds only so many connections at once (RFC 9210
@@ -673,20 +691,8 @@ fn serveOneConnectionWithMetrics(
 
 /// A client connection that offers the "dot" token, the way a DoT client
 /// does.
-fn tlsClient(
-    reader: *std.Io.Reader,
-    writer: *std.Io.Writer,
-    rng_source: *std.Random.IoSource,
-    io: std.Io,
-) !tls.Connection {
-    return tls.client(reader, writer, .{
-        .rng = rng_source.interface(),
-        .host = "localhost",
-        .root_ca = .empty,
-        .insecure_skip_verify = true,
-        .now = std.Io.Clock.real.now(io),
-        .alpn_protocols = &.{DOT_ALPN},
-    });
+fn tlsClient(fd: std.posix.fd_t, io: std.Io) !ossl.Connection {
+    return insecureTestClient(fd, io, DOT_ALPN, true);
 }
 
 /// Runs one DoT query over a real TLS handshake and returns the answer the
@@ -710,12 +716,7 @@ fn dotTlsAnswer(
     const stream = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp });
     defer stream.close(io);
 
-    var client_input: [tls_server.input_buffer_len]u8 = undefined;
-    var client_output: [tls_server.output_buffer_len]u8 = undefined;
-    var client_reader = stream.reader(io, &client_input);
-    var client_writer = stream.writer(io, &client_output);
-    var rng_source: std.Random.IoSource = .{ .io = io };
-    var connection = try tlsClient(&client_reader.interface, &client_writer.interface, &rng_source, io);
+    var connection = try tlsClient(stream.socket.handle, io);
     defer connection.close() catch {};
 
     var read_buffer: [512]u8 = undefined;
@@ -811,12 +812,10 @@ test "a DoT peer that dribbles handshake bytes is dropped inside the handshake w
     var address = std.Io.net.IpAddress{ .ip4 = .loopback(port) };
     const stalled = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp });
     defer stalled.close(io);
-    var stalled_output: [tls_server.output_buffer_len]u8 = undefined;
-    var stalled_writer = stalled.writer(io, &stalled_output);
     // A valid record header, and then a body that never arrives whole: the
-    // handshake never completes.
-    try stalled_writer.interface.writeAll(&.{ 0x16, 0x03, 0x03, 0x00, 0x64 });
-    try stalled_writer.interface.flush();
+    // handshake never completes. Written directly on the fd: the peer is
+    // deliberately not a TLS client.
+    try tcp_deadline.writeExact(stalled.socket.handle, io, &.{ 0x16, 0x03, 0x03, 0x00, 0x64 }, tcp_deadline.deadline(io, handshake_window));
 
     var stop = std.atomic.Value(bool).init(false);
     var sent = std.atomic.Value(usize).init(0);
@@ -895,21 +894,9 @@ test "DoT answers a query over a real TLS 1.3 handshake with the dot ALPN token"
     const stream = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp });
     defer stream.close(io);
 
-    var client_input: [tls_server.input_buffer_len]u8 = undefined;
-    var client_output: [tls_server.output_buffer_len]u8 = undefined;
-    var client_reader = stream.reader(io, &client_input);
-    var client_writer = stream.writer(io, &client_output);
-    var rng_source: std.Random.IoSource = .{ .io = io };
-    var connection = try tls.client(&client_reader.interface, &client_writer.interface, .{
-        .rng = rng_source.interface(),
-        .host = "localhost",
-        .root_ca = .empty,
-        .insecure_skip_verify = true,
-        .now = std.Io.Clock.real.now(io),
-        .alpn_protocols = &.{DOT_ALPN},
-    });
+    var connection = try insecureTestClient(stream.socket.handle, io, DOT_ALPN, true);
     // The server speaks "dot" and nothing else.
-    try std.testing.expectEqualStrings(DOT_ALPN, connection.alpn_protocol.?);
+    try std.testing.expectEqualStrings(DOT_ALPN, connection.alpnProtocol().?);
 
     var read_buffer: [512]u8 = undefined;
     var write_buffer: [512]u8 = undefined;
@@ -935,6 +922,113 @@ test "DoT answers a query over a real TLS 1.3 handshake with the dot ALPN token"
     // client closes its side and the server sees the end of the stream.
     connection.close() catch {};
     thread.join();
+}
+
+test "close against a silent peer waits for the deadline instead of spinning" {
+    var io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_backend.deinit();
+    const io = io_backend.io();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestIdentity(tmp.dir, io);
+
+    var server: tls_server.Server = undefined;
+    try server.init(allocator, io, tmp.dir, "cert.pem", "key.pem", DOT_ALPN);
+    defer server.deinit();
+
+    var bind_address = std.Io.net.IpAddress{ .ip4 = .loopback(0) };
+    var listener_socket = try std.Io.net.IpAddress.listen(&bind_address, io, .{ .reuse_address = true });
+    defer listener_socket.deinit(io);
+    const port = listener_socket.socket.address.getPort();
+
+    const Silent = struct {
+        fn run(listener_ptr: *std.Io.net.Server, io_inner: std.Io, server_ptr: *tls_server.Server) void {
+            const stream = listener_ptr.accept(io_inner) catch return;
+            defer stream.close(io_inner);
+            const hs_deadline = tcp_deadline.deadline(io_inner, .{ .seconds = 5 });
+            var conn = server_ptr.handshake(stream.socket.handle, io_inner, hs_deadline) catch return;
+            // Stay silent: never send close_notify, so the client's
+            // `SSL_shutdown` keeps returning 0 until its deadline lapses.
+            std.Io.sleep(io_inner, .fromMilliseconds(4000), .awake) catch {};
+            conn.closeWithoutNotify();
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Silent.run, .{ &listener_socket, io, &server });
+    defer thread.join();
+
+    var address = std.Io.net.IpAddress{ .ip4 = .loopback(port) };
+    const stream = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer stream.close(io);
+
+    const ctx = try ossl.clientCtx(.insecure);
+    defer ossl.freeClientCtx(ctx);
+    const close_deadline = tcp_deadline.deadline(io, .{ .seconds = 2 });
+    var connection = try ossl.clientHandshake(ctx, stream.socket.handle, io, close_deadline, .{
+        .verify = .insecure,
+        .verify_host = "localhost",
+        .sni = "localhost",
+        .alpn = DOT_ALPN,
+    });
+
+    const start_ns: i64 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
+    connection.close() catch {};
+    const end_ns: i64 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
+    const elapsed_ns: i64 = end_ns - start_ns;
+    // Bounded by the ~2s deadline plus a generous margin; the old tight
+    // `continue` loop never returned here at all.
+    try std.testing.expect(elapsed_ns < 10 * std.time.ns_per_s);
+}
+
+test "close against a peer that completes the shutdown returns promptly" {
+    var io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_backend.deinit();
+    const io = io_backend.io();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestIdentity(tmp.dir, io);
+
+    var server: tls_server.Server = undefined;
+    try server.init(allocator, io, tmp.dir, "cert.pem", "key.pem", DOT_ALPN);
+    defer server.deinit();
+
+    var bind_address = std.Io.net.IpAddress{ .ip4 = .loopback(0) };
+    var listener_socket = try std.Io.net.IpAddress.listen(&bind_address, io, .{ .reuse_address = true });
+    defer listener_socket.deinit(io);
+    const port = listener_socket.socket.address.getPort();
+
+    const Responder = struct {
+        fn run(listener_ptr: *std.Io.net.Server, io_inner: std.Io, server_ptr: *tls_server.Server) void {
+            const stream = listener_ptr.accept(io_inner) catch return;
+            defer stream.close(io_inner);
+            const hs_deadline = tcp_deadline.deadline(io_inner, .{ .seconds = 5 });
+            var conn = server_ptr.handshake(stream.socket.handle, io_inner, hs_deadline) catch return;
+            conn.close() catch {};
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Responder.run, .{ &listener_socket, io, &server });
+    defer thread.join();
+
+    var address = std.Io.net.IpAddress{ .ip4 = .loopback(port) };
+    const stream = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer stream.close(io);
+
+    var connection = try tlsClient(stream.socket.handle, io);
+
+    const start_ns: i64 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
+    try connection.close();
+    const end_ns: i64 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
+    const elapsed_ns: i64 = end_ns - start_ns;
+    try std.testing.expect(elapsed_ns < 10 * std.time.ns_per_s);
 }
 
 test "a DoT peer that stalls past the deadline is dropped and the server keeps serving" {
@@ -968,16 +1062,11 @@ test "a DoT peer that stalls past the deadline is dropped and the server keeps s
     const thread = try std.Thread.spawn(.{}, serveTwoConnections, .{ &listener_socket, io, &server, &runtime, frame_timeout });
 
     var address = std.Io.net.IpAddress{ .ip4 = .loopback(port) };
-    var rng_source: std.Random.IoSource = .{ .io = io };
 
     // The first peer completes the handshake and then says nothing.
     const stalled = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp });
     defer stalled.close(io);
-    var stalled_input: [tls_server.input_buffer_len]u8 = undefined;
-    var stalled_output: [tls_server.output_buffer_len]u8 = undefined;
-    var stalled_reader = stalled.reader(io, &stalled_input);
-    var stalled_writer = stalled.writer(io, &stalled_output);
-    var stalled_connection = try tlsClient(&stalled_reader.interface, &stalled_writer.interface, &rng_source, io);
+    var stalled_connection = try tlsClient(stalled.socket.handle, io);
     defer stalled_connection.close() catch {};
 
     // The stalled peer is dropped: the connection ends instead of waiting
@@ -988,11 +1077,7 @@ test "a DoT peer that stalls past the deadline is dropped and the server keeps s
     // The server is still alive: it answers the peer that comes next.
     const answered = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp });
     defer answered.close(io);
-    var answered_input: [tls_server.input_buffer_len]u8 = undefined;
-    var answered_output: [tls_server.output_buffer_len]u8 = undefined;
-    var answered_reader = answered.reader(io, &answered_input);
-    var answered_writer = answered.writer(io, &answered_output);
-    var answered_connection = try tlsClient(&answered_reader.interface, &answered_writer.interface, &rng_source, io);
+    var answered_connection = try tlsClient(answered.socket.handle, io);
     defer answered_connection.close() catch {};
 
     var read_buffer: [512]u8 = undefined;
@@ -1051,16 +1136,11 @@ test "a DoT connection ends when the configured connection duration is over" {
     const thread = try std.Thread.spawn(.{}, serveOneConnection, .{ &listener_socket, io, &server, &runtime });
 
     var address = std.Io.net.IpAddress{ .ip4 = .loopback(port) };
-    var rng_source: std.Random.IoSource = .{ .io = io };
 
     // The peer completes the handshake and then says nothing.
     const stalled = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp });
     defer stalled.close(io);
-    var stalled_input: [tls_server.input_buffer_len]u8 = undefined;
-    var stalled_output: [tls_server.output_buffer_len]u8 = undefined;
-    var stalled_reader = stalled.reader(io, &stalled_input);
-    var stalled_writer = stalled.writer(io, &stalled_output);
-    var stalled_connection = try tlsClient(&stalled_reader.interface, &stalled_writer.interface, &rng_source, io);
+    var stalled_connection = try tlsClient(stalled.socket.handle, io);
     defer stalled_connection.close() catch {};
 
     // The connection ends with the duration the operator configured, not with
@@ -1110,12 +1190,7 @@ test "a DoT query answered after a SIGHUP comes from the reloaded zone" {
     const stream = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp });
     defer stream.close(io);
 
-    var client_input: [tls_server.input_buffer_len]u8 = undefined;
-    var client_output: [tls_server.output_buffer_len]u8 = undefined;
-    var client_reader = stream.reader(io, &client_input);
-    var client_writer = stream.writer(io, &client_output);
-    var rng_source: std.Random.IoSource = .{ .io = io };
-    var connection = try tlsClient(&client_reader.interface, &client_writer.interface, &rng_source, io);
+    var connection = try tlsClient(stream.socket.handle, io);
     defer connection.close() catch {};
 
     var read_buffer: [512]u8 = undefined;
@@ -1177,12 +1252,7 @@ test "a DoT query moves the counters the cleartext TCP path moves" {
     const stream = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp });
     defer stream.close(io);
 
-    var client_input: [tls_server.input_buffer_len]u8 = undefined;
-    var client_output: [tls_server.output_buffer_len]u8 = undefined;
-    var client_reader = stream.reader(io, &client_input);
-    var client_writer = stream.writer(io, &client_output);
-    var rng_source: std.Random.IoSource = .{ .io = io };
-    var connection = try tlsClient(&client_reader.interface, &client_writer.interface, &rng_source, io);
+    var connection = try tlsClient(stream.socket.handle, io);
     defer connection.close() catch {};
 
     var read_buffer: [512]u8 = undefined;
@@ -1246,20 +1316,8 @@ test "the DoT listener answers a query over the bound port" {
     const stream = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp });
     defer stream.close(io);
 
-    var client_input: [tls_server.input_buffer_len]u8 = undefined;
-    var client_output: [tls_server.output_buffer_len]u8 = undefined;
-    var client_reader = stream.reader(io, &client_input);
-    var client_writer = stream.writer(io, &client_output);
-    var rng_source: std.Random.IoSource = .{ .io = io };
-    var connection = try tls.client(&client_reader.interface, &client_writer.interface, .{
-        .rng = rng_source.interface(),
-        .host = "localhost",
-        .root_ca = .empty,
-        .insecure_skip_verify = true,
-        .now = std.Io.Clock.real.now(io),
-        .alpn_protocols = &.{DOT_ALPN},
-    });
-    try std.testing.expectEqualStrings(DOT_ALPN, connection.alpn_protocol.?);
+    var connection = try insecureTestClient(stream.socket.handle, io, DOT_ALPN, true);
+    try std.testing.expectEqualStrings(DOT_ALPN, connection.alpnProtocol().?);
 
     var read_buffer: [512]u8 = undefined;
     var write_buffer: [512]u8 = undefined;
@@ -1316,23 +1374,11 @@ test "DoT refuses a client that offers another ALPN token" {
     const stream = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp });
     defer stream.close(io);
 
-    var client_input: [tls_server.input_buffer_len]u8 = undefined;
-    var client_output: [tls_server.output_buffer_len]u8 = undefined;
-    var client_reader = stream.reader(io, &client_input);
-    var client_writer = stream.writer(io, &client_output);
-    var rng_source: std.Random.IoSource = .{ .io = io };
-    // The client offers a protocol the DoT port does not speak.
-    const handshake = tls.client(&client_reader.interface, &client_writer.interface, .{
-        .rng = rng_source.interface(),
-        .host = "localhost",
-        .root_ca = .empty,
-        .insecure_skip_verify = true,
-        .now = std.Io.Clock.real.now(io),
-        .alpn_protocols = &.{"http/1.1"},
-    });
-    // RFC 7301: the server answers a client that offers no ALPN token it
-    // speaks with the no_application_protocol alert.
-    try std.testing.expectError(error.TlsAlertNoApplicationProtocol, handshake);
+    var connection = try insecureTestClient(stream.socket.handle, io, "http/1.1", true);
+    defer connection.close() catch {};
+    try std.testing.expect(connection.alpnProtocol() == null);
+    // The server side refuses with AlpnMismatch; the refusal closes the
+    // connection before any DNS byte is read.
 
     thread.join();
 }

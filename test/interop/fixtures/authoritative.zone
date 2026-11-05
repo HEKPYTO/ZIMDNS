@@ -22,3 +22,94 @@ mail    IN A    192.0.2.25
 srv     IN SRV  0 5 443 www.example.test.
 svc     IN SVCB 1 . alpn=h2
 caa     IN CAA  0 issue "letsencrypt.org"
+rp      IN RP   mbox.example.test. txt.example.test.
+mbox    IN A    192.0.2.60
+sshfp   IN SSHFP 1 1 123456789abcdef67890123456789abcdef67890
+tlsa    IN TLSA 3 1 1 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+naptr   IN NAPTR 100 10 "u" "E2U+sip" "!^.*$!sip:info@example.test!" .
+apl     IN APL  1:192.0.2.0/24 !1:192.0.2.128/25
+afsdb   IN AFSDB 1 afs.example.test.
+afs     IN A    192.0.2.61
+rt      IN RT   10 mail.example.test.
+uri     IN URI  10 1 "https://example.test/"
+hinfo   IN HINFO "Intel" "Linux"
+big     IN A    192.0.2.1
+big     IN A    192.0.2.2
+big     IN A    192.0.2.3
+big     IN A    192.0.2.4
+big     IN A    192.0.2.5
+big     IN A    192.0.2.6
+big     IN A    192.0.2.7
+big     IN A    192.0.2.8
+big     IN A    192.0.2.9
+big     IN A    192.0.2.10
+big     IN A    192.0.2.11
+big     IN A    192.0.2.12
+big     IN A    192.0.2.13
+big     IN A    192.0.2.14
+big     IN A    192.0.2.15
+big     IN A    192.0.2.16
+big     IN A    192.0.2.17
+big     IN A    192.0.2.18
+big     IN A    192.0.2.19
+big     IN A    192.0.2.20
+big     IN A    192.0.2.21
+big     IN A    192.0.2.22
+big     IN A    192.0.2.23
+big     IN A    192.0.2.24
+big     IN A    192.0.2.25
+big     IN A    192.0.2.26
+big     IN A    192.0.2.27
+big     IN A    192.0.2.28
+big     IN A    192.0.2.29
+big     IN A    192.0.2.30
+big     IN A    192.0.2.31
+big     IN A    192.0.2.32
+big     IN A    192.0.2.33
+big     IN A    192.0.2.34
+big     IN A    192.0.2.35
+big     IN A    192.0.2.36
+big     IN A    192.0.2.37
+big     IN A    192.0.2.38
+big     IN A    192.0.2.39
+big     IN A    192.0.2.40
+big     IN A    192.0.2.41
+big     IN A    192.0.2.42
+big     IN A    192.0.2.43
+big     IN A    192.0.2.44
+big     IN A    192.0.2.45
+big     IN A    192.0.2.46
+big     IN A    192.0.2.47
+big     IN A    192.0.2.48
+big     IN A    192.0.2.49
+big     IN A    192.0.2.50
+big     IN A    192.0.2.51
+big     IN A    192.0.2.52
+big     IN A    192.0.2.53
+big     IN A    192.0.2.54
+big     IN A    192.0.2.55
+big     IN A    192.0.2.56
+big     IN A    192.0.2.57
+big     IN A    192.0.2.58
+big     IN A    192.0.2.59
+big     IN A    192.0.2.60
+big     IN A    192.0.2.61
+big     IN A    192.0.2.62
+big     IN A    192.0.2.63
+big     IN A    192.0.2.64
+big     IN A    192.0.2.65
+big     IN A    192.0.2.66
+big     IN A    192.0.2.67
+big     IN A    192.0.2.68
+big     IN A    192.0.2.69
+big     IN A    192.0.2.70
+big     IN A    192.0.2.71
+big     IN A    192.0.2.72
+big     IN A    192.0.2.73
+big     IN A    192.0.2.74
+big     IN A    192.0.2.75
+big     IN A    192.0.2.76
+big     IN A    192.0.2.77
+big     IN A    192.0.2.78
+big     IN A    192.0.2.79
+big     IN A    192.0.2.80

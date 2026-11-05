@@ -136,6 +136,23 @@ pub fn members(allocator: std.mem.Allocator, catalog_text: []const u8, apex: []c
     return list.toOwnedSlice(allocator) catch return Error.OutOfMemory;
 }
 
+/// RFC 9432 sections 4.3 and 5.2: one member-selection rule shared by startup
+/// and refresh. A `coo` member belongs to another catalog and is never
+/// provisioned here; when a group selector is configured only members whose
+/// `group` property equals it (case-insensitive) are provisioned, and a
+/// member with no `group` property is in no named group. Order is the
+/// caller's: this only answers yes or no per member.
+pub fn selected(member: Member, group_selector: ?[]const u8) bool {
+    for (member.properties) |property| {
+        if (std.ascii.eqlIgnoreCase(property.key, "coo")) return false;
+    }
+    const want = group_selector orelse return true;
+    for (member.properties) |property| {
+        if (std.ascii.eqlIgnoreCase(property.key, "group") and std.ascii.eqlIgnoreCase(property.value, want)) return true;
+    }
+    return false;
+}
+
 fn memberLabel(owner: []const u8, apex: []const u8) ?[]const u8 {
     const tail = ".zones.";
     if (owner.len <= apex.len + tail.len) return null;
@@ -283,4 +300,39 @@ test "catalog property lines are synthesized" {
     defer std.testing.allocator.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "m1.zones.catalog.example. IN TXT \"coo=other.catalog.\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "m1.zones.catalog.example. IN TXT \"group=alpha\"") != null);
+}
+
+test "member selection skips coo and honors the group selector" {
+    const plain = Member{ .label = "m1", .name = "one.example." };
+    // No selector: every member without a coo property is provisioned, and
+    // a member with no group property is in no named group.
+    try std.testing.expect(selected(plain, null));
+    try std.testing.expect(!selected(plain, "alpha"));
+
+    const grouped = Member{
+        .label = "m2",
+        .name = "two.example.",
+        .properties = &.{.{ .key = "group", .value = "alpha" }},
+    };
+    try std.testing.expect(selected(grouped, null));
+    try std.testing.expect(selected(grouped, "alpha"));
+    try std.testing.expect(selected(grouped, "ALPHA"));
+    try std.testing.expect(!selected(grouped, "beta"));
+
+    const other_group = Member{
+        .label = "m3",
+        .name = "three.example.",
+        .properties = &.{.{ .key = "group", .value = "beta" }},
+    };
+    try std.testing.expect(selected(other_group, null));
+    try std.testing.expect(!selected(other_group, "alpha"));
+
+    // RFC 9432 section 4.3: a coo member belongs to another catalog.
+    const coo = Member{
+        .label = "m4",
+        .name = "four.example.",
+        .properties = &.{ .{ .key = "coo", .value = "other.example." }, .{ .key = "group", .value = "alpha" } },
+    };
+    try std.testing.expect(!selected(coo, null));
+    try std.testing.expect(!selected(coo, "alpha"));
 }

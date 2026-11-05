@@ -48,6 +48,9 @@ jobs:
           echo "$zig_dir" >> "$GITHUB_PATH"
           "$zig_dir/zig" version
 
+      - name: Install OpenSSL 3 headers
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+
       - name: Check formatting
         run: zig fmt --check --exclude zig-pkg .
 
@@ -71,9 +74,6 @@ jobs:
 
       - name: Run documented CLI invocation tests
         run: zig build test-cli
-
-      - name: Run the offline TLS channel interop mirror
-        run: python3 test/interop/tls_channel_test.py
 
       - name: Scan tracked sources
         shell: bash

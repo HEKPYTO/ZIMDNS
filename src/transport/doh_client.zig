@@ -1,18 +1,20 @@
 /// Contract: Speaks DNS over HTTPS as a client (RFC 8484 §4.1 POST) for a
-/// resolver that forwards instead of iterating. The TLS handshake comes from
-/// the pinned inic/tls.zig dependency; this module owns the request head, the
+/// resolver that forwards instead of iterating. The TLS handshake and
+/// certificate verification come from OpenSSL 3.x, one SSL object per socket fd (see
+/// openssl_tls.zig); this module owns the request head, the
 /// `application/dns-message` media type on both directions (RFC 8484 §4.2),
 /// the HTTP/1.1 response bound (status 200, content length or chunked
 /// transfer), and the refusal of anything else.
 /// RFC 8484 §5.2 makes HTTP/2 the minimum RECOMMENDED version; this client
 /// speaks HTTP/1.1 with the `http/1.1` ALPN token, the same disclosed
 /// deviation the server side carries.
-/// Ownership: The trust bundle is loaded once and owned here; request and
+/// Ownership: The trust context is loaded once and owned here; request and
 /// response buffers are the caller's.
 /// Errors: A refused handshake, a bad status or media type, and a malformed
 /// or oversized body are typed as `Error`.
 const std = @import("std");
-const tls = @import("tls");
+const ossl = @import("openssl_tls.zig");
+const tcp_deadline = @import("../platform/tcp_deadline.zig");
 const http11_alpn = "http/1.1";
 pub const media_type = "application/dns-message";
 pub const default_path = "/dns-query";
@@ -46,40 +48,40 @@ pub const max_head_len: usize = 8192;
 pub const Client = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    roots: std.crypto.Certificate.Bundle = .empty,
+    ctx: ?*ossl.Ctx = null,
+    ca_path: ?[]const u8 = null,
     roots_loaded: bool = false,
 
     pub fn init(self: *Client, allocator: std.mem.Allocator, io: std.Io) !void {
-        self.* = .{ .allocator = allocator, .io = io };
-        try self.loadRoots();
+        const ctx = try ossl.clientCtx(.system);
+        self.* = .{ .allocator = allocator, .io = io, .ctx = ctx, .roots_loaded = true };
     }
 
     /// A client whose trust anchors are one certificate file, for a loopback
     /// server in the tests.
     pub fn initFromCertFile(self: *Client, allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
-        self.* = .{ .allocator = allocator, .io = io };
-        try self.roots.addCertsFromFilePathAbsolute(allocator, io, std.Io.Clock.real.now(io), path);
-        self.roots_loaded = self.roots.map.count() != 0;
+        const owned = try allocator.dupe(u8, path);
+        errdefer allocator.free(owned);
+        const ctx = try ossl.clientCtx(.{ .ca_file = owned });
+        self.* = .{ .allocator = allocator, .io = io, .ctx = ctx, .ca_path = owned, .roots_loaded = true };
     }
 
     /// A client whose trust anchors are one PEM bundle inside the caller
     /// supplied directory: RFC 9462 DDR trust stores resolve through the
     /// confined configuration directory, never through an absolute path.
     pub fn initFromCaFile(self: *Client, allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8) !void {
-        self.* = .{ .allocator = allocator, .io = io };
-        try self.roots.addCertsFromFilePath(allocator, io, std.Io.Clock.real.now(io), dir, path);
-        self.roots_loaded = self.roots.map.count() != 0;
+        var abs: [std.fs.max_path_bytes]u8 = undefined;
+        const len = try dir.realPathFile(io, path, &abs);
+        const owned = try allocator.dupe(u8, abs[0..len]);
+        errdefer allocator.free(owned);
+        const ctx = try ossl.clientCtx(.{ .ca_file = owned });
+        self.* = .{ .allocator = allocator, .io = io, .ctx = ctx, .ca_path = owned, .roots_loaded = true };
     }
 
     pub fn deinit(self: *Client) void {
-        self.roots.deinit(self.allocator);
+        if (self.ctx) |ctx| ossl.freeClientCtx(ctx);
+        if (self.ca_path) |p| self.allocator.free(p);
         self.* = undefined;
-    }
-
-    fn loadRoots(self: *Client) !void {
-        self.roots.rescan(self.allocator, self.io, std.Io.Clock.real.now(self.io)) catch return Error.TrustStoreEmpty;
-        self.roots_loaded = self.roots.map.count() != 0;
-        if (!self.roots_loaded) return Error.TrustStoreEmpty;
     }
 
     /// One POST exchange. The caller dials the stream; this function owns the
@@ -107,25 +109,32 @@ pub const Client = struct {
         response_buffer: []u8,
     ) ![]const u8 {
         if (!self.roots_loaded) return Error.TrustStoreEmpty;
-        var input_buffer: [tls.input_buffer_len]u8 = undefined;
-        var output_buffer: [tls.output_buffer_len]u8 = undefined;
-        var reader = stream.reader(self.io, &input_buffer);
-        var writer = stream.writer(self.io, &output_buffer);
-        const alpn = [_][]const u8{http11_alpn};
-        var rng: std.Random.IoSource = .{ .io = self.io };
-        var connection = tls.client(&reader.interface, &writer.interface, .{
-            .rng = rng.interface(),
-            .now = std.Io.Clock.real.now(self.io),
-            .host = host,
-            .sni = sni,
-            .root_ca = self.roots,
-            .alpn_protocols = &alpn,
+        // One absolute deadline covers the handshake and the whole
+        // exchange: a stalled upstream holds neither.
+        const deadline = tcp_deadline.deadline(self.io, .{ .seconds = 5 });
+        var connection = ossl.clientHandshake(self.ctx.?, stream.socket.handle, self.io, deadline, .{
+            .verify = .system,
+            .verify_host = host,
+            .sni = if (sni.len == 0) @as(?[]const u8, "") else sni,
+            .alpn = http11_alpn,
         }) catch return Error.HandshakeFailed;
+        connection.deadline = deadline;
         defer connection.close() catch {};
-        if (connection.alpn_protocol) |negotiated| {
+        if (connection.alpnProtocol()) |negotiated| {
             if (!std.mem.eql(u8, negotiated, http11_alpn)) return Error.AlpnMismatch;
         }
+        return self.postOver(&connection, host, path, query, response_buffer);
+    }
 
+    fn postOver(
+        self: *Client,
+        connection: *ossl.Connection,
+        host: []const u8,
+        path: []const u8,
+        query: []const u8,
+        response_buffer: []u8,
+    ) ![]const u8 {
+        _ = self;
         var head_buffer: [512]u8 = undefined;
         // An IPv6 literal is bracketed in the Host authority; the
         // unbracketed text is only a certificate-verification name.
@@ -174,14 +183,14 @@ pub const Client = struct {
                 const length = std.fmt.parseInt(usize, value, 10) catch return Error.BadContentLength;
                 if (content_length) |first| {
                     if (first != length) return Error.BadContentLength;
+                } else {
+                    content_length = length;
                 }
-                content_length = length;
             } else if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
-                chunked = containsIgnoreCase(value, "chunked");
+                if (containsIgnoreCase(value, "chunked")) chunked = true;
             }
         }
         if (!content_type_ok) return Error.BadContentType;
-
         var body_len: usize = 0;
         var available = filled - split;
         var cursor = split;
@@ -197,10 +206,15 @@ pub const Client = struct {
                 const size_text = std.mem.trim(u8, received[cursor .. cursor + line_end], " \t");
                 const semi = std.mem.indexOfScalar(u8, size_text, ';') orelse size_text.len;
                 const size = std.fmt.parseInt(usize, size_text[0..semi], 16) catch return Error.BadChunk;
-                cursor += line_end + 2;
+                const after_line = std.math.add(usize, cursor, line_end) catch return Error.BadChunk;
+                cursor = std.math.add(usize, after_line, 2) catch return Error.BadChunk;
                 if (size == 0) break;
-                if (body_len + size > response_buffer.len) return Error.ResponseTooLarge;
-                while (filled - cursor < size + 2) {
+                // Bound the chunk by the remaining output space before any
+                // addition: a hex size near maxInt must not wrap past the
+                // buffer guard and reach the copy below.
+                if (size > response_buffer.len - body_len) return Error.ResponseTooLarge;
+                const need = std.math.add(usize, size, 2) catch return Error.BadChunk;
+                while (filled - cursor < need) {
                     if (filled == received.len) return Error.ResponseTooLarge;
                     const n = connection.read(received[filled..]) catch return Error.TruncatedBody;
                     if (n == 0) return Error.TruncatedBody;
@@ -208,7 +222,8 @@ pub const Client = struct {
                 }
                 @memcpy(response_buffer[body_len..][0..size], received[cursor..][0..size]);
                 body_len += size;
-                cursor += size + 2;
+                cursor = std.math.add(usize, cursor, size) catch unreachable;
+                cursor = std.math.add(usize, cursor, 2) catch unreachable;
             }
             return response_buffer[0..body_len];
         }
@@ -229,6 +244,66 @@ pub const Client = struct {
         return response_buffer[0..body_len];
     }
 };
+
+test "a chunk size that would wrap past the buffer is refused" {
+    // One legitimate chunk lands (body_len > 0), then a chunk size of
+    // ffffffffffffffff: without the pre-addition guard `body_len + size`
+    // wraps small, the copy runs, and the suite panics. Must be
+    // ResponseTooLarge with body_len still 16.
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "cert.pem", .data = tls_server.test_identity.cert_pem });
+    try tmp.dir.writeFile(io, .{ .sub_path = "key.pem", .data = tls_server.test_identity.key_pem });
+    var server: tls_server.Server = undefined;
+    try server.init(allocator, io, tmp.dir, "cert.pem", "key.pem", http11_alpn);
+    defer server.deinit();
+
+    var listen_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var listener = try std.Io.net.IpAddress.listen(&listen_address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer listener.deinit(io);
+    const bound = listener.socket.address;
+
+    const Serve = struct {
+        fn run(listener_ptr: *std.Io.net.Server, io_inner: std.Io, server_ptr: *tls_server.Server) void {
+            const stream = listener_ptr.accept(io_inner) catch return;
+            defer stream.close(io_inner);
+            const deadline = tcp_deadline.deadline(io_inner, .{ .seconds = 5 });
+            var conn = server_ptr.handshake(stream.socket.handle, io_inner, deadline) catch return;
+            defer conn.close() catch {};
+            // Drain the request head; the body is empty for this probe.
+            var head: [4096]u8 = undefined;
+            var hlen: usize = 0;
+            while (hlen < head.len) {
+                const n = conn.read(head[hlen..]) catch return;
+                if (n == 0) return;
+                hlen += n;
+                if (std.mem.indexOf(u8, head[0..hlen], "\r\n\r\n") != null) break;
+            }
+            // One 16-byte chunk, then a maxInt chunk size, then the close.
+            conn.writeAll("HTTP/1.1 200 OK\r\ncontent-type: application/dns-message\r\ntransfer-encoding: chunked\r\n\r\n10\r\n0123456789abcdef\r\nffffffffffffffff\r\n") catch return;
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Serve.run, .{ &listener, io, &server });
+    defer thread.join();
+
+    var stream = try std.Io.net.IpAddress.connect(&bound, io, .{ .mode = .stream, .protocol = .tcp, .timeout = .none });
+    defer stream.close(io);
+
+    var ca_path: [std.fs.max_path_bytes]u8 = undefined;
+    const ca_len = try tmp.dir.realPathFile(io, "cert.pem", &ca_path);
+    var client: Client = undefined;
+    try Client.initFromCertFile(&client, allocator, io, ca_path[0..ca_len]);
+    defer client.deinit();
+
+    var response_buffer: [64]u8 = undefined;
+    try std.testing.expectError(
+        Error.ResponseTooLarge,
+        client.postWithVerification(stream, "localhost", "localhost", "/dns-query{?dns}", &[_]u8{ 0xaa, 0xbb }, &response_buffer),
+    );
+}
 
 const tls_server = @import("tls_server.zig");
 const dns_message = @import("../dns/message.zig");
@@ -251,11 +326,8 @@ const DoHArgs = struct {
 fn serveDohOne(args: *DoHArgs) void {
     const stream = args.listener.accept(args.io) catch return;
     defer stream.close(args.io);
-    var input_buffer: [tls.input_buffer_len]u8 = undefined;
-    var output_buffer: [tls.output_buffer_len]u8 = undefined;
-    var reader = stream.reader(args.io, &input_buffer);
-    var writer = stream.writer(args.io, &output_buffer);
-    var connection = args.server.handshake(&reader.interface, &writer.interface) catch return;
+    const deadline = tcp_deadline.deadline(args.io, .{ .seconds = 5 });
+    var connection = args.server.handshake(stream.socket.handle, args.io, deadline) catch return;
     defer connection.close() catch {};
     var request: [8192]u8 = undefined;
     var filled: usize = 0;

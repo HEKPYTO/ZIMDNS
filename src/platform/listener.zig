@@ -254,6 +254,33 @@ fn serveTcpStreamOnceWithTimeout(stream: std.Io.net.Stream, io: std.Io, runtime:
     return unix_tcp_deadlines.serve(stream, io, runtime, timeout, counters);
 }
 
+/// What an accept failure means for a serve loop. A peer that aborts before
+/// accept returns is routine, so the loop retries at once; fd-quota
+/// exhaustion pauses 50 ms so the loop does not spin; anything else (a
+/// closed listener, a dead network, cancellation) ends the loop by
+/// propagating. There is no retry counter: the listener must not die.
+pub fn acceptRetryAction(err: anyerror) enum { retry_now, retry_paused, propagate } {
+    return switch (err) {
+        error.ConnectionAborted => .retry_now,
+        error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded => .retry_paused,
+        else => .propagate,
+    };
+}
+
+pub fn acceptWithRetry(server: anytype, io: std.Io) !std.Io.net.Stream {
+    while (true) {
+        const stream = server.accept(io) catch |err| switch (acceptRetryAction(err)) {
+            .retry_now => continue,
+            .retry_paused => {
+                std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
+                continue;
+            },
+            .propagate => return err,
+        };
+        return stream;
+    }
+}
+
 pub fn serveTcpLoop(server: anytype, io: std.Io, runtime: *Runtime, max_requests: ?usize) !void {
     return serveTcpLoopWithTimeout(server, io, runtime, max_requests, tcpIdleTimeout());
 }
@@ -271,7 +298,7 @@ fn serveTcpLoopWithTimeout(server: anytype, io: std.Io, runtime: *Runtime, max_r
     var sources = SourceCounter{};
     var accepted: usize = 0;
     while (max_requests == null or accepted < max_requests.?) {
-        const stream = try server.accept(io);
+        const stream = try acceptWithRetry(server, io);
         accepted += 1;
         // RFC 9210 section 4.2: a source address holds only so many
         // connections at once, and a connection over the limit is closed at
@@ -828,7 +855,7 @@ test "TCP loop rejects truncated frames before serving the next connection" {
     }};
     try std.testing.expectEqual(@as(usize, 1), try std.posix.poll(&response_poll_fds, 100));
     var response_buffer: [512]u8 = undefined;
-    const response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), valid_client, io, &response_buffer, query);
+    const response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), valid_client, io, &response_buffer, query, false);
     try std.testing.expectEqual(@as(u16, 0x6789), response.header.id);
     try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
 }
@@ -869,7 +896,7 @@ test "TCP loop does not count an empty EOF connection" {
     }};
     try std.testing.expectEqual(@as(usize, 1), try std.posix.poll(&response_poll_fds, 100));
     var response_buffer: [512]u8 = undefined;
-    const response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), valid_client, io, &response_buffer, query);
+    const response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), valid_client, io, &response_buffer, query, false);
     try std.testing.expectEqual(@as(u16, 0x6790), response.header.id);
     try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
 }
@@ -920,7 +947,7 @@ test "TCP loop rejects a length prefix without payload" {
     }};
     try std.testing.expectEqual(@as(usize, 1), try std.posix.poll(&response_poll_fds, 100));
     var response_buffer: [512]u8 = undefined;
-    const response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), valid_client, io, &response_buffer, query);
+    const response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), valid_client, io, &response_buffer, query, false);
     try std.testing.expectEqual(@as(u16, 0x6791), response.header.id);
     try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
 }
@@ -1050,7 +1077,7 @@ test "TCP loop refuses a connection from a source over the per-source limit" {
     try other.shutdown(io, .send);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), other, io, &response_buffer, query);
+    const response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), other, io, &response_buffer, query, false);
     try std.testing.expectEqual(@as(u16, 0x6801), response.header.id);
     try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
 }
@@ -1088,7 +1115,7 @@ test "TCP connection is closed after the configured connection duration" {
     defer server_thread.join();
 
     var response_buffer: [512]u8 = undefined;
-    const response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), client, io, &response_buffer, query);
+    const response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), client, io, &response_buffer, query, false);
     try std.testing.expectEqual(@as(u16, 0x6802), response.header.id);
     try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
 
@@ -1134,7 +1161,7 @@ test "TCP connection is closed after the configured idle timeout" {
     defer server_thread.join();
 
     var response_buffer: [512]u8 = undefined;
-    const response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), client, io, &response_buffer, query);
+    const response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), client, io, &response_buffer, query, false);
     try std.testing.expectEqual(@as(u16, 0x6803), response.header.id);
 
     // The connection is idle after the answer, and the configured timeout
@@ -1179,10 +1206,10 @@ test "TCP loop without a configured per-source limit serves two connections of o
     try serveTcpLoop(&server, io, &runtime, 2);
 
     var response_buffer: [512]u8 = undefined;
-    const first_response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), first, io, &response_buffer, first_query);
+    const first_response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), first, io, &response_buffer, first_query, false);
     try std.testing.expectEqual(@as(u16, 0x6803), first_response.header.id);
     try std.testing.expectEqual(@as(u16, 1), first_response.header.answer_count);
-    const second_response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), second, io, &response_buffer, second_query);
+    const second_response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), second, io, &response_buffer, second_query, false);
     try std.testing.expectEqual(@as(u16, 0x6804), second_response.header.id);
     try std.testing.expectEqual(@as(u16, 1), second_response.header.answer_count);
 }
@@ -1310,7 +1337,7 @@ test "TCP loop ignores malformed and idle connections before a valid query" {
     try serveTcpLoopWithTimeout(&server, io, &runtime, 3, .{ .seconds = 0, .microseconds = 1_000 });
 
     var response_buffer: [512]u8 = undefined;
-    const response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), valid_client, io, &response_buffer, query);
+    const response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), valid_client, io, &response_buffer, query, false);
     try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
 }
 
@@ -1350,7 +1377,7 @@ test "a forwarding query over the inbound TCP path is answered with the upstream
     upstream_thread.join();
 
     var response_buffer: [512]u8 = undefined;
-    const response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query);
+    const response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query, false);
     try std.testing.expectEqual(@as(u16, 0x7101), response.header.id);
     try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
     try std.testing.expectEqualSlices(u8, &.{ 192, 0, 2, 1 }, &response.answers.items[0].rdata.A);
@@ -1459,7 +1486,7 @@ test "the same forwarding query over UDP is answered the same way" {
     upstream_thread.join();
 
     var response_buffer: [512]u8 = undefined;
-    const response = try @import("../cli/query.zig").receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    const response = try @import("../cli/query.zig").receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query, false);
     try std.testing.expectEqual(@as(u16, 0x7102), response.header.id);
     try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
     try std.testing.expectEqualSlices(u8, &.{ 192, 0, 2, 1 }, &response.answers.items[0].rdata.A);
@@ -1496,7 +1523,7 @@ test "an authoritative query over the inbound TCP path is unchanged" {
     try serveTcpStreamOnce(server_stream, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query);
+    const response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query, false);
     try std.testing.expectEqual(@as(u16, 0x7103), response.header.id);
     try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
     try std.testing.expectEqualSlices(u8, &.{ 192, 168, 1, 1 }, &response.answers.items[0].rdata.A);
@@ -1533,7 +1560,7 @@ test "the recursion ACL refuses a TCP client the UDP path refuses" {
     try serveTcpStreamOnce(server_stream, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query);
+    const response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query, false);
     try std.testing.expectEqual(@as(@TypeOf(response.header.rcode), .refused), response.header.rcode);
     try std.testing.expectEqual(@as(u16, 0), response.header.answer_count);
 }
@@ -1576,7 +1603,7 @@ test "a TCP query whose upstream truncates is retried over TCP upstream" {
     upstream_thread.join();
 
     var response_buffer: [512]u8 = undefined;
-    const response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query);
+    const response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query, false);
     try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
     try std.testing.expectEqualSlices(u8, &.{ 192, 0, 2, 1 }, &response.answers.items[0].rdata.A);
     try std.testing.expect(!response.header.truncated);
@@ -1967,7 +1994,7 @@ const unix_tcp_deadlines = if (TCP_DEADLINES_SUPPORTED) struct {
         counters: ?*metrics.Counters,
     ) !void {
         if (counters) |value| metrics.bump(&value.queries_total);
-        const blob = try runtime.encodeTransferFrames(std.heap.page_allocator, request);
+        const blob = try runtime.encodeTransferFrames(std.heap.page_allocator, request, &stream.socket.address);
         defer std.heap.page_allocator.free(blob);
         const write_deadline = tcp_deadline.deadline(io, timeout);
         try tcp_deadline.writeExact(stream.socket.handle, io, blob, write_deadline);
@@ -2018,3 +2045,36 @@ const keepalive_query = &[_]u8{
     'p',  'a',  0,    0x00, 0x01, 0x00, 0x01, 0,    0x00, 0x29, 0x04, 0xd0,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x0b, 0x00, 0x00,
 };
+
+test "acceptWithRetry survives two aborted accepts then serves a client" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var listen_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var real = try std.Io.net.IpAddress.listen(&listen_addr, io, .{ .reuse_address = true });
+    defer real.deinit(io);
+    const FlakyServer = struct {
+        inner: *std.Io.net.Server,
+        failures_left: usize,
+        calls: usize = 0,
+        fn accept(self: *@This(), accept_io: std.Io) std.Io.net.Server.AcceptError!std.Io.net.Stream {
+            self.calls += 1;
+            if (self.failures_left > 0) {
+                self.failures_left -= 1;
+                return error.ConnectionAborted;
+            }
+            return self.inner.accept(accept_io);
+        }
+    };
+    var flaky = FlakyServer{ .inner = &real, .failures_left = 2 };
+    var client = try std.Io.net.IpAddress.connect(&real.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer client.close(io);
+    const server_stream = try acceptWithRetry(&flaky, io);
+    defer server_stream.close(io);
+    try std.testing.expectEqual(@as(usize, 3), flaky.calls);
+}
+
+test "acceptRetryAction classifies transient and fatal accept errors" {
+    try std.testing.expectEqual(.retry_now, acceptRetryAction(error.ConnectionAborted));
+    try std.testing.expectEqual(.retry_paused, acceptRetryAction(error.ProcessFdQuotaExceeded));
+    try std.testing.expectEqual(.retry_paused, acceptRetryAction(error.SystemFdQuotaExceeded));
+    try std.testing.expectEqual(.propagate, acceptRetryAction(error.SocketNotListening));
+}

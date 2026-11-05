@@ -1,4 +1,4 @@
 listen dns udp 0.0.0.0:1053
 listen dns tcp 0.0.0.0:1053
-blocklist file examples/blocklists/ads.txt
-zone home.arpa primary examples/zones/home.arpa.zone
+blocklist file blocklists/ads.txt
+zone home.arpa primary zones/home.arpa.zone

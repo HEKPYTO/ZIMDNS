@@ -354,9 +354,8 @@ fn writeRecord(record: dns_record.ResourceRecord, writer: *std.Io.Writer) !void 
         try writer.writeAll("DNAME ");
         try writer.writeAll(target);
     } else if (record.rrtype.eql(.TXT)) {
-        try writer.writeAll("TXT \"");
-        try writer.writeAll(record.rdata.TXT.text());
-        try writer.writeAll("\"");
+        try writer.writeAll("TXT ");
+        try writeQuoted(writer, record.rdata.TXT.text(), true);
     } else if (record.rrtype.eql(.NAPTR)) {
         const naptr = record.rdata.NAPTR;
         try writer.print("NAPTR {} {} ", .{ naptr.order, naptr.preference });
@@ -410,21 +409,21 @@ fn writeRecord(record: dns_record.ResourceRecord, writer: *std.Io.Writer) !void 
         try writeQuoted(writer, caa.valueText(), true);
     } else if (record.rrtype.eql(.X25)) {
         try writer.writeAll("X25 ");
-        try writeQuoted(writer, record.rdata.X25.text(), false);
+        try writeQuoted(writer, record.rdata.X25.text(), true);
     } else if (record.rrtype.eql(.ISDN)) {
         const isdn = record.rdata.ISDN;
         try writer.writeAll("ISDN ");
-        try writeQuoted(writer, isdn.addressText(), false);
+        try writeQuoted(writer, isdn.addressText(), true);
         if (isdn.has_subaddress) {
             try writer.writeAll(" ");
-            try writeQuoted(writer, isdn.subaddressText(), false);
+            try writeQuoted(writer, isdn.subaddressText(), true);
         }
     } else if (record.rrtype.eql(.HINFO)) {
         const hinfo = record.rdata.HINFO;
         try writer.writeAll("HINFO ");
-        try writeQuoted(writer, hinfo.cpuText(), false);
+        try writeQuoted(writer, hinfo.cpuText(), true);
         try writer.writeAll(" ");
-        try writeQuoted(writer, hinfo.osText(), false);
+        try writeQuoted(writer, hinfo.osText(), true);
     } else if (record.rrtype.eql(.APL)) {
         try writer.writeAll("APL");
         try writeApl(writer, record.rdata.APL.bytes());
@@ -641,11 +640,13 @@ pub fn sendUdpQuery(socket: *const std.Io.net.Socket, io: std.Io, server: *const
     try socket.send(io, server, query);
 }
 
-pub fn validateResponse(response: dns_message.Message, expected_id: u16, expected_opcode: dns_header.Opcode, expected_question: dns_question.Question) Error!void {
+pub fn validateResponse(response: dns_message.Message, expected_id: u16, expected_opcode: dns_header.Opcode, expected_question: dns_question.Question, require_exact_qname_case: bool) Error!void {
     if (!response.header.qr or response.header.id != expected_id or response.header.opcode != expected_opcode or response.header.question_count != 1) return Error.BadResponse;
     const actual_question = response.question orelse return Error.BadResponse;
-    if (!actual_question.name.eql(&expected_question.name) or
-        !actual_question.qtype.eql(expected_question.qtype) or
+    if (require_exact_qname_case) {
+        if (!std.mem.eql(u8, actual_question.name.asWire(), expected_question.name.asWire())) return Error.BadResponse;
+    } else if (!actual_question.name.eql(&expected_question.name)) return Error.BadResponse;
+    if (!actual_question.qtype.eql(expected_question.qtype) or
         !actual_question.qclass.eql(expected_question.qclass)) return Error.BadResponse;
 }
 
@@ -656,7 +657,7 @@ pub fn udpClientBindAddress(server: *const std.Io.net.IpAddress) std.Io.net.IpAd
     };
 }
 
-pub fn receiveUdpResponse(allocator: std.mem.Allocator, socket: *const std.Io.net.Socket, io: std.Io, buffer: []u8, expected_server: *const std.Io.net.IpAddress, query: []const u8) !dns_message.Message {
+pub fn receiveUdpResponse(allocator: std.mem.Allocator, socket: *const std.Io.net.Socket, io: std.Io, buffer: []u8, expected_server: *const std.Io.net.IpAddress, query: []const u8, require_exact_qname_case: bool) !dns_message.Message {
     var expected = dns_message.Message.parseQuery(allocator, query) catch return Error.BadResponse;
     defer expected.deinit();
     const deadline = tcp_deadline.deadlineFromTimeout(io, resolver.UDP_TIMEOUT) orelse return error.Timeout;
@@ -666,7 +667,7 @@ pub fn receiveUdpResponse(allocator: std.mem.Allocator, socket: *const std.Io.ne
         const incoming = try socket.receiveTimeout(io, buffer, .{ .duration = remaining });
         if (!incoming.from.eql(expected_server)) continue;
         var response = dns_message.Message.parse(allocator, incoming.data) catch continue;
-        validateResponse(response, expected.header.id, expected.header.opcode, expected.question.?) catch {
+        validateResponse(response, expected.header.id, expected.header.opcode, expected.question.?, require_exact_qname_case) catch {
             response.deinit();
             continue;
         };
@@ -685,7 +686,7 @@ pub fn sendTcpQuery(stream: std.Io.net.Stream, io: std.Io, query: []const u8) !v
     try writer.interface.flush();
 }
 
-pub fn receiveTcpResponse(allocator: std.mem.Allocator, stream: std.Io.net.Stream, io: std.Io, buffer: []u8, query: []const u8) !dns_message.Message {
+pub fn receiveTcpResponse(allocator: std.mem.Allocator, stream: std.Io.net.Stream, io: std.Io, buffer: []u8, query: []const u8, require_exact_qname_case: bool) !dns_message.Message {
     var expected = dns_message.Message.parseQuery(allocator, query) catch return Error.BadResponse;
     defer expected.deinit();
     tcp_deadline.setSocketTimeout(stream.socket.handle, TCP_IO_TIMEOUT);
@@ -698,17 +699,17 @@ pub fn receiveTcpResponse(allocator: std.mem.Allocator, stream: std.Io.net.Strea
     if (response_len == 0 or response_len > buffer.len) return Error.BadResponse;
     tcp_deadline.readExact(stream.socket.handle, io, buffer[0..response_len], frame_deadline) catch return Error.BadResponse;
     const response = try dns_message.Message.parse(allocator, buffer[0..response_len]);
-    try validateResponse(response, expected.header.id, expected.header.opcode, expected.question.?);
+    try validateResponse(response, expected.header.id, expected.header.opcode, expected.question.?, require_exact_qname_case);
     return response;
 }
 
-pub fn exchangeTcpQuery(allocator: std.mem.Allocator, io: std.Io, server: *const std.Io.net.IpAddress, query: []const u8, response_buffer: []u8) !dns_message.Message {
+pub fn exchangeTcpQuery(allocator: std.mem.Allocator, io: std.Io, server: *const std.Io.net.IpAddress, query: []const u8, response_buffer: []u8, require_exact_qname_case: bool) !dns_message.Message {
     if (comptime !TCP_DEADLINES_SUPPORTED) return Error.UnsupportedPlatform;
-    return unix_tcp_query.exchange(allocator, io, server, query, response_buffer);
+    return unix_tcp_query.exchange(allocator, io, server, query, response_buffer, require_exact_qname_case);
 }
 
 const unix_tcp_query = if (TCP_DEADLINES_SUPPORTED) struct {
-    fn exchange(allocator: std.mem.Allocator, io: std.Io, server: *const std.Io.net.IpAddress, query: []const u8, response_buffer: []u8) !dns_message.Message {
+    fn exchange(allocator: std.mem.Allocator, io: std.Io, server: *const std.Io.net.IpAddress, query: []const u8, response_buffer: []u8, require_exact_qname_case: bool) !dns_message.Message {
         var expected = dns_message.Message.parseQuery(allocator, query) catch return Error.BadResponse;
         defer expected.deinit();
         if (query.len == 0 or query.len > std.math.maxInt(u16)) return Error.BadResponse;
@@ -738,7 +739,7 @@ const unix_tcp_query = if (TCP_DEADLINES_SUPPORTED) struct {
         try tcp_deadline.readExact(stream.socket.handle, io, response_buffer[0..response_len], frame_deadline);
 
         const response = try dns_message.Message.parse(allocator, response_buffer[0..response_len]);
-        try validateResponse(response, expected.header.id, expected.header.opcode, expected.question.?);
+        try validateResponse(response, expected.header.id, expected.header.opcode, expected.question.?, require_exact_qname_case);
         return response;
     }
 } else struct {};
@@ -868,22 +869,35 @@ test "response validation requires QR and the exact question" {
         7,    'e',  'x',  'a',  'm',  'p',  'l',  'e',  3,    'c',  'o',  'm',
         0,    0x00, 0x01, 0x00, 0x01,
     });
-    try validateResponse(response, expected.header.id, expected.header.opcode, question);
+    try validateResponse(response, expected.header.id, expected.header.opcode, question, false);
 
     var not_response = response;
     not_response.header.qr = false;
-    try std.testing.expectError(Error.BadResponse, validateResponse(not_response, expected.header.id, expected.header.opcode, question));
+    try std.testing.expectError(Error.BadResponse, validateResponse(not_response, expected.header.id, expected.header.opcode, question, false));
 
     const wrong_id = response;
-    try std.testing.expectError(Error.BadResponse, validateResponse(wrong_id, expected.header.id + 1, expected.header.opcode, question));
+    try std.testing.expectError(Error.BadResponse, validateResponse(wrong_id, expected.header.id + 1, expected.header.opcode, question, false));
 
     var other_question = question;
     other_question.qtype = .AAAA;
-    try std.testing.expectError(Error.BadResponse, validateResponse(response, expected.header.id, expected.header.opcode, other_question));
+    try std.testing.expectError(Error.BadResponse, validateResponse(response, expected.header.id, expected.header.opcode, other_question, false));
 
     var wrong_opcode = response;
     wrong_opcode.header.opcode = .status;
-    try std.testing.expectError(Error.BadResponse, validateResponse(wrong_opcode, expected.header.id, expected.header.opcode, question));
+    try std.testing.expectError(Error.BadResponse, validateResponse(wrong_opcode, expected.header.id, expected.header.opcode, question, false));
+
+    // 0x20 exact-case: a same-name different-case echo is rejected, the exact
+    // bytes are accepted, and qtype/qclass mismatches are still rejected.
+    var wrong_case = response;
+    wrong_case.question.?.name.wire[1] = std.ascii.toUpper(wrong_case.question.?.name.wire[1]);
+    try std.testing.expect(wrong_case.question.?.name.eql(&question.name));
+    try std.testing.expect(!std.mem.eql(u8, wrong_case.question.?.name.asWire(), question.name.asWire()));
+    try std.testing.expectError(Error.BadResponse, validateResponse(wrong_case, expected.header.id, expected.header.opcode, question, true));
+    try validateResponse(response, expected.header.id, expected.header.opcode, question, true);
+    try validateResponse(wrong_case, expected.header.id, expected.header.opcode, question, false);
+    var wrong_class = question;
+    wrong_class.qclass = .ANY;
+    try std.testing.expectError(Error.BadResponse, validateResponse(response, expected.header.id, expected.header.opcode, wrong_class, true));
 }
 
 test "UDP client bind address uses an unspecified ephemeral endpoint per server family" {
@@ -1284,6 +1298,48 @@ test "query formatter prints ISDN address and optional subaddress" {
     );
 }
 
+test "query formatter escapes hostile bytes in TXT output" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const response = try dns_message.Message.parse(arena.allocator(), &.{
+        0x12, 0x34, 0x85, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x04, 'h',  'o',  's',  't',  0x04, 'h',  'o',  'm',  'e',  0x04, 'a',
+        'r',  'p',  'a',  0x00, 0x00, 0x10, 0x00, 0x01, 0xc0, 0x0c, 0x00, 0x10,
+        0x00, 0x01, 0x00, 0x00, 0x0e, 0x10, 0x00, 0x0a, 0x09, 'a',  '"',  'b',
+        '\\', 'c',  0x0a, 'd',  0x1b, 'e',
+    });
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try writeResponse(response, &output.writer);
+    const text = output.written();
+    try std.testing.expectEqualStrings(
+        "host.home.arpa. 3600 IN TXT \"a\\\"b\\\\c\\010d\\027e\"\n",
+        text,
+    );
+    try std.testing.expect(std.mem.indexOfScalar(u8, text, 0x1b) == null);
+}
+
+test "query formatter prints a plain TXT string unchanged" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const response = try dns_message.Message.parse(arena.allocator(), &.{
+        0x12, 0x34, 0x85, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x04, 'h',  'o',  's',  't',  0x04, 'h',  'o',  'm',  'e',  0x04, 'a',
+        'r',  'p',  'a',  0x00, 0x00, 0x10, 0x00, 0x01, 0xc0, 0x0c, 0x00, 0x10,
+        0x00, 0x01, 0x00, 0x00, 0x0e, 0x10, 0x00, 0x06, 0x05, 'h',  'e',  'l',
+        'l',  'o',
+    });
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try writeResponse(response, &output.writer);
+    try std.testing.expectEqualStrings(
+        "host.home.arpa. 3600 IN TXT \"hello\"\n",
+        output.written(),
+    );
+}
+
 test "query formatter prints HINFO as two quoted strings" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1459,7 +1515,48 @@ test "UDP query client ignores invalid datagrams before a valid response" {
     try sendUdpQuery(&client_socket, io, &server_socket.address, query);
     try listener.serveUdpOnce(&server_socket, io, &runtime);
     var response_buffer: [512]u8 = undefined;
-    const response = try receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    const response = try receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query, false);
+    try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
+}
+
+test "0x20 UDP client skips a wrong-case spoof then takes the exact echo" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+    var server_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server_socket = try std.Io.net.IpAddress.bind(&server_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer server_socket.close(io);
+
+    var client_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var client_socket = try std.Io.net.IpAddress.bind(&client_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer client_socket.close(io);
+
+    var query_buffer: [512]u8 = undefined;
+    const query = try buildQueryPacket(&query_buffer, 0x9998, "dns.home.arpa.", .A, false);
+    const expected = try dns_message.Message.parseQuery(arena.allocator(), query);
+
+    // Spoof from the expected source with the right name in the wrong case;
+    // exact-case mode must ignore it and wait for the server's exact echo.
+    // (buildQueryPacket normalizes case, so flip a wire byte directly.)
+    var spoof_packet: [512]u8 = undefined;
+    @memcpy(spoof_packet[0..query.len], query);
+    spoof_packet[13] = std.ascii.toUpper(spoof_packet[13]);
+    const spoof = try dns_message.Message.parse(arena.allocator(), spoof_packet[0..query.len]);
+    var forged = spoof;
+    forged.header.qr = true;
+    var forged_bytes: [512]u8 = undefined;
+    var forged_writer = dns_writer.Writer.init(&forged_bytes);
+    try forged.encode(&forged_writer);
+    try server_socket.send(io, &client_socket.address, forged_bytes[0..forged_writer.len()]);
+
+    try sendUdpQuery(&client_socket, io, &server_socket.address, query);
+    try listener.serveUdpOnce(&server_socket, io, &runtime);
+    var response_buffer: [512]u8 = undefined;
+    const response = try receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query, true);
+    try std.testing.expectEqualSlices(u8, expected.question.?.name.asWire(), response.question.?.name.asWire());
     try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
 }
 
@@ -1485,7 +1582,7 @@ test "TCP query client talks to authoritative stream handler" {
     try client_stream.shutdown(io, .send);
     try listener.serveTcpStreamOnce(server_stream, io, &runtime);
     var response_buffer: [512]u8 = undefined;
-    const response = try receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query);
+    const response = try receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query, false);
     try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
 }
 

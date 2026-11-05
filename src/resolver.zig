@@ -2073,7 +2073,18 @@ pub const Resolver = struct {
             self.sendErrorReport(depth, query, client, upstream_report, upstream_report.ede_code);
         }
         switch (response.header.rcode) {
-            .servfail => self.cache.failures.put(key, .{ .rcode = .servfail }, now),
+            .servfail => {
+                self.cache.failures.put(key, .{ .rcode = .servfail }, now);
+                // RFC 8767 section 4: the first upstream failure is the
+                // moment to answer from a stale entry; the failure cache
+                // covers the queries after it. Without this the triggering
+                // query alone gets SERVFAIL while its stale answer sits in
+                // the cache.
+                if (try self.cache.lookup(&key, query, now, output, true)) |stale| {
+                    if (cookie == .valid) return self.addCachedCookie(output, query, cookie.valid);
+                    return stale.bytes;
+                }
+            },
             .refused => self.cache.failures.put(key, .{ .rcode = .refused }, now),
             .formerr => self.cache.failures.put(key, .{ .rcode = .formerr }, now),
             // RFC 9520 section 3.2: the question resolved, so its failure
@@ -3078,6 +3089,7 @@ pub const Resolver = struct {
         return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             iterate_mod.Error.NoReachableServer => Error.NoReachableAuthority,
+            iterate_mod.Error.QueryBudgetExceeded => Error.UpstreamFailure,
             else => Error.UpstreamFailure,
         };
     }
@@ -4256,6 +4268,26 @@ fn buildDns64Query(self: *Resolver, query: dns_message.Message, name: dns_name.N
     return a_query;
 }
 
+/// Bailiwick for a copied DNS64 section record: the owner equals the anchor
+/// zone or sits below it. Both names are canonical lowercase wire, so a byte
+/// suffix check with a label boundary is exact.
+fn dns64InBailiwick(owner: *const dns_name.Name, anchor: *const dns_name.Name) bool {
+    const o = owner.asWire();
+    const a = anchor.asWire();
+    if (o.len < a.len) return false;
+    if (std.mem.eql(u8, o, a)) return true;
+    if (!std.mem.eql(u8, o[o.len - a.len ..], a)) return false;
+    var index: usize = 0;
+    while (index < o.len) {
+        const len: usize = o[index];
+        if (len == 0) return false;
+        if (index + 1 + len == o.len - a.len) return true;
+        if (index + 1 + len > o.len - a.len) return false;
+        index += 1 + len;
+    }
+    return false;
+}
+
 /// RFC 6147 sections 5.1.5, 5.1.6, 5.1.7 and 5.4: the answer section holds
 /// the chain the synthesis followed and one synthesized AAAA per A record of
 /// the owner that chain ended at, and the authority section keeps the zone's
@@ -4304,15 +4336,18 @@ fn synthesizeDns64(policy: *const Policy, owner: dns_name.Name, response: *dns_m
     }
     response.header.answer_count = @intCast(response.answers.len);
 
-    // RFC 6147 section 5.4: the authority and additional sections are
-    // copied from the A answer the synthesis rests on. When the A answer
-    // carries no authority, the negative answer's SOA is kept, capped the
-    // way a negative answer's SOA always is.
+    // RFC 6147 section 5.4 with bailiwick: only records at or below the zone
+    // the A answer names (its authority SOA owner) are copied; anything
+    // off-bailiwick is dropped rather than cached under the answer. With no
+    // SOA the A answer names no zone, so nothing is copied from it.
+    const anchor = answerZone(a_response);
     response.authorities.len = 0;
-    for (a_response.authorities.slice()) |record| {
-        try response.authorities.append(record);
+    if (anchor) |anchor_zone| {
+        for (a_response.authorities.slice()) |record| {
+            if (dns64InBailiwick(&record.owner, &anchor_zone)) try response.authorities.append(record);
+        }
     }
-    if (a_response.authorities.len == 0) {
+    if (response.authorities.len == 0 and a_response.authorities.len == 0) {
         if (soa) |record| {
             var soa_record = record;
             soa_record.ttl = @min(record.ttl, record.rdata.SOA.minimum);
@@ -4321,8 +4356,10 @@ fn synthesizeDns64(policy: *const Policy, owner: dns_name.Name, response: *dns_m
     }
     response.header.authority_count = @intCast(response.authorities.len);
     response.additionals.len = 0;
-    for (a_response.additionals.slice()) |record| {
-        try response.additionals.append(record);
+    if (anchor) |anchor_zone| {
+        for (a_response.additionals.slice()) |record| {
+            if (dns64InBailiwick(&record.owner, &anchor_zone)) try response.additionals.append(record);
+        }
     }
     response.header.additional_count = @intCast(response.additionals.len);
     response.header.authoritative = false;
@@ -5715,6 +5752,7 @@ test "a walk with no reachable authority carries EDE 22, not the network-error 2
     // every other walk failure is the upstream network error.
     try std.testing.expect(Resolver.mapIterateError(iterate_mod.Error.NoReachableServer) == Error.NoReachableAuthority);
     try std.testing.expect(Resolver.mapIterateError(iterate_mod.Error.TooManyHops) == Error.UpstreamFailure);
+    try std.testing.expect(Resolver.mapIterateError(iterate_mod.Error.QueryBudgetExceeded) == Error.UpstreamFailure);
     try std.testing.expect(Resolver.mapIterateError(error.OutOfMemory) == error.OutOfMemory);
 }
 
@@ -9147,7 +9185,7 @@ test "RFC 6147: an empty AAAA answer is answered with an AAAA synthesized from t
     try std.testing.expectEqual(@as(usize, 2), upstream.requests);
 }
 
-test "RFC 6147 section 5.4: the synthesized answer copies the A authority and additional sections" {
+test "RFC 6147 section 5.4: the synthesized answer keeps in-bailiwick A sections and drops the rest" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
@@ -9155,8 +9193,8 @@ test "RFC 6147 section 5.4: the synthesized answer copies the A authority and ad
 
     const a_records = [_]dns_record.ResourceRecord{dns64TestARecord("v4only.example.")};
     const soa_records = [_]dns_record.ResourceRecord{dns64TestSoaRecord("example.")};
-    const a_authority = [_]dns_record.ResourceRecord{dns64TestSoaRecord("example.")};
-    const a_additional = [_]dns_record.ResourceRecord{dns64TestARecord("extra.example.")};
+    const a_authority = [_]dns_record.ResourceRecord{ dns64TestSoaRecord("example."), dns64TestPtrRecord("evil.example.org.", "v4only.example.") };
+    const a_additional = [_]dns_record.ResourceRecord{ dns64TestARecord("extra.example."), dns64TestARecord("evil.example.org.") };
     var upstream = Dns64Upstream{
         .io = io,
         .udp = &upstream_socket,
@@ -9189,14 +9227,55 @@ test "RFC 6147 section 5.4: the synthesized answer copies the A authority and ad
     try std.testing.expectEqual(dns_header.Rcode.no_error, response.header.rcode);
     try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
     try std.testing.expect(response.answers.items[0].rrtype.eql(.AAAA));
-    // The A answer's authority section replaces the negative SOA, verbatim.
     try std.testing.expectEqual(@as(u16, 1), response.header.authority_count);
-    try std.testing.expect(response.authorities.items[0].rrtype.eql(.SOA));
-    try std.testing.expectEqual(@as(u32, 3600), response.authorities.items[0].ttl);
-    // The A answer's additional section rides along.
+    try std.testing.expect(response.authorities.items[0].owner.eql(&try dns_name.Name.fromText("example.")));
     try std.testing.expectEqual(@as(u16, 1), response.header.additional_count);
-    try std.testing.expect(response.additionals.items[0].rrtype.eql(.A));
     try std.testing.expect(response.additionals.items[0].owner.eql(&try dns_name.Name.fromText("extra.example.")));
+    try std.testing.expectEqual(@as(usize, 2), upstream.requests);
+}
+
+test "RFC 6147 section 5.4: an A answer with no SOA copies no authority or additional" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    const a_records = [_]dns_record.ResourceRecord{dns64TestARecord("v4only.example.")};
+    const soa_records = [_]dns_record.ResourceRecord{dns64TestSoaRecord("example.")};
+    const a_authority = [_]dns_record.ResourceRecord{dns64TestARecord("extra.example.")};
+    const a_additional = [_]dns_record.ResourceRecord{dns64TestARecord("extra.example.")};
+    var upstream = Dns64Upstream{
+        .io = io,
+        .udp = &upstream_socket,
+        .a = &a_records,
+        .soa = &soa_records,
+        .a_authority = &a_authority,
+        .a_additional = &a_additional,
+    };
+    const thread = try std.Thread.spawn(.{}, serveDns64Upstream, .{&upstream});
+
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = upstream_socket.address },
+        .nat64_prefixes = .init(&.{try config.Nat64Prefix.parse("64:ff9b::/96")}),
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x2903, "v4only.example.", false);
+    defer query.deinit();
+    query.question.?.qtype = .AAAA;
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42700);
+    const bytes = try resolver.answer(encoded, query, &client, &output);
+    thread.join();
+
+    const response = try dns_message.Message.parse(arena.allocator(), bytes);
+    try std.testing.expectEqual(dns_header.Rcode.no_error, response.header.rcode);
+    try std.testing.expectEqual(@as(u16, 0), response.header.authority_count);
+    try std.testing.expectEqual(@as(u16, 0), response.header.additional_count);
     try std.testing.expectEqual(@as(usize, 2), upstream.requests);
 }
 

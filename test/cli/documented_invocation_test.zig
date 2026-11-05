@@ -16,7 +16,28 @@ const zimdns = @import("zimdns");
 const build_options = @import("build_options");
 
 const cli_query = zimdns.cli_query;
-const tls = zimdns.tls;
+const ossl = zimdns.transport_openssl_tls;
+const tcp_deadline = zimdns.tcp_deadline;
+
+/// Test-only insecure client: skips verification for loopback fixtures with
+/// throwaway identities. MUST NOT be used in production paths.
+fn insecureTestClient(
+    fd: std.posix.fd_t,
+    io: std.Io,
+    alpn: []const u8,
+    comptime test_only: bool,
+) !ossl.Connection {
+    comptime if (!test_only) @compileError("insecureTestClient is test-only: production must verify");
+    const ctx = try ossl.clientCtx(.insecure);
+    defer ossl.freeClientCtx(ctx);
+    const deadline = tcp_deadline.deadline(io, .{ .seconds = 5 });
+    return ossl.clientHandshake(ctx, fd, io, deadline, .{
+        .verify = .insecure,
+        .verify_host = "localhost",
+        .sni = "localhost",
+        .alpn = alpn,
+    });
+}
 
 /// `exitUsage` in src/main.zig.
 const usage_exit: u8 = 2;
@@ -58,7 +79,7 @@ const child_deadline = std.Io.Timeout{ .duration = .{
     .clock = .awake,
 } };
 
-const Transport = enum { udp, tcp, dot, doh, doq, xfr };
+const Transport = enum { udp, tcp, dot, doh, doq, doh3, xfr };
 
 const Kind = enum {
     /// `--help`, `--version`: runs and exits 0.
@@ -273,7 +294,7 @@ fn buildCases(allocator: std.mem.Allocator, io: std.Io, tmp_prefix: []const u8, 
 }
 
 const mode_flags = [_][]const u8{
-    "--once-udp", "--once-tcp", "--serve-udp", "--serve-tcp", "--serve-dot", "--serve-doh", "--serve-doq", "--serve-xfr",
+    "--once-udp", "--once-tcp", "--serve-udp", "--serve-tcp", "--serve-dot", "--serve-doh", "--serve-doq", "--serve-doh3", "--serve-xfr",
 };
 
 fn hasFlag(argv: []const []const u8, flag: []const u8) bool {
@@ -323,6 +344,10 @@ fn classify(allocator: std.mem.Allocator, io: std.Io, tmp_prefix: []const u8, ar
         // The DoQ port is served too, so the case runs the real listener and
         // drives one raw-QUIC exchange.
         if (hasFlag(argv, "--serve-doq")) return classifyDoq(allocator, argv, tls_cert, tls_key);
+
+        // The DoH3 port is served now, so the case runs the real listener and
+        // drives a DoH exchange over HTTP/3.
+        if (hasFlag(argv, "--serve-doh3")) return classifyDoh3(allocator, argv, tls_cert, tls_key);
 
         // The transports this build cannot serve refuse; the encrypted ones
         // are served, so their refusal has to come from the identity.
@@ -393,6 +418,30 @@ fn classifyDoq(allocator: std.mem.Allocator, argv: []const []const u8, tls_cert:
     };
 }
 
+/// `--serve-doh3` is served: the case runs the real listener with a loadable
+/// identity and drives one DoH exchange over HTTP/3. The documented invocation
+/// names no listener, so the port is the CLI default.
+fn classifyDoh3(allocator: std.mem.Allocator, argv: []const []const u8, tls_cert: []const u8, tls_key: []const u8) !Case {
+    var out: std.ArrayList([]const u8) = .empty;
+    try out.appendSlice(allocator, argv);
+    try out.append(allocator, "--enable-encrypted-dns");
+    try out.append(allocator, "--tls-cert-file");
+    try out.append(allocator, tls_cert);
+    try out.append(allocator, "--tls-key-file");
+    try out.append(allocator, tls_key);
+    // One connection is the whole quota, so the server stops on its own.
+    try out.append(allocator, "--max-requests");
+    try out.append(allocator, "1");
+    return .{
+        .documented = argv,
+        .executed = try out.toOwnedSlice(allocator),
+        .kind = .serve,
+        .transport = .doh3,
+        .quota = 1,
+        .port = documented_port,
+    };
+}
+
 /// `--serve-doh` is served: the case runs the real listener with a loadable
 /// identity and drives one DoH exchange over TLS. The documented invocation
 /// names no listener, so the port is the CLI default.
@@ -455,6 +504,10 @@ fn classifyProseFlag(allocator: std.mem.Allocator, flag: []const u8, tls_cert: [
     if (std.mem.eql(u8, flag, "--serve-doq")) {
         const argv = [_][]const u8{ "server", "run", "--zone-file", "examples/zones/home.arpa.zone", "--serve-doq" };
         return classifyDoq(allocator, &argv, tls_cert, tls_key);
+    }
+    if (std.mem.eql(u8, flag, "--serve-doh3")) {
+        const argv = [_][]const u8{ "server", "run", "--zone-file", "examples/zones/home.arpa.zone", "--serve-doh3" };
+        return classifyDoh3(allocator, &argv, tls_cert, tls_key);
     }
     if (std.mem.eql(u8, flag, "--serve-dot")) {
         const argv = [_][]const u8{ "server", "run", "--zone-file", "examples/zones/home.arpa.zone", "--serve-dot" };
@@ -600,31 +653,54 @@ fn bindServer(allocator: std.mem.Allocator, io: std.Io, tmp_prefix: []const u8, 
 fn rebindConfig(allocator: std.mem.Allocator, io: std.Io, tmp_prefix: []const u8, path: []const u8, port: u16) !?[]const u8 {
     const text = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024)) catch return error.UnreadableConfig;
     const endpoint = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{port});
+    // The copy lives in the temporary directory, so every file it names is
+    // copied beside it and the copy names the copy. Absolute paths pass
+    // through untouched; a path that cannot be read is left as its basename
+    // (a write path like `odoh-config-out` lands beside the copy, and a
+    // missing read fails in the server exactly as it would have).
+    const anchor = std.fs.path.dirname(path) orelse ".";
 
     var out: std.ArrayList(u8) = .empty;
     var listeners: usize = 0;
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
-        var words = std.mem.tokenizeAny(u8, commentless(line), " \t");
-        if (!std.mem.eql(u8, words.next() orelse "", "listen")) {
+        const bare = commentless(line);
+        var words = std.mem.tokenizeAny(u8, bare, " \t");
+        var toks: [8][]const u8 = undefined;
+        var n: usize = 0;
+        while (words.next()) |word| {
+            if (n == toks.len) break;
+            toks[n] = word;
+            n += 1;
+        }
+        if (n == 0) {
             try out.appendSlice(allocator, line);
             try out.append(allocator, '\n');
             continue;
         }
-        // `listen dns <transport> <endpoint>` is the one shape
-        // src/config/parser.zig accepts, and the only one this rewrite knows
-        // where the server will bind. A listener it cannot place fails here,
-        // loudly, instead of binding somewhere the harness never looks.
-        var tokens: [3][]const u8 = undefined;
-        var count: usize = 0;
-        while (words.next()) |word| {
-            if (count == tokens.len) return error.UnrebindableListener;
-            tokens[count] = word;
-            count += 1;
+        if (std.mem.eql(u8, toks[0], "listen")) {
+            // `listen dns <transport> <endpoint>` is the one shape
+            // src/config/parser.zig accepts, and the only one this rewrite knows
+            // where the server will bind. A listener it cannot place fails here,
+            // loudly, instead of binding somewhere the harness never looks.
+            if (n != 4 or !std.mem.eql(u8, toks[1], "dns")) return error.UnrebindableListener;
+            listeners += 1;
+            try out.print(allocator, "listen dns {s} {s}\n", .{ toks[2], endpoint });
+            continue;
         }
-        if (count != tokens.len or !std.mem.eql(u8, tokens[0], "dns")) return error.UnrebindableListener;
-        listeners += 1;
-        try out.print(allocator, "listen dns {s} {s}\n", .{ tokens[1], endpoint });
+        if (rebindPathIndex(toks[0..n])) |pi| {
+            const staged = try stagePath(allocator, io, tmp_prefix, anchor, toks[pi]);
+            // Token slices point into `line` (`bare` is its prefix), so the
+            // path is spliced in place and comments survive verbatim.
+            const off = @intFromPtr(toks[pi].ptr) - @intFromPtr(line.ptr);
+            try out.appendSlice(allocator, line[0..off]);
+            try out.appendSlice(allocator, staged);
+            try out.appendSlice(allocator, line[off + toks[pi].len ..]);
+            try out.append(allocator, '\n');
+            continue;
+        }
+        try out.appendSlice(allocator, line);
+        try out.append(allocator, '\n');
     }
     if (listeners == 0) return null;
 
@@ -632,6 +708,55 @@ fn rebindConfig(allocator: std.mem.Allocator, io: std.Io, tmp_prefix: []const u8
     const copy = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ tmp_prefix, name });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = copy, .data = out.items });
     return copy;
+}
+
+/// The token index of the referenced file a copied line carries, if any.
+/// `zone` names a file only for the `primary` kind; a secondary names an
+/// address. `odoh-config-out` may not exist yet, but anchoring a relative
+/// path keeps the write in the same directory the operator meant.
+fn rebindPathIndex(toks: []const []const u8) ?usize {
+    const first = toks[0];
+    for ([_][]const u8{
+        "tsig-key-file",     "dnssec-key-file",     "dnssec-ksk-file",   "dnssec-new-ksk-file",
+        "trust-anchor-file", "managed-anchor-file", "ixfr-journal-file", "tls-cert-file",
+        "tls-key-file",      "odoh-key-file",       "odoh-config-out",   "forwarder-ca-file",
+        "root-zone",
+    }) |directive| {
+        if (std.mem.eql(u8, first, directive)) return if (toks.len == 2) 1 else null;
+    }
+    if (std.mem.eql(u8, first, "zone")) {
+        if (toks.len == 4 and std.mem.eql(u8, toks[2], "primary")) return 3;
+        return null;
+    }
+    if (std.mem.eql(u8, first, "blocklist")) {
+        if (toks.len == 3 and std.mem.eql(u8, toks[1], "file")) return 2;
+        return null;
+    }
+    if (std.mem.eql(u8, first, "blacklist-zone")) {
+        return if (toks.len == 3) 2 else null;
+    }
+    return null;
+}
+
+/// Stages a referenced file beside the copied configuration and returns the
+/// staged name. The copy lives in the temporary directory while the
+/// referenced files stay beside the documented configuration, so the copy
+/// names the staged twin. Absolute paths pass through untouched; a path
+/// that cannot be read is staged by basename (a write path like
+/// `odoh-config-out` lands beside the copy, and a missing read fails in
+/// the server exactly as it would have).
+fn stagePath(allocator: std.mem.Allocator, io: std.Io, tmp_prefix: []const u8, anchor: []const u8, path: []const u8) ![]const u8 {
+    if (std.fs.path.isAbsolute(path)) return allocator.dupe(u8, path);
+    const source = if (std.mem.eql(u8, anchor, ".")) try allocator.dupe(u8, path) else try std.fs.path.join(allocator, &.{ anchor, path });
+    defer allocator.free(source);
+    const staged = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ tmp_prefix, std.fs.path.basename(path) });
+    defer allocator.free(staged);
+    // The copy names the basename: both live in the temporary directory.
+    const name = try allocator.dupe(u8, std.fs.path.basename(path));
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, source, allocator, .limited(16 * 1024 * 1024)) catch return name;
+    defer allocator.free(bytes);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = staged, .data = bytes });
+    return name;
 }
 
 /// Everything from the first `#` is a comment, exactly as the config parser
@@ -712,6 +837,7 @@ fn runServe(allocator: std.mem.Allocator, io: std.Io, case: Case, argv: []const 
         .dot => driveDot(allocator, io, address, case.quota),
         .doh => driveDoh(allocator, io, address, case.quota),
         .doq => driveDoq(allocator, io, address, case.quota),
+        .doh3 => driveDoh3(allocator, io, address, case.quota),
         .xfr => driveXfr(allocator, io, address, case.quota),
     };
     const served = drive.served;
@@ -787,7 +913,7 @@ fn exchangeTcpOnce(allocator: std.mem.Allocator, io: std.Io, address: std.Io.net
     try stream.shutdown(io, .send);
 
     var response: [4096]u8 = undefined;
-    var message = try cli_query.receiveTcpResponse(allocator, stream, io, &response, query);
+    var message = try cli_query.receiveTcpResponse(allocator, stream, io, &response, query, false);
     message.deinit();
 }
 
@@ -812,19 +938,7 @@ fn exchangeDotOnce(allocator: std.mem.Allocator, io: std.Io, address: std.Io.net
     const stream = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp });
     defer stream.close(io);
 
-    var client_input: [tls.input_buffer_len]u8 = undefined;
-    var client_output: [tls.output_buffer_len]u8 = undefined;
-    var client_reader = stream.reader(io, &client_input);
-    var client_writer = stream.writer(io, &client_output);
-    var rng_source: std.Random.IoSource = .{ .io = io };
-    var connection = try tls.client(&client_reader.interface, &client_writer.interface, .{
-        .rng = rng_source.interface(),
-        .host = "localhost",
-        .root_ca = .empty,
-        .insecure_skip_verify = true,
-        .now = std.Io.Clock.real.now(io),
-        .alpn_protocols = &.{"dot"},
-    });
+    var connection = try insecureTestClient(stream.socket.handle, io, "dot", true);
     defer connection.close() catch {};
 
     var read_buffer: [4096]u8 = undefined;
@@ -866,19 +980,7 @@ fn exchangeDohOnce(allocator: std.mem.Allocator, io: std.Io, address: std.Io.net
     const stream = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp });
     defer stream.close(io);
 
-    var client_input: [tls.input_buffer_len]u8 = undefined;
-    var client_output: [tls.output_buffer_len]u8 = undefined;
-    var client_reader = stream.reader(io, &client_input);
-    var client_writer = stream.writer(io, &client_output);
-    var rng_source: std.Random.IoSource = .{ .io = io };
-    var connection = try tls.client(&client_reader.interface, &client_writer.interface, .{
-        .rng = rng_source.interface(),
-        .host = "localhost",
-        .root_ca = .empty,
-        .insecure_skip_verify = true,
-        .now = std.Io.Clock.real.now(io),
-        .alpn_protocols = &.{"http/1.1"},
-    });
+    var connection = try insecureTestClient(stream.socket.handle, io, "http/1.1", true);
     defer connection.close() catch {};
 
     var read_buffer: [4096]u8 = undefined;
@@ -1019,6 +1121,108 @@ fn driveDoq(allocator: std.mem.Allocator, io: std.Io, address: std.Io.net.IpAddr
     }
     return drive;
 }
+///
+/// One DoH exchange over HTTP/3: the QUIC handshake with the "h3" ALPN token
+/// (RFC 9114 section 3.1), a GET request for /dns-query, and the DNS answer.
+fn exchangeDoh3Once(allocator: std.mem.Allocator, io: std.Io, address: std.Io.net.IpAddress) !void {
+    const quic = zimdns.quic;
+    const qpack = quic.qpack;
+    const event_loop = quic.event_loop;
+    const Client = event_loop.Client(Doh3ClientHandler);
+
+    var packet: [512]u8 = undefined;
+    const query = try cli_query.buildQueryPacket(&packet, 0x5eed, "dns.home.arpa.", .A, false);
+    var encoded: [1024]u8 = undefined;
+    const encoded_query = std.base64.url_safe_no_pad.Encoder.encode(&encoded, query);
+    var path_buffer: [2048]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, "/dns-query?dns={s}", .{encoded_query});
+
+    const request = [_]qpack.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "localhost" },
+        .{ .name = ":path", .value = path },
+        .{ .name = "accept", .value = "application/dns-message" },
+    };
+    var handler = Doh3ClientHandler{ .request = &request };
+    var client = try Client.init(std.heap.page_allocator, &handler, .{
+        .address = "127.0.0.1",
+        .port = address.getPort(),
+        .server_name = "localhost",
+        .alpn = "h3",
+        .skip_cert_verify = true,
+    });
+    defer client.deinit();
+
+    var thread = try std.Thread.spawn(.{}, runDoh3Client, .{&client});
+    const deadline = readyDeadline(io);
+    while (!handler.done and !handler.failed and !expired(io, deadline)) {
+        std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+    }
+    client.requestStop();
+    thread.join();
+    if (!handler.done) return error.Doh3NoAnswer;
+    if (!std.mem.eql(u8, &handler.status, "200")) return error.Doh3Refused;
+    const message = try zimdns.dns_message.Message.parse(allocator, handler.response[0..handler.response_len]);
+    if (message.header.answer_count != 1) return error.Doh3NoAnswer;
+}
+
+const Doh3ClientHandler = struct {
+    pub const protocol = @import("quic").event_loop.Protocol.h3;
+    request: []const @import("quic").qpack.Header,
+    response: [70000]u8 = undefined,
+    response_len: usize = 0,
+    status: [3]u8 = .{ 0, 0, 0 },
+    done: bool = false,
+    failed: bool = false,
+
+    pub fn onConnected(self: *Doh3ClientHandler, session: *@import("quic").event_loop.ClientSession) void {
+        _ = session.sendRequest(self.request, null) catch {
+            self.failed = true;
+        };
+    }
+
+    pub fn onHeaders(self: *Doh3ClientHandler, _: *@import("quic").event_loop.ClientSession, _: u64, headers: []const @import("quic").qpack.Header) void {
+        for (headers) |h| {
+            if (std.mem.eql(u8, h.name, ":status") and h.value.len == 3) @memcpy(&self.status, h.value);
+        }
+    }
+
+    pub fn onData(self: *Doh3ClientHandler, session: *@import("quic").event_loop.ClientSession, _: u64, _: usize) void {
+        var buf: [4096]u8 = undefined;
+        while (true) {
+            const n = session.recvBody(&buf);
+            if (n == 0) break;
+            const room = self.response.len - self.response_len;
+            if (room == 0) break;
+            const take = @min(n, room);
+            @memcpy(self.response[self.response_len .. self.response_len + take], buf[0..take]);
+            self.response_len += take;
+        }
+    }
+
+    pub fn onFinished(self: *Doh3ClientHandler, session: *@import("quic").event_loop.ClientSession, _: u64) void {
+        self.done = true;
+        session.closeConnection();
+    }
+};
+
+fn runDoh3Client(client: *zimdns.quic.event_loop.Client(Doh3ClientHandler)) void {
+    client.run() catch {};
+}
+
+fn driveDoh3(allocator: std.mem.Allocator, io: std.Io, address: std.Io.net.IpAddress, quota: usize) Drive {
+    var drive: Drive = .{};
+    const deadline = readyDeadline(io);
+    while (drive.served < quota and !expired(io, deadline)) {
+        exchangeDoh3Once(allocator, io, address) catch |err| {
+            drive.last_error = @errorName(err);
+            continue;
+        };
+        drive.served += 1;
+    }
+    return drive;
+}
 
 /// The apex SOA, the record that ends a transfer sequence.
 const soa_type: @FieldType(zimdns.dns_record.ResourceRecord, "rrtype") = .SOA;
@@ -1030,22 +1234,10 @@ fn exchangeXfrOnce(allocator: std.mem.Allocator, io: std.Io, address: std.Io.net
     const stream = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp });
     defer stream.close(io);
 
-    var client_input: [tls.input_buffer_len]u8 = undefined;
-    var client_output: [tls.output_buffer_len]u8 = undefined;
-    var client_reader = stream.reader(io, &client_input);
-    var client_writer = stream.writer(io, &client_output);
-    var rng_source: std.Random.IoSource = .{ .io = io };
-    var connection = try tls.client(&client_reader.interface, &client_writer.interface, .{
-        .rng = rng_source.interface(),
-        .host = "localhost",
-        .root_ca = .empty,
-        .insecure_skip_verify = true,
-        .now = std.Io.Clock.real.now(io),
-        .alpn_protocols = &.{"dot"},
-    });
+    var connection = try insecureTestClient(stream.socket.handle, io, "dot", true);
     defer connection.close() catch {};
     // The transfer channel speaks "dot" and nothing else.
-    const negotiated = connection.alpn_protocol orelse return error.XfrAlpnMissing;
+    const negotiated = connection.alpnProtocol() orelse return error.XfrAlpnMissing;
     if (!std.mem.eql(u8, negotiated, "dot")) return error.XfrAlpnMismatch;
 
     var read_buffer: [4096]u8 = undefined;
@@ -1225,13 +1417,15 @@ test "a copied configuration moves its listeners onto the per-case port" {
     const prefix = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
 
     const source = try std.fmt.allocPrint(allocator, "{s}/source.gdns", .{prefix});
+    const zone_data = "$ORIGIN one.example.\n$TTL 3600\n@ IN SOA ns.one.example. hostmaster.one.example. 1 3600 900 1209600 3600\n@ IN NS ns.one.example.\n";
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(allocator, "{s}/one.example.zone", .{prefix}), .data = zone_data });
     try std.Io.Dir.cwd().writeFile(io, .{
         .sub_path = source,
         .data =
         \\# listen dns udp 192.0.2.9:53
         \\listen dns udp 0.0.0.0:1053
         \\listen dns tcp 0.0.0.0:1053
-        \\zone one.example primary examples/zones/one.example.zone
+        \\zone one.example primary one.example.zone
         \\
         ,
     });
@@ -1240,9 +1434,14 @@ test "a copied configuration moves its listeners onto the per-case port" {
     const text = try std.Io.Dir.cwd().readFileAlloc(io, copy, allocator, .limited(1024 * 1024));
     try std.testing.expect(std.mem.indexOf(u8, text, "listen dns udp 127.0.0.1:21499\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "listen dns tcp 127.0.0.1:21499\n") != null);
-    // A commented listener stays a comment, and every other line is untouched.
+    // A commented listener stays a comment, and a referenced path is staged
+    // beside the copy so the copy resolves it. The synthetic zone file is a
+    // real file the harness anchors at the tmp prefix and copies by content.
     try std.testing.expect(std.mem.indexOf(u8, text, "# listen dns udp 192.0.2.9:53") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "zone one.example primary examples/zones/one.example.zone") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zone one.example primary one.example.zone\n") != null);
+    const staged_zone = try std.fmt.allocPrint(allocator, "{s}/one.example.zone", .{prefix});
+    const staged_text = try std.Io.Dir.cwd().readFileAlloc(io, staged_zone, allocator, .limited(1024 * 1024));
+    try std.testing.expectEqualStrings(zone_data, staged_text);
 
     const malformed = try std.fmt.allocPrint(allocator, "{s}/malformed.gdns", .{prefix});
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = malformed, .data = "listen dns udp\n" });

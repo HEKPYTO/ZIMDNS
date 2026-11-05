@@ -77,7 +77,7 @@ fn expectSoaSerial(io: std.Io, runtime: *Runtime, qname: []const u8, expected: u
     try listener.serveUdpOnce(&server_socket, io, runtime);
 
     var response_buffer: [512]u8 = undefined;
-    var response = try cli_query.receiveUdpResponse(std.testing.allocator, &client_socket, io, &response_buffer, &server_socket.address, query);
+    var response = try cli_query.receiveUdpResponse(std.testing.allocator, &client_socket, io, &response_buffer, &server_socket.address, query, false);
     defer response.deinit();
     try std.testing.expectEqual(@as(usize, 1), response.answers.len);
     try std.testing.expect(response.answers.items[0].rrtype.eql(.SOA));

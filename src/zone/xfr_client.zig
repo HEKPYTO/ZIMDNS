@@ -91,6 +91,7 @@ pub fn fetch(
         var arena_state = std.heap.ArenaAllocator.init(allocator);
         defer arena_state.deinit();
         const message = dns_message.Message.parse(arena_state.allocator(), frame_buffer[0..length]) catch return Error.BadTransfer;
+        if (message.header.truncated) return Error.BadTransfer;
         if (message.header.rcode != .no_error) return Error.BadTransfer;
         for (message.answers.slice()) |record| {
             if (record.rrtype.eql(.SOA)) {
@@ -209,6 +210,7 @@ pub fn fetchIxfr(
         if (length == 0) return Error.BadTransfer;
         tcp_deadline.readExact(stream.socket.handle, io, frame_buffer[0..length], frame_deadline) catch return Error.IoFailed;
         const message = dns_message.Message.parse(response_arena, frame_buffer[0..length]) catch return Error.BadTransfer;
+        if (message.header.truncated) return Error.BadTransfer;
         if (message.header.rcode != .no_error) return Error.BadTransfer;
         for (message.answers.slice()) |record| {
             total_answers += 1;
@@ -223,25 +225,29 @@ pub fn fetchIxfr(
                         var owner_buffer: [256]u8 = undefined;
                         const owner = record.owner.toText(&owner_buffer) catch return Error.BadTransfer;
                         if (!std.ascii.eqlIgnoreCase(owner, zone)) return Error.BadTransfer;
+                        // RFC 1982: the first SOA must be newer than the served
+                        // copy, unless it equals it (the up-to-date answer is
+                        // a single SOA, checked below). Anything else is a
+                        // stale or wrapped answer the refresh must not apply.
+                        if (serial != current_serial and !zone_update.serialGreaterThan(serial, current_serial)) return Error.BadTransfer;
                         new_serial = serial;
                         first_soa_record = record;
                         phase = .second;
                     },
                     .second => {
-                        // The record after the current SOA: an older SOA opens
-                        // the deletion half; anything else is a full transfer
-                        // and lands in the non-SOA branch.
                         if (serial == new_serial) return Error.BadTransfer;
                         phase = .deletions;
                     },
                     .deletions => {
                         // The old SOA frames the deletions; the next new SOA
                         // opens the additions and carries the new serial.
-                        if (serial == new_serial) {
-                            additions.append(response_arena, record) catch return Error.OutOfMemory;
-                            serial_added = true;
-                            phase = .additions;
-                        }
+                        // A second delta's boundary SOA is neither the served
+                        // serial nor the final serial: reject it so the refresh
+                        // retries instead of misapplying half a delta.
+                        if (serial != new_serial) return Error.BadTransfer;
+                        additions.append(response_arena, record) catch return Error.OutOfMemory;
+                        serial_added = true;
+                        phase = .additions;
                     },
                     .additions => {
                         if (serial == new_serial) {
@@ -292,8 +298,10 @@ pub fn fetchIxfr(
             }
         }
         if (phase == .done or phase == .full_done) break;
-        // RFC 1995 section 2: no changes is answered by a single SOA.
+        // RFC 1995 section 2: the up-to-date answer is a single SOA carrying
+        // the served serial. Anything else alone is not up-to-date.
         if (total_answers == 1 and soa_seen == 1 and phase == .second) {
+            if (new_serial != current_serial) return Error.BadTransfer;
             return zone_update.renderZoneText(allocator, zone, current.records.items[0..current.records.len]);
         }
     }
@@ -732,6 +740,349 @@ test "an up-to-date IXFR keeps the served copy" {
     var kept = fetched_zone.lookup(std.testing.allocator, "dns.transferred.example.", .A);
     defer kept.deinit(std.testing.allocator);
     try std.testing.expectEqual(@import("index.zig").LookupKind.answer, kept.kind);
+}
+
+test "an IXFR with an older first SOA is rejected and the served copy is untouched" {
+    const io_impl = @import("std").Io.Threaded;
+    var server_threaded = io_impl.init(std.heap.page_allocator, .{ .concurrent_limit = .limited(8) });
+    defer server_threaded.deinit();
+    const server_io = server_threaded.io();
+    var client_threaded = io_impl.init(std.heap.page_allocator, .{ .concurrent_limit = .limited(8) });
+    defer client_threaded.deinit();
+    const io = client_threaded.io();
+    const current_text =
+        \\$ORIGIN transferred.example.
+        \\$TTL 3600
+        \\@ IN SOA ns.transferred.example. hostmaster.transferred.example. 43 3600 900 1209600 3600
+        \\@ IN NS ns.transferred.example.
+        \\ns IN A 192.0.2.53
+        \\
+    ;
+    var current_file = try @import("parser.zig").ZoneFile.parse(current_text);
+    defer current_file.deinit();
+    var current = try @import("index.zig").Zone.fromZoneFile(&current_file);
+    defer current.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const zone_name = "transferred.example.";
+    var response = dns_message.Message{
+        .allocator = arena,
+        .header = .{ .id = 0x4250, .qr = true, .opcode = .query, .question_count = 1, .answer_count = 6 },
+        .question = .{ .name = try @import("../dns/name.zig").Name.fromText(zone_name), .qtype = dns_types.RecordType.IXFR, .qclass = dns_types.Class.IN },
+        .answers = try dns_message.RecordSection.init(arena, 6),
+    };
+    try response.answers.append(try testSoa(zone_name, 42));
+    try response.answers.append(try testSoa(zone_name, 43));
+    try response.answers.append(try testA("ns.transferred.example.", .{ 192, 0, 2, 53 }));
+    try response.answers.append(try testSoa(zone_name, 42));
+    try response.answers.append(try testA("evil.transferred.example.", .{ 192, 0, 2, 99 }));
+    try response.answers.append(try testSoa(zone_name, 42));
+    var frame_buffer: [65535]u8 = undefined;
+    var frame_writer = dns_writer.Writer.init(&frame_buffer);
+    try response.encode(&frame_writer);
+    var listen_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var listener = try std.Io.net.IpAddress.listen(&listen_address, server_io, .{ .mode = .stream, .protocol = .tcp, .kernel_backlog = 4 });
+    defer listener.deinit(server_io);
+    const port = switch (listener.socket.address) {
+        .ip4 => |ip4| ip4.port,
+        .ip6 => |ip6| ip6.port,
+    };
+    var ready = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, FrameServer.run, .{FrameServerArgs{ .io = server_io, .listener = &listener, .bytes = frame_writer.written(), .ready = &ready }});
+    defer thread.join();
+    while (!ready.load(.acquire)) std.Thread.yield() catch {};
+    const primary = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+    try std.testing.expectError(Error.BadTransfer, fetchIxfr(std.testing.allocator, io, &primary, zone_name, &current, .{ .duration = .{ .raw = .fromSeconds(15), .clock = .awake } }));
+    try std.testing.expectEqual(@as(u32, 43), current.soaSerial().?);
+}
+
+test "a single-SOA IXFR with a different serial is rejected" {
+    const io_impl = @import("std").Io.Threaded;
+    var server_threaded = io_impl.init(std.heap.page_allocator, .{ .concurrent_limit = .limited(8) });
+    defer server_threaded.deinit();
+    const server_io = server_threaded.io();
+    var client_threaded = io_impl.init(std.heap.page_allocator, .{ .concurrent_limit = .limited(8) });
+    defer client_threaded.deinit();
+    const io = client_threaded.io();
+    const current_text =
+        \\$ORIGIN transferred.example.
+        \\$TTL 3600
+        \\@ IN SOA ns.transferred.example. hostmaster.transferred.example. 42 3600 900 1209600 3600
+        \\@ IN NS ns.transferred.example.
+        \\ns IN A 192.0.2.53
+        \\
+    ;
+    var current_file = try @import("parser.zig").ZoneFile.parse(current_text);
+    defer current_file.deinit();
+    var current = try @import("index.zig").Zone.fromZoneFile(&current_file);
+    defer current.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const zone_name = "transferred.example.";
+    var response = dns_message.Message{
+        .allocator = arena,
+        .header = .{ .id = 0x4251, .qr = true, .opcode = .query, .question_count = 1, .answer_count = 1 },
+        .question = .{ .name = try @import("../dns/name.zig").Name.fromText(zone_name), .qtype = dns_types.RecordType.IXFR, .qclass = dns_types.Class.IN },
+        .answers = try dns_message.RecordSection.init(arena, 1),
+    };
+    try response.answers.append(try testSoa(zone_name, 43));
+    var frame_buffer: [65535]u8 = undefined;
+    var frame_writer = dns_writer.Writer.init(&frame_buffer);
+    try response.encode(&frame_writer);
+    var listen_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var listener = try std.Io.net.IpAddress.listen(&listen_address, server_io, .{ .mode = .stream, .protocol = .tcp, .kernel_backlog = 4 });
+    defer listener.deinit(server_io);
+    const port = switch (listener.socket.address) {
+        .ip4 => |ip4| ip4.port,
+        .ip6 => |ip6| ip6.port,
+    };
+    var ready = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, FrameServer.run, .{FrameServerArgs{ .io = server_io, .listener = &listener, .bytes = frame_writer.written(), .ready = &ready }});
+    defer thread.join();
+    while (!ready.load(.acquire)) std.Thread.yield() catch {};
+    const primary = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+    try std.testing.expectError(Error.BadTransfer, fetchIxfr(std.testing.allocator, io, &primary, zone_name, &current, .{ .duration = .{ .raw = .fromSeconds(15), .clock = .awake } }));
+    try std.testing.expectEqual(@as(u32, 42), current.soaSerial().?);
+}
+
+test "a two-delta IXFR is rejected rather than half-applied" {
+    const io_impl = @import("std").Io.Threaded;
+    var server_threaded = io_impl.init(std.heap.page_allocator, .{ .concurrent_limit = .limited(8) });
+    defer server_threaded.deinit();
+    const server_io = server_threaded.io();
+    var client_threaded = io_impl.init(std.heap.page_allocator, .{ .concurrent_limit = .limited(8) });
+    defer client_threaded.deinit();
+    const io = client_threaded.io();
+    const current_text =
+        \\$ORIGIN transferred.example.
+        \\$TTL 3600
+        \\@ IN SOA ns.transferred.example. hostmaster.transferred.example. 42 3600 900 1209600 3600
+        \\@ IN NS ns.transferred.example.
+        \\ns IN A 192.0.2.53
+        \\
+    ;
+    var current_file = try @import("parser.zig").ZoneFile.parse(current_text);
+    defer current_file.deinit();
+    var current = try @import("index.zig").Zone.fromZoneFile(&current_file);
+    defer current.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const zone_name = "transferred.example.";
+    var response = dns_message.Message{
+        .allocator = arena,
+        .header = .{ .id = 0x4252, .qr = true, .opcode = .query, .question_count = 1, .answer_count = 9 },
+        .question = .{ .name = try @import("../dns/name.zig").Name.fromText(zone_name), .qtype = dns_types.RecordType.IXFR, .qclass = dns_types.Class.IN },
+        .answers = try dns_message.RecordSection.init(arena, 9),
+    };
+    try response.answers.append(try testSoa(zone_name, 44));
+    try response.answers.append(try testSoa(zone_name, 42));
+    try response.answers.append(try testA("ns.transferred.example.", .{ 192, 0, 2, 53 }));
+    try response.answers.append(try testSoa(zone_name, 43));
+    try response.answers.append(try testA("a.transferred.example.", .{ 192, 0, 2, 1 }));
+    try response.answers.append(try testSoa(zone_name, 43));
+    try response.answers.append(try testA("b.transferred.example.", .{ 192, 0, 2, 2 }));
+    try response.answers.append(try testSoa(zone_name, 44));
+    try response.answers.append(try testSoa(zone_name, 44));
+    var frame_buffer: [65535]u8 = undefined;
+    var frame_writer = dns_writer.Writer.init(&frame_buffer);
+    try response.encode(&frame_writer);
+    var listen_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var listener = try std.Io.net.IpAddress.listen(&listen_address, server_io, .{ .mode = .stream, .protocol = .tcp, .kernel_backlog = 4 });
+    defer listener.deinit(server_io);
+    const port = switch (listener.socket.address) {
+        .ip4 => |ip4| ip4.port,
+        .ip6 => |ip6| ip6.port,
+    };
+    var ready = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, FrameServer.run, .{FrameServerArgs{ .io = server_io, .listener = &listener, .bytes = frame_writer.written(), .ready = &ready }});
+    defer thread.join();
+    while (!ready.load(.acquire)) std.Thread.yield() catch {};
+    const primary = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+    try std.testing.expectError(Error.BadTransfer, fetchIxfr(std.testing.allocator, io, &primary, zone_name, &current, .{ .duration = .{ .raw = .fromSeconds(15), .clock = .awake } }));
+    try std.testing.expectEqual(@as(u32, 42), current.soaSerial().?);
+}
+const TwoFrameServerArgs = struct {
+    io: std.Io,
+    listener: *std.Io.net.Server,
+    first: []const u8,
+    second: []const u8,
+    ready: *std.atomic.Value(bool),
+};
+const TwoFrameServer = struct {
+    fn run(args: TwoFrameServerArgs) void {
+        args.ready.store(true, .release);
+        var connection = args.listener.accept(args.io) catch return;
+        defer connection.close(args.io);
+        var length_bytes: [2]u8 = undefined;
+        FrameServer.readExact(connection, args.io, &length_bytes) catch return;
+        const length = std.mem.readInt(u16, &length_bytes, .big);
+        var query_buffer: [65535]u8 = undefined;
+        FrameServer.readExact(connection, args.io, query_buffer[0..length]) catch return;
+        for ([_][]const u8{ args.first, args.second }) |bytes| {
+            var prefix: [2]u8 = undefined;
+            std.mem.writeInt(u16, &prefix, @intCast(bytes.len), .big);
+            FrameServer.writeAll(connection, args.io, &prefix) catch return;
+            FrameServer.writeAll(connection, args.io, bytes) catch return;
+        }
+    }
+};
+
+test "an AXFR frame with TC set is rejected as a failed transfer" {
+    const io_impl = @import("std").Io.Threaded;
+    var server_threaded = io_impl.init(std.heap.page_allocator, .{ .concurrent_limit = .limited(8) });
+    defer server_threaded.deinit();
+    const server_io = server_threaded.io();
+    var client_threaded = io_impl.init(std.heap.page_allocator, .{ .concurrent_limit = .limited(8) });
+    defer client_threaded.deinit();
+    const io = client_threaded.io();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const zone_name = "transferred.example.";
+    var response = dns_message.Message{
+        .allocator = arena,
+        .header = .{ .id = 0x4260, .qr = true, .truncated = true, .opcode = .query, .question_count = 1, .answer_count = 2 },
+        .question = .{ .name = try @import("../dns/name.zig").Name.fromText(zone_name), .qtype = dns_types.RecordType.AXFR, .qclass = dns_types.Class.IN },
+        .answers = try dns_message.RecordSection.init(arena, 2),
+    };
+    try response.answers.append(try testSoa(zone_name, 42));
+    try response.answers.append(try testA("www.transferred.example.", .{ 192, 0, 2, 80 }));
+    var frame_buffer: [65535]u8 = undefined;
+    var frame_writer = dns_writer.Writer.init(&frame_buffer);
+    try response.encode(&frame_writer);
+    var listen_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var listener = try std.Io.net.IpAddress.listen(&listen_address, server_io, .{ .mode = .stream, .protocol = .tcp, .kernel_backlog = 4 });
+    defer listener.deinit(server_io);
+    const port = switch (listener.socket.address) {
+        .ip4 => |ip4| ip4.port,
+        .ip6 => |ip6| ip6.port,
+    };
+    var ready = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, FrameServer.run, .{FrameServerArgs{ .io = server_io, .listener = &listener, .bytes = frame_writer.written(), .ready = &ready }});
+    defer thread.join();
+    while (!ready.load(.acquire)) std.Thread.yield() catch {};
+    const primary = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+    try std.testing.expectError(Error.BadTransfer, fetch(std.testing.allocator, io, &primary, zone_name, .{ .duration = .{ .raw = .fromSeconds(15), .clock = .awake } }));
+}
+
+test "an IXFR first frame with TC set is rejected" {
+    const io_impl = @import("std").Io.Threaded;
+    var server_threaded = io_impl.init(std.heap.page_allocator, .{ .concurrent_limit = .limited(8) });
+    defer server_threaded.deinit();
+    const server_io = server_threaded.io();
+    var client_threaded = io_impl.init(std.heap.page_allocator, .{ .concurrent_limit = .limited(8) });
+    defer client_threaded.deinit();
+    const io = client_threaded.io();
+    const current_text =
+        \\$ORIGIN transferred.example.
+        \\$TTL 3600
+        \\@ IN SOA ns.transferred.example. hostmaster.transferred.example. 42 3600 900 1209600 3600
+        \\@ IN NS ns.transferred.example.
+        \\ns IN A 192.0.2.53
+        \\
+    ;
+    var current_file = try @import("parser.zig").ZoneFile.parse(current_text);
+    defer current_file.deinit();
+    var current = try @import("index.zig").Zone.fromZoneFile(&current_file);
+    defer current.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const zone_name = "transferred.example.";
+    var response = dns_message.Message{
+        .allocator = arena,
+        .header = .{ .id = 0x4261, .qr = true, .truncated = true, .opcode = .query, .question_count = 1, .answer_count = 6 },
+        .question = .{ .name = try @import("../dns/name.zig").Name.fromText(zone_name), .qtype = dns_types.RecordType.IXFR, .qclass = dns_types.Class.IN },
+        .answers = try dns_message.RecordSection.init(arena, 6),
+    };
+    try response.answers.append(try testSoa(zone_name, 43));
+    try response.answers.append(try testSoa(zone_name, 42));
+    try response.answers.append(try testA("ns.transferred.example.", .{ 192, 0, 2, 53 }));
+    try response.answers.append(try testSoa(zone_name, 43));
+    try response.answers.append(try testA("www.transferred.example.", .{ 192, 0, 2, 99 }));
+    try response.answers.append(try testSoa(zone_name, 43));
+    var frame_buffer: [65535]u8 = undefined;
+    var frame_writer = dns_writer.Writer.init(&frame_buffer);
+    try response.encode(&frame_writer);
+    var listen_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var listener = try std.Io.net.IpAddress.listen(&listen_address, server_io, .{ .mode = .stream, .protocol = .tcp, .kernel_backlog = 4 });
+    defer listener.deinit(server_io);
+    const port = switch (listener.socket.address) {
+        .ip4 => |ip4| ip4.port,
+        .ip6 => |ip6| ip6.port,
+    };
+    var ready = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, FrameServer.run, .{FrameServerArgs{ .io = server_io, .listener = &listener, .bytes = frame_writer.written(), .ready = &ready }});
+    defer thread.join();
+    while (!ready.load(.acquire)) std.Thread.yield() catch {};
+    const primary = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+    try std.testing.expectError(Error.BadTransfer, fetchIxfr(std.testing.allocator, io, &primary, zone_name, &current, .{ .duration = .{ .raw = .fromSeconds(15), .clock = .awake } }));
+    try std.testing.expectEqual(@as(u32, 42), current.soaSerial().?);
+}
+
+test "an IXFR with TC set on a later frame is rejected" {
+    const io_impl = @import("std").Io.Threaded;
+    var server_threaded = io_impl.init(std.heap.page_allocator, .{ .concurrent_limit = .limited(8) });
+    defer server_threaded.deinit();
+    const server_io = server_threaded.io();
+    var client_threaded = io_impl.init(std.heap.page_allocator, .{ .concurrent_limit = .limited(8) });
+    defer client_threaded.deinit();
+    const io = client_threaded.io();
+    const current_text =
+        \\$ORIGIN transferred.example.
+        \\$TTL 3600
+        \\@ IN SOA ns.transferred.example. hostmaster.transferred.example. 42 3600 900 1209600 3600
+        \\@ IN NS ns.transferred.example.
+        \\ns IN A 192.0.2.53
+        \\
+    ;
+    var current_file = try @import("parser.zig").ZoneFile.parse(current_text);
+    defer current_file.deinit();
+    var current = try @import("index.zig").Zone.fromZoneFile(&current_file);
+    defer current.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const zone_name = "transferred.example.";
+    var first = dns_message.Message{
+        .allocator = arena,
+        .header = .{ .id = 0x4262, .qr = true, .opcode = .query, .question_count = 1, .answer_count = 2 },
+        .question = .{ .name = try @import("../dns/name.zig").Name.fromText(zone_name), .qtype = dns_types.RecordType.IXFR, .qclass = dns_types.Class.IN },
+        .answers = try dns_message.RecordSection.init(arena, 2),
+    };
+    try first.answers.append(try testSoa(zone_name, 43));
+    try first.answers.append(try testSoa(zone_name, 42));
+    var second = dns_message.Message{
+        .allocator = arena,
+        .header = .{ .id = 0x4262, .qr = true, .truncated = true, .opcode = .query, .answer_count = 1 },
+        .answers = try dns_message.RecordSection.init(arena, 1),
+    };
+    try second.answers.append(try testA("www.transferred.example.", .{ 192, 0, 2, 99 }));
+    var first_buffer: [65535]u8 = undefined;
+    var first_writer = dns_writer.Writer.init(&first_buffer);
+    try first.encode(&first_writer);
+    const first_bytes = first_writer.written();
+    var second_buffer: [65535]u8 = undefined;
+    var second_writer = dns_writer.Writer.init(&second_buffer);
+    try second.encode(&second_writer);
+    const second_bytes = second_writer.written();
+    var listen_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var listener = try std.Io.net.IpAddress.listen(&listen_address, server_io, .{ .mode = .stream, .protocol = .tcp, .kernel_backlog = 4 });
+    defer listener.deinit(server_io);
+    const port = switch (listener.socket.address) {
+        .ip4 => |ip4| ip4.port,
+        .ip6 => |ip6| ip6.port,
+    };
+    var ready = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, TwoFrameServer.run, .{TwoFrameServerArgs{ .io = server_io, .listener = &listener, .first = first_bytes, .second = second_bytes, .ready = &ready }});
+    defer thread.join();
+    while (!ready.load(.acquire)) std.Thread.yield() catch {};
+    const primary = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+    try std.testing.expectError(Error.BadTransfer, fetchIxfr(std.testing.allocator, io, &primary, zone_name, &current, .{ .duration = .{ .raw = .fromSeconds(15), .clock = .awake } }));
+    try std.testing.expectEqual(@as(u32, 42), current.soaSerial().?);
 }
 
 pub const RefreshAction = enum {

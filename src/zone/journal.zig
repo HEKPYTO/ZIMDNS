@@ -101,9 +101,22 @@ const StoredDelta = struct {
     wire_bytes: usize = 0,
 };
 
-/// The differences the running server keeps. The store is bounded: the
-/// oldest difference goes when a new one arrives, and the transition it
-/// belonged to falls back to the full transfer.
+/// A non-shorter incremental chain the shared-lock read path decided to
+/// answer with AXFR, drained under the exclusive lock after release.
+pub const PendingEvict = struct {
+    origin: [max_origin_len]u8 = undefined,
+    origin_len: usize = 0,
+    client_serial: u32 = 0,
+    server_serial: u32 = 0,
+
+    pub fn originText(self: *const PendingEvict) []const u8 {
+        return self.origin[0..self.origin_len];
+    }
+};
+
+/// The differences the running server keeps. The oldest difference goes
+/// when a new one arrives, and the transition it belonged to falls back to
+/// the full transfer.
 var stored: [max_stored_deltas]StoredDelta = undefined;
 var stored_len: usize = 0;
 
@@ -285,8 +298,9 @@ pub fn differenceChainBytes(origin: []const u8, from_serial: u32, to_serial: u32
 /// Drops the difference of the oldest version on the way out of
 /// `from_serial`: the information about that version does not stay in the
 /// store, so the storage stays bounded the way RFC 1995 section 5
-/// describes.
-fn purgeOldestDifference(origin: []const u8, from_serial: u32) void {
+/// describes. Reachable only from the runtime exclusive lock; never from a
+/// shared-lock read path.
+pub fn evictOldestDifference(origin: []const u8, from_serial: u32) void {
     for (stored[0..stored_len], 0..) |entry, index| {
         if (entry.from_serial != from_serial) continue;
         if (!std.ascii.eqlIgnoreCase(entry.origin[0..entry.origin_len], origin)) continue;
@@ -765,18 +779,43 @@ pub const DeltaLog = struct {
     /// IXFR with a full AXFR.
     pub fn canServeIncremental(self: *const DeltaLog, client_serial: u32, current_serial: u32) bool {
         if (client_serial == current_serial) return true;
-        if (!self.chainConnects(client_serial, current_serial)) return false;
-        // Every transition on the way carries the difference the incremental
-        // answer is built from.
-        if (!differenceChainHolds(self.originText(), client_serial, current_serial)) return false;
+        if (!self.chainKnown(client_serial, current_serial)) return false;
         // RFC 1995 section 5: the incremental answer must not be longer
         // than the full transfer it replaces.
         return self.incrementalIsShorter(client_serial, current_serial);
     }
 
+    /// Reports whether the recorded transitions connect `client_serial` to
+    /// `current_serial` and every transition on the way still carries its
+    /// difference.
+    pub fn chainKnown(self: *const DeltaLog, client_serial: u32, current_serial: u32) bool {
+        if (client_serial == current_serial) return true;
+        if (!self.chainConnects(client_serial, current_serial)) return false;
+        // Every transition on the way carries the difference the incremental
+        // answer is built from.
+        return differenceChainHolds(self.originText(), client_serial, current_serial);
+    }
+
+    /// Reports whether the held incremental chain for `client_serial` is
+    /// shorter than the full transfer of the zone.
+    pub fn servesIncremental(self: *const DeltaLog, client_serial: u32, current_serial: u32) bool {
+        return self.chainKnown(client_serial, current_serial) and self.incrementalIsShorter(client_serial, current_serial);
+    }
+
+    /// Reports whether the held incremental chain for `client_serial` is
+    /// at least as long as the full transfer, so serving AXFR lets the
+    /// server drop the oldest difference (RFC 1995 section 5).
+    pub fn chainLongerThanFull(self: *const DeltaLog, client_serial: u32, current_serial: u32) bool {
+        if (!self.chainKnown(client_serial, current_serial)) return false;
+        return !self.incrementalIsShorter(client_serial, current_serial);
+    }
+
     /// Reports whether the incremental answer for `client_serial` is
     /// shorter than the full transfer of the zone. Both answers carry the
     /// two current SOA records, so only the other records are compared.
+    /// Read-only: when the answer would not be shorter the caller serves
+    /// the full transfer and drains the oldest difference under the
+    /// runtime exclusive lock (see `evictOldestDifference`).
     fn incrementalIsShorter(self: *const DeltaLog, client_serial: u32, current_serial: u32) bool {
         const full = if (self.full_transfer_bytes != 0)
             self.full_transfer_bytes
@@ -784,12 +823,7 @@ pub const DeltaLog = struct {
             zoneSize(self.originText());
         if (full == 0) return true;
         const chain = differenceChainBytes(self.originText(), client_serial, current_serial);
-        if (chain < full) return true;
-        // RFC 1995 section 5: the information about the older version goes,
-        // so the storage stays bounded and the client gets the full
-        // transfer.
-        purgeOldestDifference(self.originText(), client_serial);
-        return false;
+        return chain < full;
     }
 
     /// Reports whether the recorded transitions connect `client_serial` to
@@ -848,7 +882,7 @@ test "delta log serves incremental answers only across recorded transitions" {
     try std.testing.expect(!log.canServeIncremental(10, 13));
 }
 
-test "a difference that is not shorter than the full transfer is purged" {
+test "a difference that is not shorter than the full transfer is kept on read" {
     var log = DeltaLog{};
     log.setOrigin("purge.example.");
     const difference = try testDifference(std.testing.allocator, 10, 11);
@@ -858,10 +892,35 @@ test "a difference that is not shorter than the full transfer is purged" {
 
     // The server knows the size of the full transfer of the zone, and the
     // difference is longer: the client at the old serial gets the full
-    // transfer, and the difference is purged so the storage stays bounded.
+    // transfer, but the read-only decision keeps the difference in place.
+    // The exclusive drain drops it later.
     log.setFullTransferBytes(16);
     try std.testing.expect(!log.canServeIncremental(10, 11));
-    try std.testing.expect(differenceFor("purge.example.", 10, 11) == null);
+    try std.testing.expect(differenceFor("purge.example.", 10, 11) != null);
+    try std.testing.expect(!log.canServeIncremental(10, 11));
+    try std.testing.expect(differenceFor("purge.example.", 10, 11) != null);
+    try std.testing.expect(log.len <= max_deltas);
+    try std.testing.expect(stored_len <= max_stored_deltas);
+}
+
+test "the exclusive drain drops only the oldest difference of one origin" {
+    var log = DeltaLog{};
+    log.setOrigin("evict.example.");
+    const difference = try testDifference(std.testing.allocator, 10, 11);
+    defer std.testing.allocator.free(difference);
+    try log.record(10, 11, difference);
+    var other = DeltaLog{};
+    other.setOrigin("other.example.");
+    const other_difference = try testDifference(std.testing.allocator, 20, 21);
+    defer std.testing.allocator.free(other_difference);
+    try other.record(20, 21, other_difference);
+    log.setFullTransferBytes(16);
+
+    try std.testing.expect(!log.canServeIncremental(10, 11));
+    evictOldestDifference("evict.example.", 10);
+    try std.testing.expect(differenceFor("evict.example.", 10, 11) == null);
+    try std.testing.expect(!log.canServeIncremental(10, 11));
+    try std.testing.expect(differenceFor("other.example.", 20, 21) != null);
     try std.testing.expect(log.len <= max_deltas);
     try std.testing.expect(stored_len <= max_stored_deltas);
 }

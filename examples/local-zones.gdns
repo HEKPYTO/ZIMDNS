@@ -16,7 +16,7 @@
 
 listen dns udp 127.0.0.1:1054
 
-zone one.example primary examples/zones/one.example.zone
+zone one.example primary zones/one.example.zone
 
 local-zones on
 

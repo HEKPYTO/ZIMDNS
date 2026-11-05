@@ -102,6 +102,44 @@ test "blocklist rejects too many and too long entries" {
     try std.testing.expectError(error.TextTooLong, Blocklist.parse(&long_name));
 }
 
+test "blocklist bounds adversarial names without panicking" {
+    var name255: [255]u8 = undefined;
+    @memset(&name255, 'a');
+    try std.testing.expectError(error.TextTooLong, Blocklist.parse(&name255));
+    var name254: [254]u8 = undefined;
+    @memset(&name254, 'a');
+    const list254 = try Blocklist.parse(&name254);
+    try std.testing.expect(list254.blocks(&name254));
+    var dotted: [256]u8 = undefined;
+    @memset(&dotted, 'a');
+    dotted[255] = '.';
+    try std.testing.expectError(error.TextTooLong, Blocklist.parse(&dotted));
+    const empty = try Blocklist.parse("");
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+    const only_dots = try Blocklist.parse("...");
+    try std.testing.expectEqual(@as(usize, 1), only_dots.len);
+    try std.testing.expect(only_dots.blocks("..."));
+    var big: [65535]u8 = undefined;
+    @memset(&big, 'b');
+    try std.testing.expectError(error.TextTooLong, Blocklist.parse(&big));
+    var high: [4]u8 = .{ 0xff, 0x80, 'a', '.' };
+    const high_list = try Blocklist.parse(&high);
+    try std.testing.expect(high_list.blocks(&high));
+}
+
+test "blocklist rejects entries past 256 in one file and across files" {
+    var one = Blocklist{};
+    var index: usize = 0;
+    while (index < 256) : (index += 1) {
+        var name: [32]u8 = undefined;
+        const text = try std.fmt.bufPrint(&name, "host{d}.example.", .{index});
+        try one.add(text);
+    }
+    try std.testing.expectError(error.TooManyEntries, one.add("extra.example."));
+    const rest = try Blocklist.parse("extra.example.\n");
+    try std.testing.expectError(error.TooManyEntries, one.appendAll(rest));
+}
+
 test "blocklist appends entries from another list" {
     var list = try Blocklist.parse("ads.example.\n");
     const extra = try Blocklist.parse("tracker.example.\n");

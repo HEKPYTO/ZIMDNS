@@ -482,7 +482,7 @@ fn isAtOrBelow(name: []const u8, parent: []const u8) bool {
     return name[offset - 1] == '.';
 }
 
-fn serialGreaterThan(candidate: u32, current: u32) bool {
+pub fn serialGreaterThan(candidate: u32, current: u32) bool {
     return @as(i32, @bitCast(candidate -% current)) > 0;
 }
 

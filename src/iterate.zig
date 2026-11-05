@@ -24,11 +24,16 @@ pub const MAX_ALIAS_HOPS: usize = 8;
 /// One delegation names at most a handful of servers this module keeps; a
 /// longer NS set is served by its first entries.
 pub const MAX_SERVERS: usize = 16;
+/// One client question may fan out into many upstream queries when a chain is
+/// glue-less or adversarial. The budget caps total upstream sends per
+/// resolution, shared across the referral walk and alias chases.
+pub const MAX_QUERIES: usize = 64;
 
 pub const Error = error{
     MalformedResponse,
     NoReachableServer,
     TooManyHops,
+    QueryBudgetExceeded,
 };
 
 /// The transport seam. `send` must send `query` to `server`, check the
@@ -156,11 +161,17 @@ pub const Options = struct {
     /// and the client's type. Off by default so the module's own tests state
     /// every hop explicitly; the resolver turns it on.
     qname_minimization: bool = false,
+    /// Total upstream sends allowed for one resolution, shared across the
+    /// referral walk and alias chases. Cache hits and local decisions are
+    /// not sends and cost nothing.
+    max_queries: usize = MAX_QUERIES,
+    /// Remaining sends. Null means resolve() starts a fresh budget of
+    /// max_queries; nested walks share the pointer, so an alias chase or a
+    /// glue-less delegation cannot reset it.
+    remaining: ?*usize = null,
 };
 
 /// Resolves `question` from `hints`: the root hint addresses for an ordinary
-/// resolution. A warm cache starts the walk at the closest known delegation
-/// and falls back to `hints` when that delegation does not answer.
 pub fn resolve(
     allocator: std.mem.Allocator,
     sender: Sender,
@@ -168,7 +179,10 @@ pub fn resolve(
     question: dns_question.Question,
     options: Options,
 ) anyerror!dns_message.Message {
-    return resolveAt(allocator, sender, hints, question, options, 0);
+    var remaining: usize = options.max_queries;
+    var owned = options;
+    if (owned.remaining == null) owned.remaining = &remaining;
+    return resolveAt(allocator, sender, hints, question, owned, 0);
 }
 
 fn resolveAt(
@@ -219,6 +233,10 @@ fn resolveFrom(
         while (index < server_count) : (index += 1) {
             var hop = hopQuestion(question, zone, options.qname_minimization);
             var query = encodeQuery(hop, &query_buffer) catch return Error.MalformedResponse;
+            if (options.remaining) |left| {
+                if (left.* == 0) return Error.QueryBudgetExceeded;
+                left.* -= 1;
+            }
             var response = sender.send(sender.context, allocator, servers[index], query, options.dnssec_ok) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => continue,
@@ -256,6 +274,10 @@ fn resolveFrom(
                 response.deinit();
                 hop = question;
                 query = encodeQuery(hop, &query_buffer) catch return Error.MalformedResponse;
+                if (options.remaining) |left| {
+                    if (left.* == 0) return Error.QueryBudgetExceeded;
+                    left.* -= 1;
+                }
                 response = sender.send(sender.context, allocator, servers[index], query, options.dnssec_ok) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     else => continue,
@@ -346,11 +368,12 @@ fn collectGlue(
         if (bailiwick) |zone| if (!isDescendant(&record.owner, zone)) continue;
         for (targets) |*target| {
             if (!record.owner.eql(target)) continue;
-            const octets = switch (record.rdata) {
-                .A => |value| value,
+            const address: std.Io.net.IpAddress = switch (record.rdata) {
+                .A => |value| .{ .ip4 = .{ .bytes = value, .port = 53 } },
+                .AAAA => |value| .{ .ip6 = .{ .bytes = value, .port = 53 } },
                 else => break,
             };
-            glue[glue_count] = .{ .ip4 = .{ .bytes = octets, .port = 53 } };
+            glue[glue_count] = address;
             glue_count += 1;
             break;
         }
@@ -440,7 +463,12 @@ fn resolveServerAddresses(
     // reaches it, so the A answer is tried first and AAAA when it is empty.
     for (targets) |target| {
         for ([_]RecordType{ .A, .AAAA }) |qtype| {
-            var answer = resolveAt(allocator, sender, hints, .{ .name = target, .qtype = qtype, .qclass = .IN }, options, depth) catch continue;
+            var answer = resolveAt(allocator, sender, hints, .{ .name = target, .qtype = qtype, .qclass = .IN }, options, depth) catch |err| switch (err) {
+                // An exhausted budget ends the whole resolution: another
+                // target would only spend sends that are already gone.
+                error.QueryBudgetExceeded => return err,
+                else => continue,
+            };
             defer answer.deinit();
             var count: usize = 0;
             for (answer.answers.slice()) |record| {
@@ -594,7 +622,7 @@ const TestScript = struct {
     kind: Kind,
 
     const Kind = union(enum) {
-        referral: struct { child: []const u8, ns: []const u8, glue: ?[4]u8 },
+        referral: struct { child: []const u8, ns: []const u8, glue: ?[4]u8, glue_v6: ?[16]u8 = null },
         address: [4]u8,
         address_v6: [16]u8,
         /// An empty NOERROR answer: the name exists with no record of the
@@ -605,14 +633,14 @@ const TestScript = struct {
         servfail,
     };
 };
-
 const FakeSender = struct {
     scripts: []const TestScript,
     used: []bool,
-
+    sends: ?*usize = null,
     fn send(context: *anyopaque, allocator: std.mem.Allocator, server: std.Io.net.IpAddress, query_bytes: []const u8, dnssec_ok: bool) anyerror!dns_message.Message {
         _ = dnssec_ok;
         const self: *FakeSender = @ptrCast(@alignCast(context));
+        if (self.sends) |count| count.* += 1;
         var query = try dns_message.Message.parse(allocator, query_bytes);
         defer query.deinit();
         const question = query.question orelse return Error.MalformedResponse;
@@ -652,7 +680,11 @@ const FakeSender = struct {
                 message.header.authority_count = 1;
                 if (next.glue) |octets| {
                     try message.additionals.append(.{ .owner = ns, .rrtype = .A, .class = .IN, .ttl = 3600, .rdata = .{ .A = octets } });
-                    message.header.additional_count = 1;
+                    message.header.additional_count += 1;
+                }
+                if (next.glue_v6) |octets| {
+                    try message.additionals.append(.{ .owner = ns, .rrtype = .AAAA, .class = .IN, .ttl = 3600, .rdata = .{ .AAAA = octets } });
+                    message.header.additional_count += 1;
                 }
             },
             .address => |octets| {
@@ -1140,4 +1172,166 @@ test "RFC 1034 section 4.3.2: a glue-less name server with only an AAAA address 
     try std.testing.expectEqual(@as(u16, 1), answer.header.answer_count);
     try std.testing.expectEqualSlices(u8, &.{ 192, 0, 2, 7 }, &answer.answers.items[0].rdata.A);
     for (used) |item| try std.testing.expect(item);
+}
+
+test "a referral with only AAAA glue is followed over IPv6" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const ns_v6: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x53 };
+    const scripts = [_]TestScript{
+        .{ .server = .{ 198, 41, 0, 4 }, .qname = "www.example.", .qtype = .A, .kind = .{ .referral = .{ .child = "example.", .ns = "ns.example.", .glue = null, .glue_v6 = ns_v6 } } },
+        .{ .server_v6 = ns_v6, .qname = "www.example.", .qtype = .A, .kind = .{ .address = .{ 192, 0, 2, 7 } } },
+    };
+    var used = std.mem.zeroes([scripts.len]bool);
+    var sends: usize = 0;
+    var fake = FakeSender{ .scripts = &scripts, .used = &used, .sends = &sends };
+    const hints = [_]std.Io.net.IpAddress{hint(.{ 198, 41, 0, 4 })};
+    var answer = try resolve(allocator, .{ .context = &fake, .send = FakeSender.send }, &hints, .{
+        .name = try Name.fromText("www.example."),
+        .qtype = .A,
+        .qclass = .IN,
+    }, .{ .now = 1000 });
+    defer answer.deinit();
+    try std.testing.expectEqual(@as(u16, 1), answer.header.answer_count);
+    try std.testing.expectEqual(@as(usize, 2), sends);
+    for (used) |item| try std.testing.expect(item);
+}
+
+test "a referral with mixed A and AAAA glue collects both" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    var message = dns_message.Message{
+        .header = .{ .id = 0, .qr = true },
+        .question = .{ .name = try Name.fromText("www.example."), .qtype = .A, .qclass = .IN },
+        .answers = try dns_message.RecordSection.init(allocator, 1),
+        .authorities = try dns_message.RecordSection.init(allocator, 1),
+        .additionals = try dns_message.RecordSection.init(allocator, 2),
+    };
+    defer message.deinit();
+    const ns = try Name.fromText("ns.example.");
+    try message.authorities.append(.{ .owner = try Name.fromText("example."), .rrtype = .NS, .class = .IN, .ttl = 3600, .rdata = .{ .NS = ns } });
+    try message.additionals.append(.{ .owner = ns, .rrtype = .A, .class = .IN, .ttl = 3600, .rdata = .{ .A = .{ 203, 0, 113, 5 } } });
+    const v6: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x53 };
+    try message.additionals.append(.{ .owner = ns, .rrtype = .AAAA, .class = .IN, .ttl = 3600, .rdata = .{ .AAAA = v6 } });
+    var targets = [_]Name{ns};
+    var glue: [MAX_SERVERS]std.Io.net.IpAddress = undefined;
+    const zone = try Name.fromText(".");
+    try std.testing.expectEqual(@as(usize, 2), collectGlue(&message, &zone, &targets, &glue));
+    try std.testing.expect(glue[0].ip4.bytes[0] == 203);
+    try std.testing.expect(glue[1] == .ip6);
+}
+
+test "off-bailiwick AAAA glue is rejected" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    var message = dns_message.Message{
+        .header = .{ .id = 0, .qr = true },
+        .question = .{ .name = try Name.fromText("www.example."), .qtype = .A, .qclass = .IN },
+        .answers = try dns_message.RecordSection.init(allocator, 1),
+        .authorities = try dns_message.RecordSection.init(allocator, 1),
+        .additionals = try dns_message.RecordSection.init(allocator, 1),
+    };
+    defer message.deinit();
+    const ns = try Name.fromText("ns.other.");
+    const v6: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x53 };
+    try message.additionals.append(.{ .owner = ns, .rrtype = .AAAA, .class = .IN, .ttl = 3600, .rdata = .{ .AAAA = v6 } });
+    var targets = [_]Name{ns};
+    var glue: [MAX_SERVERS]std.Io.net.IpAddress = undefined;
+    const zone = try Name.fromText("example.");
+    try std.testing.expectEqual(@as(usize, 0), collectGlue(&message, &zone, &targets, &glue));
+}
+
+test "a per-resolution query budget caps an endless referral chain" {
+    // A 32-hop referral chain with one glue server per hop: the unbounded
+    // walk sends 32 queries and ends in TooManyHops, while a budget of 8
+    // stops the same walk at exactly 8 sends with QueryBudgetExceeded.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var scripts: [MAX_REFERRALS]TestScript = undefined;
+    var child = try allocator.dupe(u8, "example.");
+    var server: [4]u8 = .{ 198, 41, 0, 4 };
+    for (&scripts, 0..) |*script, i| {
+        const next = try std.fmt.allocPrint(allocator, "l{d}.{s}", .{ i, child });
+        const ns = try std.fmt.allocPrint(allocator, "ns.{s}", .{next});
+        const glue: [4]u8 = .{ 203, 0, 113, @intCast(i + 1) };
+        script.* = .{
+            .server = server,
+            .qname = "www.example.",
+            .qtype = .A,
+            .kind = .{ .referral = .{ .child = next, .ns = ns, .glue = glue } },
+        };
+        child = next;
+        server = glue;
+    }
+    var used = std.mem.zeroes([scripts.len]bool);
+    var sends: usize = 0;
+    var fake = FakeSender{ .scripts = &scripts, .used = &used, .sends = &sends };
+    const hints = [_]std.Io.net.IpAddress{hint(.{ 198, 41, 0, 4 })};
+    const question: dns_question.Question = .{
+        .name = try Name.fromText("www.example."),
+        .qtype = .A,
+        .qclass = .IN,
+    };
+
+    try std.testing.expectError(
+        Error.QueryBudgetExceeded,
+        resolve(allocator, .{ .context = &fake, .send = FakeSender.send }, &hints, question, .{ .max_queries = 8 }),
+    );
+    try std.testing.expectEqual(@as(usize, 8), sends);
+
+    var used_all = std.mem.zeroes([scripts.len]bool);
+    var sends_all: usize = 0;
+    var fake_all = FakeSender{ .scripts = &scripts, .used = &used_all, .sends = &sends_all };
+    try std.testing.expectError(
+        Error.TooManyHops,
+        resolve(allocator, .{ .context = &fake_all, .send = FakeSender.send }, &hints, question, .{ .max_queries = MAX_REFERRALS + 1 }),
+    );
+    try std.testing.expectEqual(scripts.len, sends_all);
+}
+
+test "a per-resolution query budget is shared with an alias chase" {
+    // www.example. CNAMEs to target.example., whose own walk needs two
+    // more sends: a budget of 3 is exhausted inside the chase, so the
+    // nested resolve cannot reset it, while a budget of 4 succeeds.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const scripts = [_]TestScript{
+        .{ .server = .{ 198, 41, 0, 4 }, .qname = "www.example.", .qtype = .A, .kind = .{ .referral = .{ .child = "example.", .ns = "ns.example.", .glue = .{ 203, 0, 113, 5 } } } },
+        .{ .server = .{ 203, 0, 113, 5 }, .qname = "www.example.", .qtype = .A, .kind = .{ .cname = "target.example." } },
+        .{ .server = .{ 198, 41, 0, 4 }, .qname = "target.example.", .qtype = .A, .kind = .{ .referral = .{ .child = "example.", .ns = "ns.example.", .glue = .{ 203, 0, 113, 5 } } } },
+        .{ .server = .{ 203, 0, 113, 5 }, .qname = "target.example.", .qtype = .A, .kind = .{ .address = .{ 192, 0, 2, 9 } } },
+    };
+    var used = std.mem.zeroes([scripts.len]bool);
+    var sends: usize = 0;
+    var fake = FakeSender{ .scripts = &scripts, .used = &used, .sends = &sends };
+    const hints = [_]std.Io.net.IpAddress{hint(.{ 198, 41, 0, 4 })};
+
+    try std.testing.expectError(
+        Error.QueryBudgetExceeded,
+        resolve(allocator, .{ .context = &fake, .send = FakeSender.send }, &hints, .{
+            .name = try Name.fromText("www.example."),
+            .qtype = .A,
+            .qclass = .IN,
+        }, .{ .max_queries = 3 }),
+    );
+    try std.testing.expectEqual(@as(usize, 3), sends);
+
+    var used_ok = std.mem.zeroes([scripts.len]bool);
+    var sends_ok: usize = 0;
+    var fake_ok = FakeSender{ .scripts = &scripts, .used = &used_ok, .sends = &sends_ok };
+    var answer = try resolve(allocator, .{ .context = &fake_ok, .send = FakeSender.send }, &hints, .{
+        .name = try Name.fromText("www.example."),
+        .qtype = .A,
+        .qclass = .IN,
+    }, .{ .max_queries = 4 });
+    defer answer.deinit();
+    try std.testing.expectEqual(@as(usize, 4), sends_ok);
+    try std.testing.expectEqual(@as(u16, 2), answer.header.answer_count);
 }

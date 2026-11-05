@@ -13,9 +13,9 @@
 listen dns udp 0.0.0.0:1053
 listen dns tcp 0.0.0.0:1053
 
-blocklist file examples/blocklists/ads.txt
+blocklist file blocklists/ads.txt
 
-zone home.arpa primary examples/zones/home.arpa.zone
+zone home.arpa primary zones/home.arpa.zone
 
 # Optional bounded forwarding policy. Both an ACL and a forwarder are required
 # before recursion is enabled, on the UDP and the TCP ingress alike.

@@ -11,17 +11,22 @@
 /// Errors: none; the channel only computes and applies deadlines.
 const std = @import("std");
 const listener = @import("../platform/listener.zig");
+const openssl_tls = @import("openssl_tls.zig");
 const tcp_deadline = @import("../platform/tcp_deadline.zig");
 
 /// One connection: the channel the frames travel over and the deadlines that
-/// bound them. The frames travel over the TLS connection or over the socket,
-/// and the deadlines are applied to the raw descriptor under it, so a stalled
-/// peer holds neither a frame nor a connection past its bound.
+/// bound them. The frames travel over the TLS connection or over the socket;
+/// a stalled peer holds neither a frame nor a connection past its bound.
+/// On a TLS channel the TLS connection carries the absolute deadline
+/// itself (`tls` set): the fd readers are only the handshake's. On a
+/// cleartext channel (`tls` null) the deadline goes to the raw descriptor
+/// under the frame, as before.
 pub const Channel = struct {
     io: std.Io,
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,
-    deadlines: tcp_deadline.FrameDeadlines,
+    deadlines: ?tcp_deadline.FrameDeadlines = null,
+    tls: ?*openssl_tls.Connection = null,
     timeout: tcp_deadline.Timeout,
     connection_deadline: ?std.Io.Clock.Timestamp,
 
@@ -35,12 +40,17 @@ pub const Channel = struct {
         return tcp_deadline.deadline(self.io, frame_timeout);
     }
 
-    /// Bounds the frame that starts now to the raw descriptor under the
-    /// channel. False means the connection has outlived its duration and
-    /// ends here.
+    /// Bounds the frame that starts now. On a TLS channel the TLS
+    /// connection carries the absolute deadline itself; otherwise the
+    /// deadline goes to the raw descriptor under the frame. False means
+    /// the connection has outlived its duration and ends here.
     pub fn applyFrameDeadline(self: *const Channel) bool {
         const frame_deadline = self.frameDeadline() orelse return false;
-        self.deadlines.apply(frame_deadline);
+        if (self.tls) |conn| {
+            conn.deadline = frame_deadline;
+        } else if (self.deadlines) |deadlines| {
+            deadlines.apply(frame_deadline);
+        }
         return true;
     }
 };

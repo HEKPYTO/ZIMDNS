@@ -289,7 +289,7 @@ fn sendNotifyFrom(io: std.Io, runtime: *Runtime, source_ip: []const u8) !void {
     var response_buffer: [512]u8 = undefined;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, base);
+    var response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, base, false);
     defer response.deinit();
     try std.testing.expectEqual(@as(@TypeOf(response.header.rcode), .no_error), response.header.rcode);
 }
@@ -314,7 +314,7 @@ fn ask(io: std.Io, runtime: *Runtime, qname: []const u8, id: u16) !dns_message.M
     try listener.serveUdpOnce(&server_socket, io, runtime);
 
     var response_buffer: [512]u8 = undefined;
-    return cli_query.receiveUdpResponse(std.testing.allocator, &client_socket, io, &response_buffer, &server_socket.address, query);
+    return cli_query.receiveUdpResponse(std.testing.allocator, &client_socket, io, &response_buffer, &server_socket.address, query, false);
 }
 
 fn expectAddress(io: std.Io, runtime: *Runtime, qname: []const u8, a: u8, b: u8, c: u8, d: u8) !void {
@@ -333,7 +333,7 @@ fn expectAddress(io: std.Io, runtime: *Runtime, qname: []const u8, a: u8, b: u8,
     var response_buffer: [512]u8 = undefined;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query, false);
     try std.testing.expectEqual(@as(usize, 1), response.answers.len);
     try std.testing.expectEqualSlices(u8, &.{ a, b, c, d }, &response.answers.items[0].rdata.A);
 }
@@ -352,7 +352,7 @@ fn expectSoaSerial(io: std.Io, runtime: *Runtime, qname: []const u8, expected: u
     try listener.serveUdpOnce(&server_socket, io, runtime);
 
     var response_buffer: [512]u8 = undefined;
-    var response = try cli_query.receiveUdpResponse(std.testing.allocator, &client_socket, io, &response_buffer, &server_socket.address, query);
+    var response = try cli_query.receiveUdpResponse(std.testing.allocator, &client_socket, io, &response_buffer, &server_socket.address, query, false);
     defer response.deinit();
     try std.testing.expectEqual(@as(usize, 1), response.answers.len);
     try std.testing.expect(response.answers.items[0].rrtype.eql(.SOA));

@@ -81,7 +81,7 @@ test "a reloaded zone file serves the new data" {
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query, false);
     try std.testing.expectEqual(@as(usize, 1), response.answers.len);
     try std.testing.expectEqualSlices(u8, &.{ 192, 0, 2, 2 }, &response.answers.items[0].rdata.A);
 }
@@ -112,7 +112,7 @@ test "a reloaded zone keeps serving the old data when its zone file is broken" {
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query, false);
     try std.testing.expectEqual(@as(usize, 1), response.answers.len);
     try std.testing.expectEqualSlices(u8, &.{ 192, 0, 2, 1 }, &response.answers.items[0].rdata.A);
 }

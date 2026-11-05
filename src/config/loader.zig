@@ -21,7 +21,7 @@ const resolver_mod = @import("../resolver.zig");
 const zonemd = @import("../zone/zonemd.zig");
 const signer = @import("../zone/signer.zig");
 const journal_mod = @import("../zone/journal.zig");
-
+const odoh = @import("../dns/odoh.zig");
 const validate_mod = @import("../dns/validate.zig");
 const managed_mod = @import("../dns/managed_anchors.zig");
 const dns_name = @import("../dns/name.zig");
@@ -111,6 +111,21 @@ pub const ServerContext = struct {
     /// Standalone secondary refresh facts, moved into the runtime by
     /// `takeRuntime`; the apex strings are owned here until then.
     secondary_zones: std.ArrayList(auth_runtime.SecondaryState) = .empty,
+    /// RFC 9230 target key. Null when `odoh-target` is off; the private key
+    /// never leaves this struct.
+    odoh_target: ?odoh.Target = null,
+    /// RFC 9230 section 5 ObliviousDoHConfigs bytes, published via
+    /// `odoh-config-out`. Empty when the target is off.
+    odoh_configs: []u8 = &.{},
+    /// A handle on the configuration file's own directory, opened by `load`.
+    /// Reload sources registered by `takeRuntime` borrow it, so it lives
+    /// until `deinit` (the context outlives the runtime it hands out).
+    config_dir: ?std.Io.Dir = null,
+    /// The io that opened `config_dir`, kept so `deinit` can close it.
+    config_io: std.Io = std.Io.Threaded.global_single_threaded.io(),
+    /// RFC 8806 root-zone text, read confined at load with the 16 MiB limit
+    /// the serving path always used. Empty when unconfigured.
+    root_zone_text: []u8 = &.{},
 
     pub fn load(dir: std.Io.Dir, io: std.Io, config_path: []const u8, allocator: std.mem.Allocator) !ServerContext {
         try ensureConfined(dir, io, config_path);
@@ -120,9 +135,13 @@ pub const ServerContext = struct {
         var context = ServerContext{
             .allocator = allocator,
             .config = try parser.Config.parse(config_text),
+            // A fresh handle, not the caller's: the caller's may close as
+            // soon as `load` returns, while reload sources borrow this one
+            // until `deinit`.
+            .config_dir = try dir.openDir(io, ".", .{}),
+            .config_io = io,
         };
         errdefer context.deinit();
-
         // RFC 9210 section 4.2: the connection limits the operator configured
         // are the ones the TCP listener enforces.
         listener.setTcpLimits(context.config.tcp_limits);
@@ -185,7 +204,7 @@ pub const ServerContext = struct {
                 return Error.BadDnssecKey;
             };
             const first_ksk = if (zone_key.ksk) |*first| first else {
-                // The DS the zone publishes states one key, and the scheme
+                // The DS the parent publishes states one key, and the scheme
                 // needs that key to name the second one beside.
                 return Error.BadDnssecKey;
             };
@@ -263,6 +282,13 @@ pub const ServerContext = struct {
             const owned_path = try allocator.dupe(u8, ca_path);
             context.forwarder_ca_dir = dir;
             context.forwarder_ca_path = owned_path;
+        }
+        try loadOdohTarget(&context, dir, io, allocator);
+        // RFC 8806: read the root zone here so it goes through the same
+        // confinement as every other referenced file, with the 16 MiB limit
+        // the serving path always used.
+        if (context.config.has_root_zone) {
+            context.root_zone_text = try readReferencedFileLimit(dir, io, context.config.root_zone.text(), allocator, 16 * 1024 * 1024);
         }
         const now_seconds: u32 = @intCast(@divTrunc(
             std.Io.Clock.real.now(io).nanoseconds,
@@ -487,6 +513,25 @@ pub const ServerContext = struct {
                 return error.BadConfiguration;
             };
         }
+        // Default deny: transfers need an allow-transfer entry for the apex.
+        for (self.config.allow_transfers.items[0..self.config.allow_transfers.len]) |entry| {
+            const apex = entry.apexText();
+            var served = false;
+            for (self.config.zones.items[0..self.config.zones.len]) |zone| {
+                if (std.ascii.eqlIgnoreCase(zone.nameText(), apex)) served = true;
+            }
+            if (self.config.catalogZoneText()) |catalog_apex| {
+                if (std.ascii.eqlIgnoreCase(catalog_apex, apex)) served = true;
+            }
+            if (!served) {
+                runtime.deinit();
+                return error.BadConfiguration;
+            }
+            runtime.addTransferAllow(apex, entry.cidr) catch {
+                runtime.deinit();
+                return error.BadConfiguration;
+            };
+        }
         for (self.config.notifies.items[0..self.config.notifies.len]) |entry| {
             var served = false;
             for (self.config.zones.items[0..self.config.zones.len]) |zone| {
@@ -538,13 +583,12 @@ pub const ServerContext = struct {
             if (runtime.resolver) |*resolver| resolver.setRootHints(hints[0..hint_count]);
         }
         // RFC 8806: a local root zone answers root queries and disables
-        // network priming. Validate before accepting it.
+        // network priming. Validate before accepting it. The text was read
+        // confined at load, so this path only validates and enables.
         if (self.config.has_root_zone) {
-            const zone_text = std.Io.Dir.cwd().readFileAlloc(io, self.config.root_zone.text(), self.allocator, .limited(16 * 1024 * 1024)) catch {
-                runtime.deinit();
-                return error.BadConfiguration;
-            };
+            const zone_text = self.root_zone_text;
             defer self.allocator.free(zone_text);
+            self.root_zone_text = &.{};
             var zone_file = zone_parser.ZoneFile.parse(zone_text) catch {
                 runtime.deinit();
                 return error.BadConfiguration;
@@ -592,9 +636,31 @@ pub const ServerContext = struct {
             for (state.members) |member| {
                 self.allocator.free(member.label);
                 self.allocator.free(member.name);
+                for (member.properties) |property| {
+                    self.allocator.free(property.key);
+                    self.allocator.free(property.value);
+                }
+                self.allocator.free(member.properties);
             }
             self.allocator.free(state.members);
             self.catalog_consumer_state = null;
+        }
+        runtime.secondary_zones = self.secondary_zones;
+        // SIGHUP re-reads every configured primary zone file through the
+        // same base dir `load` read it from. A catalog or blacklist zone is
+        // synthesized, so it has no file and is not a source.
+        if (self.config_dir) |base| {
+            for (self.config.zones.items[0..self.config.zones.len]) |*configured| {
+                if (std.mem.eql(u8, configured.kindText(), "secondary")) continue;
+                for (runtime.zones.items) |*zone| {
+                    if (!zoneNamesEqual(configured.nameText(), zone.originText())) continue;
+                    runtime.addReloadSource(base, configured.fileText(), zone.originText()) catch {
+                        runtime.deinit();
+                        return error.BadConfiguration;
+                    };
+                    break;
+                }
+            }
         }
         runtime.secondary_zones = self.secondary_zones;
         self.secondary_zones = .empty;
@@ -623,11 +689,26 @@ pub const ServerContext = struct {
             for (state.members) |member| {
                 self.allocator.free(member.label);
                 self.allocator.free(member.name);
+                for (member.properties) |property| {
+                    self.allocator.free(property.key);
+                    self.allocator.free(property.value);
+                }
+                self.allocator.free(member.properties);
             }
             self.allocator.free(state.members);
             self.catalog_consumer_state = null;
         }
         self.config = .{};
+        if (self.config_dir) |*base| {
+            // Reload sources borrowed this handle; every runtime built from
+            // this context is gone by the time the context is deinited.
+            base.close(self.config_io);
+            self.config_dir = null;
+        }
+        if (self.root_zone_text.len != 0) {
+            self.allocator.free(self.root_zone_text);
+            self.root_zone_text = &.{};
+        }
         if (self.dnssec_session) |*session| session.deinit();
         self.dnssec_session = null;
         // Anchors that never reached a policy (load failed, or the context was
@@ -649,8 +730,58 @@ pub const ServerContext = struct {
             self.forwarder_ca_path = &.{};
         }
         self.forwarder_ca_dir = null;
+        if (self.odoh_target) |*target| {
+            std.crypto.secureZero(u8, &target.private_key);
+            self.odoh_target = null;
+        }
+        if (self.odoh_configs.len != 0) {
+            self.allocator.free(self.odoh_configs);
+            self.odoh_configs = &.{};
+        }
     }
 };
+
+/// RFC 9230 target: a stray key file with the target off misleads the
+/// operator, so refuse it; when on, the key is required and the published
+/// configs are written atomically (temp + rename). A separate function so
+/// `load`'s frame stays small: ServerContext and Config are large structs.
+fn loadOdohTarget(context: *ServerContext, dir: std.Io.Dir, io: std.Io, allocator: std.mem.Allocator) !void {
+    if (!context.config.odohTarget()) {
+        if (context.config.odohKeyFileText() != null) return Error.BadConfiguration;
+        if (context.config.odohConfigOutText() != null) return Error.BadConfiguration;
+        return;
+    }
+    const key_path = context.config.odohKeyFileText() orelse return Error.BadConfiguration;
+    const key_text = try readReferencedFile(dir, io, key_path, allocator);
+    defer allocator.free(key_text);
+    defer std.crypto.secureZero(u8, key_text);
+    const private_key = odoh.parsePrivateKeyHex(key_text) catch return Error.BadConfiguration;
+    const target = odoh.makeTarget(private_key);
+    context.odoh_target = target;
+    errdefer {
+        if (context.odoh_target) |*t| std.crypto.secureZero(u8, &t.private_key);
+        context.odoh_target = null;
+    }
+    context.odoh_configs = try odoh.buildConfigs(allocator, target.public_key);
+    errdefer {
+        allocator.free(context.odoh_configs);
+        context.odoh_configs = &.{};
+    }
+    if (context.config.odohConfigOutText()) |out_path| {
+        // The output may not exist yet, so check the path shape before
+        // resolving: ensureConfined would FileNotFound on a missing
+        // target. Writes stay confined via rename in dir.
+        if (!isConfinedPath(out_path)) return Error.InvalidReferencedPath;
+        if (std.mem.indexOfScalar(u8, out_path, '/') != null) return Error.InvalidReferencedPath;
+        const temp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{out_path});
+        defer allocator.free(temp_path);
+        const file = try dir.createFile(io, temp_path, .{ .truncate = true });
+        defer file.close(io);
+        try file.writeStreamingAll(io, context.odoh_configs);
+        try file.sync(io);
+        try dir.rename(temp_path, dir, out_path, io);
+    }
+}
 
 /// Opens the RFC 1995 delta journal the configuration names. The file is
 /// created when it is not there yet, and it sits directly in the
@@ -703,11 +834,15 @@ fn printStartupError(io: std.Io, message: []const u8) void {
 }
 
 fn readReferencedFile(dir: std.Io.Dir, io: std.Io, sub_path: []const u8, allocator: std.mem.Allocator) ![]u8 {
+    return readReferencedFileLimit(dir, io, sub_path, allocator, 1024 * 1024);
+}
+
+fn readReferencedFileLimit(dir: std.Io.Dir, io: std.Io, sub_path: []const u8, allocator: std.mem.Allocator, limit: usize) ![]u8 {
     ensureConfined(dir, io, sub_path) catch |err| switch (err) {
         error.FileNotFound => return Error.MissingReferencedFile,
         else => return err,
     };
-    return dir.readFileAlloc(io, sub_path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+    return dir.readFileAlloc(io, sub_path, allocator, .limited(limit)) catch |err| switch (err) {
         error.FileNotFound => return Error.MissingReferencedFile,
         else => return err,
     };
@@ -759,7 +894,7 @@ fn loadZoneText(
     }
     var zone = try zone_index.Zone.fromZoneFile(&zone_file);
     errdefer zone.deinit();
-    // RFC 4035 section 2.3: signing adds DNSKEY, DS, RRSIG, and NSEC to
+    // RFC 4035 section 2.3: signing adds DNSKEY, RRSIG, and NSEC to
     // the loaded zone, so the signed RRsets are served from here on
     // without touching the zone file on disk.
     const had_apex_zonemd = zonemd.hasApexRecord(&zone);
@@ -923,6 +1058,7 @@ fn blacklistOwner(buffer: *[512]u8, entry: []const u8) ![]const u8 {
     } else |_| {}
     const name = std.mem.trim(u8, entry, ".");
     if (name.len == 0) return error.BadEntry;
+    if (name.len > buffer.len) return error.EntryTooLong;
     if (std.ascii.eqlIgnoreCase(name, "invalid")) return error.ForbiddenTestEntry;
     for (name) |byte| {
         if (std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_' or byte == '.') continue;
@@ -981,6 +1117,16 @@ fn loadSecondaryZone(
 /// broken catalog (section 5.1). A member is served unsigned locally: its
 /// records arrive with whatever signatures its own primary publishes, and
 /// this server never re-signs a zone it does not hold the key for.
+/// Index of a zone the configuration already serves, if any: catalog content
+/// never overwrites it. Runs after the catalog zone itself is appended, so
+/// the check always skips it.
+fn zoneIndexForConfigured(context: *const ServerContext, origin: []const u8) ?usize {
+    for (context.zones.items, 0..) |zone, index| {
+        if (std.ascii.eqlIgnoreCase(zone.originText(), origin)) return index;
+    }
+    return null;
+}
+
 fn consumeCatalog(
     context: *ServerContext,
     io: std.Io,
@@ -1001,39 +1147,74 @@ fn consumeCatalog(
         for (members) |member| {
             allocator.free(member.label);
             allocator.free(member.name);
+            for (member.properties) |property| {
+                allocator.free(property.key);
+                allocator.free(property.value);
+            }
+            allocator.free(member.properties);
         }
         allocator.free(members);
     }
+    const group = consumer.groupText();
     try loadZoneText(context, allocator, io, catalog_text, apex, null, now_seconds, chain_policy);
+    // The runtime keeps the same facts so a NOTIFY for the catalog can ask
+    // for another read (RFC 9432 section 5.4). Only selected members are
+    // fetched and recorded, and a member at an apex the configuration
+    // already serves is skipped: a locally configured zone is never
+    // overwritten by catalog content.
+    var owned_members: std.ArrayList(catalog_mod.Member) = .empty;
+    errdefer {
+        for (owned_members.items) |member| {
+            allocator.free(member.label);
+            allocator.free(member.name);
+            for (member.properties) |property| {
+                allocator.free(property.key);
+                allocator.free(property.value);
+            }
+            allocator.free(member.properties);
+        }
+        owned_members.deinit(allocator);
+    }
     for (members) |member| {
+        if (!catalog_mod.selected(member, group)) continue;
+        if (zoneIndexForConfigured(context, member.name) != null) {
+            var clash: [256]u8 = undefined;
+            const clash_message = std.fmt.bufPrint(&clash, "catalog member {s} clashes with a configured zone and is skipped", .{member.name}) catch "a catalog member clashes with a configured zone and is skipped";
+            printStartupError(io, clash_message);
+            continue;
+        }
         const member_text = xfr_client.fetch(allocator, io, &primary, member.name, timeout) catch return Error.BadCatalogMember;
         defer allocator.free(member_text);
         try loadZoneText(context, allocator, io, member_text, member.name, null, now_seconds, chain_policy);
-    }
-
-    // The runtime keeps the same facts so a NOTIFY for the catalog can ask
-    // for another read (RFC 9432 section 5.4).
-    const owned_members = try allocator.alloc(catalog_mod.Member, members.len);
-    var filled: usize = 0;
-    errdefer {
-        for (owned_members[0..filled]) |member| {
-            allocator.free(member.label);
-            allocator.free(member.name);
+        const owned_label = try allocator.dupe(u8, member.label);
+        errdefer allocator.free(owned_label);
+        const owned_name = try allocator.dupe(u8, member.name);
+        errdefer allocator.free(owned_name);
+        var owned_properties: std.ArrayList(catalog_mod.Property) = .empty;
+        errdefer {
+            for (owned_properties.items) |property| {
+                allocator.free(property.key);
+                allocator.free(property.value);
+            }
+            owned_properties.deinit(allocator);
         }
-        allocator.free(owned_members);
-    }
-    for (members, 0..) |member, index| {
-        owned_members[index] = .{
-            .label = try allocator.dupe(u8, member.label),
-            .name = try allocator.dupe(u8, member.name),
-        };
-        filled += 1;
+        for (member.properties) |property| {
+            const key = try allocator.dupe(u8, property.key);
+            errdefer allocator.free(key);
+            const value = try allocator.dupe(u8, property.value);
+            try owned_properties.append(allocator, .{ .key = key, .value = value });
+        }
+        try owned_members.append(allocator, .{
+            .label = owned_label,
+            .name = owned_name,
+            .properties = try owned_properties.toOwnedSlice(allocator),
+        });
     }
     context.catalog_consumer_state = .{
         .apex = try allocator.dupe(u8, apex),
         .primary = primary,
-        .members = owned_members,
-        .group = if (consumer.groupText()) |value| try allocator.dupe(u8, value) else null,
+        .members = try owned_members.toOwnedSlice(allocator),
+        .group = if (group) |value| try allocator.dupe(u8, value) else null,
     };
 }
 
@@ -1266,6 +1447,44 @@ test "ddr-client on requires a plaintext forwarder and a recursion ACL" {
     defer context.deinit();
 }
 
+test "odoh target refusal and happy path" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const key_hex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.writeFile(io, .{ .sub_path = "ononly.gdns", .data = "odoh-target on\n" });
+    try std.testing.expectError(Error.BadConfiguration, ServerContext.load(dir.dir, io, "ononly.gdns", std.testing.allocator));
+    try dir.dir.writeFile(io, .{ .sub_path = "odoh.key", .data = key_hex });
+    try dir.dir.writeFile(io, .{ .sub_path = "off.gdns", .data = "odoh-target off\nodoh-key-file odoh.key\n" });
+    try std.testing.expectError(Error.BadConfiguration, ServerContext.load(dir.dir, io, "off.gdns", std.testing.allocator));
+    try dir.dir.writeFile(io, .{ .sub_path = "implicit.gdns", .data = "odoh-key-file odoh.key\n" });
+    try std.testing.expectError(Error.BadConfiguration, ServerContext.load(dir.dir, io, "implicit.gdns", std.testing.allocator));
+    try dir.dir.writeFile(io, .{ .sub_path = "strayout.gdns", .data = "odoh-target off\nodoh-config-out odoh.bin\n" });
+    try std.testing.expectError(Error.BadConfiguration, ServerContext.load(dir.dir, io, "strayout.gdns", std.testing.allocator));
+    try dir.dir.writeFile(io, .{ .sub_path = "implicitout.gdns", .data = "odoh-config-out odoh.bin\n" });
+    try std.testing.expectError(Error.BadConfiguration, ServerContext.load(dir.dir, io, "implicitout.gdns", std.testing.allocator));
+    try dir.dir.writeFile(io, .{ .sub_path = "bad.key", .data = "not hex" });
+    try dir.dir.writeFile(io, .{ .sub_path = "bad.gdns", .data = "odoh-target on\nodoh-key-file bad.key\n" });
+    try std.testing.expectError(Error.BadConfiguration, ServerContext.load(dir.dir, io, "bad.gdns", std.testing.allocator));
+    try dir.dir.writeFile(io, .{ .sub_path = "escape.gdns", .data = "odoh-target on\nodoh-key-file ../outside.key\n" });
+    try std.testing.expectError(Error.InvalidReferencedPath, ServerContext.load(dir.dir, io, "escape.gdns", std.testing.allocator));
+    try dir.dir.writeFile(io, .{ .sub_path = "escapeout.gdns", .data = "odoh-target on\nodoh-key-file odoh.key\nodoh-config-out ../outside.bin\n" });
+    try std.testing.expectError(Error.InvalidReferencedPath, ServerContext.load(dir.dir, io, "escapeout.gdns", std.testing.allocator));
+    try dir.dir.writeFile(io, .{ .sub_path = "good.gdns", .data = "odoh-target on\nodoh-key-file odoh.key\nodoh-config-out odoh.bin\n" });
+    var context = try ServerContext.load(dir.dir, io, "good.gdns", std.testing.allocator);
+    defer context.deinit();
+    try std.testing.expect(context.odoh_target != null);
+    try std.testing.expectEqual(@as(usize, 46), context.odoh_configs.len);
+    const written = try dir.dir.readFileAlloc(io, "odoh.bin", std.testing.allocator, .limited(1024));
+    defer std.testing.allocator.free(written);
+    try std.testing.expectEqualSlices(u8, context.odoh_configs, written);
+    try dir.dir.writeFile(io, .{ .sub_path = "plain.gdns", .data = "listen dns udp 127.0.0.1:1053\n" });
+    var plain = try ServerContext.load(dir.dir, io, "plain.gdns", std.testing.allocator);
+    defer plain.deinit();
+    try std.testing.expect(plain.odoh_target == null);
+    try std.testing.expectEqual(@as(usize, 0), plain.odoh_configs.len);
+}
+
 test "forwarder-ca-file must name a confined file that exists" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var dir = std.testing.tmpDir(.{});
@@ -1323,18 +1542,20 @@ test "a signed zone carries an RRSIG over its ZONEMD RRset" {
     try std.testing.expect(std.mem.startsWith(u8, message, "zone example.: ZONEMD verified"));
 }
 
-// A loopback primary that answers the AXFR for whichever of the two zones the
-// question names, so the consumer's catalog fetch and member fetch both meet a
-// real transfer.
+// A loopback primary that answers the AXFR for whichever of the listed zones
+// the question names, so the consumer's catalog fetch and member fetches meet
+// a real transfer. `served` counts answered connections, so a test can prove
+// an unselected member was never fetched.
 const CatalogServer = struct {
     io: std.Io,
     listener: *std.Io.net.Server,
-    zones: *const [2]*const zone_index.Zone,
+    zones: []const *const zone_index.Zone,
     connections: usize,
+    served: *std.atomic.Value(usize),
 
     fn run(args: CatalogServer) void {
-        var served: usize = 0;
-        while (served < args.connections) : (served += 1) {
+        var done: usize = 0;
+        while (done < args.connections) : (done += 1) {
             var stream = args.listener.accept(args.io) catch return;
             defer stream.close(args.io);
             var read_buffer: [4096]u8 = undefined;
@@ -1370,6 +1591,7 @@ const CatalogServer = struct {
                 writer.interface.writeAll(frame_writer.written()) catch return;
             }
             writer.interface.flush() catch return;
+            _ = args.served.fetchAdd(1, .acq_rel);
         }
     }
 };
@@ -1391,7 +1613,8 @@ test "the catalog consumer refuses a schema version this build does not implemen
     defer catalog_file.deinit();
     var catalog_zone = try zone_index.Zone.fromZoneFile(&catalog_file);
     defer catalog_zone.deinit();
-    const zones = [2]*const zone_index.Zone{ &catalog_zone, &catalog_zone };
+    const zones = [_]*const zone_index.Zone{ &catalog_zone, &catalog_zone };
+    var served: std.atomic.Value(usize) = .init(0);
 
     var listen_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     var transfer_server = try std.Io.net.IpAddress.listen(&listen_address, io, .{ .mode = .stream, .protocol = .tcp });
@@ -1405,6 +1628,7 @@ test "the catalog consumer refuses a schema version this build does not implemen
         .listener = &transfer_server,
         .zones = &zones,
         .connections = 1,
+        .served = &served,
     }});
     defer thread.join();
 
@@ -1444,7 +1668,8 @@ test "the catalog consumer provisions the members a catalog names" {
     defer member_file.deinit();
     var member_zone = try zone_index.Zone.fromZoneFile(&member_file);
     defer member_zone.deinit();
-    const zones = [2]*const zone_index.Zone{ &catalog_zone, &member_zone };
+    const zones = [_]*const zone_index.Zone{ &catalog_zone, &member_zone };
+    var served: std.atomic.Value(usize) = .init(0);
 
     var listen_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     var transfer_server = try std.Io.net.IpAddress.listen(&listen_address, io, .{ .mode = .stream, .protocol = .tcp });
@@ -1458,6 +1683,7 @@ test "the catalog consumer provisions the members a catalog names" {
         .listener = &transfer_server,
         .zones = &zones,
         .connections = 2,
+        .served = &served,
     }});
     defer thread.join();
 
@@ -1484,6 +1710,153 @@ test "the catalog consumer provisions the members a catalog names" {
     const response = try dns_message.Message.parse(arena.allocator(), response_bytes);
     try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
     try std.testing.expectEqualSlices(u8, &.{ 192, 0, 2, 80 }, &response.answers.items[0].rdata.A);
+}
+
+test "the catalog consumer provisions only the selected group and never fetches coo" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    const catalog_text =
+        \\$ORIGIN catalog.example.
+        \\$TTL 3600
+        \\@ IN SOA invalid. hostmaster.invalid. 1 3600 900 1209600 3600
+        \\@ IN NS invalid.
+        \\version IN TXT "2"
+        \\ma.zones IN PTR alpha.example.
+        \\ma.zones IN TXT "group=alpha"
+        \\mb.zones IN PTR beta.example.
+        \\mb.zones IN TXT "group=beta"
+        \\mn.zones IN PTR plain.example.
+        \\mc.zones IN PTR redirected.example.
+        \\mc.zones IN TXT "group=alpha"
+        \\mc.zones IN TXT "coo=other.example."
+        \\
+    ;
+    const member_text =
+        \\$ORIGIN alpha.example.
+        \\$TTL 3600
+        \\@ IN SOA ns.alpha.example. hostmaster.alpha.example. 3 3600 900 1209600 3600
+        \\@ IN NS ns.alpha.example.
+        \\www IN A 192.0.2.81
+        \\
+    ;
+    var catalog_file = try zone_parser.ZoneFile.parse(catalog_text);
+    defer catalog_file.deinit();
+    var catalog_zone = try zone_index.Zone.fromZoneFile(&catalog_file);
+    defer catalog_zone.deinit();
+    var member_file = try zone_parser.ZoneFile.parse(member_text);
+    defer member_file.deinit();
+    var member_zone = try zone_index.Zone.fromZoneFile(&member_file);
+    defer member_zone.deinit();
+    const zones = [_]*const zone_index.Zone{ &catalog_zone, &member_zone };
+    var served: std.atomic.Value(usize) = .init(0);
+
+    var listen_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var transfer_server = try std.Io.net.IpAddress.listen(&listen_address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer transfer_server.deinit(io);
+    const port = switch (transfer_server.socket.address) {
+        .ip4 => |ip4| ip4.port,
+        .ip6 => |ip6| ip6.port,
+    };
+    // One catalog fetch plus one member fetch: the beta member, the
+    // groupless member, and the coo member are never fetched.
+    const thread = try std.Thread.spawn(.{}, CatalogServer.run, .{CatalogServer{
+        .io = io,
+        .listener = &transfer_server,
+        .zones = &zones,
+        .connections = 2,
+        .served = &served,
+    }});
+    defer thread.join();
+
+    var config_buffer: [256]u8 = undefined;
+    const config = try std.fmt.bufPrint(&config_buffer, "catalog-consumer catalog.example. 127.0.0.1:{d} group alpha\n", .{port});
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = config });
+
+    var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+    defer context.deinit();
+    // The catalog zone plus the one selected member.
+    try std.testing.expectEqual(@as(usize, 2), context.zones.items.len);
+    try std.testing.expectEqual(@as(usize, 2), served.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), context.catalog_consumer_state.?.members.len);
+    try std.testing.expectEqualStrings("alpha.example.", context.catalog_consumer_state.?.members[0].name);
+}
+
+test "the catalog consumer keeps a locally configured zone at a member apex" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    const catalog_text =
+        \\$ORIGIN catalog.example.
+        \\$TTL 3600
+        \\@ IN SOA invalid. hostmaster.invalid. 1 3600 900 1209600 3600
+        \\@ IN NS invalid.
+        \\version IN TXT "2"
+        \\ml.zones IN PTR local.example.
+        \\
+    ;
+    // The member claims a different serial, but the configured file wins.
+    const member_text =
+        \\$ORIGIN local.example.
+        \\$TTL 3600
+        \\@ IN SOA ns.local.example. hostmaster.local.example. 99 3600 900 1209600 3600
+        \\@ IN NS ns.local.example.
+        \\www IN A 192.0.2.99
+        \\
+    ;
+    const local_text =
+        \\$ORIGIN local.example.
+        \\$TTL 3600
+        \\@ IN SOA ns.local.example. hostmaster.local.example. 7 3600 900 1209600 3600
+        \\@ IN NS ns.local.example.
+        \\www IN A 192.0.2.7
+        \\
+    ;
+    var catalog_file = try zone_parser.ZoneFile.parse(catalog_text);
+    defer catalog_file.deinit();
+    var catalog_zone = try zone_index.Zone.fromZoneFile(&catalog_file);
+    defer catalog_zone.deinit();
+    var member_file = try zone_parser.ZoneFile.parse(member_text);
+    defer member_file.deinit();
+    var member_zone = try zone_index.Zone.fromZoneFile(&member_file);
+    defer member_zone.deinit();
+    const zones = [_]*const zone_index.Zone{ &catalog_zone, &member_zone };
+    var served: std.atomic.Value(usize) = .init(0);
+
+    var listen_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var transfer_server = try std.Io.net.IpAddress.listen(&listen_address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer transfer_server.deinit(io);
+    const port = switch (transfer_server.socket.address) {
+        .ip4 => |ip4| ip4.port,
+        .ip6 => |ip6| ip6.port,
+    };
+    // Only the catalog itself is fetched: the clashing member is skipped.
+    const thread = try std.Thread.spawn(.{}, CatalogServer.run, .{CatalogServer{
+        .io = io,
+        .listener = &transfer_server,
+        .zones = &zones,
+        .connections = 1,
+        .served = &served,
+    }});
+    defer thread.join();
+
+    try dir.dir.writeFile(io, .{ .sub_path = "local.zone", .data = local_text });
+    var config_buffer: [512]u8 = undefined;
+    const config = try std.fmt.bufPrint(&config_buffer, "zone local.example primary local.zone\ncatalog-consumer catalog.example. 127.0.0.1:{d}\n", .{port});
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = config });
+
+    var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 2), context.zones.items.len);
+    try std.testing.expectEqual(@as(usize, 1), served.load(.acquire));
+    // The member was not recorded: refresh will not remove the local zone.
+    try std.testing.expectEqual(@as(usize, 0), context.catalog_consumer_state.?.members.len);
+    for (context.zones.items) |*zone| {
+        if (!std.ascii.eqlIgnoreCase(zone.originText(), "local.example.")) continue;
+        try std.testing.expectEqual(@as(?u32, 7), zone.soaSerial());
+    }
 }
 
 test "server context publishes an RFC 5782 blacklist zone" {
@@ -1566,6 +1939,20 @@ test "an RFC 5782 entry list the convention forbids fails the load" {
     try std.testing.expectError(Error.BadBlacklistZone, ServerContext.load(dir.dir, io, "mapped.gdns", std.testing.allocator));
     try std.testing.expectError(Error.BadBlacklistZone, ServerContext.load(dir.dir, io, "invalid.gdns", std.testing.allocator));
     try std.testing.expectError(Error.BadBlacklistZone, ServerContext.load(dir.dir, io, "range.gdns", std.testing.allocator));
+}
+
+test "an oversized RFC 5782 entry fails the load without panicking" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{ .sub_path = "one.zone", .data = "$ORIGIN one.example.\n$TTL 3600\n@ IN SOA ns.one.example. hostmaster.one.example. 1 3600 900 1209600 3600\n@ IN NS ns.one.example.\n" });
+    var long_entry: [600]u8 = undefined;
+    @memset(&long_entry, 'a');
+    try dir.dir.writeFile(io, .{ .sub_path = "long.txt", .data = &long_entry });
+    try dir.dir.writeFile(io, .{ .sub_path = "long.gdns", .data = "zone one.example primary one.zone\nblacklist-zone bad.example. long.txt\n" });
+
+    try std.testing.expectError(Error.BadBlacklistZone, ServerContext.load(dir.dir, io, "long.gdns", std.testing.allocator));
 }
 
 /// True when the zone carries the RFC 5782 entry record at `owner`.
@@ -1962,7 +2349,7 @@ test "server context signs every zone named by the configured DNSSEC key file" {
     try dir.dir.writeFile(io, .{ .sub_path = "zsk.key", .data = dnssec_test_key });
     try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone signed.example primary signed.example.zone\ndnssec-key-file zsk.key\n" });
 
-    // std.testing.allocator fails this test if the generated DNSKEY, DS, RRSIG,
+    // std.testing.allocator fails this test if the generated DNSKEY, RRSIG,
     // and NSEC records outlive the zone, which is the whole reason the zone
     // now carries the allocator that made them.
     var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
@@ -2789,7 +3176,10 @@ const ixfr_query_bytes = [_]u8{
 /// The messages one IXFR exchange answers with, read from the length
 /// prefixed frames the transfer path returns.
 fn ixfrFrames(allocator: std.mem.Allocator, runtime: *const auth_runtime.Runtime, query: []const u8) ![]dns_message.Message {
-    const blob = try runtime.encodeTransferFrames(allocator, query);
+    var local = std.Io.net.IpAddress{ .ip4 = .loopback(0) };
+    const rt: *auth_runtime.Runtime = @constCast(runtime);
+    try rt.addTransferAllow("one.example.", parser.Cidr.parse("127.0.0.0/8") catch unreachable);
+    const blob = try runtime.encodeTransferFrames(allocator, query, &local);
     defer allocator.free(blob);
     var frames: std.ArrayList(dns_message.Message) = .empty;
     errdefer frames.deinit(allocator);

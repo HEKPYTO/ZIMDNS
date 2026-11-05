@@ -19,6 +19,7 @@ const Runtime = @import("../auth/runtime.zig").Runtime;
 const metrics = @import("../metrics.zig");
 const listener = @import("../platform/listener.zig");
 const tls_policy = @import("tls.zig");
+const StreamRegistry = @import("stream_registry.zig");
 
 /// The IANA ALPN protocol ID for DNS-over-QUIC (RFC 9250 section 4.2). The
 /// handshake selects exactly this token, so the port never serves another
@@ -40,31 +41,45 @@ pub const MAX_STREAMS: usize = 64;
 /// Counts what `onStreamData` knows about one stream.
 const DoqHandler = struct {
     pub const protocol = event_loop.Protocol.quic;
-
     allocator: std.mem.Allocator,
     runtime: *Runtime,
     io: std.Io,
     counters: ?*metrics.Counters,
     max_requests: ?usize,
     completed: usize = 0,
-    parsers: std.AutoHashMapUnmanaged(u64, *StreamParser) = .empty,
+    parsers: StreamRegistry.Registry(StreamParser) = .{ .max_entries = MAX_STREAMS },
     /// The running server, so the handler can stop the loop once the quota
     /// is served. Set before the loop starts and cleared before it ends.
     server: ?*anyopaque = null,
     request_stop: ?*const fn (*anyopaque) void = null,
 
-    fn parserFor(self: *DoqHandler, stream_id: u64) !*StreamParser {
-        if (self.parsers.get(stream_id)) |parser| return parser;
-        if (self.parsers.count() >= MAX_STREAMS) return error.TooManyStreams;
+    fn destroyParser(allocator: std.mem.Allocator, parser: *StreamParser) void {
+        allocator.destroy(parser);
+    }
+
+    fn keyFor(session: *event_loop.Session, stream_id: u64) StreamRegistry.Key {
+        return .{ .connection = session.id(), .stream = stream_id };
+    }
+
+    /// Ownership: on success the registry owns `parser`; on error the
+    /// caller keeps it (single `errdefer` destroy, no destroy in the
+    /// catch, so the error path destroys exactly once).
+    fn parserFor(self: *DoqHandler, session: *event_loop.Session, stream_id: u64) !*StreamParser {
+        const key = keyFor(session, stream_id);
+        if (self.parsers.get(key)) |parser| return parser;
         const parser = try self.allocator.create(StreamParser);
         errdefer self.allocator.destroy(parser);
         parser.* = .{};
-        try self.parsers.put(self.allocator, stream_id, parser);
+        try self.parsers.insert(self.allocator, key, parser);
         return parser;
     }
 
-    fn dropParser(self: *DoqHandler, stream_id: u64) void {
-        if (self.parsers.fetchRemove(stream_id)) |kv| self.allocator.destroy(kv.value);
+    fn dropParser(self: *DoqHandler, session: *event_loop.Session, stream_id: u64) void {
+        self.parsers.removeOne(self.allocator, keyFor(session, stream_id), destroyParser);
+    }
+
+    pub fn onConnectionClosed(self: *DoqHandler, session: *event_loop.Session) void {
+        self.parsers.removeConnection(self.allocator, session.id(), destroyParser);
     }
 
     pub fn onStreamData(self: *DoqHandler, session: *event_loop.Session, stream_id: u64, data: []const u8, fin: bool) void {
@@ -75,7 +90,7 @@ const DoqHandler = struct {
             session.resetQuicStream(stream_id, DOQ_PROTOCOL_ERROR);
             return;
         }
-        const parser = self.parserFor(stream_id) catch {
+        const parser = self.parserFor(session, stream_id) catch {
             session.resetQuicStream(stream_id, DOQ_PROTOCOL_ERROR);
             return;
         };
@@ -86,7 +101,7 @@ const DoqHandler = struct {
                 // second query on this stream (RFC 9250 section 4.3).
                 if (parser.extra) {
                     session.resetQuicStream(stream_id, DOQ_PROTOCOL_ERROR);
-                    self.dropParser(stream_id);
+                    self.dropParser(session, stream_id);
                     return;
                 }
                 self.maybeStop();
@@ -94,7 +109,7 @@ const DoqHandler = struct {
             .incomplete => {},
             .protocol_error => {
                 session.resetQuicStream(stream_id, DOQ_PROTOCOL_ERROR);
-                self.dropParser(stream_id);
+                self.dropParser(session, stream_id);
                 return;
             },
         }
@@ -102,10 +117,10 @@ const DoqHandler = struct {
         // already answered above; an incomplete one is a protocol error.
         if (fin) {
             if (parser.hasMessage()) {
-                self.dropParser(stream_id);
+                self.dropParser(session, stream_id);
             } else {
                 session.resetQuicStream(stream_id, DOQ_PROTOCOL_ERROR);
-                self.dropParser(stream_id);
+                self.dropParser(session, stream_id);
             }
         }
     }
@@ -286,7 +301,7 @@ pub fn serveDoqLoopOnAddress(
         .counters = counters,
         .max_requests = max_requests,
     };
-    defer handler.parsers.deinit(allocator);
+    defer handler.parsers.deinit(allocator, DoqHandler.destroyParser);
     var server = try event_loop.Server(DoqHandler).init(allocator, &handler, .{
         .address = address_text,
         .port = address.getPort(),

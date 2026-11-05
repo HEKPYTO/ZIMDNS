@@ -108,8 +108,9 @@ pub const Name = struct {
     /// The 0x20 mechanism: the case of the first letter of each label is
     /// drawn at random and the rest of the label keeps its case. The name
     /// still compares equal to the one it was built from, so the responder's
-    /// case-insensitive comparison (RFC 1035 section 2.3.3) still matches it,
-    /// while a forged answer has to carry the exact case to be accepted.
+    /// case-insensitive comparison (RFC 1035 section 2.3.3) still matches it.
+    /// The query CLI requires the echoed question bytes to match exactly when
+    /// 0x20 is enabled, so a forged answer has to carry the exact case.
     pub fn withRandomizedLabelFirstCase(self: *const Name, random: std.Random) Name {
         var out = self.*;
         var index: usize = 0;

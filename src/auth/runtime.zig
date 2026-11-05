@@ -16,6 +16,7 @@ const dns_validate = @import("../dns/validate.zig");
 const dns_writer = @import("../dns/writer.zig");
 const response = @import("response.zig");
 const zone_parser = @import("../zone/parser.zig");
+const config_parser = @import("../config/parser.zig");
 const zone_index = @import("../zone/index.zig");
 const zone_signer = @import("../zone/signer.zig");
 const metrics = @import("../metrics.zig");
@@ -126,6 +127,13 @@ pub const UpdatePolicy = struct {
     key_name: []const u8,
     dir: std.Io.Dir,
     path: []const u8,
+};
+
+/// One transfer ACL: the zone apex and one client CIDR allowed AXFR/IXFR.
+/// Empty means deny all.
+pub const TransferAllow = struct {
+    origin: []const u8,
+    cidr: config_parser.Cidr,
 };
 
 /// What one zone replacement did. The served zone changes only when the
@@ -243,6 +251,8 @@ pub const Runtime = struct {
     /// RFC 2136 update policies, one per zone the operator allowed updates
     /// for. Empty unless `allow-update` is configured.
     update_policies: std.ArrayList(UpdatePolicy) = .empty,
+    /// Transfer ACLs, one per `allow-transfer` line. Empty denies all.
+    transfer_allows: std.ArrayList(TransferAllow) = .empty,
     /// RFC 1996 secondaries to notify when one of the listed zones changes.
     /// Empty unless `notify` is configured. The apex string is heap-owned.
     notify_targets: std.ArrayList(NotifyTarget) = .empty,
@@ -471,6 +481,9 @@ pub const Runtime = struct {
         }
         self.update_policies.deinit(self.allocator);
         self.update_policies = .empty;
+        for (self.transfer_allows.items) |allow| self.allocator.free(allow.origin);
+        self.transfer_allows.deinit(self.allocator);
+        self.transfer_allows = .empty;
         for (self.notify_targets.items) |target| self.allocator.free(target.apex);
         self.notify_targets.deinit(self.allocator);
         self.notify_targets = .empty;
@@ -564,6 +577,12 @@ pub const Runtime = struct {
             .dir = dir,
             .path = owned_path,
         });
+    }
+    /// Records one transfer ACL: the apex and one client CIDR allowed AXFR/IXFR.
+    pub fn addTransferAllow(self: *Runtime, origin: []const u8, cidr: config_parser.Cidr) !void {
+        const owned_origin = try self.allocator.dupe(u8, origin);
+        errdefer self.allocator.free(owned_origin);
+        try self.transfer_allows.append(self.allocator, .{ .origin = owned_origin, .cidr = cidr });
     }
 
     /// Registers one RFC 9461 SVCB record for `_dns.resolver.arpa.` and its
@@ -735,15 +754,47 @@ pub const Runtime = struct {
             }
         }
 
-        // Every member is fetched and parsed before the lock is taken, so a
-        // failed transfer or a broken zone leaves the served set whole.
-        var member_zones: std.ArrayList(zone_index.Zone) = .empty;
+        // Every selected member is fetched and parsed before the lock is
+        // taken, so a failed transfer or a broken zone leaves the served set
+        // whole. Unselected members (coo, wrong group) are never fetched.
+        // The selection is copied first: `new_members` is freed at the end
+        // while the owned set keeps its own copies.
+        var selected: std.ArrayList(catalog_mod.Member) = .empty;
+        defer {
+            for (selected.items) |member| {
+                self.allocator.free(member.label);
+                self.allocator.free(member.name);
+                freeProperties(self.allocator, member.properties);
+            }
+            selected.deinit(self.allocator);
+        }
         for (new_members) |member| {
-            var is_coo = false;
-            for (member.properties) |property| if (std.ascii.eqlIgnoreCase(property.key, "coo")) {
-                is_coo = true;
+            if (!catalog_mod.selected(member, consumer.group_selector)) continue;
+            const label = self.allocator.dupe(u8, member.label) catch {
+                catalog_zone.deinit();
+                return .failed;
             };
-            if (is_coo) continue;
+            const name = self.allocator.dupe(u8, member.name) catch {
+                self.allocator.free(label);
+                catalog_zone.deinit();
+                return .failed;
+            };
+            const properties = dupeProperties(self.allocator, member.properties) catch {
+                self.allocator.free(label);
+                self.allocator.free(name);
+                catalog_zone.deinit();
+                return .failed;
+            };
+            selected.append(self.allocator, .{ .label = label, .name = name, .properties = properties }) catch {
+                self.allocator.free(label);
+                self.allocator.free(name);
+                freeProperties(self.allocator, properties);
+                catalog_zone.deinit();
+                return .failed;
+            };
+        }
+        var member_zones: std.ArrayList(zone_index.Zone) = .empty;
+        for (selected.items) |member| {
             const text = xfr_client.fetch(self.allocator, io, &consumer.primary, member.name, timeout) catch {
                 reportReload(io, "error: cannot fetch the catalog member {s}", .{member.name});
                 for (member_zones.items) |*zone| zone.deinit();
@@ -812,14 +863,17 @@ pub const Runtime = struct {
             self.transfer_delta_logs.append(self.allocator, .{}) catch {};
         }
 
-        // A member whose label changed is removed and added again with fresh
-        // state (RFC 9432 section 5.4); a member the catalog stops naming is
-        // removed. The catalog zone itself stays.
+        // `consumer.members` is the owned set: only apexes this consumer
+        // installed. A member whose label changed is removed and added again
+        // with fresh state (RFC 9432 section 5.4); a member the catalog
+        // stops naming is removed. An apex this consumer never installed —
+        // a configured local zone or another catalog's member — is never
+        // touched. The catalog zone itself stays.
         var index: usize = 0;
         while (index < consumer.members.items.len) {
             const old = consumer.members.items[index];
             var keep = false;
-            for (new_members) |member| {
+            for (selected.items) |member| {
                 if (!std.ascii.eqlIgnoreCase(member.name, old.name)) continue;
                 if (!std.ascii.eqlIgnoreCase(member.label, old.label)) continue;
                 keep = true;
@@ -831,26 +885,22 @@ pub const Runtime = struct {
             self.removeZoneLocked(old.name);
             self.allocator.free(old.label);
             self.allocator.free(old.name);
-            for (old.properties) |property| {
-                self.allocator.free(property.key);
-                self.allocator.free(property.value);
-            }
-            self.allocator.free(old.properties);
+            freeProperties(self.allocator, old.properties);
             _ = consumer.members.orderedRemove(index);
         }
-        var member_zone_index: usize = 0;
-        for (new_members) |member| {
-            // coo members are not provisioned here.
-            var coo_member = false;
-            for (member.properties) |property| if (std.ascii.eqlIgnoreCase(property.key, "coo")) {
-                coo_member = true;
-            };
-            if (coo_member) continue;
+        for (selected.items, 0..) |member, member_zone_index| {
             var member_zone = member_zones.items[member_zone_index];
-            member_zone_index += 1;
             if (self.zoneIndexForOrigin(member.name) != null) {
+                if (!ownedByConsumer(consumer, member.name)) {
+                    member_zone.deinit();
+                    reportReload(io, "catalog member {s} clashes with a served zone and is skipped", .{member.name});
+                    continue;
+                }
                 const installed = self.installZoneLocked(io, member.name, &member_zone);
-                if (installed != .replaced) member_zone.deinit();
+                if (installed != .replaced) {
+                    member_zone.deinit();
+                    continue;
+                }
             } else {
                 self.zones.append(self.allocator, member_zone) catch {
                     member_zone.deinit();
@@ -858,53 +908,21 @@ pub const Runtime = struct {
                 };
                 self.transfer_delta_logs.append(self.allocator, .{}) catch {};
             }
-            // RFC 9432 section 4.3: a member whose `coo` property points at
-            // another catalog belongs to that catalog, not this one; this
-            // consumer skips provisioning it.
-            var is_coo = false;
-            for (member.properties) |property| {
-                if (std.ascii.eqlIgnoreCase(property.key, "coo")) is_coo = true;
-            }
-            if (is_coo) continue;
+            if (ownedByConsumer(consumer, member.name)) continue;
             const label = self.allocator.dupe(u8, member.label) catch continue;
             const name = self.allocator.dupe(u8, member.name) catch {
                 self.allocator.free(label);
                 continue;
             };
-            var property_list: std.ArrayList(catalog_mod.Property) = .empty;
-            for (member.properties) |property| {
-                const key = self.allocator.dupe(u8, property.key) catch {
-                    self.allocator.free(label);
-                    self.allocator.free(name);
-                    for (property_list.items) |owned_property| {
-                        self.allocator.free(owned_property.key);
-                        self.allocator.free(owned_property.value);
-                    }
-                    property_list.deinit(self.allocator);
-                    continue;
-                };
-                const value = self.allocator.dupe(u8, property.value) catch {
-                    self.allocator.free(key);
-                    self.allocator.free(label);
-                    self.allocator.free(name);
-                    for (property_list.items) |owned_property| {
-                        self.allocator.free(owned_property.key);
-                        self.allocator.free(owned_property.value);
-                    }
-                    property_list.deinit(self.allocator);
-                    continue;
-                };
-                property_list.append(self.allocator, .{ .key = key, .value = value }) catch {};
-            }
-            const properties = property_list.toOwnedSlice(self.allocator) catch &.{};
+            const properties = dupeProperties(self.allocator, member.properties) catch {
+                self.allocator.free(label);
+                self.allocator.free(name);
+                continue;
+            };
             consumer.members.append(self.allocator, .{ .label = label, .name = name, .properties = properties }) catch {
                 self.allocator.free(label);
                 self.allocator.free(name);
-                for (properties) |property| {
-                    self.allocator.free(property.key);
-                    self.allocator.free(property.value);
-                }
-                self.allocator.free(properties);
+                freeProperties(self.allocator, properties);
             };
         }
         member_zones.deinit(self.allocator);
@@ -1044,6 +1062,12 @@ pub const Runtime = struct {
             if (sameDnsName(policy.origin, origin)) return policy;
         }
         return null;
+    }
+    fn transferAllowedFor(self: *const Runtime, origin: []const u8, client: *const std.Io.net.IpAddress) bool {
+        for (self.transfer_allows.items) |*allow| {
+            if (sameDnsName(allow.origin, origin) and allow.cidr.contains(client)) return true;
+        }
+        return false;
     }
     fn secondaryFor(self: *const Runtime, origin: []const u8) ?*const SecondaryState {
         for (self.secondary_zones.items) |*secondary| {
@@ -1850,21 +1874,61 @@ pub const Runtime = struct {
     /// message signed as a standard answer and every later one chained on the
     /// MAC of the message before it (RFC 8945 section 5.3.1). Non-transfer
     /// queries and failures yield a single frame so the client always gets an
-    /// answer. The caller owns the returned blob.
+    /// answer. The decision runs under the shared lock and stays read-only;
+    /// a non-shorter chain is drained under the exclusive lock after the
+    /// shared lock releases, so concurrent transfer reads never race on
+    /// journal storage. The caller owns the returned blob.
     pub fn encodeTransferFrames(
         self: *const Runtime,
         allocator: std.mem.Allocator,
         request_bytes: []const u8,
+        client: *const std.Io.net.IpAddress,
     ) ![]u8 {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         self.lockShared();
-        defer self.unlockShared();
-        const parsed = try self.parseIncoming(arena.allocator(), request_bytes);
+        var pending: ?journal_mod.PendingEvict = null;
+        const result = self.encodeTransferFramesLocked(allocator, arena.allocator(), request_bytes, client, &pending);
+        self.unlockShared();
+        if (pending) |evict| self.drainPendingEvict(evict);
+        return result;
+    }
+
+    /// Drops the oldest difference of a non-shorter chain. Runs with the
+    /// exclusive lock held; never from a shared-lock read path. Re-checks
+    /// the chain: another thread may have evicted or reloaded first, so a
+    /// stale pending eviction is skipped rather than dropping fresh history.
+    fn drainPendingEvict(self: *const Runtime, evict: journal_mod.PendingEvict) void {
+        const mutable = @constCast(self);
+        mutable.lockExclusive();
+        defer mutable.unlockExclusive();
+        const log = mutable.deltaLogForOrigin(evict.originText()) orelse return;
+        if (!log.chainLongerThanFull(evict.client_serial, evict.server_serial)) return;
+        journal_mod.evictOldestDifference(evict.originText(), evict.client_serial);
+    }
+
+    fn deltaLogForOrigin(self: *Runtime, origin: []const u8) ?*journal_mod.DeltaLog {
+        if (self.transfer_delta_logs.items.len != self.zones.items.len) return null;
+        for (self.zones.items, 0..) |*zone, index| {
+            if (!std.ascii.eqlIgnoreCase(zone.originText(), origin)) continue;
+            return &self.transfer_delta_logs.items[index];
+        }
+        return null;
+    }
+
+    fn encodeTransferFramesLocked(
+        self: *const Runtime,
+        allocator: std.mem.Allocator,
+        scratch: std.mem.Allocator,
+        request_bytes: []const u8,
+        client: *const std.Io.net.IpAddress,
+        pending: *?journal_mod.PendingEvict,
+    ) ![]u8 {
+        const parsed = try self.parseIncoming(scratch, request_bytes);
         switch (parsed) {
             .failure => |failure| {
                 var output: [transfer.tcp_max_frame_size]u8 = undefined;
-                const single = try self.encodeFailure(arena.allocator(), request_bytes, &output, failure);
+                const single = try self.encodeFailure(scratch, request_bytes, &output, failure);
                 return frameSingle(allocator, single);
             },
             .incoming => |incoming| {
@@ -1903,7 +1967,24 @@ pub const Runtime = struct {
                         try self.encodeMessage(try response.buildRefusedResponse(incoming.query), &output);
                     return frameSingle(allocator, single);
                 };
-                return self.encodeZoneTransfer(allocator, arena.allocator(), &incoming, zone);
+                // Default deny: no allow-transfer entry for this apex and
+                // client means a signed refusal and no zone data encoded.
+                if (!self.transferAllowedFor(zone.originText(), client)) {
+                    var output: [transfer.tcp_max_frame_size]u8 = undefined;
+                    const single = if (incoming.auth) |auth|
+                        try self.encodeSignedMessage(
+                            try response.buildRefusedResponse(incoming.query),
+                            &output,
+                            auth,
+                            0,
+                            &.{},
+                            null,
+                        )
+                    else
+                        try self.encodeMessage(try response.buildRefusedResponse(incoming.query), &output);
+                    return frameSingle(allocator, single);
+                }
+                return self.encodeZoneTransfer(allocator, scratch, &incoming, zone, pending);
             },
         }
     }
@@ -1925,6 +2006,7 @@ pub const Runtime = struct {
         scratch: std.mem.Allocator,
         incoming: *const Incoming,
         zone: *const zone_index.Zone,
+        pending: *?journal_mod.PendingEvict,
     ) ![]u8 {
         const query = incoming.query;
         const q = query.question orelse return Error.BadQuery;
@@ -1949,7 +2031,27 @@ pub const Runtime = struct {
             },
             .ixfr => {
                 const client = transfer.clientSerialFromMessage(&query);
-                switch (transfer.decideIxfr(serial, client, self.deltaLogForOriginConst(zone.originText()))) {
+                const outcome = transfer.decideIxfrOutcome(serial, client, self.deltaLogForOriginConst(zone.originText()));
+                // The decision is read-only under the shared lock; a
+                // non-shorter chain is drained after release under the
+                // exclusive lock, so concurrent transfer reads never race on
+                // journal storage. Re-checks the chain there: another thread
+                // may have evicted or reloaded first, so a stale pending
+                // eviction is skipped rather than dropping fresh history.
+                pending.* = if (outcome.evict_client_serial) |evict_serial| .{
+                    .client_serial = evict_serial,
+                    .server_serial = serial,
+                } else null;
+                if (pending.*) |*evict| {
+                    const text = zone.originText();
+                    if (text.len == 0 or text.len > journal_mod.max_origin_len) {
+                        pending.* = null;
+                    } else {
+                        @memcpy(evict.origin[0..text.len], text);
+                        evict.origin_len = text.len;
+                    }
+                }
+                switch (outcome.decision) {
                     .up_to_date => {
                         single_slot = transfer.buildIxfrUpToDateMessage(scratch, &query, zone) catch
                             return Error.EncodeFailed;
@@ -2253,8 +2355,11 @@ pub const Runtime = struct {
             // from being skipped.
             for (@constCast(self).secondary_zones.items) |*secondary| {
                 if (std.ascii.eqlIgnoreCase(secondary.apex, notify_name)) {
-                    secondary.last_success_ns = null;
-                    secondary.expired = false;
+                    const from_master = if (notify_source) |source| sameIp(source, &secondary.primary) else false;
+                    if (from_master) {
+                        secondary.last_success_ns = null;
+                        secondary.expired = false;
+                    }
                 }
             }
             return transfer.buildNotifyResponse(query.allocator, &query, zone, notify_serial) catch return Error.EncodeFailed;
@@ -2298,6 +2403,44 @@ pub const Runtime = struct {
         return selected;
     }
 };
+
+/// An apex this catalog consumer installed: it is recorded in
+/// `consumer.members`, the owned set. Anything else at that apex — a
+/// configured local zone or another catalog's member — stays untouched.
+fn ownedByConsumer(consumer: *const CatalogConsumer, origin: []const u8) bool {
+    for (consumer.members.items) |member| {
+        if (std.ascii.eqlIgnoreCase(member.name, origin)) return true;
+    }
+    return false;
+}
+
+/// Deep copy of member properties for the owned set.
+fn dupeProperties(allocator: std.mem.Allocator, properties: []const catalog_mod.Property) ![]catalog_mod.Property {
+    var list: std.ArrayList(catalog_mod.Property) = .empty;
+    errdefer {
+        for (list.items) |property| {
+            allocator.free(property.key);
+            allocator.free(property.value);
+        }
+        list.deinit(allocator);
+    }
+    for (properties) |property| {
+        const key = try allocator.dupe(u8, property.key);
+        errdefer allocator.free(key);
+        const value = try allocator.dupe(u8, property.value);
+        try list.append(allocator, .{ .key = key, .value = value });
+    }
+    return list.toOwnedSlice(allocator);
+}
+
+/// Frees a property slice made by `dupeProperties`.
+fn freeProperties(allocator: std.mem.Allocator, properties: []const catalog_mod.Property) void {
+    for (properties) |property| {
+        allocator.free(property.key);
+        allocator.free(property.value);
+    }
+    allocator.free(properties);
+}
 
 /// One operator-facing line about a zone replacement. A test build has no
 /// operator and the test runner fails on any stderr write.
@@ -4844,6 +4987,307 @@ test "a catalog NOTIFY is honored only from the configured primary" {
     try std.testing.expect(runtime.catalog_refresh_requested.load(.acquire));
 }
 
+// A loopback primary answering AXFR for whichever of the listed zones the
+// question names, so a refresh test can serve new catalog text over a real
+// transfer. `served` counts answered connections.
+const CatalogRefreshServer = struct {
+    io: std.Io,
+    listener: *std.Io.net.Server,
+    zones: []const *const zone_index.Zone,
+    connections: usize,
+    served: *std.atomic.Value(usize),
+
+    fn run(args: CatalogRefreshServer) void {
+        var done: usize = 0;
+        while (done < args.connections) : (done += 1) {
+            var stream = args.listener.accept(args.io) catch return;
+            defer stream.close(args.io);
+            var read_buffer: [4096]u8 = undefined;
+            var reader = stream.reader(args.io, &read_buffer);
+            var length_bytes: [2]u8 = undefined;
+            reader.interface.readSliceAll(&length_bytes) catch return;
+            const length = std.mem.readInt(u16, &length_bytes, .big);
+            var query_buffer: [65535]u8 = undefined;
+            reader.interface.readSliceAll(query_buffer[0..length]) catch return;
+
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            const request = dns_message.Message.parseQuery(arena.allocator(), query_buffer[0..length]) catch return;
+            var question_buffer: [256]u8 = undefined;
+            const qname = request.question.?.name.toText(&question_buffer) catch return;
+            const zone = for (args.zones) |candidate| {
+                if (std.ascii.eqlIgnoreCase(candidate.originText(), qname)) break candidate;
+            } else return;
+            const messages = transfer.buildAxfrMessages(std.heap.page_allocator, &request, zone, 2) catch return;
+            defer {
+                for (messages) |*message| message.deinit();
+                std.heap.page_allocator.free(messages);
+            }
+            var write_buffer: [4096]u8 = undefined;
+            var writer = stream.writer(args.io, &write_buffer);
+            for (messages) |*message| {
+                var frame: [65535]u8 = undefined;
+                var frame_writer = dns_writer.Writer.init(&frame);
+                message.encode(&frame_writer) catch return;
+                var prefix: [2]u8 = undefined;
+                std.mem.writeInt(u16, &prefix, @intCast(frame_writer.len()), .big);
+                writer.interface.writeAll(&prefix) catch return;
+                writer.interface.writeAll(frame_writer.written()) catch return;
+            }
+            writer.interface.flush() catch return;
+            _ = args.served.fetchAdd(1, .acq_rel);
+        }
+    }
+
+    fn spawn(io: std.Io, listener: *std.Io.net.Server, zones: []const *const zone_index.Zone, connections: usize, served: *std.atomic.Value(usize)) !std.Thread {
+        return std.Thread.spawn(.{}, CatalogRefreshServer.run, .{CatalogRefreshServer{
+            .io = io,
+            .listener = listener,
+            .zones = zones,
+            .connections = connections,
+            .served = served,
+        }});
+    }
+
+    fn portOf(listener: *const std.Io.net.Server) u16 {
+        return switch (listener.socket.address) {
+            .ip4 => |ip4| ip4.port,
+            .ip6 => |ip6| ip6.port,
+        };
+    }
+};
+
+test "a catalog refresh provisions only selected members and never fetches coo" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var runtime = try Runtime.fromZoneTexts(&.{
+        \\$ORIGIN catalog.example.
+        \\$TTL 3600
+        \\@ IN SOA invalid. hostmaster.invalid. 1 3600 900 1209600 3600
+        \\@ IN NS invalid.
+        \\version IN TXT "2"
+        \\m1.zones IN PTR one.example.
+        \\
+        ,
+        \\$ORIGIN kept.example.
+        \\$TTL 3600
+        \\@ IN SOA ns.kept.example. hostmaster.kept.example. 5 3600 900 1209600 3600
+        \\@ IN NS ns.kept.example.
+        \\www IN A 192.0.2.5
+        \\
+        ,
+    });
+    defer runtime.deinit();
+
+    const new_catalog_text =
+        \\$ORIGIN catalog.example.
+        \\$TTL 3600
+        \\@ IN SOA invalid. hostmaster.invalid. 2 3600 900 1209600 3600
+        \\@ IN NS invalid.
+        \\version IN TXT "2"
+        \\ma.zones IN PTR alpha.example.
+        \\ma.zones IN TXT "group=alpha"
+        \\mb.zones IN PTR beta.example.
+        \\mb.zones IN TXT "group=beta"
+        \\mn.zones IN PTR plain.example.
+        \\mc.zones IN PTR redirected.example.
+        \\mc.zones IN TXT "coo=other.example."
+        \\
+    ;
+    const member_text =
+        \\$ORIGIN alpha.example.
+        \\$TTL 3600
+        \\@ IN SOA ns.alpha.example. hostmaster.alpha.example. 4 3600 900 1209600 3600
+        \\@ IN NS ns.alpha.example.
+        \\www IN A 192.0.2.81
+        \\
+    ;
+    var new_catalog_file = try zone_parser.ZoneFile.parse(new_catalog_text);
+    defer new_catalog_file.deinit();
+    var new_catalog_zone = try zone_index.Zone.fromZoneFile(&new_catalog_file);
+    defer new_catalog_zone.deinit();
+    var member_file = try zone_parser.ZoneFile.parse(member_text);
+    defer member_file.deinit();
+    var member_zone = try zone_index.Zone.fromZoneFile(&member_file);
+    defer member_zone.deinit();
+    const zones = [_]*const zone_index.Zone{ &new_catalog_zone, &member_zone };
+    var served: std.atomic.Value(usize) = .init(0);
+
+    var listen_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var transfer_server = try std.Io.net.IpAddress.listen(&listen_address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer transfer_server.deinit(io);
+    // One catalog fetch plus one member fetch: coo, wrong-group, and
+    // groupless members are never fetched.
+    const thread = try CatalogRefreshServer.spawn(io, &transfer_server, &zones, 2, &served);
+    defer thread.join();
+
+    const primary = try std.Io.net.IpAddress.parse("127.0.0.1", CatalogRefreshServer.portOf(&transfer_server));
+    try runtime.setCatalogConsumer("catalog.example.", primary, "alpha");
+    try runtime.setCatalogMembers(&.{});
+    try std.testing.expectEqual(CatalogRefreshOutcome.updated, runtime.refreshCatalog(io));
+    try std.testing.expectEqual(@as(usize, 2), served.load(.acquire));
+    // The catalog zone plus the unrelated local zone plus alpha.
+    try std.testing.expectEqual(@as(usize, 3), runtime.zones.items.len);
+    try std.testing.expectEqual(@as(usize, 1), runtime.catalog_consumer.?.members.items.len);
+    try std.testing.expectEqualStrings("alpha.example.", runtime.catalog_consumer.?.members.items[0].name);
+    try std.testing.expect(runtime.zoneIndexForOrigin("kept.example.") != null);
+}
+
+test "a catalog refresh keeps a local zone at a member apex and never removes it" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var runtime = try Runtime.fromZoneTexts(&.{
+        \\$ORIGIN catalog.example.
+        \\$TTL 3600
+        \\@ IN SOA invalid. hostmaster.invalid. 1 3600 900 1209600 3600
+        \\@ IN NS invalid.
+        \\version IN TXT "2"
+        \\ml.zones IN PTR local.example.
+        \\
+        ,
+        \\$ORIGIN local.example.
+        \\$TTL 3600
+        \\@ IN SOA ns.local.example. hostmaster.local.example. 7 3600 900 1209600 3600
+        \\@ IN NS ns.local.example.
+        \\www IN A 192.0.2.7
+        \\
+        ,
+    });
+    defer runtime.deinit();
+
+    const new_catalog_text =
+        \\$ORIGIN catalog.example.
+        \\$TTL 3600
+        \\@ IN SOA invalid. hostmaster.invalid. 2 3600 900 1209600 3600
+        \\@ IN NS invalid.
+        \\version IN TXT "2"
+        \\ml.zones IN PTR local.example.
+        \\
+    ;
+    const member_text =
+        \\$ORIGIN local.example.
+        \\$TTL 3600
+        \\@ IN SOA ns.local.example. hostmaster.local.example. 99 3600 900 1209600 3600
+        \\@ IN NS ns.local.example.
+        \\www IN A 192.0.2.99
+        \\
+    ;
+    var new_catalog_file = try zone_parser.ZoneFile.parse(new_catalog_text);
+    defer new_catalog_file.deinit();
+    var new_catalog_zone = try zone_index.Zone.fromZoneFile(&new_catalog_file);
+    defer new_catalog_zone.deinit();
+    var member_file = try zone_parser.ZoneFile.parse(member_text);
+    defer member_file.deinit();
+    var member_zone = try zone_index.Zone.fromZoneFile(&member_file);
+    defer member_zone.deinit();
+    const zones = [_]*const zone_index.Zone{ &new_catalog_zone, &member_zone };
+    var served: std.atomic.Value(usize) = .init(0);
+
+    var listen_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var transfer_server = try std.Io.net.IpAddress.listen(&listen_address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer transfer_server.deinit(io);
+    const thread = try CatalogRefreshServer.spawn(io, &transfer_server, &zones, 2, &served);
+    defer thread.join();
+
+    const port = CatalogRefreshServer.portOf(&transfer_server);
+    const primary = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+    try runtime.setCatalogConsumer("catalog.example.", primary, null);
+    // No owned members: `local.example.` is a configured zone, not a
+    // provisioned member.
+    try runtime.setCatalogMembers(&.{});
+    try std.testing.expectEqual(CatalogRefreshOutcome.updated, runtime.refreshCatalog(io));
+
+    // The local zone survives unchanged: origin and serial intact.
+    const index = runtime.zoneIndexForOrigin("local.example.").?;
+    try std.testing.expectEqual(@as(?u32, 7), runtime.zones.items[index].soaSerial());
+    try std.testing.expectEqual(@as(usize, 0), runtime.catalog_consumer.?.members.items.len);
+
+    // A later catalog that drops the member leaves the local zone served.
+    const dropped_catalog_text =
+        \\$ORIGIN catalog.example.
+        \\$TTL 3600
+        \\@ IN SOA invalid. hostmaster.invalid. 3 3600 900 1209600 3600
+        \\@ IN NS invalid.
+        \\version IN TXT "2"
+        \\
+    ;
+    var dropped_file = try zone_parser.ZoneFile.parse(dropped_catalog_text);
+    defer dropped_file.deinit();
+    var dropped_zone = try zone_index.Zone.fromZoneFile(&dropped_file);
+    defer dropped_zone.deinit();
+    const dropped_zones = [_]*const zone_index.Zone{&dropped_zone};
+    var listen2: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var transfer_server2 = try std.Io.net.IpAddress.listen(&listen2, io, .{ .mode = .stream, .protocol = .tcp });
+    defer transfer_server2.deinit(io);
+    const thread2 = try CatalogRefreshServer.spawn(io, &transfer_server2, &dropped_zones, 1, &served);
+    defer thread2.join();
+    const port2 = CatalogRefreshServer.portOf(&transfer_server2);
+    const primary2 = try std.Io.net.IpAddress.parse("127.0.0.1", port2);
+    runtime.catalog_consumer.?.primary = primary2;
+    try std.testing.expectEqual(CatalogRefreshOutcome.updated, runtime.refreshCatalog(io));
+    const still_there = runtime.zoneIndexForOrigin("local.example.").?;
+    try std.testing.expectEqual(@as(?u32, 7), runtime.zones.items[still_there].soaSerial());
+}
+
+test "a catalog refresh removes only apexes this consumer installed" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var runtime = try Runtime.fromZoneTexts(&.{
+        \\$ORIGIN catalog.example.
+        \\$TTL 3600
+        \\@ IN SOA invalid. hostmaster.invalid. 2 3600 900 1209600 3600
+        \\@ IN NS invalid.
+        \\version IN TXT "2"
+        \\mg.zones IN PTR gone.example.
+        \\
+        ,
+        \\$ORIGIN gone.example.
+        \\$TTL 3600
+        \\@ IN SOA ns.gone.example. hostmaster.gone.example. 5 3600 900 1209600 3600
+        \\@ IN NS ns.gone.example.
+        \\www IN A 192.0.2.6
+        \\
+        ,
+        \\$ORIGIN kept.example.
+        \\$TTL 3600
+        \\@ IN SOA ns.kept.example. hostmaster.kept.example. 6 3600 900 1209600 3600
+        \\@ IN NS ns.kept.example.
+        \\www IN A 192.0.2.7
+        \\
+        ,
+    });
+    defer runtime.deinit();
+    try runtime.setCatalogConsumer("catalog.example.", try std.Io.net.IpAddress.parse("127.0.0.1", 1), null);
+    try runtime.setCatalogMembers(&.{.{ .label = "mg", .name = "gone.example." }});
+
+    const new_catalog_text =
+        \\$ORIGIN catalog.example.
+        \\$TTL 3600
+        \\@ IN SOA invalid. hostmaster.invalid. 3 3600 900 1209600 3600
+        \\@ IN NS invalid.
+        \\version IN TXT "2"
+        \\
+    ;
+    var new_catalog_file = try zone_parser.ZoneFile.parse(new_catalog_text);
+    defer new_catalog_file.deinit();
+    var new_catalog_zone = try zone_index.Zone.fromZoneFile(&new_catalog_file);
+    defer new_catalog_zone.deinit();
+    const zones = [_]*const zone_index.Zone{&new_catalog_zone};
+    var served: std.atomic.Value(usize) = .init(0);
+
+    var listen_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var transfer_server = try std.Io.net.IpAddress.listen(&listen_address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer transfer_server.deinit(io);
+    const thread = try CatalogRefreshServer.spawn(io, &transfer_server, &zones, 1, &served);
+    defer thread.join();
+    const port = CatalogRefreshServer.portOf(&transfer_server);
+    const primary = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+    runtime.catalog_consumer.?.primary = primary;
+    try std.testing.expectEqual(CatalogRefreshOutcome.updated, runtime.refreshCatalog(io));
+
+    // The owned member is gone, the unrelated local zone stays.
+    try std.testing.expect(runtime.zoneIndexForOrigin("gone.example.") == null);
+    try std.testing.expect(runtime.zoneIndexForOrigin("kept.example.") != null);
+    try std.testing.expectEqual(@as(usize, 0), runtime.catalog_consumer.?.members.items.len);
+}
+
 const SecondaryFetchStub = struct {
     calls: usize = 0,
     last_zone_name: ?[]const u8 = null,
@@ -4899,17 +5343,38 @@ test "a NOTIFY for a secondary marks it due for the next refresh tick" {
 
     var output: [1024]u8 = undefined;
     var request_buffer: [512]u8 = undefined;
+    var stranger = try std.Io.net.IpAddress.parse("203.0.113.7", 40000);
+    var master = try std.Io.net.IpAddress.parse("192.0.2.1", 40000);
     // A NOTIFY for a zone that is not a tracked secondary does not mark
     // the secondary due.
     const primary_request = try encodeNotifyRequest(arena.allocator(), &request_buffer, "primary.example.", 11, .SOA);
-    _ = try runtime.answer(primary_request, &output);
+    _ = try runtime.answerFrom(primary_request, &output, &master);
     try runtime.maybeRefreshSecondaries(6_000_000_000, SecondaryFetchStub.fetch, &stub);
     try std.testing.expectEqual(@as(usize, 0), stub.calls);
 
+    // RFC 1996 section 3.10: a NOTIFY from a host that is not the zone's
+    // master is ignored but still answered; refresh state is untouched.
+    const spoofed_request = try encodeNotifyRequest(arena.allocator(), &request_buffer, "example.", 11, .SOA);
+    const spoofed_bytes = try runtime.answerFrom(spoofed_request, &output, &stranger);
+    const spoofed_response = try dns_message.Message.parse(arena.allocator(), spoofed_bytes);
+    try std.testing.expectEqual(@as(@TypeOf(spoofed_response.header.rcode), .no_error), spoofed_response.header.rcode);
+    try std.testing.expectEqual(@as(?i64, 5_000_000_000), runtime.secondary_zones.items[0].last_success_ns);
+    try std.testing.expect(!runtime.secondary_zones.items[0].expired);
+    try runtime.maybeRefreshSecondaries(6_000_000_000, SecondaryFetchStub.fetch, &stub);
+    try std.testing.expectEqual(@as(usize, 0), stub.calls);
+
+    // A NOTIFY with no source context cannot be attributed to the master,
+    // so it is ignored for refresh as well.
+    const nosource_request = try encodeNotifyRequest(arena.allocator(), &request_buffer, "example.", 11, .SOA);
+    _ = try runtime.answer(nosource_request, &output);
+    try std.testing.expectEqual(@as(?i64, 5_000_000_000), runtime.secondary_zones.items[0].last_success_ns);
+
     // A NOTIFY for the tracked secondary marks it due, so the next tick
     // fetches it even though the refresh interval has not elapsed.
+    runtime.secondary_zones.items[0].expired = true;
     const secondary_request = try encodeNotifyRequest(arena.allocator(), &request_buffer, "example.", 11, .SOA);
-    _ = try runtime.answer(secondary_request, &output);
+    _ = try runtime.answerFrom(secondary_request, &output, &master);
+    try std.testing.expect(!runtime.secondary_zones.items[0].expired);
     try runtime.maybeRefreshSecondaries(6_000_000_000, SecondaryFetchStub.fetch, &stub);
     try std.testing.expectEqual(@as(usize, 1), stub.calls);
     try std.testing.expectEqualStrings("example.", stub.last_zone_name.?);
@@ -5131,7 +5596,9 @@ test "runtime serves AXFR as one bounded TCP blob opening and closing with SOA" 
     );
     defer runtime.deinit();
 
-    const blob = try runtime.encodeTransferFrames(std.testing.allocator, &transfer_test_axfr_query);
+    var loopback = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    try runtime.addTransferAllow("example.", try config_parser.Cidr.parse("127.0.0.1/32"));
+    const blob = try runtime.encodeTransferFrames(std.testing.allocator, &transfer_test_axfr_query, &loopback);
     defer std.testing.allocator.free(blob);
     try std.testing.expect(blob.len > 2);
 
@@ -5195,9 +5662,11 @@ test "a signed AXFR is answered with signed frames a client can verify" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const query = try makeSignedQueryWithQuestions(now, 32, false, 1, &axfr_question_wire, sha256_test_key);
-    const blob = try runtime.encodeTransferFrames(arena.allocator(), query.packet[0..query.len]);
-    const request_final = (try tsig.parseFinalAdditional(query.packet[0..query.len])) orelse return error.TestExpectedEqual;
+    const signed = try makeSignedQueryWithQuestions(now, 32, false, 1, &axfr_question_wire, sha256_test_key);
+    var loopback = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    try runtime.addTransferAllow("example.", try config_parser.Cidr.parse("127.0.0.1/32"));
+    const blob = try runtime.encodeTransferFrames(arena.allocator(), signed.packet[0..signed.len], &loopback);
+    const request_final = (try tsig.parseFinalAdditional(signed.packet[0..signed.len])) orelse return error.TestExpectedEqual;
 
     var offset: usize = 0;
     var frames: usize = 0;
@@ -5241,7 +5710,8 @@ test "a signed out-of-zone AXFR is refused with a signed frame" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const query = try makeSignedQueryWithQuestions(now, 32, false, 1, &other_zone_question_wire, sha256_test_key);
-    const blob = try runtime.encodeTransferFrames(arena.allocator(), query.packet[0..query.len]);
+    var any = try std.Io.net.IpAddress.parse("0.0.0.0", 0);
+    const blob = try runtime.encodeTransferFrames(arena.allocator(), query.packet[0..query.len], &any);
     const frame_len = std.mem.readInt(u16, blob[0..2], .big);
     const frame = blob[2..][0..frame_len];
     const parsed = try dns_message.Message.parse(arena.allocator(), frame);
@@ -5251,6 +5721,35 @@ test "a signed out-of-zone AXFR is refused with a signed frame" {
     try std.testing.expectEqual(@as(usize, 32), final.tsig.macBytes().len);
     const request_final = (try tsig.parseFinalAdditional(query.packet[0..query.len])) orelse return error.TestExpectedEqual;
     _ = try tsig.verify(frame, sha256_test_key.secret, request_final.tsig.macBytes());
+}
+test "transfer without an allow entry is refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var runtime = try Runtime.fromZoneText(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 10 3600 900 1209600 3600
+        \\@ IN NS ns.example.
+        \\www IN A 192.0.2.1
+        \\
+    );
+    defer runtime.deinit();
+    var denied = try std.Io.net.IpAddress.parse("10.0.0.9", 0);
+    const refused = try runtime.encodeTransferFrames(std.testing.allocator, &transfer_test_axfr_query, &denied);
+    defer std.testing.allocator.free(refused);
+    const refused_len = std.mem.readInt(u16, refused[0..2], .big);
+    const refused_frame = try dns_message.Message.parse(arena.allocator(), refused[2..][0..refused_len]);
+    try std.testing.expectEqual(@as(@TypeOf(refused_frame.header.rcode), .refused), refused_frame.header.rcode);
+    try std.testing.expect(!runtime.transferAllowedFor("example.", &denied));
+    var loopback = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    try runtime.addTransferAllow("example.", try config_parser.Cidr.parse("127.0.0.0/8"));
+    try std.testing.expect(runtime.transferAllowedFor("example.", &loopback));
+    try std.testing.expect(!runtime.transferAllowedFor("other.", &loopback));
+    const allowed = try runtime.encodeTransferFrames(std.testing.allocator, &transfer_test_axfr_query, &loopback);
+    defer std.testing.allocator.free(allowed);
+    const allowed_len = std.mem.readInt(u16, allowed[0..2], .big);
+    const allowed_frame = try dns_message.Message.parse(arena.allocator(), allowed[2..][0..allowed_len]);
+    try std.testing.expect(allowed_frame.answers.len > 0);
 }
 
 const reload_zone =

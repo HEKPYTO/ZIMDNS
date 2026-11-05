@@ -80,7 +80,7 @@ test "RFC 9567: the authoritative answer carries the Report-Channel option" {
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query, false);
     try std.testing.expect(response.header.qr);
     // The answer is the zone's own answer, not a refusal: the option rides
     // with an authoritative answer.
@@ -112,7 +112,7 @@ test "RFC 9567: the authoritative answer carries the Report-Channel option" {
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
     var plain_response_buffer: [512]u8 = undefined;
-    const plain_response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &plain_response_buffer, &server_socket.address, plain_query);
+    const plain_response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &plain_response_buffer, &server_socket.address, plain_query, false);
     try std.testing.expect(plain_response.edns == null);
     for (plain_response.additionals.slice()) |record| {
         try std.testing.expect(!record.rrtype.eql(.OPT));
@@ -142,7 +142,7 @@ test "RFC 9567: the monitoring agent answers a report query" {
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query, false);
 
     // RFC 9567 section 6.3: the report query is answered with NOERROR, by the
     // server that holds the zone.
@@ -188,7 +188,7 @@ test "RFC 9567: the monitoring agent never denies a monitored name" {
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query, false);
 
     // RFC 9567 section 8.2: a name at or below a monitored domain is never a
     // name error, because a resolver that cached the name error treats

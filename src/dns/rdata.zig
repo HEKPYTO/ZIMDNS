@@ -782,7 +782,9 @@ pub const RData = union(enum) {
             RecordType.PTR.value => .{ .PTR = try parseNameOnly(message, offset, end) },
             RecordType.SOA.value => blk: {
                 const mname_result = Name.parse(message, offset) catch return Error.BadName;
+                if (mname_result.next_offset > end) return Error.BadName;
                 const rname_result = Name.parse(message, mname_result.next_offset) catch return Error.BadName;
+                if (rname_result.next_offset > end) return Error.BadName;
                 if (end - rname_result.next_offset != 20) return Error.InvalidLength;
                 var reader = @import("reader.zig").Reader.init(message[rname_result.next_offset..end]);
                 break :blk .{ .SOA = .{
@@ -1887,6 +1889,12 @@ test "rdata parses SOA, SRV, and CAA records" {
     try std.testing.expectEqual(@as(u8, 0), caa.CAA.flags);
     try std.testing.expectEqualStrings("issue", caa.CAA.tagText());
     try std.testing.expectEqualStrings("letsencrypt", caa.CAA.valueText());
+}
+test "rdata SOA name crossing rdata end returns error" {
+    var mname_wire = [_]u8{ 1, 'a', 0 };
+    try std.testing.expectError(Error.BadName, RData.parse(.SOA, &mname_wire, 0, 1));
+    var rname_wire = [_]u8{ 0, 1, 'b', 0 };
+    try std.testing.expectError(Error.BadName, RData.parse(.SOA, &rname_wire, 0, 1));
 }
 
 test "SRV wire round trips numeric boundaries with root and normal targets" {

@@ -16,7 +16,6 @@ the point of the suite is external evidence, not a skip.
 
 import argparse
 import base64
-import http.client
 import os
 import shutil
 import socket
@@ -24,6 +23,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 
@@ -77,6 +77,18 @@ QUERIES = [
     ("srv.example.test.", "SRV"),
     ("svc.example.test.", "SVCB"),
     ("caa.example.test.", "CAA"),
+    ("rp.example.test.", "RP"),
+    ("sshfp.example.test.", "SSHFP"),
+    ("tlsa.example.test.", "TLSA"),
+    ("naptr.example.test.", "NAPTR"),
+    ("apl.example.test.", "APL"),
+    ("afsdb.example.test.", "AFSDB"),
+    ("rt.example.test.", "RT"),
+    ("uri.example.test.", "URI"),
+    ("hinfo.example.test.", "HINFO"),
+    ("WwW.ExAmPlE.TeSt.", "A"),
+    ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.example.test.", "A"),
+    ("a.b.c.d.e.f.g.h.i.j.k.l.m.n.o.p.q.r.s.t.u.v.w.x.y.z.example.test.", "A"),
 ]
 
 
@@ -212,19 +224,52 @@ class Suite:
         private = [name for name in private if name.endswith(".private")]
         if not private:
             raise Failure("dnssec-keygen produced no .private file")
-        secret = None
+        lines = {}
         with open(os.path.join(work, private[0])) as f:
             for line in f:
-                if line.startswith("PrivateKey:"):
-                    secret = line.split(":", 1)[1].strip()
-                    break
-        if secret is None:
-            raise Failure("dnssec-keygen private file has no PrivateKey line")
+                if ":" in line:
+                    field, value = line.split(":", 1)
+                    lines[field.strip()] = value.strip()
+        if "PrivateKey" in lines:
+            secret = lines["PrivateKey"]
+        elif "Modulus" in lines and "PrivateExponent" in lines:
+            # BIND writes RSA as PKCS#1 components; the signer reads a
+            # PKCS#1 DER blob, so rebuild one with the cryptography library.
+            try:
+                import base64 as b64
+                from cryptography.hazmat.primitives import serialization
+                from cryptography.hazmat.primitives.asymmetric import rsa
+            except ImportError as exc:
+                raise Failure(f"cryptography is required for RSA key conversion: {exc}")
+
+            def component(field):
+                return int.from_bytes(b64.b64decode(lines[field]), "big")
+
+            key = rsa.RSAPrivateNumbers(
+                p=component("Prime1"),
+                q=component("Prime2"),
+                d=component("PrivateExponent"),
+                dmp1=component("Exponent1"),
+                dmq1=component("Exponent2"),
+                iqmp=component("Coefficient"),
+                public_numbers=rsa.RSAPublicNumbers(
+                    e=component("PublicExponent"),
+                    n=component("Modulus"),
+                ),
+            ).private_key()
+            der = key.private_bytes(
+                serialization.Encoding.DER,
+                serialization.PrivateFormat.TraditionalOpenSSL,
+                serialization.NoEncryption(),
+            )
+            secret = b64.b64encode(der).decode()
+        else:
+            raise Failure("dnssec-keygen private file has no private key")
         with open(os.path.join(work, filename), "w") as f:
             f.write(f"{algorithm.lower()} {secret}\n")
         return filename
 
-    def write_named_config(self, work, port):
+    def write_named_config(self, work, port, zone_name="example.test", zone_file="authoritative.zone"):
         path = os.path.join(work, "named.conf")
         with open(path, "w") as f:
             f.write(
@@ -239,22 +284,500 @@ class Suite:
   pid-file "{work}/named.pid";
   session-keyfile "{work}/session.key";
 }};
-zone "example.test" {{
+zone "{zone_name}" {{
   type master;
-  file "{work}/authoritative.zone";
+  file "{work}/{zone_file}";
 }};
 '''
             )
         return path
 
-    def start_named(self, work, port):
-        config = self.write_named_config(work, port)
+    def start_named(self, work, port, zone_name="example.test", zone_file="authoritative.zone"):
+        config = self.write_named_config(work, port, zone_name, zone_file)
         proc = self.spawn(
             [TOOLS["named"], "-g", "-4", "-c", config],
             cwd=work,
         )
         self.wait_query(port, proc=proc)
         return proc
+
+    def check_tc_and_headers(self, work, udp_port, tcp_port):
+        """RFC 6891/1035: TC over UDP, whole answer over TCP, header bits.
+
+        A 1.5 KB TXT RRset does not fit a 512-octet datagram, so the UDP
+        response carries TC and the TCP retry carries every string. CD is
+        copied into the response, AD is not invented, and a query with two
+        questions is FORMERR (RFC 9619).
+        """
+        udp = self.start_zimdns(work, udp_port, "--serve-udp")
+        tcp = self.start_zimdns(work, tcp_port, "--serve-tcp")
+        try:
+            truncated = self.dig(
+                udp_port, "big.example.test.", "A", "+bufsize=512", "+ignore",
+            )
+            if " tc " not in truncated.split("flags:")[1].split(";")[0] + " ":
+                raise Failure(f"a 512-octet UDP query did not set TC:\n{truncated[:1600]}")
+            whole = self.dig(tcp_port, "big.example.test.", "A", "+tcp", "+short")
+            addresses = [line for line in whole.splitlines() if line.startswith("192.0.2.")]
+            if len(addresses) != 80:
+                raise Failure(f"TCP did not carry the whole A RRset ({len(addresses)} addresses):\n{whole[:1600]}")
+            cd = self.dig(udp_port, "example.test.", "SOA", "+cdflag")
+            if not self.dig_flag(cd, "cd"):
+                raise Failure(f"CD was not copied into the answer:\n{cd[:1200]}")
+            if self.dig_flag(cd, "ad"):
+                raise Failure(f"an unsigned authoritative answer set AD:\n{cd[:1200]}")
+            query = dns.message.Message(id=0)
+            query.flags = dns.flags.RD
+            query.question.append(dns.rrset.RRset(dns.name.from_text("example.test."), dns.rdataclass.IN, dns.rdatatype.SOA))
+            query.question.append(dns.rrset.RRset(dns.name.from_text("example.test."), dns.rdataclass.IN, dns.rdatatype.NS))
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.settimeout(2)
+                sock.sendto(query.to_wire(), ("127.0.0.1", udp_port))
+                response = dns.message.from_wire(sock.recvfrom(65535)[0])
+            if response.rcode() != dns.rcode.FORMERR:
+                raise Failure(f"a two-question query answered {dns.rcode.to_text(response.rcode())}")
+        finally:
+            self.stop(udp)
+            self.stop(tcp)
+
+    def check_edns_options(self, work, udp_port, tcp_port):
+        """RFC 5001/6891/7828/9660: external clients see the EDNS options.
+
+        `dig` requests NSID, a cookie, TCP keepalive, and ZONEVERSION, and
+        the server must answer each with the option; ANY at the apex must be
+        the RFC 8482 minimal form, not the whole RRset set.
+        """
+        extra = (
+            "nsid 00ff\n"
+            "cookies validate 00112233445566778899aabbccddeeff\n"
+            "minimal-any-ttl 120\n"
+        )
+        udp = self.start_zimdns(work, udp_port, "--serve-udp", extra=extra)
+        tcp = self.start_zimdns(work, tcp_port, "--serve-tcp", extra=extra)
+        try:
+            nsid = self.dig(udp_port, "example.test.", "SOA", "+nsid")
+            if "NSID: 00 ff" not in nsid:
+                raise Failure(f"NSID option is not the configured payload:\n{nsid[:1200]}")
+            cookie = self.dig(udp_port, "example.test.", "SOA", "+cookie")
+            if "COOKIE:" not in cookie or "(good)" not in cookie:
+                raise Failure(f"cookie option is not a valid server cookie:\n{cookie[:1200]}")
+            version = self.dig(udp_port, "example.test.", "SOA", "+ednsopt=19")
+            if "ZONEVERSION:" not in version:
+                raise Failure(f"ZONEVERSION option is missing:\n{version[:1200]}")
+            keepalive = self.dig(tcp_port, "example.test.", "SOA", "+tcp", "+keepalive")
+            if "TCP-KEEPALIVE:" not in keepalive:
+                raise Failure(f"TCP keepalive option is missing:\n{keepalive[:1200]}")
+            alive = self.run(
+                [TOOLS["dig"], "@127.0.0.1", "-p", str(udp_port), "example.test.", "SOA"],
+                check=False,
+            )
+            # dig follows ANY over TCP by default; this listener is UDP.
+            minimal = self.run(
+                [TOOLS["dig"], "@127.0.0.1", "-p", str(udp_port), "example.test.", "ANY", "+notcp"],
+                check=False,
+            ).stdout
+            if "HINFO" not in minimal:
+                diag = ""
+                if udp.poll() is not None:
+                    out, err = udp.communicate()
+                    diag = f"\nudp exited {udp.returncode}: {out[-500:]} {err[-1500:]}"
+                raise Failure(f"ANY did not get the RFC 8482 minimal answer:\n{minimal[:1200]}{diag}")
+            if "\tSOA\t" in minimal or "\tNS\t" in minimal:
+                raise Failure(f"ANY returned more than the minimal RRset:\n{minimal[:1200]}")
+        finally:
+            self.stop(udp)
+            self.stop(tcp)
+
+    def check_error_report(self, work, upstream_port, resolver_port):
+        """RFC 9567: an upstream EDE with an agent produces a report query."""
+        import struct
+        seen = []
+        stop = threading.Event()
+
+        def serve_tcp():
+            server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind(("127.0.0.1", upstream_port))
+            server.listen(4)
+            server.settimeout(0.2)
+            try:
+                while not stop.is_set():
+                    try:
+                        conn, _ = server.accept()
+                    except socket.timeout:
+                        continue
+                    with conn:
+                        conn.settimeout(1)
+                        try:
+                            prefix = conn.recv(2)
+                            if len(prefix) != 2:
+                                continue
+                            length = struct.unpack("!H", prefix)[0]
+                            data = b""
+                            while len(data) < length:
+                                chunk = conn.recv(length - len(data))
+                                if not chunk:
+                                    break
+                                data += chunk
+                            query = dns.message.from_wire(data)
+                            seen.append(query.question[0].name.to_text().lower())
+                            response = dns.message.make_response(query)
+                            response.use_edns(0, options=[])
+                            wire = response.to_wire()
+                            conn.sendall(struct.pack("!H", len(wire)) + wire)
+                        except Exception:
+                            continue
+            finally:
+                server.close()
+
+        def serve():
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("127.0.0.1", upstream_port))
+            sock.settimeout(0.2)
+            try:
+                while not stop.is_set():
+                    try:
+                        data, addr = sock.recvfrom(65535)
+                    except socket.timeout:
+                        continue
+                    query = dns.message.from_wire(data)
+                    name = query.question[0].name.to_text().lower()
+                    seen.append(name)
+                    response = dns.message.make_response(query)
+                    if name.startswith("_er."):
+                        response.use_edns(0, options=[])
+                    else:
+                        response.set_rcode(dns.rcode.SERVFAIL)
+                        agent = dns.name.from_text("agent.example.").to_wire()
+                        response.use_edns(0, options=[
+                            dns.edns.GenericOption(15, struct.pack("!H", 3)),
+                            dns.edns.GenericOption(18, agent),
+                        ])
+                    sock.sendto(response.to_wire(), addr)
+            finally:
+                sock.close()
+
+        tcp_thread = threading.Thread(target=serve_tcp, daemon=True)
+        tcp_thread.start()
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        try:
+            extra = (
+                "recursion allow 127.0.0.0/8\n"
+                f"forwarder 127.0.0.1:{upstream_port}\n"
+            )
+            resolver = self.start_resolver(work, resolver_port, extra)
+            try:
+                answer = self.dig(resolver_port, "broken.example.test.", "A")
+                if "SERVFAIL" not in answer and "EDE: 3" not in answer:
+                    raise Failure(f"the upstream failure was not relayed:\n{answer[:1400]}")
+                deadline = time.time() + 5
+                expected = "_er.1.broken.example.test.3._er.agent.example."
+                while time.time() < deadline and expected not in seen:
+                    time.sleep(0.1)
+                if expected not in seen:
+                    raise Failure(f"no RFC 9567 report query for the failed name (saw {seen!r})")
+            finally:
+                self.stop(resolver)
+        finally:
+            stop.set()
+            thread.join(timeout=2)
+            tcp_thread.join(timeout=2)
+
+    def check_forged_answers(self, work, upstream_port, resolver_port):
+        """RFC 5452: wrong-ID and wrong-question answers are ignored."""
+        stop = threading.Event()
+        exchanges = {"count": 0}
+
+        def serve():
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.bind(("127.0.0.1", upstream_port))
+            sock.settimeout(0.2)
+            try:
+                while not stop.is_set():
+                    try:
+                        data, addr = sock.recvfrom(65535)
+                    except socket.timeout:
+                        continue
+                    query = dns.message.from_wire(data)
+                    exchanges["count"] += 1
+                    # The first exchange gets only forged answers; the
+                    # resolver's retry gets the real one.
+                    if exchanges["count"] == 1:
+                        bogus = dns.message.make_response(query)
+                        bogus.id = (query.id + 1) & 0xFFFF
+                        bogus.answer.append(
+                            dns.rrset.from_text("forged.example.test.", 60, "IN", "A", "6.6.6.6")
+                        )
+                        sock.sendto(bogus.to_wire(), addr)
+                        wrong = dns.message.make_response(query)
+                        wrong.question[0].name = dns.name.from_text("other.example.test.")
+                        wrong.answer.append(
+                            dns.rrset.from_text("forged.example.test.", 60, "IN", "A", "6.6.6.6")
+                        )
+                        sock.sendto(wrong.to_wire(), addr)
+                        continue
+                    response = dns.message.make_response(query)
+                    response.answer.append(
+                        dns.rrset.from_text("forged.example.test.", 60, "IN", "A", "192.0.2.80")
+                    )
+                    sock.sendto(response.to_wire(), addr)
+            finally:
+                sock.close()
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        try:
+            extra = (
+                "recursion allow 127.0.0.0/8\n"
+                f"forwarder 127.0.0.1:{upstream_port}\n"
+            )
+            resolver = self.start_resolver(work, resolver_port, extra)
+            try:
+                answer = self.dig(resolver_port, "forged.example.test.", "A")
+                if "192.0.2.80" not in answer:
+                    raise Failure(f"the valid answer is missing:\n{answer[:1400]}")
+                if "6.6.6.6" in answer:
+                    raise Failure(f"a forged answer was accepted:\n{answer[:1400]}")
+            finally:
+                self.stop(resolver)
+        finally:
+            stop.set()
+            thread.join(timeout=2)
+
+    def check_dns64(self, work, upstream_port, resolver_port):
+        """RFC 6147: an empty AAAA answer is synthesized from A."""
+        stop = threading.Event()
+
+        def serve():
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.bind(("127.0.0.1", upstream_port))
+            sock.settimeout(0.2)
+            try:
+                while not stop.is_set():
+                    try:
+                        data, addr = sock.recvfrom(65535)
+                    except socket.timeout:
+                        continue
+                    query = dns.message.from_wire(data)
+                    qtype = query.question[0].rdtype
+                    response = dns.message.make_response(query)
+                    if qtype == dns.rdatatype.A:
+                        response.answer.append(
+                            dns.rrset.from_text("v4only.example.test.", 60, "IN", "A", "1.2.3.4")
+                        )
+                    sock.sendto(response.to_wire(), addr)
+            finally:
+                sock.close()
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        try:
+            extra = (
+                "recursion allow 127.0.0.0/8\n"
+                "dns64 on\n"
+                "nat64-prefix 64:ff9b::/96\n"
+                f"forwarder 127.0.0.1:{upstream_port}\n"
+            )
+            resolver = self.start_resolver(work, resolver_port, extra)
+            try:
+                answer = self.dig(resolver_port, "v4only.example.test.", "AAAA")
+                if "64:ff9b::102:304" not in answer:
+                    raise Failure(f"DNS64 did not synthesize the AAAA from A:\n{answer[:1400]}")
+            finally:
+                self.stop(resolver)
+        finally:
+            stop.set()
+            thread.join(timeout=2)
+
+    def check_blacklist(self, work, port):
+        """RFC 5782: listed addresses are published under the blacklist apex."""
+        with open(os.path.join(work, "blacklist.txt"), "w") as f:
+            f.write("192.0.2.1\n2001:db8::1\nbad.example\n")
+        proc = self.start_zimdns(
+            work, port, "--serve-udp",
+            extra="blacklist-zone blacklist.example.test blacklist.txt\n",
+        )
+        try:
+            listed = self.dig(port, "1.2.0.192.blacklist.example.test.", "A", "+short")
+            if "127.0.0.2" not in listed:
+                raise Failure(f"the listed IPv4 entry is not published:\n{listed[:800]}")
+            bad = self.dig(port, "bad.example.blacklist.example.test.", "A", "+short")
+            if "127.0.0.2" not in bad:
+                raise Failure(f"the listed name is not published:\n{bad[:800]}")
+            missing = self.dig(port, "2.2.0.192.blacklist.example.test.", "A")
+            if "NXDOMAIN" not in missing:
+                raise Failure(f"an unlisted entry is not NXDOMAIN:\n{missing[:1200]}")
+        finally:
+            self.stop(proc)
+
+    def check_catalog(self, work, producer_port, consumer_port):
+        """RFC 9432: a consumer serves the members a producer publishes."""
+        producer = self.start_zimdns(
+            work, producer_port, "--serve-udp",
+            extra="catalog-zone catalog.example.test\n",
+        )
+        try:
+            catalog = self.dig(producer_port, "version.catalog.example.test.", "TXT", "+short")
+            if "2" not in catalog:
+                raise Failure(f"the producer catalog has no schema-2 version:\n{catalog[:800]}")
+            # The consumer fetches the catalog by AXFR over DNS/TCP at startup.
+            self.start_zimdns(work, producer_port, "--serve-tcp", extra="catalog-zone catalog.example.test\nallow-transfer catalog.example.test 127.0.0.1/32\nallow-transfer example.test 127.0.0.1/32\n")
+            consumer = self.start_resolver(
+                work, consumer_port,
+                extra=f"catalog-consumer catalog.example.test 127.0.0.1:{producer_port}\n",
+            )
+            try:
+                answer = self.dig(consumer_port, "www.example.test.", "A")
+                if "192.0.2.80" not in answer:
+                    raise Failure(f"the catalog member is not served by the consumer:\n{answer[:1600]}")
+            finally:
+                self.stop(consumer)
+        finally:
+            self.stop(producer)
+
+    def check_cache_behaviour(self, work, upstream_port, resolver_port):
+        """RFC 8767/2308/8914: stale answers and negative caching.
+
+        The upstream answers with TTL 1, then fails; the cached answer is
+        served stale with TTL 30 and EDE 3. An NXDOMAIN with an SOA is
+        cached, so a second query for it never reaches the upstream.
+        """
+        mode = {"fail": False}
+        counts = {}
+        stop = threading.Event()
+
+        def serve():
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.bind(("127.0.0.1", upstream_port))
+            sock.settimeout(0.2)
+            try:
+                while not stop.is_set():
+                    try:
+                        data, addr = sock.recvfrom(65535)
+                    except socket.timeout:
+                        continue
+                    query = dns.message.from_wire(data)
+                    name = query.question[0].name.to_text().lower()
+                    counts[name] = counts.get(name, 0) + 1
+                    if name.startswith("missing."):
+                        response = dns.message.make_response(query)
+                        response.set_rcode(dns.rcode.NXDOMAIN)
+                        soa = dns.rrset.from_text(
+                            "example.test.", 60, "IN", "SOA",
+                            "ns1.example.test. hostmaster.example.test. 1 3600 900 604800 60",
+                        )
+                        response.authority.append(soa)
+                    elif mode["fail"]:
+                        response = dns.message.make_response(query)
+                        response.set_rcode(dns.rcode.SERVFAIL)
+                    else:
+                        response = dns.message.make_response(query)
+                        response.answer.append(
+                            dns.rrset.from_text("fresh.example.test.", 1, "IN", "A", "192.0.2.80")
+                        )
+                    sock.sendto(response.to_wire(), addr)
+            finally:
+                sock.close()
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        try:
+            extra = (
+                "recursion allow 127.0.0.0/8\n"
+                f"forwarder 127.0.0.1:{upstream_port}\n"
+            )
+            resolver = self.start_resolver(work, resolver_port, extra)
+            try:
+                first = self.dig(resolver_port, "fresh.example.test.", "A")
+                if "192.0.2.80" not in first:
+                    raise Failure(f"the first answer is missing:\n{first[:1200]}")
+                mode["fail"] = True
+                time.sleep(2.2)
+                stale = self.dig(resolver_port, "fresh.example.test.", "A", "+ednsopt=15")
+                if "192.0.2.80" not in stale:
+                    raise Failure(f"the stale answer is missing:\n{stale[:1200]}")
+                if "EDE: 3" not in stale and "Stale Answer" not in stale:
+                    raise Failure(f"the stale answer carries no EDE 3:\n{stale[:1400]}")
+                missing = self.dig(resolver_port, "missing.example.test.", "A")
+                if "NXDOMAIN" not in missing:
+                    raise Failure(f"the negative answer is not NXDOMAIN:\n{missing[:1200]}")
+                again = self.dig(resolver_port, "missing.example.test.", "A")
+                if "NXDOMAIN" not in again:
+                    raise Failure(f"the cached negative answer is not NXDOMAIN:\n{again[:1200]}")
+                if counts.get("missing.example.test.", 0) != 1:
+                    raise Failure(f"the negative answer was fetched {counts.get('missing.example.test.')} times")
+            finally:
+                self.stop(resolver)
+        finally:
+            stop.set()
+            thread.join(timeout=2)
+
+    def check_ecs(self, work, upstream_port, resolver_port):
+        """RFC 7871: the forwarding resolver carries and scopes ECS.
+
+        A scripted ECS-aware upstream records the option the resolver sends
+        and answers with scope 24; the resolver is configured with
+        `client-subnet-max-prefix 20`, so the upstream must see /20 and the
+        client must see the upstream's /24 scope.
+        """
+        seen = []
+        stop = threading.Event()
+
+        def serve():
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.bind(("127.0.0.1", upstream_port))
+            sock.settimeout(0.2)
+            try:
+                while not stop.is_set():
+                    try:
+                        data, addr = sock.recvfrom(65535)
+                    except socket.timeout:
+                        continue
+                    query = dns.message.from_wire(data)
+                    option = next((o for o in query.options if o.otype == dns.edns.ECS), None)
+                    seen.append(option)
+                    response = dns.message.make_response(query)
+                    response.answer.append(
+                        dns.rrset.from_text("www.example.test.", 60, "IN", "A", "192.0.2.80")
+                    )
+                    options = []
+                    if option is not None:
+                        options.append(dns.edns.ECSOption(option.address, option.srclen, 16))
+                    response.use_edns(0, options=options)
+                    sock.sendto(response.to_wire(), addr)
+            finally:
+                sock.close()
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        try:
+            extra = (
+                "recursion allow 127.0.0.0/8\n"
+                f"forwarder 127.0.0.1:{upstream_port}\n"
+                "client-subnet-max-prefix 20\n"
+            )
+            resolver = self.start_resolver(work, resolver_port, extra)
+            try:
+                answer = self.dig(
+                    resolver_port, "www.example.test.", "A",
+                    "+subnet=192.0.2.0/24",
+                )
+                if "192.0.2.80" not in answer:
+                    raise Failure(f"ECS answer missing:\n{answer[:1200]}")
+                if "CLIENT-SUBNET: 192.0.0.0/20/16" not in answer:
+                    raise Failure(f"ECS response scope is not the upstream's /16:\n{answer[:1200]}")
+                scoped = [o for o in seen if o is not None]
+                if not scoped:
+                    raise Failure("the resolver sent no client subnet option upstream")
+                if scoped[0].srclen != 20 or scoped[0].address != "192.0.0.0":
+                    raise Failure(f"upstream saw {scoped[0]!r}, expected 192.0.0.0/20")
+            finally:
+                self.stop(resolver)
+        finally:
+            stop.set()
+            thread.join(timeout=2)
 
     # ---------------------------------------------------------- differential
     def rrset_key(self, rrset):
@@ -289,8 +812,8 @@ zone "example.test" {{
         sender = dns.query.tcp if tcp else dns.query.udp
         return sender(query, "127.0.0.1", port=port, timeout=5.0)
 
-    def diff_authoritative(self, zport, nport, tcp=False):
-        for name, rdtype in QUERIES:
+    def diff_authoritative(self, zport, nport, tcp=False, queries=None):
+        for name, rdtype in (queries or QUERIES):
             label = f"{'tcp' if tcp else 'udp'} {name} {rdtype}"
             try:
                 mine = self.response_view(self.query(zport, name, rdtype, tcp=tcp))
@@ -394,6 +917,43 @@ zone "example.test" {{
         ).stdout
         if "SOA" not in ixfr:
             raise Failure(f"IXFR produced no zone text:\n{ixfr[:1200]}")
+
+        # Deny half: a second instance serves the same zone but allows only
+        # TEST-NET-1, so 127.0.0.1 is denied. Reachability and refusal are
+        # both proven on that instance, so no loopback alias is needed.
+        deny_port = self.free_port()
+        deny_work = tempfile.mkdtemp(prefix="zimdns-deny-")
+        shutil.copy(ZONE, os.path.join(deny_work, "authoritative.zone"))
+        deny_udp = deny_tcp = None
+        try:
+            deny_udp = self.start_zimdns(
+                deny_work, deny_port, "--serve-udp",
+                extra="allow-transfer example.test 192.0.2.0/24\n",
+            )
+            deny_tcp = self.start_zimdns(
+                deny_work, deny_port, "--serve-tcp",
+                extra="allow-transfer example.test 192.0.2.0/24\n",
+            )
+            control = self.dig(deny_port, "www.example.test.", "A", "+short")
+            if "192.0.2.80" not in control:
+                raise Failure(f"deny-instance unreachable:\n{control[:800]}")
+            tcp_control = self.dig(deny_port, "www.example.test.", "A", "+short", "+tcp")
+            if "192.0.2.80" not in tcp_control:
+                raise Failure(f"deny-instance TCP unreachable:\nudp:\n{control[:800]}\ntcp:\n{tcp_control[:800]}")
+            denied_proc = self.run(
+                [TOOLS["dig"], "@127.0.0.1", "-p", str(deny_port), "example.test.", "AXFR", "+noall", "+answer", "+time=2", "+tries=1"],
+                check=False,
+            )
+            denied = denied_proc.stdout
+            refused = "REFUSED" in denied or "Transfer failed" in denied or "failed" in denied_proc.stderr or denied_proc.returncode != 0
+            if "SOA" in denied or not refused:
+                raise Failure(f"AXFR from an unauthorized client was not refused:\nstdout:\n{denied[:1200]}\nstderr:\n{denied_proc.stderr[:800]}")
+        finally:
+            if deny_tcp is not None:
+                self.stop(deny_tcp)
+            if deny_udp is not None:
+                self.stop(deny_udp)
+            shutil.rmtree(deny_work, ignore_errors=True)
 
     def check_doh(self, work, port):
         cert = os.path.join(work, "cert.pem")
@@ -746,6 +1306,265 @@ zone "example.test" {{
         finally:
             self.stop(designated)
 
+    def check_doh3(self, work, port):
+        cert, key = self.make_cert(work)
+        with open(os.path.join(work, "doh3.gdns"), "w") as f:
+            f.write(f"listen dns doh3 127.0.0.1:{port}\n")
+            f.write("zone example.test primary authoritative.zone\n")
+            f.write("local-zones off\n")
+        proc = self.spawn(
+            [
+                self.zimdns, "server", "run", "--config", "doh3.gdns",
+                "--serve-doh3", "--enable-encrypted-dns",
+                "--tls-cert-file", cert, "--tls-key-file", key,
+            ],
+            cwd=work,
+        )
+        try:
+            import asyncio
+            from aioquic.asyncio.client import connect
+            from aioquic.asyncio.protocol import QuicConnectionProtocol
+            from aioquic.h3.connection import H3Connection, H3_ALPN
+            from aioquic.h3.events import DataReceived, HeadersReceived
+            from aioquic.quic.configuration import QuicConfiguration
+        except ImportError as exc:
+            raise Failure(f"aioquic is not installed: {exc}")
+        query = dns.message.make_query("www.example.test.", "A").to_wire()
+        b64 = base64.urlsafe_b64encode(query).rstrip(b"=").decode()
+
+        class H3Protocol(QuicConnectionProtocol):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self._h3 = H3Connection(self._quic)
+                self._h3_events = []
+
+            def quic_event_received(self, event):
+                super().quic_event_received(event)
+                for h3_event in self._h3.handle_event(event):
+                    self._h3_events.append(h3_event)
+
+        async def run_exchange(headers, body):
+            asyncio.get_running_loop().set_exception_handler(lambda _loop, _context: None)
+            config = QuicConfiguration(alpn_protocols=H3_ALPN, is_client=True, verify_mode=ssl.CERT_NONE)
+            context = connect("127.0.0.1", port, configuration=config, create_protocol=H3Protocol)
+            protocol = await context.__aenter__()
+            try:
+                stream_id = protocol._quic.get_next_available_stream_id()
+                protocol._h3.send_headers(stream_id, headers, end_stream=body is None)
+                if body is not None:
+                    protocol._h3.send_data(stream_id, body, end_stream=True)
+                protocol.transmit()
+                got_headers = []
+                got_body = b""
+                for _ in range(100):
+                    for event in protocol._h3_events:
+                        if isinstance(event, HeadersReceived):
+                            got_headers = event.headers
+                        elif isinstance(event, DataReceived):
+                            got_body += event.data
+                            if event.stream_ended:
+                                return got_headers, got_body
+                    await asyncio.sleep(0.05)
+                return got_headers, got_body
+            finally:
+                # aioquic's context exit writes a final EOF on its own
+                # stream; this exchange already finished its stream.
+                try:
+                    await context.__aexit__(None, None, None)
+                except RuntimeError:
+                    pass
+
+        # POST readiness loop: the server may still be starting.
+        deadline = time.time() + 10
+        answer = None
+        status = None
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                out, err = proc.communicate()
+                raise Failure(f"DoH/3 server exited: {out} {err}")
+            try:
+                headers, body = asyncio.run(run_exchange(
+                    [(b":method", b"POST"), (b":path", b"/dns-query"), (b":scheme", b"https"), (b":authority", b"localhost"), (b"content-type", b"application/dns-message")],
+                    query,
+                ))
+                status = dict((k.decode("latin-1"), v.decode("latin-1")) for k, v in headers).get(":status")
+                if status == "200" and body:
+                    answer = dns.message.from_wire(body)
+                    break
+            except Exception:
+                answer = None
+            time.sleep(0.1)
+        else:
+            raise Failure(f"aioquic did not get a DoH/3 POST answer; status={status}")
+        if answer is None or answer.rcode() != 0 or not answer.answer:
+            raise Failure(f"DoH/3 POST response is not a positive answer: {answer}")
+
+        headers, body = asyncio.run(run_exchange(
+            [(b":method", b"GET"), (b":path", f"/dns-query?dns={b64}".encode()), (b":scheme", b"https"), (b":authority", b"localhost")],
+            None,
+        ))
+        status_get = dict((k.decode("latin-1"), v.decode("latin-1")) for k, v in headers).get(":status")
+        if status_get != "200":
+            raise Failure(f"DoH/3 GET returned {status_get}")
+        get_answer = dns.message.from_wire(body)
+        if get_answer.rcode() != 0 or not get_answer.answer:
+            raise Failure(f"DoH/3 GET response is not a positive answer: {get_answer}")
+
+        try:
+            cleartext = dns.message.make_query("www.example.test.", "A")
+            dns.query.udp(cleartext, "127.0.0.1", port=port, timeout=2)
+        except Exception:
+            pass
+        else:
+            raise Failure("the DoH/3 port answered cleartext DNS over UDP")
+
+    def check_odoh(self, work, port):
+        """RFC 9230 oblivious DoH: pyhpke seals a query the target opens."""
+        import hashlib
+        import hmac as hmac_mod
+
+        try:
+            from pyhpke import AEADId, CipherSuite, KDFId, KEMId, KEMKey
+        except ImportError as exc:
+            raise Failure(f"pyhpke is not installed: {exc}")
+        try:
+            from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        except ImportError as exc:
+            raise Failure(f"cryptography is not installed: {exc}")
+
+        priv = X25519PrivateKey.generate()
+        pub = priv.public_key()
+        raw_priv = priv.private_bytes_raw()
+        raw_pub = pub.public_bytes_raw()
+        with open(os.path.join(work, "odoh.key"), "w") as f:
+            f.write(raw_priv.hex() + "\n")
+        cert, key = self.make_cert(work)
+        shutil.copy(ZONE, os.path.join(work, "authoritative.zone"))
+        with open(os.path.join(work, "odoh.gdns"), "w") as f:
+            f.write(f"listen dns doh 127.0.0.1:{port}\n")
+            f.write("zone example.test primary authoritative.zone\n")
+            f.write("local-zones off\n")
+            f.write("odoh-target on\n")
+            f.write("odoh-key-file odoh.key\n")
+            f.write("odoh-config-out odoh.config\n")
+        proc = self.spawn(
+            [
+                self.zimdns, "server", "run", "--config", "odoh.gdns",
+                "--serve-doh", "--enable-encrypted-dns",
+                "--tls-cert-file", cert, "--tls-key-file", key,
+            ],
+            cwd=work,
+        )
+
+        def post_odoh_raw(body, ctype="application/oblivious-dns-message"):
+            import subprocess as _sp
+            with open(os.path.join(work, "odoh-body.bin"), "wb") as f:
+                f.write(body)
+            result = _sp.run(
+                ["curl", "-sk", "-o", os.path.join(work, "odoh-resp.bin"), "-w", "%{http_code}",
+                 "--data-binary", "@" + os.path.join(work, "odoh-body.bin"),
+                 "-H", "content-type: " + ctype, f"https://127.0.0.1:{port}/dns-query"],
+                capture_output=True, text=True, timeout=15,
+            )
+            code = result.stdout.strip()
+            with open(os.path.join(work, "odoh-resp.bin"), "rb") as f:
+                return int(code), f.read()
+
+        def post_odoh(body, ctype="application/oblivious-dns-message"):
+            return post_odoh_raw(body, ctype)
+
+        deadline = time.time() + 15
+        configs = None
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                out, err = proc.communicate()
+                raise Failure(f"ODoH server exited: {out} {err}")
+            config_path = os.path.join(work, "odoh.config")
+            if configs is None and os.path.exists(config_path):
+                configs = open(config_path, "rb").read()
+            if configs:
+                try:
+                    if post_odoh(b"\x00")[0] in (400, 401):
+                        break
+                except Exception:
+                    pass
+            time.sleep(0.2)
+        else:
+            raise Failure("ODoH target did not start answering")
+        if len(configs) < 46 or int.from_bytes(configs[0:2], "big") != len(configs) - 2:
+            raise Failure(f"ODoH configs file is malformed: {len(configs)} bytes")
+        contents = configs[6:46]
+        kem_id = int.from_bytes(contents[0:2], "big")
+        kdf_id = int.from_bytes(contents[2:4], "big")
+        aead_id = int.from_bytes(contents[4:6], "big")
+        if (kem_id, kdf_id, aead_id) != (0x0020, 0x0001, 0x0001):
+            raise Failure(f"ODoH configs name the wrong suite: {kem_id:#x} {kdf_id:#x} {aead_id:#x}")
+        if contents[6:8] != b"\x00\x20" or contents[8:40] != raw_pub:
+            raise Failure("ODoH configs do not carry this target's public key")
+        prk = hmac_mod.new(b"", contents, hashlib.sha256).digest()
+        key_id = hmac_mod.new(prk, b"odoh key id\x01", hashlib.sha256).digest()
+
+        pkr = KEMKey.from_pyca_cryptography_key(pub)
+        suite = CipherSuite.new(KEMId.DHKEM_X25519_HKDF_SHA256, KDFId.HKDF_SHA256, AEADId.AES128_GCM)
+        enc, sender = suite.create_sender_context(pkr, info=b"odoh query")
+        dns_query = dns.message.make_query("www.example.test.", "A").to_wire()
+        q_plain = len(dns_query).to_bytes(2, "big") + dns_query + (0).to_bytes(2, "big")
+        aad = b"\x01" + len(key_id).to_bytes(2, "big") + key_id
+        ct = sender.seal(q_plain, aad)
+        msg = b"\x01" + len(key_id).to_bytes(2, "big") + key_id
+        msg += len(enc + ct).to_bytes(2, "big") + enc + ct
+
+        deadline = time.time() + 10
+        while True:
+            if proc.poll() is not None:
+                out, err = proc.communicate()
+                raise Failure(f"ODoH server exited: {out} {err}")
+            try:
+                status, body = post_odoh(msg)
+            except Exception as exc:
+                if time.time() > deadline:
+                    raise Failure(f"ODoH POST never succeeded: {exc}")
+                time.sleep(0.1)
+                continue
+            if status == 200 and body:
+                break
+            if time.time() > deadline:
+                raise Failure(f"ODoH POST returned {status}: {body[:200]}")
+            time.sleep(0.1)
+
+        if body[0] != 0x02:
+            raise Failure(f"ODoH response has the wrong message type: {body[0]}")
+        kid_len = int.from_bytes(body[1:3], "big")
+        resp_nonce = body[3:3 + kid_len]
+        enc_len = int.from_bytes(body[3 + kid_len:5 + kid_len], "big")
+        encrypted = body[5 + kid_len:]
+        if len(resp_nonce) != 16 or enc_len != len(encrypted) or len(encrypted) < 16:
+            raise Failure("ODoH response framing is malformed")
+        secret = sender.export(b"odoh response", 16)
+        info = q_plain + len(resp_nonce).to_bytes(2, "big") + resp_nonce
+        prk2 = hmac_mod.new(info, secret, hashlib.sha256).digest()
+        rkey = hmac_mod.new(prk2, b"odoh key\x01", hashlib.sha256).digest()[:16]
+        rnonce = hmac_mod.new(prk2, b"odoh nonce\x01", hashlib.sha256).digest()[:12]
+        aad_r = b"\x02" + len(resp_nonce).to_bytes(2, "big") + resp_nonce
+        r_plain = AESGCM(rkey).decrypt(rnonce, encrypted, aad_r)
+        dns_len = int.from_bytes(r_plain[0:2], "big")
+        answer = dns.message.from_wire(r_plain[2:2 + dns_len])
+        if answer.rcode() != 0 or not answer.answer:
+            raise Failure(f"ODoH answer is not positive: {answer}")
+        if "192.0.2.80" not in answer.to_text():
+            raise Failure(f"ODoH answer lacks the fixture A record:\n{answer}")
+
+        bad_key = bytes([key_id[0] ^ 0xFF]) + key_id[1:]
+        bad = b"\x01" + len(bad_key).to_bytes(2, "big") + bad_key
+        bad += len(enc + ct).to_bytes(2, "big") + enc + ct
+        if post_odoh(bad)[0] != 401:
+            raise Failure("ODoH target did not return 401 for an unknown key id")
+        corrupt = bytearray(msg)
+        corrupt[-1] ^= 0xFF
+        if post_odoh(bytes(corrupt))[0] != 400:
+            raise Failure("ODoH target did not return 400 for a corrupted ciphertext")
+
     def check_doq(self, work, port):
         cert, key = self.make_cert(work)
         with open(os.path.join(work, "doq.gdns"), "w") as f:
@@ -811,6 +1630,7 @@ zone "example.test" {{
         with open(os.path.join(work, "xfr.gdns"), "w") as f:
             f.write(f"listen dns dot 127.0.0.1:{xfr_port}\n")
             f.write("zone example.test primary authoritative.zone\n")
+            f.write("allow-transfer example.test 127.0.0.1/32\n")
             f.write("local-zones off\n")
         xfr_proc = self.spawn(
             [
@@ -849,7 +1669,7 @@ zone "example.test" {{
         # supported algorithm; the Ed25519 path is covered by the signer's
         # RFC 8080 vector tests and by dnssec-verify below.
         self.new_key(work, "ECDSAP256SHA256", "zsk.key")
-        extra = "dnssec-key-file zsk.key\n"
+        extra = "dnssec-key-file zsk.key\nzonemd publish sha384\nallow-transfer example.test 127.0.0.1/32\n"
         self.start_zimdns(work, port, "--serve-udp", extra=extra)
         self.start_zimdns(work, port, "--serve-tcp", extra=extra)
 
@@ -899,6 +1719,63 @@ zone "example.test" {{
         )
         if "fully validated" not in delv.stdout and "192.0.2.80" not in delv.stdout:
             raise Failure(f"delv did not validate the answer:\n{delv.stdout}\n{delv.stderr}")
+
+    def check_obsolete_types(self, work, zport, nport, tcp):
+        """RFC 1035: X25 and ISDN RDATA encode and compare with BIND 9."""
+        zone = """$ORIGIN obsolete.test.
+$TTL 300
+@ IN SOA ns.obsolete.test. hostmaster.obsolete.test. 1 3600 900 604800 300
+@ IN NS ns.obsolete.test.
+ns IN A 127.0.0.1
+x25 IN X25 "311061700956"
+isdn IN ISDN "150862028003217" "004"
+"""
+        with open(os.path.join(work, "obsolete.zone"), "w") as f:
+            f.write(zone)
+        zimdns = self.start_zimdns(
+            work, zport, "--serve-tcp" if tcp else "--serve-udp", zone=False,
+            extra="zone obsolete.test primary obsolete.zone\n",
+        )
+        named = self.start_named(work, nport, "obsolete.test", "obsolete.zone")
+        try:
+            self.diff_authoritative(
+                zport, nport, tcp=tcp,
+                queries=[("x25.obsolete.test.", "X25"), ("isdn.obsolete.test.", "ISDN")],
+            )
+            x25 = self.dig(zport, "x25.obsolete.test.", "X25", "+short")
+            if "311061700956" not in x25:
+                raise Failure(f"X25 presentation is wrong:\n{x25[:800]}")
+        finally:
+            self.stop(named)
+            self.stop(zimdns)
+
+    def check_dnssec_algorithms(self, work, port):
+        """RFC 5702/8080/6605: each signing algorithm verifies externally.
+
+        The same zone is signed with RSA/SHA-256, ECDSA P-384, and Ed25519 in
+        turn; `dnssec-verify` and `ldns-verify-zone` must accept every one.
+        """
+        algorithms = [
+            ("RSASHA256", "rsa.key"),
+            ("ECDSAP384SHA384", "p384.key"),
+            ("ED25519", "ed.key"),
+        ]
+        for algorithm, key_file in algorithms:
+            self.new_key(work, algorithm, key_file)
+            self.start_zimdns(work, port, "--serve-udp", extra=f"dnssec-key-file {key_file}\n")
+            self.start_zimdns(work, port, "--serve-tcp", extra=f"dnssec-key-file {key_file}\nallow-transfer example.test 127.0.0.1/32\n")
+            axfr = self.run(
+                [
+                    TOOLS["dig"], "@127.0.0.1", "-p", str(port),
+                    "example.test.", "AXFR", "+noall", "+answer",
+                ]
+            ).stdout
+            signed_path = os.path.join(work, f"signed-{algorithm}.zone")
+            with open(signed_path, "w") as f:
+                f.write(axfr)
+            self.run([TOOLS["dnssec-verify"], "-o", "example.test", signed_path])
+            self.run([TOOLS["ldns-verify-zone"], signed_path])
+            self.cleanup()
 
     def check_managed_anchors(self, work, port):
         """RFC 5011: a resolver follows a DNSKEY revocation end to end.
@@ -1000,6 +1877,21 @@ zone "example.test" {{
         self.wait_query(port, proc=proc)
         return proc
 
+    def check_cli_query(self, port):
+        """external client: shipped query CLI against BIND."""
+        answer = subprocess.run(
+            [self.zimdns, "query", "@127.0.0.1", "-p", str(port), "www.example.test.", "A"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if answer.returncode != 0 or "192.0.2.80" not in answer.stdout:
+            raise Failure(f"query CLI did not answer: rc={answer.returncode} out={answer.stdout[-800:]!r}")
+        refusal = subprocess.run(
+            [self.zimdns, "query", "@127.0.0.1", "-p", str(port), "--no-such-flag", "www.example.test.", "A"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if refusal.returncode == 0:
+            raise Failure("query CLI accepted an unknown flag")
+
     # ----------------------------------------------------------------- main
     def run_all(self):
         self.check_tools()
@@ -1008,10 +1900,11 @@ zone "example.test" {{
         nport = self.free_port()
         try:
             self.start_zimdns(work, zport, "--serve-udp")
-            self.start_zimdns(work, zport, "--serve-tcp")
+            self.start_zimdns(work, zport, "--serve-tcp", extra="allow-transfer example.test 127.0.0.1/32\n")
             self.start_named(work, nport)
             self.check("differential oracle, UDP corpus", lambda: self.diff_authoritative(zport, nport, tcp=False))
             self.check("differential oracle, TCP corpus", lambda: self.diff_authoritative(zport, nport, tcp=True))
+            self.check("external client: shipped query CLI", lambda: self.check_cli_query(nport))
             self.check(
                 "external clients: dig, kdig, AXFR, named-checkzone, kzonecheck",
                 lambda: self.external_authoritative(zport, zport, work),
@@ -1030,6 +1923,95 @@ zone "example.test" {{
             self.cleanup()
             shutil.rmtree(tsig_work, ignore_errors=True)
 
+            tc_work = self.make_workdir()
+            tc_udp = self.free_port()
+            tc_tcp = self.free_port()
+            self.check(
+                "external client: TC, TCP retry, CD, and question count",
+                lambda: self.check_tc_and_headers(tc_work, tc_udp, tc_tcp),
+            )
+            self.cleanup()
+            shutil.rmtree(tc_work, ignore_errors=True)
+
+            cache_work = self.make_workdir()
+            cache_resolver_port = self.free_port()
+            cache_upstream_port = self.free_port()
+            self.check(
+                "external client: stale answers and negative cache",
+                lambda: self.check_cache_behaviour(cache_work, cache_upstream_port, cache_resolver_port),
+            )
+            self.cleanup()
+            shutil.rmtree(cache_work, ignore_errors=True)
+
+            report_work = self.make_workdir()
+            report_resolver = self.free_port()
+            report_upstream = self.free_port()
+            self.check(
+                "external client: RFC 9567 error report query",
+                lambda: self.check_error_report(report_work, report_upstream, report_resolver),
+            )
+            self.cleanup()
+            shutil.rmtree(report_work, ignore_errors=True)
+
+            forged_work = self.make_workdir()
+            forged_resolver = self.free_port()
+            forged_upstream = self.free_port()
+            self.check(
+                "external client: forged upstream answers are ignored",
+                lambda: self.check_forged_answers(forged_work, forged_upstream, forged_resolver),
+            )
+            self.cleanup()
+            shutil.rmtree(forged_work, ignore_errors=True)
+
+            dns64_work = self.make_workdir()
+            dns64_resolver = self.free_port()
+            dns64_upstream = self.free_port()
+            self.check(
+                "external client: DNS64 synthesis",
+                lambda: self.check_dns64(dns64_work, dns64_upstream, dns64_resolver),
+            )
+            self.cleanup()
+            shutil.rmtree(dns64_work, ignore_errors=True)
+
+            blacklist_work = self.make_workdir()
+            blacklist_port = self.free_port()
+            self.check(
+                "external client: RFC 5782 blacklist zone",
+                lambda: self.check_blacklist(blacklist_work, blacklist_port),
+            )
+            self.cleanup()
+            shutil.rmtree(blacklist_work, ignore_errors=True)
+
+            catalog_work = self.make_workdir()
+            catalog_producer = self.free_port()
+            catalog_consumer = self.free_port()
+            self.check(
+                "external client: RFC 9432 catalog consumer",
+                lambda: self.check_catalog(catalog_work, catalog_producer, catalog_consumer),
+            )
+            self.cleanup()
+            shutil.rmtree(catalog_work, ignore_errors=True)
+
+            edns_work = self.make_workdir()
+            edns_udp = self.free_port()
+            edns_tcp = self.free_port()
+            self.check(
+                "external clients: EDNS options and minimal ANY",
+                lambda: self.check_edns_options(edns_work, edns_udp, edns_tcp),
+            )
+            self.cleanup()
+            shutil.rmtree(edns_work, ignore_errors=True)
+
+            ecs_work = self.make_workdir()
+            ecs_resolver_port = self.free_port()
+            ecs_upstream_port = self.free_port()
+            self.check(
+                "external client: ECS forwarding and scope",
+                lambda: self.check_ecs(ecs_work, ecs_upstream_port, ecs_resolver_port),
+            )
+            self.cleanup()
+            shutil.rmtree(ecs_work, ignore_errors=True)
+
             dot_work = self.make_workdir()
             dot_port = self.free_port()
             self.check("external client: kdig DoT and TLS AXFR", lambda: self.check_dot(dot_work, dot_port))
@@ -1045,6 +2027,25 @@ zone "example.test" {{
             self.cleanup()
             shutil.rmtree(dnssec_work, ignore_errors=True)
 
+            obsolete_work = self.make_workdir()
+            obsolete_z = self.free_port()
+            obsolete_n = self.free_port()
+            self.check(
+                "external clients: X25 and ISDN against BIND",
+                lambda: self.check_obsolete_types(obsolete_work, obsolete_z, obsolete_n, tcp=False),
+            )
+            self.cleanup()
+            shutil.rmtree(obsolete_work, ignore_errors=True)
+
+            dnssec_algs_work = self.make_workdir()
+            dnssec_algs_port = self.free_port()
+            self.check(
+                "external clients: RSA, P-384, and Ed25519 zones verify",
+                lambda: self.check_dnssec_algorithms(dnssec_algs_work, dnssec_algs_port),
+            )
+            self.cleanup()
+            shutil.rmtree(dnssec_algs_work, ignore_errors=True)
+
             managed_work = self.make_workdir()
             managed_port = self.free_port()
             self.check(
@@ -1058,6 +2059,10 @@ zone "example.test" {{
             doh_port = self.free_port()
             self.check("external client: curl DoH GET and POST", lambda: self.check_doh(doh_work, doh_port))
             shutil.rmtree(doh_work, ignore_errors=True)
+            odoh_work = self.make_workdir()
+            odoh_port = self.free_port()
+            self.check("external client: pyhpke ODoH target", lambda: self.check_odoh(odoh_work, odoh_port))
+            shutil.rmtree(odoh_work, ignore_errors=True)
 
             ddr_work = self.make_workdir()
             ddr_plain = self.free_port()
@@ -1082,6 +2087,7 @@ zone "example.test" {{
             doq_work = self.make_workdir()
             doq_port = self.free_port()
             self.check("external client: kdig DoQ", lambda: self.check_doq(doq_work, doq_port))
+            self.check("external client: aioquic DoH/3", lambda: self.check_doh3(doq_work, doq_port))
             self.cleanup()
             shutil.rmtree(doq_work, ignore_errors=True)
         finally:

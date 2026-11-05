@@ -2,6 +2,7 @@ const std = @import("std");
 const zimdns = @import("zimdns");
 const Config = zimdns.config_parser.Config;
 const ServerContext = zimdns.config_loader.ServerContext;
+const auth_runtime = zimdns.auth_runtime;
 
 const zone_one =
     \\$ORIGIN one.example.
@@ -26,9 +27,9 @@ test "config parser loads bundled example config" {
     const config = try Config.parse(text);
     try std.testing.expectEqual(@as(usize, 2), config.listeners.len);
     try std.testing.expectEqual(@as(usize, 1), config.zones.len);
-    try std.testing.expectEqualStrings("examples/zones/home.arpa.zone", config.zones.items[0].fileText());
+    try std.testing.expectEqualStrings("zones/home.arpa.zone", config.zones.items[0].fileText());
     try std.testing.expectEqual(@as(usize, 1), config.blocklists.len);
-    try std.testing.expectEqualStrings("examples/blocklists/ads.txt", config.blocklists.items[0].pathText());
+    try std.testing.expectEqualStrings("blocklists/ads.txt", config.blocklists.items[0].pathText());
 }
 
 test "server context loads zones and blocklists in declaration order" {
@@ -217,8 +218,10 @@ test "server context decodes the nsid hex and the zoneversion switch into the ru
 
 test "the shipped local-zones example configuration loads with its zone and forwarder" {
     const io = std.Io.Threaded.global_single_threaded.io();
-    var context = try ServerContext.load(std.Io.Dir.cwd(), io, "examples/local-zones.gdns", std.testing.allocator);
-    defer context.deinit();
+    // The CLI passes the config file's own directory as the loader base.
+    var examples = try std.Io.Dir.cwd().openDir(io, "examples", .{});
+    defer examples.close(io);
+    var context = try ServerContext.load(examples, io, "local-zones.gdns", std.testing.allocator);
     var runtime = try context.takeRuntime(io);
     defer runtime.deinit();
 
@@ -267,4 +270,112 @@ test "server context rejects a referenced zone that escapes the base directory" 
         error.InvalidReferencedPath,
         ServerContext.load(base, io, "config.gdns", std.testing.allocator),
     );
+}
+
+test "referenced files resolve against the config directory, not the cwd" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var root = std.testing.tmpDir(.{});
+    defer root.cleanup();
+
+    try root.dir.createDir(io, "conf", .default_dir);
+    var conf = try root.dir.openDir(io, "conf", .{});
+    defer conf.close(io);
+    try conf.writeFile(io, .{ .sub_path = "one.zone", .data = zone_one });
+    try conf.writeFile(io, .{
+        .sub_path = "root.zone",
+        .data = "$ORIGIN .\n$TTL 3600\n@ IN SOA a.root-servers.net. nstld.verisign-grs.com. 2024010101 1800 900 604800 86400\n@ IN NS a.root-servers.net.\na.root-servers.net. IN A 198.41.0.4\n",
+    });
+    try conf.writeFile(io, .{
+        .sub_path = "config.gdns",
+        .data = "zone one.example primary one.zone\nroot-zone root.zone\nrecursion allow 127.0.0.0/8\n",
+    });
+
+    // The loader base is the config file's directory: the same relative
+    // names the old cwd-based CLI failed to find now load. The recursion
+    // ACL gives the runtime a resolver, so the root zone is enabled on it.
+    var context = try ServerContext.load(conf, io, "config.gdns", std.testing.allocator);
+    defer context.deinit();
+    var runtime = try context.takeRuntime(io);
+    defer runtime.deinit();
+    try std.testing.expectEqualStrings("one.example.", runtime.zones.items[0].originText());
+    try std.testing.expect(runtime.resolver.?.local_root_zone);
+}
+
+test "a root-zone path escaping the config directory is refused" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    try dir.dir.writeFile(io, .{ .sub_path = "one.zone", .data = zone_one });
+    try dir.dir.writeFile(io, .{ .sub_path = "escape.gdns", .data = "zone one.example primary one.zone\nroot-zone ../outside.zone\n" });
+    try std.testing.expectError(
+        error.InvalidReferencedPath,
+        ServerContext.load(dir.dir, io, "escape.gdns", std.testing.allocator),
+    );
+    try dir.dir.writeFile(io, .{ .sub_path = "abs.gdns", .data = "zone one.example primary one.zone\nroot-zone /etc/outside.zone\n" });
+    try std.testing.expectError(
+        error.InvalidReferencedPath,
+        ServerContext.load(dir.dir, io, "abs.gdns", std.testing.allocator),
+    );
+}
+
+test "a config in a subdirectory loads by absolute path from another cwd" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var root = std.testing.tmpDir(.{});
+    defer root.cleanup();
+
+    try root.dir.createDir(io, "conf", .default_dir);
+    var conf = try root.dir.openDir(io, "conf", .{});
+    defer conf.close(io);
+    try conf.writeFile(io, .{ .sub_path = "one.zone", .data = zone_one });
+    try conf.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone one.example primary one.zone\n" });
+
+    // The CLI split: absolute parent opened directly, basename to the
+    // loader. The tmp dir is not the process cwd, so a cwd-based load
+    // would fail to find the zone.
+    var abs_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const abs_len = try root.dir.realPathFile(io, "conf/config.gdns", &abs_buffer);
+    const abs_path = abs_buffer[0..abs_len];
+    const base_name = std.fs.path.basename(abs_path);
+    const parent_name = std.fs.path.dirname(abs_path) orelse unreachable;
+    try std.testing.expect(std.fs.path.isAbsolute(parent_name));
+    var base_dir = try std.Io.Dir.openDirAbsolute(io, parent_name, .{});
+    defer base_dir.close(io);
+    var context = try ServerContext.load(base_dir, io, base_name, std.testing.allocator);
+    defer context.deinit();
+    var runtime = try context.takeRuntime(io);
+    defer runtime.deinit();
+    try std.testing.expectEqualStrings("one.example.", runtime.zones.items[0].originText());
+}
+
+test "a config in a subdirectory registers reload sources through its own dir" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var root = std.testing.tmpDir(.{});
+    defer root.cleanup();
+
+    try root.dir.createDir(io, "conf", .default_dir);
+    var conf = try root.dir.openDir(io, "conf", .{});
+    defer conf.close(io);
+    try conf.writeFile(io, .{ .sub_path = "one.zone", .data = zone_one });
+    try conf.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone one.example primary one.zone\n" });
+
+    var context = try ServerContext.load(conf, io, "config.gdns", std.testing.allocator);
+    defer context.deinit();
+    var runtime = try context.takeRuntime(io);
+    defer runtime.deinit();
+    try std.testing.expectEqual(@as(usize, 1), runtime.reload_sources.items.len);
+
+    // The source reads through the config directory: a changed zone file
+    // is what the reload picks up, not a cwd-relative lookup.
+    const zone_two_serial =
+        \\$ORIGIN one.example.
+        \\$TTL 3600
+        \\@ IN SOA ns.one.example. hostmaster.one.example. 2 3600 900 1209600 3600
+        \\@ IN NS ns.one.example.
+        \\www IN A 192.0.2.1
+        \\
+    ;
+    try conf.writeFile(io, .{ .sub_path = "one.zone", .data = zone_two_serial });
+    try std.testing.expectEqual(auth_runtime.ReloadOutcome.replaced, runtime.reloadZone(io));
+    try std.testing.expectEqual(@as(?u32, 2), runtime.zones.items[0].soaSerial());
 }

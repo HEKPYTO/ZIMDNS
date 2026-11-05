@@ -9,6 +9,7 @@ pub const dns_writer = @import("dns/writer.zig");
 pub const dns_rdata = @import("dns/rdata.zig");
 pub const dns_record = @import("dns/record.zig");
 pub const dns_dnssec = @import("dns/dnssec.zig");
+pub const dns_odoh = @import("dns/odoh.zig");
 pub const dns_validate = @import("dns/validate.zig");
 pub const zone_parser = @import("zone/parser.zig");
 pub const zone_index = @import("zone/index.zig");
@@ -19,6 +20,7 @@ pub const auth_response = @import("auth/response.zig");
 pub const auth_runtime = @import("auth/runtime.zig");
 pub const auth_keyring = @import("auth/keyring.zig");
 pub const listener = @import("platform/listener.zig");
+pub const tcp_deadline = @import("platform/tcp_deadline.zig");
 pub const cli_query = @import("cli/query.zig");
 pub const config_parser = @import("config/parser.zig");
 pub const config_loader = @import("config/loader.zig");
@@ -30,9 +32,11 @@ pub const transport_doh_client = @import("transport/doh_client.zig");
 pub const transport_dot = @import("transport/dot.zig");
 pub const transport_doh = @import("transport/doh.zig");
 pub const transport_doq = @import("transport/doq.zig");
-/// The pinned TLS dependency, exported so the CLI guard can drive a DoH
+pub const transport_doh3 = @import("transport/doh3.zig");
+pub const transport_stream_registry = @import("transport/stream_registry.zig");
+/// The OpenSSL TLS wrapper, exported so the CLI guard can drive a DoH
 /// exchange over the same client the server side uses.
-pub const tls = @import("tls");
+pub const transport_openssl_tls = @import("transport/openssl_tls.zig");
 /// The pinned QUIC dependency, exported so the CLI guard can drive a DoQ
 /// exchange over the same library the server side uses.
 pub const quic = @import("quic");
@@ -44,7 +48,7 @@ pub const local_zone = @import("local_zone.zig");
 pub const zone_zonemd = @import("zone/zonemd.zig");
 pub const zone_signer = @import("zone/signer.zig");
 
-const ServerRunMode = enum { none, udp_once, tcp_once, udp_loop, tcp_loop, dot_loop, doh_loop, doq_loop, xfr_loop };
+const ServerRunMode = enum { none, udp_once, tcp_once, udp_loop, tcp_loop, dot_loop, doh_loop, doq_loop, doh3_loop, xfr_loop };
 
 /// The runtime a SIGHUP asks to reload its zone. A signal handler cannot
 /// take user data, so the running server is a process-wide pointer.
@@ -80,6 +84,7 @@ test {
     _ = @import("dns/question.zig");
     _ = @import("dns/message.zig");
     _ = @import("dns/tsig.zig");
+    _ = dns_odoh;
     _ = @import("dns/ed448.zig");
     _ = golden_fixture;
     _ = @import("zone/journal.zig");
@@ -95,11 +100,15 @@ test {
     _ = listener;
     _ = transport_tls;
     _ = transport_tls_server;
+    _ = transport_openssl_tls;
+    _ = tcp_deadline;
     _ = transport_tls_client;
     _ = transport_doh_client;
     _ = transport_dot;
     _ = transport_doh;
     _ = transport_doq;
+    _ = transport_doh3;
+    _ = transport_stream_registry;
     _ = transfer_axfr;
     _ = transfer_xfr_tls;
     _ = cli_query;
@@ -179,6 +188,7 @@ fn printHelp(writer: *std.Io.Writer) !void {
         \\  zimdns server run --zone-file examples/zones/home.arpa.zone --serve-tcp
         \\  zimdns server run --zone-file examples/zones/home.arpa.zone --serve-doh
         \\  zimdns server run --zone-file examples/zones/home.arpa.zone --serve-doq
+        \\  zimdns server run --zone-file examples/zones/home.arpa.zone --serve-doh3
         \\  zimdns query @127.0.0.1 -p 1055 --dnssec signed.example. A
         \\  zimdns query @127.0.0.1 -p 1055 --zoneversion example.com A
         \\  zimdns query @127.0.0.1 -p 1055 --nsid example.com A
@@ -215,12 +225,14 @@ fn printHelp(writer: *std.Io.Writer) !void {
         \\
         \\  --serve-dot serves DNS over TLS (RFC 7858) with the "dot" ALPN
         \\  token, --serve-doh serves DNS over HTTPS (RFC 8484) with the
-        \\  "http/1.1" token, --serve-doq serves DNS over QUIC (RFC 9250)
+        \\  "http/1.1" token, --serve-doh3 serves DNS over HTTPS over HTTP/3
+        \\  (RFC 9114) with the "h3" token, --serve-doq serves DNS over QUIC (RFC 9250)
         \\  with the "doq" token, and --serve-xfr serves zone transfers over TLS
         \\  with the "dot" token (RFC 9103 section 7.1): each listener
         \\  terminates the handshake before it speaks DNS, so the port never
         \\  answers in cleartext. They need --enable-encrypted-dns and a
-        \\  certificate and key.
+        \\  certificate and key. An Oblivious DoH target is one config line:
+        \\  'odoh-target on' with 'odoh-key-file <path>' (RFC 9230).
         \\
         \\Implemented now:
         \\  --help, --version, server run, query
@@ -289,7 +301,8 @@ fn handleQuery(args: []const []const u8, io: std.Io, allocator: std.mem.Allocato
 
     const qname = dns_name.Name.fromText(absolute_name) catch return cli_query.Error.BadName;
     // The 0x20 mechanism draws the case of the first letter of every label
-    // from the system CSPRNG, so a forged answer has to match the exact case
+    // from the system CSPRNG; the receive path requires the echoed question
+    // to match those bytes exactly, so a forged answer has to match the case
     // to be accepted.
     var random_source = std.Random.IoSource{ .io = io };
     const question_name = if (use_case_randomization)
@@ -306,9 +319,9 @@ fn handleQuery(args: []const []const u8, io: std.Io, allocator: std.mem.Allocato
 
     var response_buffer: [listener.UDP_RESPONSE_BUFFER_SIZE]u8 = undefined;
     var response = if (use_tcp)
-        try queryTcp(allocator, io, &server, query, &response_buffer)
+        try queryTcp(allocator, io, &server, query, &response_buffer, use_case_randomization)
     else
-        try queryUdp(allocator, io, &server, query, &response_buffer);
+        try queryUdp(allocator, io, &server, query, &response_buffer, use_case_randomization);
     defer response.deinit();
     // The question the server echoed is what shows the case that went on the
     // wire, so it is printed only when the case was randomized.
@@ -354,20 +367,7 @@ fn parseQueryType(text: []const u8) !@import("dns/types.zig").RecordType {
     return error.UnsupportedType;
 }
 
-/// Two zone names are the same when they compare case-insensitively and only
-/// the trailing dot differs: the configuration text is written the way the
-/// operator typed it, and the runtime stores the parsed origin.
-fn sameZoneName(configured: []const u8, parsed: []const u8) bool {
-    if (std.ascii.eqlIgnoreCase(configured, parsed)) return true;
-    if (parsed.len > 0 and parsed[parsed.len - 1] == '.') {
-        return std.ascii.eqlIgnoreCase(configured, parsed[0 .. parsed.len - 1]);
-    }
-    if (configured.len > 0 and configured[configured.len - 1] == '.') {
-        return std.ascii.eqlIgnoreCase(configured[0 .. configured.len - 1], parsed);
-    }
-    return false;
-}
-
+/// Appends the trailing dot a relative question name is missing.
 fn ensureAbsoluteName(name: []const u8, buffer: []u8) ![]const u8 {
     if (std.mem.endsWith(u8, name, ".")) return name;
     if (name.len + 1 > buffer.len) return error.NameTooLong;
@@ -376,16 +376,16 @@ fn ensureAbsoluteName(name: []const u8, buffer: []u8) ![]const u8 {
     return buffer[0 .. name.len + 1];
 }
 
-fn queryUdp(allocator: std.mem.Allocator, io: std.Io, server: *const std.Io.net.IpAddress, query: []const u8, response_buffer: []u8) !@import("dns/message.zig").Message {
+fn queryUdp(allocator: std.mem.Allocator, io: std.Io, server: *const std.Io.net.IpAddress, query: []const u8, response_buffer: []u8, require_exact_qname_case: bool) !@import("dns/message.zig").Message {
     var client_addr = cli_query.udpClientBindAddress(server);
     var socket = try std.Io.net.IpAddress.bind(&client_addr, io, .{ .mode = .dgram, .protocol = .udp });
     defer socket.close(io);
     try cli_query.sendUdpQuery(&socket, io, server, query);
-    return cli_query.receiveUdpResponse(allocator, &socket, io, response_buffer, server, query);
+    return cli_query.receiveUdpResponse(allocator, &socket, io, response_buffer, server, query, require_exact_qname_case);
 }
 
-fn queryTcp(allocator: std.mem.Allocator, io: std.Io, server: *const std.Io.net.IpAddress, query: []const u8, response_buffer: []u8) !@import("dns/message.zig").Message {
-    return cli_query.exchangeTcpQuery(allocator, io, server, query, response_buffer);
+fn queryTcp(allocator: std.mem.Allocator, io: std.Io, server: *const std.Io.net.IpAddress, query: []const u8, response_buffer: []u8, require_exact_qname_case: bool) !@import("dns/message.zig").Message {
+    return cli_query.exchangeTcpQuery(allocator, io, server, query, response_buffer, require_exact_qname_case);
 }
 
 /// A `--help` anywhere after the subcommand prints the same usage a bare
@@ -473,6 +473,8 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
             mode = .doh_loop;
         } else if (std.mem.eql(u8, arg, "--serve-doq")) {
             mode = .doq_loop;
+        } else if (std.mem.eql(u8, arg, "--serve-doh3")) {
+            mode = .doh3_loop;
         } else if (std.mem.eql(u8, arg, "--serve-xfr")) {
             mode = .xfr_loop;
         } else if (std.mem.eql(u8, arg, "--enable-encrypted-dns")) {
@@ -525,7 +527,16 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
     defer if (server_context) |*context| context.deinit();
 
     if (config_file) |path| {
-        server_context = try config_loader.ServerContext.load(std.Io.Dir.cwd(), io, path, allocator);
+        // Referenced files resolve against the configuration file's own
+        // directory, never the process cwd.
+        const base_name = std.fs.path.basename(path);
+        const parent_name = std.fs.path.dirname(path) orelse ".";
+        var base_dir = if (std.fs.path.isAbsolute(parent_name))
+            try std.Io.Dir.openDirAbsolute(io, parent_name, .{})
+        else
+            try std.Io.Dir.cwd().openDir(io, parent_name, .{});
+        defer base_dir.close(io);
+        server_context = try config_loader.ServerContext.load(base_dir, io, base_name, allocator);
         if (!port_set) {
             if (try findListenerAddress(&server_context.?.config, mode)) |address| {
                 configured_address = address;
@@ -535,7 +546,7 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
     }
 
     if (mode == .none) {
-        try writer.writeAll("error: server run currently requires --once-udp, --once-tcp, --serve-udp, --serve-tcp, --serve-dot, --serve-doh, --serve-doq, or --serve-xfr\n");
+        try writer.writeAll("error: server run currently requires --once-udp, --once-tcp, --serve-udp, --serve-tcp, --serve-dot, --serve-doh, --serve-doq, --serve-doh3, or --serve-xfr\n");
         try exitUsage(writer);
     }
 
@@ -547,7 +558,7 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
     var encrypted_key_path: ?[]const u8 = null;
     defer if (tls_identity) |*server| server.deinit();
 
-    if (mode == .dot_loop or mode == .doh_loop or mode == .doq_loop or mode == .xfr_loop) {
+    if (mode == .dot_loop or mode == .doh_loop or mode == .doq_loop or mode == .doh3_loop or mode == .xfr_loop) {
         const cert_path = tls_cert_file orelse (if (server_context) |*context| context.config.tlsCertFileText() else null);
         const key_path = tls_key_file orelse (if (server_context) |*context| context.config.tlsKeyFileText() else null);
         const enabled = encrypted_dns_flag or (if (server_context) |*context| context.config.encrypted_dns else false);
@@ -563,6 +574,7 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
             .dot_loop => .dot,
             .doh_loop => .doh,
             .doq_loop => .doq,
+            .doh3_loop => .doh3,
             .xfr_loop => .xfr,
             else => unreachable,
         };
@@ -589,10 +601,10 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
             try exitUsage(writer);
         };
         // The identity is loaded before the bind, so a certificate or key
-        // that cannot be loaded refuses the run and binds no port. DoQ
-        // loads its own identity inside quic-zig from the same two paths,
-        // so it needs the validation above but no TCP TLS server object.
-        if (mode != .doq_loop) {
+        // that cannot be loaded refuses the run and binds no port. DoQ and
+        // DoH/3 load their own identity inside quic-zig from the same two paths,
+        // so they need the validation above but no TCP TLS server object.
+        if (mode != .doq_loop and mode != .doh3_loop) {
             var server: transport_tls_server.Server = undefined;
             server.init(allocator, io, std.Io.Dir.cwd(), cert_path.?, key_path.?, transport_tls.alpnFor(transport)) catch {
                 try writer.writeAll("error: cannot load the TLS certificate and key\n");
@@ -603,25 +615,9 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
     }
 
     var runtime: auth_runtime.Runtime = undefined;
-    // The reload sources are read from the configuration now: taking the
-    // runtime moves the configuration out of the context.
-    var configured_reloads: std.ArrayList(struct { name: []const u8, path: []const u8 }) = .empty;
-    defer {
-        for (configured_reloads.items) |configured| {
-            allocator.free(configured.name);
-            allocator.free(configured.path);
-        }
-        configured_reloads.deinit(allocator);
-    }
-    if (!explicit_zone_file and server_context != null) {
-        for (server_context.?.config.zones.items) |configured| {
-            if (std.mem.eql(u8, configured.kindText(), "secondary")) continue;
-            try configured_reloads.append(allocator, .{
-                .name = try allocator.dupe(u8, configured.nameText()),
-                .path = try allocator.dupe(u8, configured.fileText()),
-            });
-        }
-    }
+    // The reload sources come from the loader, through the same base dir it
+    // read the zone files from. Taking the runtime moves the configuration
+    // out of the context.
     if (!explicit_zone_file and server_context != null) {
         if (server_context.?.zones.items.len == 0) {
             try writer.writeAll("error: server run requires --zone-file or --config with a zone\n");
@@ -652,14 +648,6 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
     if (explicit_zone_file) {
         if (runtime.zones.items.len == 1) {
             try runtime.setReloadSource(std.Io.Dir.cwd(), zone_file.?, runtime.zones.items[0].originText());
-        }
-    } else if (server_context != null) {
-        for (configured_reloads.items) |configured| {
-            for (runtime.zones.items) |*zone| {
-                if (!sameZoneName(configured.name, zone.originText())) continue;
-                try runtime.addReloadSource(std.Io.Dir.cwd(), configured.path, zone.originText());
-                break;
-            }
         }
     }
     installReloadHandler(&runtime);
@@ -772,11 +760,12 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
             const doh_io = io_backend.io();
             // The DoH workers share the counters of the run, so the DoH
             // queries are counted the way the other transports count them.
+            const odoh_target: ?*const dns_odoh.Target = if (server_context) |*context| if (context.odoh_target) |*target| target else null else null;
             if (configured_address) |*address| {
-                try transport_doh.serveDohLoopOnAddress(doh_io, &runtime, address, &server, max_requests, &counters);
+                try transport_doh.serveDohLoopOnAddress(doh_io, &runtime, address, &server, max_requests, &counters, odoh_target);
             } else {
                 var address = defaultListenerAddress(port);
-                try transport_doh.serveDohLoopOnAddress(doh_io, &runtime, &address, &server, max_requests, &counters);
+                try transport_doh.serveDohLoopOnAddress(doh_io, &runtime, &address, &server, max_requests, &counters, odoh_target);
             }
         },
         .doq_loop => {
@@ -792,6 +781,22 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
             } else {
                 var address = defaultListenerAddress(port);
                 try transport_doq.serveDoqLoopOnAddress(io, &runtime, &address, cert_path, key_path, max_requests, doq_counters);
+            }
+        },
+        .doh3_loop => {
+            const cert_path = encrypted_cert_path orelse return error.MissingTlsIdentity;
+            const key_path = encrypted_key_path orelse return error.MissingTlsIdentity;
+            // The DoH/3 server runs on its own thread with its own event loop,
+            // joined inside serveDoh3LoopOnAddress before it returns, so the
+            // runtime outlives every use of it. The counters reach the port,
+            // so the DoH/3 query counter moves in a metrics run.
+            const doh3_counters: ?*metrics.Counters = if (print_metrics) &counters else null;
+            const odoh_target: ?*const dns_odoh.Target = if (server_context) |*context| if (context.odoh_target) |*target| target else null else null;
+            if (configured_address) |*address| {
+                try transport_doh3.serveDoh3LoopOnAddress(io, &runtime, address, cert_path, key_path, max_requests, doh3_counters, odoh_target);
+            } else {
+                var address = defaultListenerAddress(port);
+                try transport_doh3.serveDoh3LoopOnAddress(io, &runtime, &address, cert_path, key_path, max_requests, doh3_counters, odoh_target);
             }
         },
         // The strict-TLS transfer channel: the same handshake and the same
@@ -825,6 +830,7 @@ fn findListenerAddress(config: *const config_parser.Config, mode: ServerRunMode)
         .dot_loop, .xfr_loop => .dot,
         .doh_loop => .doh,
         .doq_loop => .doq,
+        .doh3_loop => .doh3,
         .none => return null,
     };
     var index: usize = 0;
@@ -863,6 +869,7 @@ test "configured loop modes use their transport listener endpoint" {
         \\listen dns dot 127.0.0.1:12055
         \\listen dns doh 127.0.0.1:12056
         \\listen dns doq 127.0.0.1:12057
+        \\listen dns doh3 127.0.0.1:12058
         \\
     );
     const expected_udp = try std.Io.net.IpAddress.parse("127.0.0.1", 12053);
@@ -886,6 +893,10 @@ test "configured loop modes use their transport listener endpoint" {
     const expected_doq = try std.Io.net.IpAddress.parse("127.0.0.1", 12057);
     const doq = try findListenerAddress(&config, .doq_loop) orelse return error.TestExpectedEqual;
     try std.testing.expect(doq.eql(&expected_doq));
+
+    const expected_doh3 = try std.Io.net.IpAddress.parse("127.0.0.1", 12058);
+    const doh3 = try findListenerAddress(&config, .doh3_loop) orelse return error.TestExpectedEqual;
+    try std.testing.expect(doh3.eql(&expected_doh3));
 }
 
 test "no-config listener default is loopback" {
@@ -902,6 +913,7 @@ test "the encrypted listeners exist and each speaks its own ALPN token" {
     try std.testing.expect(@hasDecl(transport_doh, "serveDohLoopOnAddress"));
     try std.testing.expect(@hasDecl(transport_doq, "serveDoqLoopOnAddress"));
     try std.testing.expect(@hasDecl(transfer_xfr_tls, "serveXfrLoopOnAddress"));
+    try std.testing.expect(@hasDecl(transport_doh3, "serveDoh3LoopOnAddress"));
 
     // 2. The zone-transfer channel speaks "dot", which RFC 9103 section 7.1
     //    requires for the transfer channel.
@@ -915,6 +927,8 @@ test "the encrypted listeners exist and each speaks its own ALPN token" {
     try std.testing.expectEqualStrings("dot", transport_tls.alpnFor(.dot));
     try std.testing.expectEqualStrings("http/1.1", transport_tls.alpnFor(.doh));
     try std.testing.expectEqualStrings("doq", transport_tls.alpnFor(.doq));
+    try std.testing.expectEqualStrings("h3", transport_tls.alpnFor(.doh3));
+    try std.testing.expectEqualStrings("h3", transport_doh3.DOH3_ALPN);
     try std.testing.expectEqualStrings("doq", transport_doq.DOQ_ALPN);
 }
 

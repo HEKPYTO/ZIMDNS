@@ -46,7 +46,7 @@ test "the server echoes the 0x20 question name bit for bit" {
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query, false);
 
     // RFC 4343 section 4.1: the answer carries the question as it was sent,
     // case and all.

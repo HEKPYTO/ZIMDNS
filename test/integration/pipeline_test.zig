@@ -73,7 +73,7 @@ test "UDP request pipeline answers A query and records metrics" {
     try listener.serveUdpOnceWithMetrics(&server_socket, io, &runtime, &counters);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query, false);
     try expectAResponse(response);
     try std.testing.expectEqual(@as(u16, 0x4242), response.header.id);
     try expectMetrics(counters);
@@ -107,7 +107,7 @@ test "UDP pipeline echoes the question in the case the client sent" {
     try listener.serveUdpOnceWithMetrics(&server_socket, io, &runtime, &counters);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, &query);
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, &query, false);
     var text: [64]u8 = undefined;
     try std.testing.expectEqualStrings("Dns.Home.Arpa.", try response.question.?.name.toText(&text));
     try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
@@ -182,7 +182,7 @@ test "TCP request pipeline answers A query and records metrics" {
     try listener.serveTcpStreamOnceWithMetrics(server_stream, io, &runtime, &counters);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query);
+    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query, false);
     try expectAResponse(response);
     try expectMetrics(counters);
 }
@@ -284,7 +284,7 @@ test "UDP request pipeline answers SSHFP query" {
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query, false);
     try expectSshfpResponse(response, 0x4247);
 }
 
@@ -313,7 +313,7 @@ test "TCP request pipeline answers SSHFP query" {
     try listener.serveTcpStreamOnce(server_stream, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query);
+    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query, false);
     try expectSshfpResponse(response, 0x4248);
 }
 
@@ -339,7 +339,7 @@ test "UDP request pipeline answers TLSA query" {
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query, false);
     try expectTlsaResponse(response, 0x4249);
 }
 
@@ -368,7 +368,7 @@ test "TCP request pipeline answers TLSA query" {
     try listener.serveTcpStreamOnce(server_stream, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query);
+    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query, false);
     try expectTlsaResponse(response, 0x4250);
 }
 
@@ -394,7 +394,7 @@ test "UDP request pipeline answers URI query" {
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query, false);
     try expectUriResponse(response, 0x4251);
 }
 
@@ -423,7 +423,7 @@ test "TCP request pipeline answers URI query" {
     try listener.serveTcpStreamOnce(server_stream, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query);
+    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query, false);
     try expectUriResponse(response, 0x4252);
 }
 
@@ -449,7 +449,7 @@ test "UDP request pipeline answers NAPTR query with nonroot replacement" {
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query, false);
     try expectNaptrResponse(response, 0x4253, "", "replacement.example.");
 }
 
@@ -478,7 +478,7 @@ test "TCP request pipeline answers NAPTR query with root replacement" {
     try listener.serveTcpStreamOnce(server_stream, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query);
+    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query, false);
     try expectNaptrResponse(response, 0x4254, "!^.*$!sip:info@example.com!", ".");
 }
 
@@ -504,7 +504,7 @@ test "UDP request pipeline answers RP query without synthesized TXT additional" 
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query, false);
     try expectRpResponse(response, 0x425b);
 }
 
@@ -533,7 +533,7 @@ test "TCP request pipeline answers RP query without synthesized TXT additional" 
     try listener.serveTcpStreamOnce(server_stream, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query);
+    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query, false);
     try expectRpResponse(response, 0x425c);
 }
 
@@ -559,7 +559,7 @@ test "UDP request pipeline answers ordered APL query" {
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query, false);
     try expectAplResponse(response, 0x4255);
 }
 
@@ -588,7 +588,7 @@ test "TCP request pipeline answers ordered APL query" {
     try listener.serveTcpStreamOnce(server_stream, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query);
+    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query, false);
     try expectAplResponse(response, 0x4256);
 }
 
@@ -614,7 +614,7 @@ test "UDP request pipeline answers CAA query with raw value bytes" {
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query, false);
     try expectCaaResponse(response, 0x4259);
 }
 
@@ -643,7 +643,7 @@ test "TCP request pipeline answers CAA query with raw value bytes" {
     try listener.serveTcpStreamOnce(server_stream, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query);
+    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query, false);
     try expectCaaResponse(response, 0x425a);
 }
 
@@ -669,7 +669,7 @@ test "UDP request pipeline answers AFSDB query without synthesized additional A"
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query, false);
     try expectAfsdbResponse(response, 0x4257);
 }
 
@@ -698,7 +698,7 @@ test "TCP request pipeline answers AFSDB query without synthesized additional A"
     try listener.serveTcpStreamOnce(server_stream, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query);
+    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query, false);
     try expectAfsdbResponse(response, 0x4258);
 }
 
@@ -724,7 +724,7 @@ test "UDP request pipeline answers X25 query without synthesized additional" {
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query, false);
     try expectX25Response(response, 0x425d);
 }
 
@@ -753,7 +753,7 @@ test "TCP request pipeline answers X25 query without synthesized additional" {
     try listener.serveTcpStreamOnce(server_stream, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query);
+    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query, false);
     try expectX25Response(response, 0x425e);
 }
 
@@ -779,7 +779,7 @@ test "UDP request pipeline answers ISDN query without synthesized additional" {
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query, false);
     try expectIsdnResponse(response, 0x425f);
 }
 
@@ -808,7 +808,7 @@ test "TCP request pipeline answers ISDN query without synthesized additional" {
     try listener.serveTcpStreamOnce(server_stream, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query);
+    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query, false);
     try expectIsdnResponse(response, 0x4260);
 }
 
@@ -834,7 +834,7 @@ test "UDP request pipeline answers HINFO query without synthesized additional" {
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query, false);
     try expectHinfoResponse(response, 0x4265);
 }
 
@@ -863,7 +863,7 @@ test "TCP request pipeline answers HINFO query without synthesized additional" {
     try listener.serveTcpStreamOnce(server_stream, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query);
+    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query, false);
     try expectHinfoResponse(response, 0x4266);
 }
 
@@ -889,7 +889,7 @@ test "UDP request pipeline answers RT query without synthesized additionals" {
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query, false);
     try expectRtResponse(response, 0x4261);
 }
 
@@ -918,7 +918,7 @@ test "TCP request pipeline answers RT query without synthesized additionals" {
     try listener.serveTcpStreamOnce(server_stream, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query);
+    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query, false);
     try expectRtResponse(response, 0x4262);
 }
 
@@ -944,7 +944,7 @@ test "UDP request pipeline answers SRV query without synthesized A or AAAA addit
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query, false);
     try expectSrvResponse(response, 0x4263);
 }
 
@@ -973,7 +973,7 @@ test "TCP request pipeline answers SRV query without synthesized A or AAAA addit
     try listener.serveTcpStreamOnce(server_stream, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query);
+    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query, false);
     try expectSrvResponse(response, 0x4264);
 }
 test "UDP request pipeline answers DNAME query with target" {
@@ -998,7 +998,7 @@ test "UDP request pipeline answers DNAME query with target" {
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query, false);
     try expectDnameResponse(response, 0x42D1);
 }
 
@@ -1027,7 +1027,7 @@ test "TCP request pipeline answers DNAME query with target" {
     try listener.serveTcpStreamOnce(server_stream, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query);
+    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query, false);
     try expectDnameResponse(response, 0x42D2);
 }
 
@@ -1053,7 +1053,7 @@ test "UDP request pipeline answers SVCB query with params" {
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query, false);
     try expectSvcbResponse(response, 0x42B1);
 }
 
@@ -1082,7 +1082,7 @@ test "TCP request pipeline answers SVCB query with params" {
     try listener.serveTcpStreamOnce(server_stream, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query);
+    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query, false);
     try expectSvcbResponse(response, 0x42B2);
 }
 test "UDP request pipeline answers HTTPS alias query" {
@@ -1107,7 +1107,7 @@ test "UDP request pipeline answers HTTPS alias query" {
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query, false);
     try expectHttpsResponse(response, 0x42C1);
 }
 
@@ -1136,7 +1136,7 @@ test "TCP request pipeline answers HTTPS alias query" {
     try listener.serveTcpStreamOnce(server_stream, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query);
+    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query, false);
     try expectHttpsResponse(response, 0x42C2);
 }
 
@@ -1162,7 +1162,7 @@ test "UDP request pipeline answers AAAA query with address" {
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query, false);
     try expectAaaaResponse(response, 0x42A1);
 }
 
@@ -1191,7 +1191,7 @@ test "TCP request pipeline answers AAAA query with address" {
     try listener.serveTcpStreamOnce(server_stream, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query);
+    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query, false);
     try expectAaaaResponse(response, 0x42A2);
 }
 test "UDP request pipeline answers ZONEVERSION with SOA serial" {
@@ -1225,7 +1225,7 @@ test "UDP request pipeline answers ZONEVERSION with SOA serial" {
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query, false);
     try std.testing.expect(response.header.qr);
     try std.testing.expectEqual(@as(u16, 0x42E1), response.header.id);
     // Response OPT carries ZONEVERSION: LABELCOUNT(2 for the responding zone home.arpa.),
@@ -1270,7 +1270,7 @@ test "TCP request pipeline answers ZONEVERSION with SOA serial" {
     try listener.serveTcpStreamOnce(server_stream, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query);
+    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query, false);
     try std.testing.expect(response.header.qr);
     try std.testing.expectEqual(@as(u16, 0x42E2), response.header.id);
     var found = false;
@@ -1313,7 +1313,7 @@ test "UDP request pipeline answers NSID with configured payload" {
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query, false);
     try std.testing.expect(response.header.qr);
     var found = false;
     for (response.additionals.slice()) |record| {
@@ -1349,7 +1349,7 @@ test "the query CLI asks for NSID and prints the server's identifier" {
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query, false);
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     try cli_query.writeResponse(response, &output.writer);
@@ -1389,7 +1389,7 @@ test "TCP request pipeline answers NSID with configured payload" {
     try listener.serveTcpStreamOnce(server_stream, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query);
+    const response = try cli_query.receiveTcpResponse(arena.allocator(), client_stream, io, &response_buffer, query, false);
     try std.testing.expect(response.header.qr);
     var found = false;
     for (response.additionals.slice()) |record| {
@@ -1464,7 +1464,7 @@ test "CLI TCP exchange uses the bounded connection path" {
     var args = CliTcpArgs{ .io = io, .server = &server, .runtime = &runtime };
     const thread = try std.Thread.spawn(.{}, serveCliTcp, .{&args});
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.exchangeTcpQuery(arena.allocator(), io, &server.socket.address, query, &response_buffer);
+    const response = try cli_query.exchangeTcpQuery(arena.allocator(), io, &server.socket.address, query, &response_buffer, false);
     thread.join();
 
     try std.testing.expect(args.ok);
@@ -1565,9 +1565,9 @@ test "configured two-zone UDP loop dispatches by longest origin" {
     try listener.serveUdpLoop(&server_socket, io, &runtime, 2);
 
     var response_buffer: [512]u8 = undefined;
-    const parent_response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, parent_query);
+    const parent_response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, parent_query, false);
     try expectAddress(parent_response, .{ 192, 0, 2, 1 });
-    const child_response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, child_query);
+    const child_response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, child_query, false);
     try expectAddress(child_response, .{ 192, 0, 2, 2 });
 }
 
@@ -1605,9 +1605,9 @@ test "configured two-zone TCP loop accepts bounded independent connections" {
 
     var parent_response_buffer: [512]u8 = undefined;
     var child_response_buffer: [512]u8 = undefined;
-    const parent_response = try cli_query.receiveTcpResponse(arena.allocator(), parent_client, io, &parent_response_buffer, parent_query);
+    const parent_response = try cli_query.receiveTcpResponse(arena.allocator(), parent_client, io, &parent_response_buffer, parent_query, false);
     try expectAddress(parent_response, .{ 192, 0, 2, 1 });
-    const child_response = try cli_query.receiveTcpResponse(arena.allocator(), child_client, io, &child_response_buffer, child_query);
+    const child_response = try cli_query.receiveTcpResponse(arena.allocator(), child_client, io, &child_response_buffer, child_query, false);
     try expectAddress(child_response, .{ 192, 0, 2, 2 });
 }
 
@@ -1661,7 +1661,7 @@ test "authoritative TCP loop caps active connections at eight" {
 
     var response_buffers: [listener.TCP_MAX_CONNECTION_WORKERS][512]u8 = undefined;
     for (&clients, 0..) |*client, index| {
-        const response = try cli_query.receiveTcpResponse(arena.allocator(), client.*.?, io, &response_buffers[index], client_query_slices[index]);
+        const response = try cli_query.receiveTcpResponse(arena.allocator(), client.*.?, io, &response_buffers[index], client_query_slices[index], false);
         try expectAResponse(response);
         try std.testing.expectEqual(@as(u16, @intCast(0x5300 + index)), response.header.id);
     }
@@ -1902,7 +1902,7 @@ test "authorized UDP listener request reaches a local upstream" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query, false);
     try expectForwardedAResponse(response, 0x7003);
 }
 
@@ -2022,7 +2022,7 @@ test "locally served zone answers over UDP from a config with no forwarder" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query, false);
     try expectLocalNxdomain(response, 0x7a21, "127.in-addr.arpa.");
 
     // The operator's own zone is untouched by the local-zone table.
@@ -2030,7 +2030,7 @@ test "locally served zone answers over UDP from a config with no forwarder" {
     try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, zone_query);
     try listener.serveUdpOnce(&server_socket, io, &runtime);
     var zone_response_buffer: [512]u8 = undefined;
-    const zone_response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &zone_response_buffer, &server_socket.address, zone_query);
+    const zone_response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &zone_response_buffer, &server_socket.address, zone_query, false);
     try expectAddress(zone_response, .{ 192, 0, 2, 1 });
 }
 test "local-zones except falls through to refused without a forwarder" {
@@ -2072,7 +2072,7 @@ test "local-zones except falls through to refused without a forwarder" {
     try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, query);
     try listener.serveUdpOnce(&server_socket, io, &runtime);
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query, false);
     try std.testing.expectEqual(@as(@TypeOf(response.header.rcode), .refused), response.header.rcode);
 
     // Non-excluded apex still answered locally.
@@ -2080,16 +2080,17 @@ test "local-zones except falls through to refused without a forwarder" {
     try cli_query.sendUdpQuery(&client_socket, io, &server_socket.address, kept_query);
     try listener.serveUdpOnce(&server_socket, io, &runtime);
     var kept_buffer: [512]u8 = undefined;
-    const kept = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &kept_buffer, &server_socket.address, kept_query);
+    const kept = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &kept_buffer, &server_socket.address, kept_query, false);
     try expectLocalNxdomain(kept, 0x7a32, "10.in-addr.arpa.");
 }
 
-test "the shipped --config invocation loads through the cwd Dir and answers a query" {
+test "the shipped --config invocation loads through the config Dir and answers a query" {
     const io = std.Io.Threaded.global_single_threaded.io();
     // Exactly what `zimdns server run --config examples/config.gdns` passes:
-    // Dir.cwd() carries the AT_FDCWD sentinel, so no hand-built Dir reproduces
-    // the failure the shipped command had.
-    var context = try zimdns.config_loader.ServerContext.load(std.Io.Dir.cwd(), io, "examples/config.gdns", std.testing.allocator);
+    // the config file's own directory and the basename.
+    var examples = try std.Io.Dir.cwd().openDir(io, "examples", .{});
+    defer examples.close(io);
+    var context = try zimdns.config_loader.ServerContext.load(examples, io, "config.gdns", std.testing.allocator);
     defer context.deinit();
     try std.testing.expectEqual(@as(usize, 1), context.zones.items.len);
     try std.testing.expectEqualStrings("home.arpa.", context.zones.items[0].originText());
@@ -2112,7 +2113,7 @@ test "the shipped --config invocation loads through the cwd Dir and answers a qu
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query, false);
     try expectAddress(response, .{ 192, 168, 1, 1 });
 }
 
@@ -3677,7 +3678,7 @@ test "UDP request pipeline ANY answers one synthesized HINFO at the operator TTL
     try listener.serveUdpOnce(&server_socket, io, &runtime);
 
     var response_buffer: [512]u8 = undefined;
-    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query);
+    const response = try cli_query.receiveUdpResponse(arena.allocator(), &client_socket, io, &response_buffer, &server_socket.address, query, false);
     try std.testing.expect(response.header.qr);
     try std.testing.expectEqual(@as(u16, 1), response.header.answer_count);
     try std.testing.expect(response.answers.items[0].rrtype.eql(.{ .value = 13 }));

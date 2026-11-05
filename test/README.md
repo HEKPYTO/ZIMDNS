@@ -10,7 +10,7 @@ The test suite. Six groups, one command each.
 | `fuzz/` | `zig build test-fuzz` | The message, name, zone, configuration, and blocklist parsers against malformed input. |
 | `integration/` | `zig build test-integration` | A real server on a real socket. |
 | `cli/` | `zig build test-cli` | The documented invocations, exactly as the README prints them. |
-| `interop/` | `python3 test/interop/tls_channel_test.py` | An offline mirror of the encrypted-channel unit tests, written in Python so the contract is stated twice. |
+| `interop/` | `python3 test/interop/harness.py --zimdns <binary>` | The external suite: drives the built binary with dig, delv, named, named-checkzone, nsupdate, kdig, kzonecheck, ldns-verify-zone, curl, pyhpke, and aioquic; a missing tool is a hard failure. |
 
 ## Rules
 

@@ -18,7 +18,7 @@ pub const Error = error{
     TooManyItems,
 };
 
-pub const Transport = enum { udp, tcp, dot, doh, doq };
+pub const Transport = enum { udp, tcp, dot, doh, doq, doh3 };
 
 /// The chain a signed zone publishes: the RFC 4034 NSEC chain or the
 /// RFC 5155 NSEC3 chain.
@@ -312,6 +312,17 @@ pub const Zone = struct {
     }
 };
 
+/// One `allow-transfer <apex> <cidr>` line: the zone an operator allowed
+/// AXFR/IXFR for and one client CIDR allowed to transfer it. Repeatable.
+pub const AllowTransfer = struct {
+    apex: Text = .{},
+    cidr: Cidr = .{},
+
+    pub fn apexText(self: *const AllowTransfer) []const u8 {
+        return self.apex.text();
+    }
+};
+
 /// One `allow-update <apex> <key-name>` line: the zone an operator allowed
 /// RFC 2136 updates for and the one TSIG key allowed to write it.
 pub const AllowUpdate = struct {
@@ -326,7 +337,6 @@ pub const AllowUpdate = struct {
         return self.key.text();
     }
 };
-
 /// One `notify <apex> <address:port>` line: RFC 1996 section 3.8 has the
 /// master notify its secondaries when a zone changes. The address is the
 /// operator's, not one derived from the NS RRset.
@@ -438,6 +448,7 @@ pub const Config = struct {
     cookies: CookieConfig = .{},
     zones: List(Zone) = .{},
     blocklists: List(BlocklistFile) = .{},
+    allow_transfers: List(AllowTransfer) = .{},
     allow_updates: List(AllowUpdate) = .{},
     notifies: List(NotifyTarget) = .{},
     blacklist_zones: List(BlacklistZone) = .{},
@@ -490,6 +501,12 @@ pub const Config = struct {
     has_tls_key_file: bool = false,
     encrypted_dns: bool = false,
     has_encrypted_dns: bool = false,
+    odoh_target: bool = false,
+    has_odoh_target: bool = false,
+    odoh_key_file: Text = .{},
+    has_odoh_key_file: bool = false,
+    odoh_config_out: Text = .{},
+    has_odoh_config_out: bool = false,
     /// RFC 9462 section 4: DDR client discovery for the plaintext
     /// forwarder. Off unless `ddr-client on`.
     ddr_client: bool = false,
@@ -604,6 +621,19 @@ pub const Config = struct {
         if (!self.has_tls_key_file) return null;
         return self.tls_key_file.text();
     }
+    pub fn odohTarget(self: *const Config) bool {
+        return self.odoh_target;
+    }
+
+    pub fn odohKeyFileText(self: *const Config) ?[]const u8 {
+        if (!self.has_odoh_key_file) return null;
+        return self.odoh_key_file.text();
+    }
+
+    pub fn odohConfigOutText(self: *const Config) ?[]const u8 {
+        if (!self.has_odoh_config_out) return null;
+        return self.odoh_config_out.text();
+    }
 
     pub fn forwarderCaFileText(self: *const Config) ?[]const u8 {
         if (!self.has_forwarder_ca_file) return null;
@@ -687,6 +717,7 @@ pub const Config = struct {
         if (std.mem.eql(u8, first, "cookies")) return self.parseCookies(&tokens);
         if (std.mem.eql(u8, first, "zone")) return self.parseZone(&tokens);
         if (std.mem.eql(u8, first, "blocklist")) return self.parseBlocklist(&tokens);
+        if (std.mem.eql(u8, first, "allow-transfer")) return self.parseAllowTransfer(&tokens);
         if (std.mem.eql(u8, first, "allow-update")) return self.parseAllowUpdate(&tokens);
         if (std.mem.eql(u8, first, "notify")) return self.parseNotify(&tokens);
         if (std.mem.eql(u8, first, "blacklist-zone")) return self.parseBlacklistZone(&tokens);
@@ -701,6 +732,9 @@ pub const Config = struct {
         if (std.mem.eql(u8, first, "ixfr-journal-file")) return self.parseIxfrJournalFile(&tokens);
         if (std.mem.eql(u8, first, "tls-cert-file")) return self.parseTlsCertFile(&tokens);
         if (std.mem.eql(u8, first, "tls-key-file")) return self.parseTlsKeyFile(&tokens);
+        if (std.mem.eql(u8, first, "odoh-target")) return self.parseOdohTarget(&tokens);
+        if (std.mem.eql(u8, first, "odoh-key-file")) return self.parseOdohKeyFile(&tokens);
+        if (std.mem.eql(u8, first, "odoh-config-out")) return self.parseOdohConfigOut(&tokens);
         if (std.mem.eql(u8, first, "encrypted-dns")) return self.parseEncryptedDns(&tokens);
         if (std.mem.eql(u8, first, "ddr-client")) return self.parseDdrClient(&tokens);
         if (std.mem.eql(u8, first, "ddr-client-port")) return self.parseDdrClientPort(&tokens);
@@ -949,6 +983,16 @@ pub const Config = struct {
         }
         try self.allow_updates.append(entry);
     }
+    fn parseAllowTransfer(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        var entry = AllowTransfer{};
+        try entry.apex.set(tokens.next() orelse return Error.BadDirective);
+        entry.cidr = try Cidr.parse(tokens.next() orelse return Error.BadDirective);
+        try requireNoTrailingTokens(tokens);
+        for (self.allow_transfers.items[0..self.allow_transfers.len]) |existing| {
+            if (std.ascii.eqlIgnoreCase(existing.apexText(), entry.apexText()) and std.mem.eql(u8, existing.cidr.text(), entry.cidr.text())) return Error.BadDirective;
+        }
+        try self.allow_transfers.append(entry);
+    }
 
     fn parseBlocklist(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
         if (!std.mem.eql(u8, tokens.next() orelse return Error.BadDirective, "file")) return Error.BadDirective;
@@ -1045,6 +1089,38 @@ pub const Config = struct {
         if (path.len == 0) return Error.BadDirective;
         try self.tls_key_file.set(path);
         self.has_tls_key_file = true;
+    }
+
+    fn parseOdohTarget(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        if (self.has_odoh_target) return Error.BadDirective;
+        const value = tokens.next() orelse return Error.BadDirective;
+        try requireNoTrailingTokens(tokens);
+        if (std.mem.eql(u8, value, "on")) {
+            self.odoh_target = true;
+        } else if (std.mem.eql(u8, value, "off")) {
+            self.odoh_target = false;
+        } else {
+            return Error.BadDirective;
+        }
+        self.has_odoh_target = true;
+    }
+
+    fn parseOdohKeyFile(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        if (self.has_odoh_key_file) return Error.BadDirective;
+        const path = tokens.next() orelse return Error.BadDirective;
+        try requireNoTrailingTokens(tokens);
+        if (path.len == 0) return Error.BadDirective;
+        try self.odoh_key_file.set(path);
+        self.has_odoh_key_file = true;
+    }
+
+    fn parseOdohConfigOut(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        if (self.has_odoh_config_out) return Error.BadDirective;
+        const path = tokens.next() orelse return Error.BadDirective;
+        try requireNoTrailingTokens(tokens);
+        if (path.len == 0) return Error.BadDirective;
+        try self.odoh_config_out.set(path);
+        self.has_odoh_config_out = true;
     }
 
     fn parseEncryptedDns(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
@@ -1380,6 +1456,16 @@ test "allow-update rejects a duplicate apex and a missing key" {
     try std.testing.expectError(Error.BadDirective, Config.parse("allow-update example.com."));
     try std.testing.expectError(Error.BadDirective, Config.parse("allow-update example.com. key. extra"));
 }
+test "allow-transfer names a zone and its client cidr" {
+    const config = try Config.parse("zone example.com. primary zones/example.zone\nallow-transfer example.com. 127.0.0.1/32\n");
+    try std.testing.expectEqual(@as(usize, 1), config.allow_transfers.len);
+    try std.testing.expectEqualStrings("example.com.", config.allow_transfers.items[0].apexText());
+    try std.testing.expectEqualStrings("127.0.0.1/32", config.allow_transfers.items[0].cidr.text());
+    try std.testing.expectError(Error.BadDirective, Config.parse("allow-transfer example.com. 127.0.0.1/32\nallow-transfer example.com. 127.0.0.1/32\n"));
+    try std.testing.expectError(Error.BadCidr, Config.parse("allow-transfer example.com. 127.0.0.1\n"));
+    try std.testing.expectError(Error.BadDirective, Config.parse("allow-transfer example.com.\n"));
+    try std.testing.expectError(Error.BadDirective, Config.parse("allow-transfer example.com. 127.0.0.1/32 extra\n"));
+}
 
 fn requireNoTrailingTokens(tokens: *std.mem.TokenIterator(u8, .any)) Error!void {
     if (tokens.next() != null) return Error.BadDirective;
@@ -1391,6 +1477,7 @@ fn parseTransport(text: []const u8) !Transport {
     if (std.mem.eql(u8, text, "dot")) return .dot;
     if (std.mem.eql(u8, text, "doh")) return .doh;
     if (std.mem.eql(u8, text, "doq")) return .doq;
+    if (std.mem.eql(u8, text, "doh3")) return .doh3;
     return Error.BadDirective;
 }
 
@@ -1490,6 +1577,13 @@ test "config parser accepts the doq listener transport" {
     try std.testing.expectEqual(@as(usize, 1), config.listeners.len);
     try std.testing.expectEqual(Transport.doq, config.listeners.items[0].transport);
     try std.testing.expectEqual(@as(u16, 853), config.listeners.items[0].port);
+}
+
+test "config parser accepts the doh3 listener transport" {
+    const config = try Config.parse("listen dns doh3 127.0.0.1:443\n");
+    try std.testing.expectEqual(@as(usize, 1), config.listeners.len);
+    try std.testing.expectEqual(Transport.doh3, config.listeners.items[0].transport);
+    try std.testing.expectEqual(@as(u16, 443), config.listeners.items[0].port);
 }
 
 test "config parser loads strict forwarding policy" {
@@ -1647,6 +1741,26 @@ test "config parser accepts opt-in encrypted DNS listeners and TLS identity" {
     try std.testing.expectError(error.BadDirective, Config.parse(
         "tls-key-file /a\ntls-key-file /b\n",
     ));
+}
+
+test "config parser accepts odoh-target directives once each" {
+    const on = try Config.parse("odoh-target on\nodoh-key-file odoh.key\n");
+    try std.testing.expect(on.odohTarget());
+    try std.testing.expectEqualStrings("odoh.key", on.odohKeyFileText().?);
+    try std.testing.expect(on.odohConfigOutText() == null);
+    const off = try Config.parse("odoh-target off\n");
+    try std.testing.expect(!off.odohTarget());
+    const empty = try Config.parse("listen dns udp 127.0.0.1:1053\n");
+    try std.testing.expect(!empty.odohTarget());
+    try std.testing.expect(empty.odohKeyFileText() == null);
+    try std.testing.expect(empty.odohConfigOutText() == null);
+    try std.testing.expectError(error.BadDirective, Config.parse("odoh-target yes\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("odoh-target\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("odoh-target on extra\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("odoh-target on\nodoh-target off\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("odoh-key-file a\nodoh-key-file b\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("odoh-config-out a\nodoh-config-out b\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("odoh-key-file\n"));
 }
 
 test "config parser accepts one TSIG key-file path and no secret directive" {

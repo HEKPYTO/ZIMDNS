@@ -92,3 +92,7 @@ the live anchor set (`src/dns/managed_anchors.zig`). Still deferred by decision:
 the parent-side DS change that starts a key-signing rollover (it belongs to the
 parent zone's operator, not this server) and the zone-signing key rollover
 tooling. Matrix rows 51, 91, 92, 117, and 126 describe the shipped split.
+
+## Oblivious DoH target crypto (RFC 9230)
+
+`src/dns/odoh.zig` is the HPKE base mode (RFC 9180) with the RFC 9230 §9 mandatory suite: DHKEM(X25519, HKDF-SHA256) 0x0020, HKDF-SHA256 0x0001, AES-128-GCM 0x0001. It frames `ObliviousDoHConfigs` (key id = HKDF over the config contents, "odoh key id"), opens `ObliviousDoHMessage` queries ("odoh query" info, 0x01 AAD), and seals responses (16-byte nonce, "odoh response" export, "odoh key" / "odoh nonce" expand, 0x02 AAD). `openQuery` maps an unknown key id to `UnknownKeyId` (HTTP 401) and decrypt/padding failures to `BadMessage` (HTTP 400); the module holds no HTTP state. RFC 9180 Appendix A vectors and a query/response round trip are pinned in-file. Rotation is the operator's action (replace the key file and restart; RFC 9230 §5 recommends daily, not a MUST).

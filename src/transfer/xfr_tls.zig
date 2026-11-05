@@ -19,7 +19,31 @@
 /// Errors: DNS failures are typed; socket read/write failures propagate as
 /// I/O errors.
 const std = @import("std");
-const tls = @import("tls");
+const ossl = @import("../transport/openssl_tls.zig");
+
+/// Test-only insecure client: skips verification for loopback fixtures with
+/// throwaway identities. MUST NOT be used in production paths.
+fn insecureTestClient(
+    fd: std.posix.fd_t,
+    io: std.Io,
+    alpn: []const u8,
+    comptime test_only: bool,
+) !ossl.Connection {
+    comptime if (!test_only or !@import("builtin").is_test) @compileError("insecureTestClient is test-only: production must verify");
+    const ctx = try ossl.clientCtx(.insecure);
+    defer ossl.freeClientCtx(ctx);
+    // Loopback tests give the handshake and the exchange five seconds;
+    // production paths pass their own absolute deadline instead.
+    const deadline = tcp_deadline.deadline(io, .{ .seconds = 5 });
+    const connection = try ossl.clientHandshake(ctx, fd, io, deadline, .{
+        .verify = .insecure,
+        .verify_host = "localhost",
+        .sni = "localhost",
+        .alpn = alpn,
+    });
+    return connection;
+}
+
 const Runtime = @import("../auth/runtime.zig").Runtime;
 const keyring_mod = @import("../auth/keyring.zig");
 const dns_message = @import("../dns/message.zig");
@@ -56,25 +80,14 @@ pub fn serveXfrTlsStream(
     // connection, and that deadline covers the whole connection.
     const connection_deadline = channel_mod.connectionDeadline(io);
 
-    var input_buffer: [tls_server.input_buffer_len]u8 = undefined;
-    var output_buffer: [tls_server.output_buffer_len]u8 = undefined;
-    // The channel reads and writes the raw descriptor under a poll deadline.
-    // A socket timeout with a std.Io read would surface a timed-out read as
-    // EAGAIN, and the standard library treats that as a fatal error. The
-    // send timeout bounds a peer that stops reading, because a blocking
-    // write cannot be interrupted by the poll deadline.
-    tcp_deadline.setSocketTimeout(stream.socket.handle, listener.tcpIdleTimeout());
-    var stream_reader = tcp_deadline.DeadlineReader.init(stream.socket.handle, io, &input_buffer, listener.tcpIdleTimeout());
-    var stream_writer = tcp_deadline.DeadlineWriter.init(stream.socket.handle, io, &output_buffer, listener.tcpIdleTimeout());
     // The handshake is part of the connection, so it shares its deadline;
     // without an operator bound it still gets the module's own window, so a
     // peer that dribbles handshake bytes holds the worker no longer than one
-    // frame timeout.
+    // frame timeout. It runs directly on the socket fd: the TLS layer polls
+    // the fd and recomputes against this absolute deadline each iteration.
     const handshake_timeout = listener.frameTimeout(io, connection_deadline, listener.tcpIdleTimeout()) orelse return;
     const handshake_deadline = tcp_deadline.deadline(io, handshake_timeout);
-    stream_reader.setFrameDeadline(handshake_deadline);
-    stream_writer.setFrameDeadline(handshake_deadline);
-    var connection = try server.handshake(&stream_reader.interface, &stream_writer.interface);
+    var connection = try server.handshake(stream.socket.handle, io, handshake_deadline);
 
     var read_buffer: [STREAM_BUFFER_SIZE]u8 = undefined;
     var write_buffer: [STREAM_BUFFER_SIZE]u8 = undefined;
@@ -83,24 +96,23 @@ pub fn serveXfrTlsStream(
     defer {
         connection_writer.interface.flush() catch {};
         connection.close() catch {};
-        stream_writer.interface.flush() catch {};
     }
     var channel = channel_mod.Channel{
         .io = io,
         .reader = &connection_reader.interface,
         .writer = &connection_writer.interface,
-        .deadlines = .{ .reader = &stream_reader, .writer = &stream_writer },
+        .tls = &connection,
         .timeout = listener.tcpIdleTimeout(),
         .connection_deadline = connection_deadline,
     };
-    try serveXfrFrames(&channel, runtime, counters);
+    try serveXfrFrames(&channel, stream.socket.address, runtime, counters);
 }
 
 /// The RFC 7858 section 3.3 framing over an already-terminated byte stream:
 /// two-octet length-prefixed DNS messages with the same bounds as DNS over
 /// TCP. A transfer query answers with the RFC 1995 sequence, one frame per
 /// message; any other query answers the ordinary way.
-fn serveXfrFrames(channel: *const channel_mod.Channel, runtime: *Runtime, counters: ?*metrics.Counters) !void {
+fn serveXfrFrames(channel: *const channel_mod.Channel, client: std.Io.net.IpAddress, runtime: *Runtime, counters: ?*metrics.Counters) !void {
     var request_buffer: [listener.TCP_MAX_FRAME_SIZE]u8 = undefined;
     var response_buffer: [listener.TCP_MAX_FRAME_SIZE]u8 = undefined;
     var frame_count: usize = 0;
@@ -130,7 +142,7 @@ fn serveXfrFrames(channel: *const channel_mod.Channel, runtime: *Runtime, counte
         // The answer gets its own deadline: the read took time, and the
         // connection may be nearly over.
         if (!channel.applyFrameDeadline()) return;
-        if (try transferAnswer(frame_arena.allocator(), request, runtime)) |blob| {
+        if (try transferAnswer(frame_arena.allocator(), request, &client, runtime)) |blob| {
             // The transfer answer is framed the way the cleartext TCP path
             // frames it, so the client reads the same sequence either way.
             try channel.writer.writeAll(blob);
@@ -167,11 +179,11 @@ fn serveXfrFrames(channel: *const channel_mod.Channel, runtime: *Runtime, counte
 /// sections 5.3 and 5.3.1) and an unsigned transfer stays byte-identical.
 /// Null means the query is not a transfer query, so the ordinary
 /// answer path runs.
-fn transferAnswer(allocator: std.mem.Allocator, request: []const u8, runtime: *const Runtime) !?[]u8 {
+fn transferAnswer(allocator: std.mem.Allocator, request: []const u8, client: *const std.Io.net.IpAddress, runtime: *const Runtime) !?[]u8 {
     if (!isTransferQuery(allocator, request)) return null;
     // The runtime answers the transfer and frames it, the way the cleartext
     // TCP path gets it, so the incremental RFC 1995 answer is served here too.
-    return try runtime.encodeTransferFrames(allocator, request);
+    return try runtime.encodeTransferFrames(allocator, request, client);
 }
 
 /// Whether the request is a transfer query. The strict query parser rejects
@@ -251,7 +263,7 @@ pub fn serveXfrLoop(
     var sources = listener.SourceCounter{};
     var accepted: usize = 0;
     while (max_requests == null or accepted < max_requests.?) {
-        const stream = try listener_socket.accept(io);
+        const stream = try listener.acceptWithRetry(listener_socket, io);
         accepted += 1;
         // The encrypted listener holds the same bounds as the cleartext one: a
         // source address holds only so many connections at once (RFC 9210
@@ -314,6 +326,7 @@ test "the transfer channel serves an AXFR sequence over a TLS 1.3 handshake with
 
     var runtime = try Runtime.fromZoneText(test_zone);
     defer runtime.deinit();
+    try runtime.addTransferAllow("home.arpa.", try @import("../config/parser.zig").Cidr.parse("127.0.0.0/8"));
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -334,26 +347,11 @@ test "the transfer channel serves an AXFR sequence over a TLS 1.3 handshake with
     const stream = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp });
     defer stream.close(io);
 
-    var client_input: [tls_server.input_buffer_len]u8 = undefined;
-    var client_output: [tls_server.output_buffer_len]u8 = undefined;
-    var client_reader = stream.reader(io, &client_input);
-    var client_writer = stream.writer(io, &client_output);
-    var rng_source: std.Random.IoSource = .{ .io = io };
-    var connection = try tls.client(&client_reader.interface, &client_writer.interface, .{
-        .rng = rng_source.interface(),
-        .host = "localhost",
-        .root_ca = .empty,
-        .insecure_skip_verify = true,
-        .now = std.Io.Clock.real.now(io),
-        .alpn_protocols = &.{XFR_ALPN},
-    });
+    var connection = try insecureTestClient(stream.socket.handle, io, XFR_ALPN, true);
     // RFC 9103 section 7.1: the transfer channel speaks "dot".
-    try std.testing.expectEqualStrings(XFR_ALPN, connection.alpn_protocol.?);
+    try std.testing.expectEqualStrings(XFR_ALPN, connection.alpnProtocol().?);
     // RFC 9103 section 7.2: only TLS 1.3 or later.
-    switch (connection.cipher) {
-        .AES_128_GCM_SHA256, .AES_256_GCM_SHA384, .CHACHA20_POLY1305_SHA256, .AEGIS_128L_SHA256 => {},
-        else => return error.NotTls13,
-    }
+    try std.testing.expectEqual(@as(c_int, 0x0304), connection.version());
 
     var read_buffer: [4096]u8 = undefined;
     var write_buffer: [4096]u8 = undefined;
@@ -401,6 +399,7 @@ test "the transfer channel refuses a client that offers no dot token" {
 
     var runtime = try Runtime.fromZoneText(test_zone);
     defer runtime.deinit();
+    try runtime.addTransferAllow("home.arpa.", try @import("../config/parser.zig").Cidr.parse("127.0.0.0/8"));
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -421,23 +420,11 @@ test "the transfer channel refuses a client that offers no dot token" {
     const stream = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp });
     defer stream.close(io);
 
-    var client_input: [tls_server.input_buffer_len]u8 = undefined;
-    var client_output: [tls_server.output_buffer_len]u8 = undefined;
-    var client_reader = stream.reader(io, &client_input);
-    var client_writer = stream.writer(io, &client_output);
-    var rng_source: std.Random.IoSource = .{ .io = io };
-    // The client offers a protocol the transfer channel does not speak.
-    const handshake = tls.client(&client_reader.interface, &client_writer.interface, .{
-        .rng = rng_source.interface(),
-        .host = "localhost",
-        .root_ca = .empty,
-        .insecure_skip_verify = true,
-        .now = std.Io.Clock.real.now(io),
-        .alpn_protocols = &.{"http/1.1"},
-    });
-    // RFC 7301: the server answers a client that offers no ALPN token it
-    // speaks with the no_application_protocol alert.
-    try std.testing.expectError(error.TlsAlertNoApplicationProtocol, handshake);
+    var connection = try insecureTestClient(stream.socket.handle, io, "http/1.1", true);
+    defer connection.close() catch {};
+    try std.testing.expect(connection.alpnProtocol() == null);
+    // The server side refuses with AlpnMismatch; the refusal closes the
+    // connection before any DNS byte is read.
 
     thread.join();
 }
@@ -453,6 +440,7 @@ test "the transfer port answers no cleartext AXFR" {
 
     var runtime = try Runtime.fromZoneText(test_zone);
     defer runtime.deinit();
+    try runtime.addTransferAllow("home.arpa.", try @import("../config/parser.zig").Cidr.parse("127.0.0.0/8"));
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -518,6 +506,7 @@ test "a transfer connection ends when the operator's connection duration is over
 
     var runtime = try Runtime.fromZoneText(test_zone);
     defer runtime.deinit();
+    try runtime.addTransferAllow("home.arpa.", try @import("../config/parser.zig").Cidr.parse("127.0.0.0/8"));
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -538,20 +527,8 @@ test "a transfer connection ends when the operator's connection duration is over
     const stream = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp });
     defer stream.close(io);
 
-    var client_input: [tls_server.input_buffer_len]u8 = undefined;
-    var client_output: [tls_server.output_buffer_len]u8 = undefined;
-    var client_reader = stream.reader(io, &client_input);
-    var client_writer = stream.writer(io, &client_output);
-    var rng_source: std.Random.IoSource = .{ .io = io };
     // The peer completes the handshake and then says nothing.
-    var connection = try tls.client(&client_reader.interface, &client_writer.interface, .{
-        .rng = rng_source.interface(),
-        .host = "localhost",
-        .root_ca = .empty,
-        .insecure_skip_verify = true,
-        .now = std.Io.Clock.real.now(io),
-        .alpn_protocols = &.{XFR_ALPN},
-    });
+    var connection = try insecureTestClient(stream.socket.handle, io, XFR_ALPN, true);
     defer connection.close() catch {};
 
     // The connection ends with the duration the operator configured, not with
@@ -579,6 +556,7 @@ test "a transfer query answered after a SIGHUP comes from the reloaded zone" {
 
     var runtime = try Runtime.fromZoneText(reload_zone_text);
     defer runtime.deinit();
+    try runtime.addTransferAllow("home.arpa.", try @import("../config/parser.zig").Cidr.parse("127.0.0.0/8"));
     try runtime.setReloadSource(tmp.dir, zone_file_name, zone_origin);
 
     var server: tls_server.Server = undefined;
@@ -601,19 +579,7 @@ test "a transfer query answered after a SIGHUP comes from the reloaded zone" {
     const stream = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp });
     defer stream.close(io);
 
-    var client_input: [tls_server.input_buffer_len]u8 = undefined;
-    var client_output: [tls_server.output_buffer_len]u8 = undefined;
-    var client_reader = stream.reader(io, &client_input);
-    var client_writer = stream.writer(io, &client_output);
-    var rng_source: std.Random.IoSource = .{ .io = io };
-    var connection = try tls.client(&client_reader.interface, &client_writer.interface, .{
-        .rng = rng_source.interface(),
-        .host = "localhost",
-        .root_ca = .empty,
-        .insecure_skip_verify = true,
-        .now = std.Io.Clock.real.now(io),
-        .alpn_protocols = &.{XFR_ALPN},
-    });
+    var connection = try insecureTestClient(stream.socket.handle, io, XFR_ALPN, true);
     defer connection.close() catch {};
 
     var read_buffer: [512]u8 = undefined;
@@ -674,19 +640,7 @@ test "the transfer channel refuses an out-of-zone AXFR" {
     const stream = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp });
     defer stream.close(io);
 
-    var client_input: [tls_server.input_buffer_len]u8 = undefined;
-    var client_output: [tls_server.output_buffer_len]u8 = undefined;
-    var client_reader = stream.reader(io, &client_input);
-    var client_writer = stream.writer(io, &client_output);
-    var rng_source: std.Random.IoSource = .{ .io = io };
-    var connection = try tls.client(&client_reader.interface, &client_writer.interface, .{
-        .rng = rng_source.interface(),
-        .host = "localhost",
-        .root_ca = .empty,
-        .insecure_skip_verify = true,
-        .now = std.Io.Clock.real.now(io),
-        .alpn_protocols = &.{XFR_ALPN},
-    });
+    var connection = try insecureTestClient(stream.socket.handle, io, XFR_ALPN, true);
     defer connection.close() catch {};
 
     var read_buffer: [4096]u8 = undefined;
@@ -735,6 +689,7 @@ test "the transfer channel serves a signed AXFR as a chained TSIG sequence" {
     var keyring = try keyring_mod.Keyring.parse("key \"key.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };");
     var runtime = try Runtime.fromZoneTextWithKeyring(zone_text.items, &keyring);
     defer runtime.deinit();
+    try runtime.addTransferAllow("home.arpa.", try @import("../config/parser.zig").Cidr.parse("127.0.0.0/8"));
     const now = 1_700_000_000;
     runtime.setTsigNow(now);
 
@@ -757,19 +712,7 @@ test "the transfer channel serves a signed AXFR as a chained TSIG sequence" {
     const stream = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp });
     defer stream.close(io);
 
-    var client_input: [tls_server.input_buffer_len]u8 = undefined;
-    var client_output: [tls_server.output_buffer_len]u8 = undefined;
-    var client_reader = stream.reader(io, &client_input);
-    var client_writer = stream.writer(io, &client_output);
-    var rng_source: std.Random.IoSource = .{ .io = io };
-    var connection = try tls.client(&client_reader.interface, &client_writer.interface, .{
-        .rng = rng_source.interface(),
-        .host = "localhost",
-        .root_ca = .empty,
-        .insecure_skip_verify = true,
-        .now = std.Io.Clock.real.now(io),
-        .alpn_protocols = &.{XFR_ALPN},
-    });
+    var connection = try insecureTestClient(stream.socket.handle, io, XFR_ALPN, true);
     defer connection.close() catch {};
 
     var read_buffer: [4096]u8 = undefined;
@@ -845,19 +788,7 @@ test "the transfer channel answers an ordinary query the ordinary way" {
     const stream = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp });
     defer stream.close(io);
 
-    var client_input: [tls_server.input_buffer_len]u8 = undefined;
-    var client_output: [tls_server.output_buffer_len]u8 = undefined;
-    var client_reader = stream.reader(io, &client_input);
-    var client_writer = stream.writer(io, &client_output);
-    var rng_source: std.Random.IoSource = .{ .io = io };
-    var connection = try tls.client(&client_reader.interface, &client_writer.interface, .{
-        .rng = rng_source.interface(),
-        .host = "localhost",
-        .root_ca = .empty,
-        .insecure_skip_verify = true,
-        .now = std.Io.Clock.real.now(io),
-        .alpn_protocols = &.{XFR_ALPN},
-    });
+    var connection = try insecureTestClient(stream.socket.handle, io, XFR_ALPN, true);
     defer connection.close() catch {};
 
     var read_buffer: [4096]u8 = undefined;
@@ -891,6 +822,7 @@ test "the transfer channel serves the incremental transfer after a zone reload" 
 
     var runtime = try Runtime.fromZoneText(test_zone);
     defer runtime.deinit();
+    try runtime.addTransferAllow("home.arpa.", try @import("../config/parser.zig").Cidr.parse("127.0.0.0/8"));
     // The zone is replaced under the runtime, so the delta log holds the
     // transition from the serial the client holds to the current one.
     try std.testing.expectEqual(@import("../auth/runtime.zig").ReloadOutcome.replaced, runtime.replaceZoneText(io, zone_origin, next_zone_text));
@@ -914,19 +846,7 @@ test "the transfer channel serves the incremental transfer after a zone reload" 
     const stream = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp });
     defer stream.close(io);
 
-    var client_input: [tls_server.input_buffer_len]u8 = undefined;
-    var client_output: [tls_server.output_buffer_len]u8 = undefined;
-    var client_reader = stream.reader(io, &client_input);
-    var client_writer = stream.writer(io, &client_output);
-    var rng_source: std.Random.IoSource = .{ .io = io };
-    var connection = try tls.client(&client_reader.interface, &client_writer.interface, .{
-        .rng = rng_source.interface(),
-        .host = "localhost",
-        .root_ca = .empty,
-        .insecure_skip_verify = true,
-        .now = std.Io.Clock.real.now(io),
-        .alpn_protocols = &.{XFR_ALPN},
-    });
+    var connection = try insecureTestClient(stream.socket.handle, io, XFR_ALPN, true);
     defer connection.close() catch {};
 
     var read_buffer: [4096]u8 = undefined;

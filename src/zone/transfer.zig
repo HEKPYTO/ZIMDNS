@@ -20,10 +20,8 @@ const journal_mod = @import("journal.zig");
 /// Reuses the platform TCP profile bounds without importing the listener:
 /// one DNS message per length-prefixed frame, at most 65535 bytes each.
 pub const tcp_max_frame_size: usize = 65535;
-/// Reuses the TCP connection frame budget: one transfer query produces at most
-/// this many response frames before the connection-level cap applies.
-pub const max_messages_per_transfer: usize = 16;
-/// Default answer-section chunking for transfer messages. Tests override this
+/// Default answer-section chunking for transfer messages: an upper bound on
+/// records per message on top of the wire-size bound. Tests override this
 /// to force multi-message sequences from small zones.
 pub const default_records_per_message: usize = 64;
 pub const tsig_fudge: u16 = 300;
@@ -33,7 +31,6 @@ pub const Error = error{
     BadZoneRecord,
     NotAuthoritative,
     ResponseTooLarge,
-    TooManyMessages,
     BadTransferQuery,
 };
 
@@ -142,6 +139,40 @@ pub const IxfrDecision = enum {
     fallback_axfr,
 };
 
+/// The RFC 1995 response shape plus the client serial whose oldest
+/// difference the server may drop once it holds the exclusive lock. The
+/// decision itself stays read-only; the drain happens outside the shared
+/// lock so concurrent transfer reads never mutate journal storage.
+pub const IxfrOutcome = struct {
+    decision: IxfrDecision,
+    /// Set when `decision` is `.fallback_axfr` and the incremental chain
+    /// holds but would not be shorter than the full transfer (RFC 1995
+    /// section 5). Carries the serial to pass to `evictOldestDifference`.
+    evict_client_serial: ?u32 = null,
+};
+
+/// Picks the RFC 1995 response shape plus any pending eviction for a
+/// server at `server_serial` asked from `client_serial` (null when the
+/// query carries no authority SOA). Read-only: never mutates the journal.
+pub fn decideIxfrOutcome(
+    server_serial: u32,
+    client_serial: ?u32,
+    deltas: ?*const journal_mod.DeltaLog,
+) IxfrOutcome {
+    const client = client_serial orelse return .{ .decision = .fallback_axfr };
+    switch (journal_mod.compareSerial(server_serial, client)) {
+        .equal => return .{ .decision = .up_to_date },
+        .newer => {
+            const log = deltas orelse return .{ .decision = .fallback_axfr };
+            if (!log.chainKnown(client, server_serial)) return .{ .decision = .fallback_axfr };
+            if (log.servesIncremental(client, server_serial)) return .{ .decision = .incremental };
+            if (!log.chainLongerThanFull(client, server_serial)) return .{ .decision = .fallback_axfr };
+            return .{ .decision = .fallback_axfr, .evict_client_serial = client };
+        },
+        .older, .undefined => return .{ .decision = .fallback_axfr },
+    }
+}
+
 /// Picks the RFC 1995 response shape for a server at `server_serial` asked
 /// from `client_serial` (null when the query carries no authority SOA).
 /// `deltas` is the zone's serial transition log; null means no delta history
@@ -151,15 +182,7 @@ pub fn decideIxfr(
     client_serial: ?u32,
     deltas: ?*const journal_mod.DeltaLog,
 ) IxfrDecision {
-    const client = client_serial orelse return .fallback_axfr;
-    switch (journal_mod.compareSerial(server_serial, client)) {
-        .equal => return .up_to_date,
-        .newer => {
-            const log = deltas orelse return .fallback_axfr;
-            return if (log.canServeIncremental(client, server_serial)) .incremental else .fallback_axfr;
-        },
-        .older, .undefined => return .fallback_axfr,
-    }
+    return decideIxfrOutcome(server_serial, client_serial, deltas).decision;
 }
 
 /// Extracts the client's serial from an IXFR query's authority section: the
@@ -277,11 +300,12 @@ fn baseTransferMessage(
     return message;
 }
 
-/// Builds the AXFR answer sequence for `zone` in chunks of at most
-/// `records_per_message` answer records. Every message echoes the question so
-/// each frame parses standalone; the first answer is the apex SOA and the
-/// final answer of the last message is the same SOA. Caller owns the returned
-/// messages and must deinit each.
+/// Builds the AXFR answer sequence for `zone`: every message echoes the
+/// question so each frame parses standalone, and each message holds as many
+/// records as fit in `tcp_max_frame_size` encoded bytes, at most
+/// `records_per_message` per message. The first answer is the apex SOA and
+/// the final answer of the last message is the same SOA. Caller owns the
+/// returned messages and must deinit each.
 pub fn buildAxfrMessages(
     allocator: std.mem.Allocator,
     request: *const dns_message.Message,
@@ -291,31 +315,44 @@ pub fn buildAxfrMessages(
     const per_message = @max(@as(usize, 1), records_per_message);
     const ordered = try orderedAxfrRecords(allocator, zone);
     defer allocator.free(ordered);
-    const count = (ordered.len + per_message - 1) / per_message;
-    if (count > max_messages_per_transfer) return Error.TooManyMessages;
-    var messages = allocator.alloc(dns_message.Message, count) catch return Error.BadTransferQuery;
-    // Only initialized slots own sections: later slots stay undefined until
-    // their message is stored, so cleanup must not touch them.
-    var initialized: usize = 0;
+    var messages: std.ArrayList(dns_message.Message) = .empty;
     errdefer {
-        for (messages[0..initialized]) |*message| message.deinit();
-        allocator.free(messages);
+        for (messages.items) |*message| message.deinit();
+        messages.deinit(allocator);
     }
     var index: usize = 0;
-    while (index < count) : (index += 1) {
+    while (index < ordered.len) {
         var message = try baseTransferMessage(allocator, request);
         errdefer message.deinit();
-        const start = index * per_message;
-        const end = @min(start + per_message, ordered.len);
-        for (ordered[start..end]) |record| {
-            const converted = toResourceRecord(record) catch return Error.BadTransferQuery;
+        var in_message: usize = 0;
+        while (index + in_message < ordered.len and in_message < per_message) {
+            const converted = toResourceRecord(ordered[index + in_message]) catch return Error.BadTransferQuery;
             message.answers.append(converted) catch return Error.BadTransferQuery;
+            try setHeaderCounts(&message);
+            if (messageFitsFrame(&message)) {
+                in_message += 1;
+                continue;
+            }
+            // The last append overflowed the frame: move it to the next
+            // message. A single record that alone exceeds the frame is
+            // unservable.
+            message.answers.len -= 1;
+            if (in_message == 0) return Error.ResponseTooLarge;
+            try setHeaderCounts(&message);
+            break;
         }
-        try setHeaderCounts(&message);
-        messages[index] = message;
-        initialized = index + 1;
+        messages.append(allocator, message) catch return Error.BadTransferQuery;
+        index += in_message;
     }
-    return messages;
+    return messages.toOwnedSlice(allocator) catch return Error.BadTransferQuery;
+}
+
+/// Reports whether `message` encodes within one TCP frame.
+fn messageFitsFrame(message: *const dns_message.Message) bool {
+    var frame: [tcp_max_frame_size]u8 = undefined;
+    var writer = dns_writer.Writer.init(&frame);
+    message.encode(&writer) catch return false;
+    return writer.len() > 0 and writer.len() <= tcp_max_frame_size;
 }
 
 /// Builds the single-message RFC 1995 up-to-date response: one answer holding
@@ -439,13 +476,12 @@ pub fn buildNotifyResponse(
 }
 
 /// Encodes transfer messages into one length-prefixed TCP blob: each message
-/// gets its two-octet big-endian frame length. Enforces the bounded TCP
-/// profile by rejecting oversized frames and over-long sequences.
+/// gets its two-octet big-endian frame length. Rejects oversized frames.
 pub fn encodeFramed(
     allocator: std.mem.Allocator,
     messages: []const dns_message.Message,
 ) Error![]u8 {
-    if (messages.len == 0 or messages.len > max_messages_per_transfer) return Error.TooManyMessages;
+    if (messages.len == 0) return Error.BadTransferQuery;
     var blob: std.ArrayList(u8) = .empty;
     errdefer blob.deinit(allocator);
     var frame: [tcp_max_frame_size]u8 = undefined;
@@ -801,6 +837,96 @@ test "transfer AXFR cleanup releases only initialized messages on a bad record" 
     );
 }
 
+fn axfrRequestForOrigin(arena: std.mem.Allocator, origin: []const u8) !dns_message.Message {
+    const owner = try dns_name.Name.fromText(origin);
+    var query = axfr_query_bytes;
+    const parsed = try dns_message.Message.parseQuery(arena, &query);
+    var request = parsed;
+    request.question = .{ .name = owner, .qtype = .AXFR, .qclass = .IN };
+    return request;
+}
+
+test "AXFR serves a zone past 1024 records in more than 16 frames" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var text: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer text.deinit();
+    try text.writer.writeAll("$ORIGIN big.example.\n$TTL 3600\n@ IN SOA ns.big.example. host.example. 10 3600 900 1209600 3600\n@ IN NS ns.big.example.\n");
+    var i: usize = 0;
+    while (i < 1300) : (i += 1) {
+        try text.writer.print("h{d} IN A 192.0.2.{d}\n", .{ i, 1 + i % 250 });
+    }
+    var zone_file = try zone_parser.ZoneFile.parse(text.written());
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+    const request = try axfrRequestForOrigin(allocator, "big.example.");
+    const messages = try buildAxfrMessages(allocator, &request, &zone, 64);
+    defer {
+        for (messages) |*message| message.deinit();
+        allocator.free(messages);
+    }
+    try std.testing.expect(messages.len > 16);
+    var frame: [tcp_max_frame_size]u8 = undefined;
+    var total_answers: usize = 0;
+    var saw_first_soa = false;
+    var last_soa_serial: ?u32 = null;
+    for (messages, 0..) |message, index| {
+        var writer = dns_writer.Writer.init(&frame);
+        try message.encode(&writer);
+        try std.testing.expect(writer.len() > 0 and writer.len() <= tcp_max_frame_size);
+        total_answers += message.answers.len;
+        for (message.answers.slice()) |record| {
+            if (!record.rrtype.eql(.SOA)) continue;
+            if (index == 0 and !saw_first_soa) {
+                try std.testing.expectEqual(@as(u32, 10), record.rdata.SOA.serial);
+                saw_first_soa = true;
+            }
+            last_soa_serial = record.rdata.SOA.serial;
+        }
+    }
+    try std.testing.expect(saw_first_soa);
+    try std.testing.expectEqual(@as(?u32, 10), last_soa_serial);
+    try std.testing.expectEqual(zone.records.len + 1, total_answers);
+}
+
+test "AXFR chunks large TXT records within the frame bound" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var text: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer text.deinit();
+    try text.writer.writeAll("$ORIGIN txt.example.\n$TTL 3600\n@ IN SOA ns.txt.example. host.example. 10 3600 900 1209600 3600\n@ IN NS ns.txt.example.\n");
+    const chunk = "abcdefghij";
+    var i: usize = 0;
+    while (i < 400) : (i += 1) {
+        try text.writer.print("h{d} IN TXT \"", .{i});
+        var k: usize = 0;
+        while (k < 25) : (k += 1) try text.writer.writeAll(chunk);
+        try text.writer.writeAll("\"\n");
+    }
+    var zone_file = try zone_parser.ZoneFile.parse(text.written());
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+    const request = try axfrRequestForOrigin(allocator, "txt.example.");
+    const messages = try buildAxfrMessages(allocator, &request, &zone, 64);
+    defer {
+        for (messages) |*message| message.deinit();
+        allocator.free(messages);
+    }
+    try std.testing.expect(messages.len > 1);
+    var frame: [tcp_max_frame_size]u8 = undefined;
+    var total_answers: usize = 0;
+    for (messages) |message| {
+        var writer = dns_writer.Writer.init(&frame);
+        try message.encode(&writer);
+        try std.testing.expect(writer.len() > 0 and writer.len() <= tcp_max_frame_size);
+        try std.testing.expect(message.answers.len <= 64);
+        total_answers += message.answers.len;
+    }
+    try std.testing.expectEqual(zone.records.len + 1, total_answers);
+}
+
 test "transfer answers IXFR from the authority SOA serial" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -1143,10 +1269,14 @@ test "the zone's full transfer size reaches the delta log" {
     // The zone was loaded, so the server knows the size of its full
     // transfer, and the difference of this small zone is longer than it.
     try std.testing.expect(journal_mod.zoneSize("example.") > 0);
-    try std.testing.expectEqual(IxfrDecision.fallback_axfr, decideIxfr(10, 9, &log));
+    const outcome = decideIxfrOutcome(10, 9, &log);
+    try std.testing.expectEqual(IxfrDecision.fallback_axfr, outcome.decision);
+    try std.testing.expectEqual(@as(?u32, 9), outcome.evict_client_serial);
 
-    // The client is not left without an answer: the difference of the
-    // oldest version is purged, so the client gets the full transfer.
+    // The decision is read-only: the difference stays until the exclusive
+    // drain drops it, and the client still gets the full transfer.
+    try std.testing.expect(journal_mod.differenceFor("example.", 9, 10) != null);
+    journal_mod.evictOldestDifference("example.", 9);
     try std.testing.expect(journal_mod.differenceFor("example.", 9, 10) == null);
     const request = try ixfrRequest(arena.allocator(), "example.", 9);
     const messages = try buildAxfrMessages(arena.allocator(), &request, &new_zone, 64);

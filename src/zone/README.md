@@ -5,7 +5,7 @@
 A zone is signed at startup by the key `dnssec-key-file` names, and that key
 signs every RRset. A zone that separates the roles names a second key with
 `dnssec-ksk-file`: the key-signing key carries the Secure Entry Point flag
-(257), the DS the zone publishes states it, and it signs the DNSKEY RRset and
+(257), the DS the parent publishes states it, and it signs the DNSKEY RRset and
 nothing else. The zone-signing key then carries the Zone Key flag alone
 (256) and signs every other RRset.
 
@@ -97,8 +97,7 @@ publishes it with the RFC 5011 §3 REVOKE bit set.
 - signs that DNSKEY RRset once per key-signing key: two RRSIGs over one
   RRset, each with its own key's key tag, which RFC 4034 §3.1.3 allows;
 - signs every other RRset with the zone-signing key alone;
-- publishes exactly one DS, for the key `dnssec-ksk-file` names — the
-  Double-Signature scheme, not the Double-DS one;
+- computes exactly one DS digest, for the key `dnssec-ksk-file` names, for the operator to publish in the parent — the Double-Signature scheme, not the Double-DS one; the server itself serves no apex DS (RFC 4035 §2.2);
 - publishes a key marked `revoked` with the RFC 5011 §3 REVOKE bit set
   (flags 385), keeps signing the DNSKEY RRset with it so the revocation is
   self-signed as RFC 6781 §4.1.2.1 asks, and publishes no DS for it: RFC
@@ -143,10 +142,10 @@ server already holds.
 - `src/zone/signer.zig`: "RFC 6781 section 4.1.2: a double-signature KSK
   rollover publishes both key-signing keys and signs the DNSKEY RRset with
   both" — the three published keys, the two signatures over the DNSKEY
-  RRset, the one DS, and the project's own validator accepting the zone —
+  RRset, the one DS digest, and the project's own validator accepting the zone —
   and "RFC 6781 section 4.1.2.1: a revoked key-signing key is published with
   the REVOKE bit and still signs the DNSKEY RRset" — the revoked key's
-  flags, its own signature over the RRset, the one DS, and the validator
+  flags, its own signature over the RRset, the one DS digest, and the validator
   accepting the zone through that DS.
 - `src/config/loader.zig`: "a zone with a second key-signing key publishes
   both DNSKEYs at the apex", "a revoked second key-signing key is published

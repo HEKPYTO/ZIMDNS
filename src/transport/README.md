@@ -54,6 +54,8 @@ pull an AXFR or IXFR over an encrypted session. Section 7.3 recommends port
 listeners, and an operator reaches 853 with a `listen dns dot
 <address>:853` line.
 
+DoH over HTTP/3 (RFC 9114) is served too: `--serve-doh3` terminates the QUIC handshake with the `h3` ALPN token (RFC 9114 section 3.1) and then maps the same RFC 8484 section 4.1/4.2 requests as the HTTP/1.1 port, answering with `application/dns-message` and `cache-control: max-age=<TTL>`. The port never answers cleartext DNS.
+
 DNS-over-QUIC (RFC 9250) is served: `--serve-doq` terminates the QUIC
 handshake with the `doq` ALPN token (RFC 9250 §4.2) over one UDP port and
 then speaks RFC 9250 §4.1 framing: one client-initiated bidirectional
@@ -65,6 +67,10 @@ build binds 1053 by default like the other encrypted listeners, and an
 operator reaches 853 with a `listen dns doq <address>:853` line. The port
 never answers non-QUIC traffic: a cleartext DNS/UDP or DNS/TCP frame gets
 no DNS answer.
+Per-stream state for DoQ and DoH/3 is keyed by `{ connection, stream }` in
+`stream_registry.zig`, shared by both handlers; closing a connection drops
+every entry that connection owned, so stream ids never collide across
+connections and dead connections leave no state behind.
 
 The QUIC stack is `quic-zig` (<https://github.com/endel/quic-zig>, MIT),
 pinned to v0.6.0 at commit `e7dc3eee3086fc460db37a01535f2c1a4c0f023f` in
@@ -86,14 +92,24 @@ port is not bound either way, so nothing is served in the clear.
 
 ## The TLS-server dependency (decided)
 
-Accepted 2026-10-22 by the owner: the project's first dependency is
-`tls.zig` (<https://github.com/ianic/tls.zig>, MIT), pinned to commit
-`bd22bcb73f423389441a1de80bf031ef1b623cce` in `build.zig.zon` with the
-package hash `tls-0.1.0-ER2e0l6qBgDEYo6RBkVZw5UrxOqtI6-OqLwyFJvEr3RK`.
-The handshake comes from that dependency; this repository owns the
-operator's identity paths, the ALPN token, the opt-in gate, and the
-refusal of a transport that has no listener. The dependency is fetched
-into `zig-pkg/`, which is not tracked.
+Accepted 2026-11-05 by the owner: transport crypto comes from the
+system OpenSSL 3.x (`ssl` + `crypto`, linked, never vendored), replacing the
+former pinned `tls.zig` dependency, which is deleted. `src/transport/openssl_tls.zig`
+owns the thin seam: one `SSL*` per connection directly on the nonblocking
+socket fd (`SSL_set_fd`), an immutable shared read-only `SSL_CTX`, TLS 1.3
+minimum, an ALPN select callback restricted to the transport's configured
+token, and verification (`SSL_VERIFY_PEER` with `SSL_set1_host` for DNS
+names, IP SAN via `X509_VERIFY_PARAM_set1_ip_asc` with no SNI for IP
+literals) before any DNS byte. `SSL_ERROR_WANT_READ/WRITE` polls the fd
+against one absolute deadline per iteration; expiry is typed, and fatal
+errors close without sending close_notify. The ABI surface is the small
+set in `src/transport/openssl_abi.zig` (hand-set `extern` declarations:
+Zig 0.17 removed `@cImport`); OpenSSL >= 3.0 is required at configure time
+and refused otherwise. This repository still owns the operator's identity
+paths, the ALPN token, the opt-in gate, and the refusal of a transport
+that has no listener. No test-only bypass exists outside tests: production
+paths never set `insecure`. The QUIC stack stays on the pinned `quic-zig`
+dependency, unchanged.
 
 ## What the DoT slice still owes
 
@@ -109,8 +125,9 @@ RFC 7858 §3.1; RFC 9103 §§7.1–7.2 scope to transfers.
 ### The ALPN objection no longer holds (re-checked 2026-10-21)
 
 The reason given on 2026-10-05 — that no pure-Zig server can select an ALPN
-token — is no longer true. What did not change is the fail-closed gate: no
-dependency is linked, so the encrypted listeners still refuse to start.
+token — was no longer true. It is now moot: the shipped stack is the system
+OpenSSL 3.x described above, whose ALPN select callback restricts the
+handshake to the transport's configured token.
 
 - The standard library is not a source. Zig 0.17.0 ships
   `std.crypto.tls.Client` only: `std/crypto/tls/` holds `Client.zig` and no
@@ -119,50 +136,36 @@ dependency is linked, so the encrypted listeners still refuse to start.
   open, its last comment is from March 2024, and the pull request it
   references (#19308) is closed and unmerged, so nothing upstream is in
   flight to deliver one.
-- A pure-Zig TLS 1.3 server with server-side ALPN does exist for Zig 0.17.0.
-  `tls.zig` (<https://github.com/ianic/tls.zig>, MIT) declares
-  `.minimum_zig_version = "0.17.0"`, and its server handshake picks the ALPN
-  token by server preference (RFC 7301) and refuses a client that offers no
-  common token. Checked 2026-10-21 at commit `bd22bcb73f`: it builds on Zig
-  0.17.0 and its test suite passes; a scratch server offering only `dot`
-  negotiated TLS 1.3 and ALPN `dot` with `openssl s_client -alpn dot`, a
-  client offering only `h2` was refused with TLS alert 120 (no application
-  protocol), and a TLS 1.2 client was refused, so the RFC 9103 §7.2 floor
-  holds by default. A second MIT server with TLS 1.2 and 1.3
-  (<https://github.com/zig-utils/zig-tls>) also builds on Zig 0.17.0.
 
-## The decision that was open (resolved 2026-10-22)
+## The earlier decision record (superseded 2026-11-05)
 
-The tree had no dependencies, and every path from `planned` to a
-`supported` encrypted-transport row adds one: a TLS server for DoT and DoH,
+The tree once had no dependencies, and every path from `planned` to a
+`supported` encrypted-transport row added one: a TLS server for DoT and DoH,
 an HTTP/2 implementation for DoH as well (RFC 8484 §5.2 makes HTTP/2 the
 minimum RECOMMENDED version; an HTTP/1.1-only DoH breaks no RFC but will not
 interoperate with mainstream clients), and a QUIC stack for DoQ (RFC 9250,
-which cannot be approximated by TCP plus TLS). The owner chose option (a):
-one pinned MIT TLS dependency, `tls.zig`. The record of the options is kept
-here because the reasons still hold for the transports that remain.
+which cannot be approximated by TCP plus TLS). The owner first chose one
+pinned MIT TLS dependency, `tls.zig`; on 2026-11-05 that choice was
+superseded by the system OpenSSL 3.x stack above, and the vendored `tls.zig`
+dependency is deleted. The record of the options is kept here because the
+reasons still hold for the transports that remain.
 
-- (a) Pin one MIT TLS dependency: the cheapest credible path to a
-  `supported` DoT row. The candidate the evidence supports is `tls.zig`
-  (<https://github.com/ianic/tls.zig>) at a pinned commit. A 2026-10-21
-  survey put DoT at 16–30 hours, most of it refactoring the transport layer
-  from file-descriptor I/O to a byte channel, because socket deadlines have
-  no meaning over a TLS socket. DoH adds 2–4 days on top of that with an
+- (a) Pin one MIT TLS dependency (superseded): the cheapest credible path to
+  a `supported` DoT row at the time. DoH adds 2–4 days on top of that with an
   HTTP/2 dependency (<https://github.com/dnsoa/zig-http2>, MIT,
   dependency-free, builds on Zig 0.17.0, but publishes no interop results),
-  or 5–10 days if HTTP/2 is written in-tree. DoQ is 1.5–3 weeks on a
-  pure-Zig QUIC stack (<https://github.com/ericsssan/zquic>, MIT,
-  dependency-free, with its own TLS 1.3 and ALPN) plus RFC 9250 framing and
-  interop.
+  or 5–10 days if HTTP/2 is written in-tree.
 - (b) Keep the tree dependency-free and accept that the encrypted-transport
-  rows stay `planned`, DoQ stays out of scope, and the state in the first
-  section above stands.
+  rows stay `planned` and DoQ stays out of scope. Closed: options (a) and
+  then OpenSSL were chosen instead.
 - (c) Hand-roll TLS in-tree. Not credible: handshake parsing is the attack
   surface, and the project would own the security fixes.
 
-Option (a) is chosen and implemented; the other two are closed. DoT and DoH
-now run on it. The next dependency question is the same shape: DoQ needs a
-QUIC stack.
+DoT and DoH now run on the OpenSSL stack. DoQ (RFC 9250) and DoH/3
+(RFC 9114) are implemented on the pinned `quic-zig` dependency, not on an
+open question: the remaining owner decision is whether that small-fork
+dependency stays credible (the ngtcp2+nghttp3 alternative is still the
+fallback), stated here as current risk, not as a missing implementation.
 
 ## The bounds the encrypted ports hold
 
@@ -193,3 +196,7 @@ budget is answered 431, a body over the 65535-octet budget is answered
 413, a POST whose media type is not `application/dns-message` is answered
 415, and the last exchange of a connection carries `connection: close` so
 the client does not reuse a connection the server is about to close.
+
+## Oblivious DoH (RFC 9230) on both DoH channels
+
+Both the HTTP/1.1 port (`doh.zig`) and the HTTP/3 port (`doh3.zig`) serve ODoH target behavior behind the same request mapping: a POST to `/dns-query` whose content-type is `application/oblivious-dns-message` is opened with `odoh.openQuery`, the inner DNS query is answered through the same `runtime.answerFromTcp` entry point (peer address, recursion policy, cookie check, and local zones all apply), and the answer is sealed with `odoh.sealResponse` and returned as 200 with content-type `application/oblivious-dns-message`. The crypto is the RFC 9230 section 9 mandatory suite: DHKEM(X25519, HKDF-SHA256) 0x0020, HKDF-SHA256 0x0001, AES-128-GCM 0x0001. Status codes: 200 on a sealed answer, 401 on an unknown key id, 400 on a decrypt or padding failure, 404 when ODoH is requested but no target is configured (the resource is not served). GET with the ODoH media type is not a thing: the GET path is unchanged plain DoH. Plain DoH (`application/dns-message` GET/POST) is otherwise unchanged on both channels.
