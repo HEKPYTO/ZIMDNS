@@ -5,6 +5,7 @@ pub const golden_fixture = @import("golden_fixture.zig");
 pub const dns_message = @import("dns/message.zig");
 pub const dns_name = @import("dns/name.zig");
 pub const dns_tsig = @import("dns/tsig.zig");
+pub const dns_types = @import("dns/types.zig");
 pub const dns_writer = @import("dns/writer.zig");
 pub const dns_rdata = @import("dns/rdata.zig");
 pub const dns_record = @import("dns/record.zig");
@@ -37,9 +38,6 @@ pub const transport_stream_registry = @import("transport/stream_registry.zig");
 /// The OpenSSL TLS wrapper, exported so the CLI guard can drive a DoH
 /// exchange over the same client the server side uses.
 pub const transport_openssl_tls = @import("transport/openssl_tls.zig");
-/// The pinned QUIC dependency, exported so the CLI guard can drive a DoQ
-/// exchange over the same library the server side uses.
-pub const quic = @import("quic");
 pub const transfer_axfr = @import("transfer/axfr.zig");
 pub const transfer_xfr_tls = @import("transfer/xfr_tls.zig");
 pub const blocklist = @import("blocklist.zig");
@@ -602,8 +600,8 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
         };
         // The identity is loaded before the bind, so a certificate or key
         // that cannot be loaded refuses the run and binds no port. DoQ and
-        // DoH/3 load their own identity inside quic-zig from the same two paths,
-        // so they need the validation above but no TCP TLS server object.
+        // DoH/3 load their own identity inside the vendored ngtcp2 stack from
+        // the same two paths, so they need the validation above but no TCP TLS server object.
         if (mode != .doq_loop and mode != .doh3_loop) {
             var server: transport_tls_server.Server = undefined;
             server.init(allocator, io, std.Io.Dir.cwd(), cert_path.?, key_path.?, transport_tls.alpnFor(transport)) catch {

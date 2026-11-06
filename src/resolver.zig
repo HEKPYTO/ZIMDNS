@@ -1634,12 +1634,18 @@ pub const Resolver = struct {
             self.allocator.free(self.policy.managed_path);
             self.policy.managed_path = &.{};
         }
-        self.policy.managed_dir = null;
+        if (self.policy.managed_dir) |*mbase| {
+            mbase.close(self.io);
+            self.policy.managed_dir = null;
+        }
         if (self.policy.forwarder_ca_path.len != 0) {
             self.allocator.free(self.policy.forwarder_ca_path);
             self.policy.forwarder_ca_path = &.{};
         }
-        self.policy.forwarder_ca_dir = null;
+        if (self.policy.forwarder_ca_dir) |*cbase| {
+            cbase.close(self.io);
+            self.policy.forwarder_ca_dir = null;
+        }
         if (self.tls_ready) self.tls_client_state.deinit();
         if (self.doh_ready) self.doh_client_state.deinit();
         for (self.chain_entries[0..self.chain_len]) |entry| self.allocator.free(entry.records);

@@ -392,11 +392,13 @@ test "an AXFR over DNS/TCP returns the transferred zone as text" {
             args.ready.store(true, .release);
             var connection = args.listener.accept(args.io) catch return;
             defer connection.close(args.io);
+            var read_buffer: [4096]u8 = undefined;
+            var reader = connection.reader(args.io, &read_buffer);
             var length_bytes: [2]u8 = undefined;
-            readExact(connection, args.io, &length_bytes) catch return;
+            readExact(&reader, &length_bytes) catch return;
             const length = std.mem.readInt(u16, &length_bytes, .big);
             var query_buffer: [65535]u8 = undefined;
-            readExact(connection, args.io, query_buffer[0..length]) catch return;
+            readExact(&reader, query_buffer[0..length]) catch return;
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const request = dns_message.Message.parseQuery(arena.allocator(), query_buffer[0..length]) catch return;
@@ -415,13 +417,9 @@ test "an AXFR over DNS/TCP returns the transferred zone as text" {
                 writeAll(connection, args.io, writer.written()) catch return;
             }
         }
-
-        fn readExact(stream: std.Io.net.Stream, args_io: std.Io, buffer: []u8) !void {
-            var read_buffer: [4096]u8 = undefined;
-            var reader = stream.reader(args_io, &read_buffer);
+        fn readExact(reader: *std.Io.net.Stream.Reader, buffer: []u8) !void {
             try reader.interface.readSliceAll(buffer);
         }
-
         fn writeAll(stream: std.Io.net.Stream, args_io: std.Io, bytes: []const u8) !void {
             var write_buffer: [4096]u8 = undefined;
             var writer = stream.writer(args_io, &write_buffer);
@@ -464,19 +462,19 @@ const FrameServer = struct {
         args.ready.store(true, .release);
         var connection = args.listener.accept(args.io) catch return;
         defer connection.close(args.io);
+        var read_buffer: [4096]u8 = undefined;
+        var reader = connection.reader(args.io, &read_buffer);
         var length_bytes: [2]u8 = undefined;
-        readExact(connection, args.io, &length_bytes) catch return;
+        readExact(&reader, &length_bytes) catch return;
         const length = std.mem.readInt(u16, &length_bytes, .big);
         var query_buffer: [65535]u8 = undefined;
-        readExact(connection, args.io, query_buffer[0..length]) catch return;
+        readExact(&reader, query_buffer[0..length]) catch return;
         var prefix: [2]u8 = undefined;
         std.mem.writeInt(u16, &prefix, @intCast(args.bytes.len), .big);
         writeAll(connection, args.io, &prefix) catch return;
         writeAll(connection, args.io, args.bytes) catch return;
     }
-    fn readExact(stream: std.Io.net.Stream, stream_io: std.Io, buffer: []u8) !void {
-        var read_buffer: [4096]u8 = undefined;
-        var reader = stream.reader(stream_io, &read_buffer);
+    fn readExact(reader: *std.Io.net.Stream.Reader, buffer: []u8) !void {
         try reader.interface.readSliceAll(buffer);
     }
     fn writeAll(stream: std.Io.net.Stream, stream_io: std.Io, bytes: []const u8) !void {
@@ -916,11 +914,13 @@ const TwoFrameServer = struct {
         args.ready.store(true, .release);
         var connection = args.listener.accept(args.io) catch return;
         defer connection.close(args.io);
+        var read_buffer: [4096]u8 = undefined;
+        var reader = connection.reader(args.io, &read_buffer);
         var length_bytes: [2]u8 = undefined;
-        FrameServer.readExact(connection, args.io, &length_bytes) catch return;
+        FrameServer.readExact(&reader, &length_bytes) catch return;
         const length = std.mem.readInt(u16, &length_bytes, .big);
         var query_buffer: [65535]u8 = undefined;
-        FrameServer.readExact(connection, args.io, query_buffer[0..length]) catch return;
+        FrameServer.readExact(&reader, query_buffer[0..length]) catch return;
         for ([_][]const u8{ args.first, args.second }) |bytes| {
             var prefix: [2]u8 = undefined;
             std.mem.writeInt(u16, &prefix, @intCast(bytes.len), .big);

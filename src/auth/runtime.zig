@@ -4578,11 +4578,13 @@ test "a secondary forwards a signed RFC 2136 update to its primary" {
             args.ready.store(true, .release);
             var connection = args.listener.accept(args.io) catch return;
             defer connection.close(args.io);
+            var read_buffer: [4096]u8 = undefined;
+            var reader = connection.reader(args.io, &read_buffer);
             var length_bytes: [2]u8 = undefined;
-            readExact(connection, args.io, &length_bytes) catch return;
+            readExact(&reader, &length_bytes) catch return;
             const length = std.mem.readInt(u16, &length_bytes, .big);
             var request_buffer: [65535]u8 = undefined;
-            readExact(connection, args.io, request_buffer[0..length]) catch return;
+            readExact(&reader, request_buffer[0..length]) catch return;
             var response_buffer: [65535]u8 = undefined;
             const response_bytes = args.runtime.answerFromTcp(request_buffer[0..length], &response_buffer, &connection.socket.address, null) catch return;
             var prefix: [2]u8 = undefined;
@@ -4590,9 +4592,7 @@ test "a secondary forwards a signed RFC 2136 update to its primary" {
             writeAll(connection, args.io, &prefix) catch return;
             writeAll(connection, args.io, response_bytes) catch return;
         }
-        fn readExact(stream: std.Io.net.Stream, stream_io: std.Io, buffer: []u8) !void {
-            var read_buffer: [4096]u8 = undefined;
-            var reader = stream.reader(stream_io, &read_buffer);
+        fn readExact(reader: *std.Io.net.Stream.Reader, buffer: []u8) !void {
             try reader.interface.readSliceAll(buffer);
         }
         fn writeAll(stream: std.Io.net.Stream, stream_io: std.Io, bytes: []const u8) !void {

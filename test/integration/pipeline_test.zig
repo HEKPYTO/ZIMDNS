@@ -1478,6 +1478,8 @@ test "TCP AXFR carries a length-framed SOA-bounded transfer sequence" {
 
     var runtime = try Runtime.fromZoneText(transfer_zone);
     defer runtime.deinit();
+    // The transfer ACL denies by default; this loopback grant permits the fixture's AXFR.
+    try runtime.addTransferAllow("home.arpa.", try zimdns.config_parser.Cidr.parse("127.0.0.1/32"));
 
     var listen_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     var server = try std.Io.net.IpAddress.listen(&listen_addr, io, .{ .reuse_address = true });
@@ -1512,6 +1514,8 @@ test "TCP IXFR from a stale serial falls back to a full AXFR sequence" {
 
     var runtime = try Runtime.fromZoneText(transfer_zone);
     defer runtime.deinit();
+    // The transfer ACL denies by default; this loopback grant permits the fixture's IXFR.
+    try runtime.addTransferAllow("home.arpa.", try zimdns.config_parser.Cidr.parse("127.0.0.1/32"));
 
     var listen_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     var server = try std.Io.net.IpAddress.listen(&listen_addr, io, .{ .reuse_address = true });

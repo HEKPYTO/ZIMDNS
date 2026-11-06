@@ -49,7 +49,9 @@ line.
 The strict-TLS transfer channel (RFC 9103) is served: `--serve-xfr`
 terminates a TLS 1.3 handshake with the `dot` token, as section 7.1 requires,
 and then speaks the RFC 7858 framing over that channel, so a secondary can
-pull an AXFR or IXFR over an encrypted session. Section 7.3 recommends port
+pull an AXFR or IXFR over an encrypted session. A transfer is served only
+for a zone an `allow-transfer` line grants; a zone with no matching entry
+gets REFUSED. Section 7.3 recommends port
 853; this build binds 1053 by default, like the other two encrypted
 listeners, and an operator reaches 853 with a `listen dns dot
 <address>:853` line.
@@ -72,23 +74,21 @@ Per-stream state for DoQ and DoH/3 is keyed by `{ connection, stream }` in
 every entry that connection owned, so stream ids never collide across
 connections and dead connections leave no state behind.
 
-The QUIC stack is `quic-zig` (<https://github.com/endel/quic-zig>, MIT),
-pinned to v0.6.0 at commit `e7dc3eee3086fc460db37a01535f2c1a4c0f023f` in
-`build.zig.zon` (it brings its own pinned `libxev`); this repository owns
-the operator's identity paths, the `doq` ALPN token, the opt-in gate, and
-the RFC 9250 §4 framing.
+The QUIC stack is ngtcp2 1.26.0 + nghttp3 1.19.0, vendored under
+`third_party/` and compiled with the Zig C compiler, with the GnuTLS crypto
+backend and system GnuTLS linked at build time. The migration from the
+pure-Zig QUIC dependency was motivated by the X41/OSTIF 2025 audit of the
+ngtcp2-family stack; neither the Zig integration nor the vendored versions
+are independently audited. DoQ and DoH/3 are proven by the external interop
+harness (`test/interop/harness.py`, aioquic client), not by in-process
+drivers. This repository owns the operator's identity paths,
+the `doq` ALPN token, the opt-in gate, and the RFC 9250 §4 framing.
 
 The invariants that hold whichever transport is served: no cleartext on a
 port the operator configured as encrypted, ALPN `dot` selected on a
 strict-TLS transfer channel (RFC 9103 §7.1), TLS 1.3 or later on that
 channel (RFC 9103 §7.2), and a fail-closed refusal when the transport
 cannot be provided.
-
-One limit of the pinned dependency is recorded in the code: the standard
-library's DER parser aborts the process on a truncated length field, and the
-dependency calls that parser directly, so a certificate whose DER is
-truncated ends the run with a stack trace rather than a typed error. The
-port is not bound either way, so nothing is served in the clear.
 
 ## The TLS-server dependency (decided)
 
@@ -108,8 +108,7 @@ Zig 0.17 removed `@cImport`); OpenSSL >= 3.0 is required at configure time
 and refused otherwise. This repository still owns the operator's identity
 paths, the ALPN token, the opt-in gate, and the refusal of a transport
 that has no listener. No test-only bypass exists outside tests: production
-paths never set `insecure`. The QUIC stack stays on the pinned `quic-zig`
-dependency, unchanged.
+paths never set `insecure`.
 
 ## What the DoT slice still owes
 
@@ -161,11 +160,9 @@ reasons still hold for the transports that remain.
 - (c) Hand-roll TLS in-tree. Not credible: handshake parsing is the attack
   surface, and the project would own the security fixes.
 
-DoT and DoH now run on the OpenSSL stack. DoQ (RFC 9250) and DoH/3
-(RFC 9114) are implemented on the pinned `quic-zig` dependency, not on an
-open question: the remaining owner decision is whether that small-fork
-dependency stays credible (the ngtcp2+nghttp3 alternative is still the
-fallback), stated here as current risk, not as a missing implementation.
+DoT and DoH run on the OpenSSL stack. DoQ (RFC 9250) and DoH/3 (RFC 9114)
+run on the vendored ngtcp2 1.26.0 + nghttp3 1.19.0 stack with GnuTLS
+described above.
 
 ## The bounds the encrypted ports hold
 

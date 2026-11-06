@@ -22,3 +22,10 @@ TSIG: request authentication and the responses that answer it.
 - The MAC primitives live in `src/dns/tsig.zig`. `verify` and `verifyChained`
   return the MAC exactly as it appears in the message, so a caller that chains
   on it uses the transmitted value.
+- AXFR/IXFR is denied by default. `allow-transfer <apex> <cidr>` is
+  repeatable for distinct zone/CIDR pairs and grants one zone to one client
+  CIDR; both the cleartext TCP ingress and the strict-TLS transfer channel
+  consult it, and a zone with no matching entry answers REFUSED before any
+  transfer sequence is built. The decision runs under the shared lock; a
+  non-shorter journal chain is drained under the exclusive lock after the
+  read.

@@ -52,17 +52,16 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Vendored ngtcp2 1.26.0 + nghttp3 1.19.0 with the GnuTLS crypto
+    // backend, compiled with the Zig C compiler into one static library.
+    const ngtcp2_lib = buildNgtcp2(b, target, optimize);
+
     // Single source of truth for `zimdns --version`; override with -Dversion=x.y.z.
     const version = b.option([]const u8, "version", "Version string reported by --version") orelse "0.1.0";
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
 
-    // The DNS-over-QUIC server: endel/quic-zig, pinned to one commit in
-    // build.zig.zon. Its module is named "quic".
-    const quic_dep = b.dependency("quic", .{ .target = target, .optimize = optimize });
-    const quic_module = quic_dep.module("quic");
-
-    const app_module = mainModule(b, target, optimize, build_options, quic_module);
+    const app_module = mainModule(b, target, optimize, build_options, ngtcp2_lib);
 
     const exe = b.addExecutable(.{
         .name = "zimdns",
@@ -94,7 +93,7 @@ pub fn build(b: *std.Build) void {
 
     // groups[0] is the unit group: the unit tests embedded in src/main.zig
     // stay the root module of the main test artifact and share that step.
-    const unit_test_module = mainModule(b, target, optimize, build_options, quic_module);
+    const unit_test_module = mainModule(b, target, optimize, build_options, ngtcp2_lib);
     linkOpenSsl(unit_test_module, b);
     const unit_tests = b.addTest(.{
         .root_module = unit_test_module,
@@ -111,10 +110,7 @@ pub fn build(b: *std.Build) void {
                 .target = target,
                 .optimize = optimize,
             });
-            module.addImport("zimdns", mainModule(b, target, optimize, build_options, quic_module));
-            // A CLI test drives a real DoQ client against the built server,
-            // so the root needs the same quic module the server uses.
-            module.addImport("quic", quic_module);
+            module.addImport("zimdns", mainModule(b, target, optimize, build_options, ngtcp2_lib));
             switch (group.extra) {
                 .none => {},
                 .fuzz => module.addOptions("fuzz_options", fuzz_options),
@@ -133,14 +129,18 @@ pub fn build(b: *std.Build) void {
 
 /// Every artifact above compiles `src/main.zig`, so the build options it reads
 /// are attached here once instead of at every call site.
-fn mainModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, build_options: *std.Build.Step.Options, quic_module: *std.Build.Module) *std.Build.Module {
+fn mainModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, build_options: *std.Build.Step.Options, ngtcp2_lib: *std.Build.Step.Compile) *std.Build.Module {
     const module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
     module.addOptions("build_options", build_options);
-    module.addImport("quic", quic_module);
+    module.linkLibrary(ngtcp2_lib);
+    // The ngtcp2 extern declarations link by library name, so the module
+    // needs the same GnuTLS search paths the static lib was built with.
+    linkGnuTlsPaths(module, b);
+    module.linkSystemLibrary("gnutls", .{});
     linkOpenSsl(module, b);
     return module;
 }
@@ -221,6 +221,88 @@ fn groupIndex(dir: []const u8) ?usize {
 
 fn joinPath(arena: std.mem.Allocator, parts: []const []const u8) ![]const u8 {
     return std.mem.join(arena, "/", parts);
+}
+
+/// Compiles the vendored ngtcp2 1.26.0 + nghttp3 1.19.0 sources (GnuTLS
+/// crypto backend) into one static library with the Zig C compiler.
+/// No config.h is generated; the checked-in headers stand alone.
+fn buildNgtcp2(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
+    const lib_root = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    linkGnuTlsPaths(lib_root, b);
+    for ([_][]const u8{
+        "third_party/ngtcp2/lib/includes",
+        "third_party/ngtcp2/lib",
+        "third_party/ngtcp2/crypto",
+        "third_party/ngtcp2/crypto/includes",
+        "third_party/nghttp3/lib/includes",
+        "third_party/nghttp3/lib",
+    }) |dir| lib_root.addIncludePath(b.path(dir));
+    // No config.h is generated; the vendored headers gate their system
+    // includes behind HAVE_* defines, so declare the two portable POSIX
+    // byte-order headers directly (musl and glibc both ship them).
+    const flags: []const []const u8 = &.{ "-std=c11", "-DHAVE_ARPA_INET_H", "-DHAVE_NETINET_IN_H" };
+    const roots: []const []const u8 = &.{
+        "third_party/ngtcp2/lib",
+        "third_party/nghttp3/lib",
+    };
+    for (roots) |root| {
+        var dir = b.root.openDir(b.graph.io, root, .{ .iterate = true }) catch |err| {
+            std.process.fatal("cannot open {s}: {t}", .{ root, err });
+        };
+        defer dir.close(b.graph.io);
+        var it = dir.iterate();
+        while (it.next(b.graph.io) catch |err| {
+            std.process.fatal("cannot read {s}: {t}", .{ root, err });
+        }) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".c")) continue;
+            lib_root.addCSourceFile(.{
+                .file = b.path(b.fmt("{s}/{s}", .{ root, entry.name })),
+                .flags = flags,
+            });
+        }
+    }
+    for ([_][]const u8{
+        "third_party/ngtcp2/crypto/shared.c",
+        "third_party/ngtcp2/crypto/gnutls/gnutls.c",
+        "third_party/nghttp3/lib/sfparse/sfparse.c",
+    }) |file| lib_root.addCSourceFile(.{ .file = b.path(file), .flags = flags });
+    lib_root.linkSystemLibrary("gnutls", .{});
+    return b.addLibrary(.{ .name = "ngtcp2", .root_module = lib_root });
+}
+
+/// Adds the GnuTLS include/lib paths to a module. Honours GNUTLS_PREFIX
+/// when set; otherwise finds the prefix at configure time with
+/// pkg-config, then brew on macOS. The link itself is a plain
+/// linkSystemLibrary("gnutls"), which resolves on Linux via the default
+/// search path.
+fn linkGnuTlsPaths(module: *std.Build.Module, b: *std.Build) void {
+    if (b.graph.environ_map.get("GNUTLS_PREFIX")) |prefix| {
+        module.addIncludePath(b.graph.cwdRelativePath(b.fmt("{s}/include", .{prefix})));
+        module.addLibraryPath(b.graph.cwdRelativePath(b.fmt("{s}/lib", .{prefix})));
+        return;
+    }
+    const prefix = runCapture(b, &.{ "pkg-config", "--variable=prefix", "gnutls" }) orelse
+        runCapture(b, &.{ "brew", "--prefix", "gnutls" });
+    if (prefix) |pp| {
+        module.addIncludePath(b.graph.cwdRelativePath(b.fmt("{s}/include", .{pp})));
+        module.addLibraryPath(b.graph.cwdRelativePath(b.fmt("{s}/lib", .{pp})));
+    }
+}
+
+/// Runs a command at configure time, returning trimmed stdout on success
+/// or null when the command is missing or fails.
+fn runCapture(b: *std.Build, argv: []const []const u8) ?[]const u8 {
+    var code: u8 = 0;
+    const result = b.runAllowFail(argv, &code, .ignore) catch return null;
+    if (code != 0) return null;
+    const trimmed = std.mem.trim(u8, result, &std.ascii.whitespace);
+    if (trimmed.len == 0) return null;
+    return b.dupe(trimmed);
 }
 
 /// Links OpenSSL 3.x (`ssl` + `crypto`). On macOS Homebrew OpenSSL is

@@ -12,11 +12,11 @@ server that serves the same zone file.
 - External tools on `PATH`: `dig`, `delv`, `named`, `named-checkzone`,
   `nsupdate`, `kdig`, `kzonecheck`, `ldns-verify-zone`, `curl`, `openssl`.
   macOS: `brew install bind knot ldns`.
-- `dnspython`: create a virtual environment once.
+- `dnspython`, `aioquic`, `pyhpke`, `cryptography`: create a virtual environment once. `aioquic` proves DoH/3, `pyhpke` (with `cryptography`) proves ODoH, and `cryptography` proves BIND RSA key conversion.
 
 ```sh
 python3 -m venv .interop-venv
-.interop-venv/bin/pip install dnspython
+.interop-venv/bin/pip install dnspython aioquic pyhpke cryptography
 .interop-venv/bin/python test/interop/harness.py --zimdns zig-out/bin/zimdns
 ```
 

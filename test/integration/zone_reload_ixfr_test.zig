@@ -45,6 +45,8 @@ fn loadReloadableRuntime(io: std.Io, tmp: *std.testing.TmpDir) !Runtime {
     try tmp.dir.writeFile(io, .{ .sub_path = zone_file_name, .data = zone_text });
     var runtime = try Runtime.fromZoneText(zone_text);
     errdefer runtime.deinit();
+    // The transfer ACL denies by default; this loopback grant permits the fixture's IXFR.
+    try runtime.addTransferAllow(zone_origin, try zimdns.config_parser.Cidr.parse("127.0.0.1/32"));
     try runtime.setReloadSource(tmp.dir, zone_file_name, zone_origin);
     return runtime;
 }

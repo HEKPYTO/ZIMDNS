@@ -5,7 +5,7 @@ ARG ZIG_VERSION=0.17.0
 ARG ZIG_X86_64_SHA=1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
 ARG ZIG_AARCH64_SHA=9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8
 
-RUN apk add --no-cache ca-certificates openssl-dev openssl tar wget xz
+RUN apk add --no-cache ca-certificates gnutls-dev openssl-dev openssl tar wget xz
 
 RUN set -eux; \
     case "${TARGETARCH}" in \
@@ -27,7 +27,7 @@ FROM alpine:3.22 AS runtime
 
 # OpenSSL is linked dynamically, so the runtime keeps libssl/libcrypto
 # beside the CA bundle the system-trust client paths verify against.
-RUN apk add --no-cache ca-certificates libssl3 \
+RUN apk add --no-cache ca-certificates gnutls libssl3 \
     && addgroup -S -g 10001 zimdns \
     && adduser -S -D -H -u 10001 -G zimdns zimdns \
     && mkdir -p /etc/zimdns /run/zimdns \
@@ -35,12 +35,13 @@ RUN apk add --no-cache ca-certificates libssl3 \
 
 COPY --from=build /workspace/zig-out/bin/zimdns /usr/local/bin/zimdns
 COPY examples/config.gdns /etc/zimdns/config.gdns
-COPY examples/blocklists /examples/blocklists
-COPY examples/zones /examples/zones
+COPY examples/blocklists /etc/zimdns/blocklists
+COPY examples/zones /etc/zimdns/zones
 
 USER 10001:10001
 WORKDIR /
 EXPOSE 1053/udp
+EXPOSE 1053/tcp
 VOLUME ["/etc/zimdns"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \

@@ -37,7 +37,15 @@ pub fn Registry(comptime T: type) type {
 
         pub fn insert(self: *Self, allocator: std.mem.Allocator, key: Key, value: *T) !void {
             if (self.map.contains(key)) return error.DuplicateStream;
-            if (self.map.count() >= self.max_entries) return error.TooManyStreams;
+            // Per-connection cap: one client holding the advertised
+            // limit must not starve every other connection sharing
+            // this registry.
+            var held: usize = 0;
+            var it = self.map.iterator();
+            while (it.next()) |kv| if (kv.key_ptr.connection == key.connection) {
+                held += 1;
+            };
+            if (held >= self.max_entries) return error.TooManyStreams;
             try self.map.put(allocator, key, value);
         }
 
@@ -53,7 +61,7 @@ pub fn Registry(comptime T: type) type {
         /// connection ids are a no-op. Repeatedly removes one match until
         /// none remain, so no entry is dropped no matter how large
         /// `max_entries` is. O(n^2) worst case; fine while the bound is
-        /// tiny (64 in both handlers).
+        /// tiny (`max_entries` in each handler).
         pub fn removeConnection(self: *Self, allocator: std.mem.Allocator, connection: u64, destroy: *const fn (std.mem.Allocator, *T) void) void {
             while (self.findConnectionEntry(connection)) |key| self.removeOne(allocator, key, destroy);
         }
@@ -123,6 +131,19 @@ test "the bound rejects the 65th live entry and accepts again after removal" {
     registry.removeOne(std.testing.allocator, .{ .connection = 1, .stream = 0 }, destroyU64);
     try registry.insert(std.testing.allocator, .{ .connection = 1, .stream = 64 }, owned);
     try std.testing.expectEqual(@as(usize, 64), registry.count());
+}
+test "the bound is per connection: a full client does not starve others" {
+    var registry = Registry(u64).init(2);
+    defer registry.deinit(std.testing.allocator, destroyU64);
+    try putEntry(&registry, std.testing.allocator, 1, 0, 11);
+    try putEntry(&registry, std.testing.allocator, 1, 1, 12);
+    // Client 1 is at its cap; client 2 still inserts fine.
+    try putEntry(&registry, std.testing.allocator, 2, 0, 22);
+    const owned = try std.testing.allocator.create(u64);
+    owned.* = 13;
+    defer std.testing.allocator.destroy(owned);
+    try std.testing.expectError(error.TooManyStreams, registry.insert(std.testing.allocator, .{ .connection = 1, .stream = 2 }, owned));
+    try std.testing.expectEqual(@as(usize, 3), registry.count());
 }
 
 test "removeConnection on an unknown id is a no-op" {

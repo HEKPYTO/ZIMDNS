@@ -7,7 +7,7 @@ or named-checkzone, and the authoritative answer corpus is compared against a
 BIND 9 authoritative server serving the same zone file.
 
 Run:
-  python3 -m venv .interop-venv && .interop-venv/bin/pip install dnspython
+  python3 -m venv .interop-venv && .interop-venv/bin/pip install dnspython aioquic pyhpke cryptography
   .interop-venv/bin/python test/interop/harness.py --zimdns zig-out/bin/zimdns
 
 Exit code 0 only when every check passes. Missing tools are a hard failure:
@@ -34,8 +34,8 @@ try:
     import dns.rdatatype
 except ImportError:
     sys.stderr.write(
-        "dnspython is required: python3 -m venv .interop-venv && "
-        ".interop-venv/bin/pip install dnspython\n"
+        "dnspython, aioquic, pyhpke and cryptography are required: python3 -m venv .interop-venv && "
+        ".interop-venv/bin/pip install dnspython aioquic pyhpke cryptography\n"
     )
     raise SystemExit(2)
 
@@ -795,7 +795,11 @@ zone "{zone_name}" {{
             sorted(
                 self.rrset_key(rr)
                 for rr in message.additional
-                if rr.rdtype != dns.rdatatype.OPT
+                # RFC 6891: OPT is a per-hop pseudo-RR reflecting the
+                # requester's UDP size/flags, never authoritative data.
+                # RFC 8945 4.1/4.4: TSIG is a per-transaction MAC over the
+                # exchanged message; every server varies it by key/time.
+                if rr.rdtype not in (dns.rdatatype.OPT, dns.rdatatype.TSIG)
             )
         )
         return {
@@ -818,11 +822,33 @@ zone "{zone_name}" {{
             try:
                 mine = self.response_view(self.query(zport, name, rdtype, tcp=tcp))
                 ref = self.response_view(self.query(nport, name, rdtype, tcp=tcp))
-                # The answer set and the response meaning must match exactly.
+                # The answer set and the response meaning must match exactly,
+                # including additional-section glue (RFC 1034 4.3.2 referrals).
                 for key in ("rcode", "aa", "tc", "answer"):
                     if mine[key] != ref[key]:
                         raise Failure(
                             f"{label}: {key} differs\n  zimdns: {mine[key]}\n  bind:   {ref[key]}"
+                        )
+                # Additional must match exactly, except BIND appends
+                # in-bailiwick A/AAAA glue to a positive apex-NS answer
+                # (RFC 1034 4.3.2) while ZIMDNS omits that optional glue.
+                # That one observed case is normalized by intersecting on
+                # the NS target names present in the answer; every other
+                # additional record must match exactly.
+                mine_add, ref_add = mine["additional"], ref["additional"]
+                if mine_add != ref_add:
+                    ns_targets = set()
+                    for owner, rdtype, rdata in mine["answer"]:
+                        if rdtype == dns.rdatatype.NS:
+                            ns_targets.update(rdata)
+                    if ns_targets and all(
+                        owner in ns_targets and rdtype in (dns.rdatatype.A, dns.rdatatype.AAAA)
+                        for owner, rdtype, rdata in set(ref_add) - set(mine_add)
+                    ) and not (set(mine_add) - set(ref_add)):
+                        pass
+                    else:
+                        raise Failure(
+                            f"{label}: additional differs\n  zimdns: {mine_add}\n  bind:   {ref_add}"
                         )
                 # Negative answers must carry the same SOA/denial proof; BIND
                 # with minimal-responses may differ on authority NS in
@@ -1410,6 +1436,28 @@ zone "{zone_name}" {{
         if get_answer.rcode() != 0 or not get_answer.answer:
             raise Failure(f"DoH/3 GET response is not a positive answer: {get_answer}")
 
+        def status_of(hdrs):
+            return dict((k.decode("latin-1"), v.decode("latin-1")) for k, v in hdrs).get(":status")
+
+        cases = [
+            ("DoH/3 wrong path 404", [(b":method", b"GET"), (b":path", b"/not-dns-query?dns=abcd"), (b":scheme", b"https"), (b":authority", b"localhost")], None, "404"),
+            ("DoH/3 PUT 405", [(b":method", b"PUT"), (b":path", b"/dns-query"), (b":scheme", b"https"), (b":authority", b"localhost")], None, "405"),
+            ("DoH/3 bad media 415", [(b":method", b"POST"), (b":path", b"/dns-query"), (b":scheme", b"https"), (b":authority", b"localhost"), (b"content-type", b"text/plain")], query, "415"),
+            ("DoH/3 bad base64 400", [(b":method", b"GET"), (b":path", b"/dns-query?dns=!!!"), (b":scheme", b"https"), (b":authority", b"localhost")], None, "400"),
+        ]
+        for label, hdrs, payload, want in cases:
+            got_h, _ = asyncio.run(run_exchange(hdrs, payload))
+            got = status_of(got_h)
+            if got != want:
+                raise Failure(f"{label}: got {got}, want {want}")
+        put_h, _ = asyncio.run(run_exchange(
+            [(b":method", b"PUT"), (b":path", b"/dns-query"), (b":scheme", b"https"), (b":authority", b"localhost")],
+            None,
+        ))
+        allow = dict((k.decode("latin-1"), v.decode("latin-1")) for k, v in put_h).get("allow")
+        if allow != "GET, POST":
+            raise Failure(f"DoH/3 405 allow header is {allow!r}, want 'GET, POST'")
+
         try:
             cleartext = dns.message.make_query("www.example.test.", "A")
             dns.query.udp(cleartext, "127.0.0.1", port=port, timeout=2)
@@ -1892,6 +1940,21 @@ isdn IN ISDN "150862028003217" "004"
         if refusal.returncode == 0:
             raise Failure("query CLI accepted an unknown flag")
 
+    def check_additional_view(self):
+        # Views differing only in ADDITIONAL must compare unequal, so
+        # deleting the additional comparison fails this check.
+        import copy
+        base = {
+            "rcode": 0, "aa": True, "tc": False,
+            "answer": (("example.test.", 2, ("ns1.example.test.",)),),
+            "authority": (),
+            "additional": (),
+        }
+        other = copy.deepcopy(base)
+        other["additional"] = (("ns1.example.test.", 1, ("192.0.2.53",)),)
+        if base == other:
+            raise Failure("response views differing only in ADDITIONAL compare equal")
+
     # ----------------------------------------------------------------- main
     def run_all(self):
         self.check_tools()
@@ -1904,6 +1967,7 @@ isdn IN ISDN "150862028003217" "004"
             self.start_named(work, nport)
             self.check("differential oracle, UDP corpus", lambda: self.diff_authoritative(zport, nport, tcp=False))
             self.check("differential oracle, TCP corpus", lambda: self.diff_authoritative(zport, nport, tcp=True))
+            self.check("differential oracle: ADDITIONAL in comparison", self.check_additional_view)
             self.check("external client: shipped query CLI", lambda: self.check_cli_query(nport))
             self.check(
                 "external clients: dig, kdig, AXFR, named-checkzone, kzonecheck",

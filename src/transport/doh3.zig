@@ -1,26 +1,24 @@
 /// Contract: Serves the RFC 8484 DNS-over-HTTPS message mapping (GET
 /// /dns-query?dns=<base64url> and POST /dns-query with application/dns-message
-/// bodies) over HTTP/3 (RFC 9114), reusing the RFC 8484 mapping in
-/// `doh.zig` so the parsing rules cannot drift apart. The QUIC handshake
-/// selects the `h3` ALPN token (RFC 9114 section 3.1) before any DNS byte
-/// is written, so the port never answers in cleartext. One exchange per
-/// stream: a GET is answered at its headers, a POST is answered when its
-/// body ends. Plain answers use content-type application/dns-message and
-/// cache-control max-age=<TTL>, the freshness lifetime the HTTP/1.1
-/// channel computes; Oblivious DoH answers use the oblivious media type
-/// with cache-control no-store. A missing :method or :path, a wrong path,
-/// a wrong method, a wrong media type, or a malformed base64url/DNS
-/// message is an HTTP status, never a resolver error.
-/// Ownership: Runtime is borrowed; per-stream state is allocated per
-/// stream and freed when the stream ends; scratch lives in per-request
+/// bodies) over HTTP/3 on nghttp3 over the ngtcp2 core in
+/// `ngtcp2_server.zig`, reusing the RFC 8484 mapping in `doh.zig` so the
+/// parsing rules cannot drift apart. The handshake selects the `h3` ALPN
+/// token before any DNS byte is written, so the port never answers in
+/// cleartext. One exchange per stream: a GET is answered at its headers,
+/// a POST is answered when its body ends. Plain answers use content-type
+/// application/dns-message and cache-control max-age=<TTL>, the freshness
+/// lifetime the HTTP/1.1 channel computes; Oblivious DoH answers use the
+/// oblivious media type with cache-control no-store. A missing :method or
+/// :path, a wrong path, a wrong method, a wrong media type, or a malformed
+/// base64url/DNS message is an HTTP status, never a resolver error.
+/// Ownership: Runtime is borrowed; nghttp3 state lives per core
+/// connection and is freed when the connection is destroyed; per-stream
+/// state is freed when the stream ends; scratch lives in per-request
 /// arenas.
 /// Errors: HTTP mapping failures map to HTTP status codes and never reach
 /// the resolver; malformed streams are reset where the handler cannot
 /// answer them.
 const std = @import("std");
-const quic = @import("quic");
-const event_loop = quic.event_loop;
-const qpack = quic.qpack;
 const Runtime = @import("../auth/runtime.zig").Runtime;
 const cli_query = @import("../cli/query.zig");
 const metrics = @import("../metrics.zig");
@@ -29,38 +27,62 @@ const dns_padding = @import("../dns/padding.zig");
 const listener = @import("../platform/listener.zig");
 const tls_policy = @import("tls.zig");
 const StreamRegistry = @import("stream_registry.zig");
-const tls_server = @import("tls_server.zig");
 const doh = @import("doh.zig");
 const odoh = @import("../dns/odoh.zig");
-const doq = @import("doq.zig");
-/// The IANA ALPN protocol ID for HTTP/3 (RFC 9114 section 3.1). The
-/// handshake selects exactly this token, so the port never serves another
-/// protocol and a client that offers no common token is refused.
+const core = @import("ngtcp2_server.zig");
+const gnutls = @import("gnutls_server.zig");
+const abi = @import("ngtcp2_abi.zig");
+const h3abi = @import("nghttp3_abi.zig");
+
+/// The IANA ALPN protocol ID for HTTP/3. The handshake selects exactly
+/// this token, so the port never serves another protocol and a client
+/// that offers no common token is refused.
 pub const DOH3_ALPN = "h3";
 /// The HTTPS default port, the same default DoH binds.
 pub const DOH3_PORT = tls_policy.doh_port;
-pub const MAX_CONNECTION_WORKERS = listener.TCP_MAX_CONNECTION_WORKERS;
 pub const MAX_BODY_LEN: usize = doh.MAX_BODY_LEN;
 pub const MAX_HEADER_BYTES: usize = doh.MAX_HEADER_BYTES;
 /// Concurrent request streams across every connection this port serves.
-pub const MAX_STREAMS: usize = 64;
+pub const MAX_STREAMS: usize = core.Server.MAX_STREAMS_PER_CONN;
 
-/// One request stream's state. The header slices the event loop hands to
-/// `onRequest` are poisoned once the callback returns, so everything the
-/// handler needs past that point is copied here.
+/// One request stream's state. The header rcbufs nghttp3 hands to the
+/// callbacks die when the callback returns, so everything the handler
+/// needs past that point is copied here. `respond_now` stages the
+/// answer decision: callbacks never submit responses or write packets,
+/// the dispatch loop answers after nghttp3 returns.
 const StreamState = struct {
-    method_is_get: bool,
-    method_is_post: bool,
-    target: []u8,
-    content_type: ?[]u8,
+    method: [8]u8 = undefined,
+    method_len: usize = 0,
+    target: [2048]u8 = undefined,
+    target_len: usize = 0,
+    content_type: [64]u8 = undefined,
+    content_type_len: usize = 0,
+    has_content_type: bool = false,
+    head_bytes: usize = 0,
+    head_too_large: bool = false,
+    duplicate: bool = false,
+    seen_method: bool = false,
+    seen_path: bool = false,
+    answered: bool = false,
     body: [MAX_BODY_LEN]u8 = undefined,
     body_len: usize = 0,
-    responded: bool = false,
+    respond_now: bool = false,
+    post_end: bool = false,
+    response: [MAX_BODY_LEN]u8 = undefined,
+    response_len: usize = 0,
+    response_sent: usize = 0,
+    response_ready: bool = false,
+    is_odoh: bool = false,
+    max_age: u32 = 0,
 };
 
-/// Counts what one HTTP/3 connection knows about its request streams.
+/// Per-connection nghttp3 state. Created on handshake, destroyed with
+/// the core connection.
+const H3Conn = struct {
+    h3: ?*h3abi.conn_t,
+};
+
 const Doh3Handler = struct {
-    pub const protocol = event_loop.Protocol.h3;
     allocator: std.mem.Allocator,
     runtime: *Runtime,
     io: std.Io,
@@ -69,316 +91,526 @@ const Doh3Handler = struct {
     odoh_target: ?*const odoh.Target = null,
     completed: usize = 0,
     streams: StreamRegistry.Registry(StreamState) = .{ .max_entries = MAX_STREAMS },
-    server: ?*anyopaque = null,
-    request_stop: ?*const fn (*anyopaque) void = null,
+    conns: std.AutoHashMapUnmanaged(u64, *H3Conn) = .empty,
+    active: ?*core.Connection = null,
 
     fn destroyState(allocator: std.mem.Allocator, state: *StreamState) void {
-        allocator.free(state.target);
-        if (state.content_type) |ct| allocator.free(ct);
         allocator.destroy(state);
     }
 
-    fn keyFor(session: *event_loop.Session, stream_id: u64) StreamRegistry.Key {
-        return .{ .connection = session.id(), .stream = stream_id };
+    fn keyFor(conn: *const core.Connection, stream_id: i64) StreamRegistry.Key {
+        return .{ .connection = @intFromPtr(conn), .stream = @bitCast(stream_id) };
     }
 
-    /// Ownership: on success the registry owns `owned` (the slice fields
-    /// move with it); on error the registry owns nothing and the caller
-    /// keeps freeing the passed state's slices. Single `errdefer` destroys
-    /// only `owned`, exactly once.
-    fn stateFor(self: *Doh3Handler, session: *event_loop.Session, stream_id: u64, state: *StreamState) !void {
-        const owned = try self.allocator.create(StreamState);
-        errdefer self.allocator.destroy(owned);
-        owned.* = state.*;
-        try self.streams.insert(self.allocator, keyFor(session, stream_id), owned);
+    fn stateForId(self: *Doh3Handler, conn: *const core.Connection, stream_id: i64) ?*StreamState {
+        return self.streams.get(keyFor(conn, stream_id));
     }
 
-    fn stateForId(self: *Doh3Handler, session: *event_loop.Session, stream_id: u64) ?*StreamState {
-        return self.streams.get(keyFor(session, stream_id));
-    }
-
-    fn dropState(self: *Doh3Handler, session: *event_loop.Session, stream_id: u64) void {
-        self.streams.removeOne(self.allocator, keyFor(session, stream_id), destroyState);
-    }
-
-    pub fn onConnectionClosed(self: *Doh3Handler, session: *event_loop.Session) void {
-        self.streams.removeConnection(self.allocator, session.id(), destroyState);
-    }
-
-    pub fn onRequest(self: *Doh3Handler, session: *event_loop.Session, stream_id: u64, headers: []const qpack.Header) void {
-        var head_bytes: usize = 0;
-        var method: ?[]const u8 = null;
-        var path: ?[]const u8 = null;
-        var content_type: ?[]const u8 = null;
-        var duplicate_method = false;
-        var duplicate_path = false;
-        var duplicate_content_type = false;
-        for (headers) |h| {
-            head_bytes += h.name.len + h.value.len + 2;
-            if (head_bytes > MAX_HEADER_BYTES) {
-                self.respondStatus(session, stream_id, .request_header_fields_too_large);
-                self.completed += 1;
-                self.maybeStop();
-                return;
-            }
-            if (std.mem.eql(u8, h.name, ":method")) {
-                if (method != null) duplicate_method = true;
-                method = h.value;
-            } else if (std.mem.eql(u8, h.name, ":path")) {
-                if (path != null) duplicate_path = true;
-                path = h.value;
-            } else if (std.ascii.eqlIgnoreCase(h.name, "content-type")) {
-                if (content_type != null) duplicate_content_type = true;
-                content_type = h.value;
-            }
-        }
-        // A request with no :method or no :path cannot be mapped at all.
-        if (method == null or path == null or duplicate_method or duplicate_path or duplicate_content_type) {
-            self.respondStatus(session, stream_id, .bad_request);
-            self.completed += 1;
-            self.maybeStop();
-            return;
-        }
-        const method_is_get = std.mem.eql(u8, method.?, "GET");
-        const method_is_post = std.mem.eql(u8, method.?, "POST");
-        if (!method_is_get and !method_is_post) {
-            self.respondStatus(session, stream_id, .method_not_allowed);
-            self.completed += 1;
-            self.maybeStop();
-            return;
-        }
-        var state = StreamState{
-            .method_is_get = method_is_get,
-            .method_is_post = method_is_post,
-            .target = self.allocator.dupe(u8, path.?) catch return,
-            .content_type = blk: {
-                if (content_type) |ct| break :blk self.allocator.dupe(u8, ct) catch null;
-                break :blk null;
-            },
+    fn ensureState(self: *Doh3Handler, conn: *const core.Connection, stream_id: i64) ?*StreamState {
+        if (self.stateForId(conn, stream_id)) |s| return s;
+        const owned = self.allocator.create(StreamState) catch return null;
+        owned.* = .{};
+        self.streams.insert(self.allocator, keyFor(conn, stream_id), owned) catch {
+            self.allocator.destroy(owned);
+            return null;
         };
-        self.stateFor(session, stream_id, &state) catch {
-            self.allocator.free(state.target);
-            if (state.content_type) |ct| self.allocator.free(ct);
-            session.resetRequest(stream_id, @backingInt(event_loop.H3Error.request_rejected));
+        return owned;
+    }
+
+    fn dropState(self: *Doh3Handler, conn: *const core.Connection, stream_id: i64) void {
+        const had = self.streams.get(keyFor(conn, stream_id)) != null;
+        self.streams.removeOne(self.allocator, keyFor(conn, stream_id), destroyState);
+        if (self.getH3(conn)) |h3conn| {
+            _ = h3abi.nghttp3_conn_set_stream_user_data(h3conn.h3, stream_id, null);
+            _ = h3abi.nghttp3_conn_close_stream2(h3conn.h3, 0, stream_id, 0, 0);
+        }
+        // One credit per actually-closed client bidi stream: uni streams
+        // and missing entries grant nothing, and reset+close can no
+        // longer double-grant since the second drop finds no entry.
+        if (had and @as(u64, @bitCast(stream_id)) & 0x3 == 0) abi.conn_extend_max_streams_bidi(conn.conn, 1);
+    }
+
+    fn onClose(ctx: *anyopaque, conn: *core.Connection) void {
+        const self: *Doh3Handler = @ptrCast(@alignCast(ctx));
+        const id: u64 = @intFromPtr(conn);
+        self.streams.removeConnection(self.allocator, id, destroyState);
+        if (self.conns.fetchRemove(id)) |kv| {
+            if (kv.value.h3) |c| h3abi.nghttp3_conn_del(c);
+            self.allocator.destroy(kv.value);
+        }
+    }
+
+    fn getH3(self: *Doh3Handler, conn: *const core.Connection) ?*H3Conn {
+        return self.conns.get(@intFromPtr(conn));
+    }
+
+    fn onHandshake(ctx: *anyopaque, conn: *core.Connection) void {
+        const self: *Doh3Handler = @ptrCast(@alignCast(ctx));
+        // The ports serve exactly one ALPN each, configured on the
+        // TLS session before the handshake runs; the core refreshes the
+        // mirror once the handshake completes. A mismatch here means
+        // the client offered no common token, so doom the connection.
+        const got = conn.session.alpn[0..conn.session.alpn_len];
+        if (!std.mem.eql(u8, got, DOH3_ALPN)) {
+            conn.doomed = true;
+            return;
+        }
+        const h3conn = self.allocator.create(H3Conn) catch {
+            conn.doomed = true;
             return;
         };
-        // A GET carries its query in the path and is answered at the
-        // headers; a POST waits for its body to end before answering.
-        // HTTP/3 request streams the client opens (RFC 9114 section 4.1):
-        // the handler takes one exchange per stream.
-        if (method_is_get) {
-            self.answer(session, stream_id, &.{});
-        }
-    }
-
-    pub fn onData(self: *Doh3Handler, session: *event_loop.Session, stream_id: u64, data: []const u8) void {
-        const state = self.stateForId(session, stream_id) orelse return;
-        if (state.responded) return;
-        if (state.body_len + data.len > MAX_BODY_LEN) {
-            self.respondStatus(session, stream_id, .payload_too_large);
-            state.responded = true;
-            self.completed += 1;
-            self.maybeStop();
+        var settings = std.mem.zeroes(h3abi.settings);
+        h3abi.settings_default(h3abi.SETTINGS_VERSION, &settings);
+        settings.qpack_max_dtable_capacity = 4096;
+        settings.qpack_blocked_streams = 100;
+        settings.max_field_section_size = MAX_HEADER_BYTES;
+        settings.qpack_encoder_max_dtable_capacity = 4096;
+        var cbs = std.mem.zeroes(h3abi.callbacks);
+        cbs.begin_headers = h3BeginHeaders;
+        cbs.recv_header = h3RecvHeader;
+        cbs.end_headers = h3EndHeaders;
+        cbs.recv_data = h3RecvData;
+        cbs.deferred_consume = h3DeferredConsume;
+        cbs.end_stream = h3EndStream;
+        cbs.acked_stream_data = h3AckedData;
+        cbs.stop_sending = h3StopSending;
+        cbs.reset_stream = h3ResetStream;
+        cbs.stream_close2 = h3StreamClose;
+        cbs.rand = h3Rand;
+        var h3: ?*h3abi.conn_t = null;
+        if (h3abi.conn_server_new(&h3, h3abi.CALLBACKS_VERSION, &cbs, h3abi.SETTINGS_VERSION, &settings, null, self) != 0 or h3 == null) {
+            self.allocator.destroy(h3conn);
+            conn.doomed = true;
             return;
         }
-        @memcpy(state.body[state.body_len .. state.body_len + data.len], data);
-        state.body_len += data.len;
+        h3conn.h3 = h3;
+        h3abi.nghttp3_conn_set_max_client_streams_bidi(h3, MAX_STREAMS);
+        h3abi.nghttp3_conn_set_max_concurrent_streams(h3, MAX_STREAMS + 8);
+        self.conns.put(self.allocator, @intFromPtr(conn), h3conn) catch {
+            h3abi.nghttp3_conn_del(h3);
+            self.allocator.destroy(h3conn);
+            conn.doomed = true;
+            return;
+        };
+        var control: i64 = 0;
+        if (abi.conn_open_uni_stream(conn.conn, &control, null) != 0) return;
+        if (h3abi.nghttp3_conn_bind_control_stream(h3, control) != 0) return;
+        var qenc: i64 = 0;
+        var qdec: i64 = 0;
+        if (abi.conn_open_uni_stream(conn.conn, &qenc, null) != 0) return;
+        if (abi.conn_open_uni_stream(conn.conn, &qdec, null) != 0) return;
+        if (h3abi.nghttp3_conn_bind_qpack_streams(h3, qenc, qdec) != 0) return;
     }
 
-    pub fn onRequestEnd(self: *Doh3Handler, session: *event_loop.Session, stream_id: u64) void {
-        if (self.stateForId(session, stream_id)) |state| {
-            if (!state.responded and state.method_is_post) {
-                self.answer(session, stream_id, state.body[0..state.body_len]);
-            }
+    fn onStreamClose(ctx: *anyopaque, conn: *core.Connection, stream_id: i64) void {
+        const self: *Doh3Handler = @ptrCast(@alignCast(ctx));
+        if (self.getH3(conn)) |h3conn| {
+            _ = h3abi.nghttp3_conn_close_stream2(h3conn.h3, 0, stream_id, 0, 0);
         }
-        self.dropState(session, stream_id);
+        self.dropState(conn, stream_id);
     }
 
-    pub fn onRequestCancelled(self: *Doh3Handler, session: *event_loop.Session, stream_id: u64, _: u64) void {
-        self.dropState(session, stream_id);
+    fn onStreamReset(ctx: *anyopaque, conn: *core.Connection, stream_id: i64, code: u64) void {
+        const self: *Doh3Handler = @ptrCast(@alignCast(ctx));
+        _ = code;
+        if (self.getH3(conn)) |h3conn| {
+            _ = h3abi.nghttp3_conn_close_stream2(h3conn.h3, 0, stream_id, 0, 0);
+        }
+        self.dropState(conn, stream_id);
     }
 
-    fn answer(self: *Doh3Handler, session: *event_loop.Session, stream_id: u64, body: []const u8) void {
-        const state = self.stateForId(session, stream_id) orelse return;
-        state.responded = true;
-        // Per-exchange arena: the parsed query, the response buffer, and
-        // any padding live and die with this answer.
+    fn onStopSending(ctx: *anyopaque, conn: *core.Connection, stream_id: i64, code: u64) void {
+        const self: *Doh3Handler = @ptrCast(@alignCast(ctx));
+        _ = code;
+        if (self.getH3(conn)) |h3conn| {
+            _ = h3abi.nghttp3_conn_close_stream2(h3conn.h3, 0, stream_id, 0, 0);
+        }
+        self.dropState(conn, stream_id);
+    }
+
+    fn onAck(ctx: *anyopaque, conn: *core.Connection, stream_id: i64, datalen: u64) void {
+        const self: *Doh3Handler = @ptrCast(@alignCast(ctx));
+        const h3conn = self.getH3(conn) orelse return;
+        _ = h3abi.nghttp3_conn_add_ack_offset(h3conn.h3, stream_id, datalen);
+        // Newly acked bytes reopen the flow-control window a blocked
+        // stream was waiting on; resume it so nghttp3 re-offers the
+        // bytes instead of stalling a small-window client.
+        _ = h3abi.nghttp3_conn_resume_stream(h3conn.h3, stream_id);
+    }
+
+    fn onStream(ctx: *anyopaque, conn: *core.Connection, event: core.StreamEvent) void {
+        const self: *Doh3Handler = @ptrCast(@alignCast(ctx));
+        switch (event) {
+            .reset => |r| Doh3Handler.onStreamReset(ctx, conn, r.stream_id, 0),
+            .data => |d| self.onStreamData(conn, d.stream_id, d.bytes, d.fin, d.now),
+        }
+    }
+
+    fn withActive(self: *Doh3Handler, conn: *core.Connection, stream_id: i64, data: []const u8, fin: bool, now: h3abi.tstamp) isize {
+        self.active = conn;
+        defer self.active = null;
+
+        var empty: u8 = 0;
+        const ptr: [*c]const u8 = if (data.len > 0) data.ptr else @as([*c]const u8, @ptrCast(&empty));
+        const h3conn = self.getH3(conn) orelse return -1;
+        const n = h3abi.nghttp3_conn_read_stream2(h3conn.h3, stream_id, ptr, data.len, if (fin) @as(c_int, 1) else 0, now);
+
+        return n;
+    }
+
+    fn onStreamData(self: *Doh3Handler, conn: *core.Connection, stream_id: i64, data: []const u8, fin: bool, now: abi.tstamp) void {
+        const is_bidi = @as(u64, @bitCast(stream_id)) & 0x3 == 0;
+        const n = self.withActive(conn, stream_id, data, fin, now);
+        _ = abi.conn_extend_max_stream_offset(conn.conn, stream_id, data.len);
+        abi.conn_extend_max_offset(conn.conn, data.len);
+        if (!is_bidi) {
+            // Control/QPACK decode failures are connection-fatal in
+            // HTTP/3; doom rather than serve half-decoded requests.
+            if (n < 0 and n != h3abi.ERR_WOULDBLOCK) conn.doomed = true;
+            return;
+        }
+        if (n < 0) {
+            conn.pending.resetStream(stream_id, 0x105);
+            self.pumpAnswers(conn);
+            return;
+        }
+        self.pumpAnswers(conn);
+    }
+
+    /// Runs every staged answer decision: submit the response, or reset
+    /// the stream when the request is unanswerable.
+    fn pumpAnswers(self: *Doh3Handler, conn: *core.Connection) void {
+        var it = self.streams.map.iterator();
+        while (it.next()) |kv| {
+            if (kv.key_ptr.connection != @intFromPtr(conn)) continue;
+            const state = kv.value_ptr.*;
+            if (!state.respond_now or state.answered) continue;
+            const stream_id: i64 = @bitCast(kv.key_ptr.stream);
+            self.answer(conn, stream_id, state);
+        }
+    }
+
+    fn flushConn(ctx: *anyopaque, server: *core.Server, conn: *core.Connection, now: abi.tstamp) void {
+        const self: *Doh3Handler = @ptrCast(@alignCast(ctx));
+        const h3conn = self.getH3(conn) orelse return;
+        self.pumpAnswers(conn);
+        var vecs: [16]h3abi.vec = undefined;
+        var qvecs: [16]abi.vec = undefined;
+        while (true) {
+            var out_sid: i64 = -1;
+            var out_fin: c_int = 0;
+            const nvec = h3abi.nghttp3_conn_writev_stream(h3conn.h3, &out_sid, &out_fin, &vecs, vecs.len);
+            if (nvec <= 0 or out_sid < 0) break;
+            const count: usize = @intCast(nvec);
+            for (vecs[0..count], 0..) |v, i| qvecs[i] = .{ .base = v.base, .len = v.len };
+            var pi = abi.pkt_info{ .ecn = 0 };
+            const flags: u32 = if (out_fin != 0) abi.WRITE_STREAM_FLAG_FIN else abi.WRITE_STREAM_FLAG_NONE;
+            var ndatalen: abi.ssize = 0;
+            var tx_buf: [65527]u8 = undefined;
+            const written = abi.conn_writev_stream(conn.conn, &conn.storage.path, abi.PKT_INFO_VERSION, &pi, &tx_buf, tx_buf.len, &ndatalen, flags, out_sid, if (count > 0) &qvecs else null, count, now);
+            if (written < 0) {
+                // STREAM_DATA_BLOCKED (no flow-control window) and
+                // WRITE_MORE (packet full, stream bytes pending): tell
+                // nghttp3 the stream is blocked so it re-offers the
+                // bytes on the next writev_stream pass.
+                if (written == abi.ERR_STREAM_DATA_BLOCKED or written == abi.ERR_WRITE_MORE) h3abi.nghttp3_conn_block_stream(h3conn.h3, out_sid);
+                // Transient errors: stop this pass, the next pump
+                // resumes.
+                break;
+            }
+            if (written == 0) break;
+            if (ndatalen >= 0) _ = h3abi.nghttp3_conn_add_write_offset(h3conn.h3, out_sid, @intCast(@max(ndatalen, 0)));
+            server.sendDatagram(conn, tx_buf[0..@intCast(written)]);
+            if (ndatalen == 0 and out_fin == 0) break;
+        }
+    }
+
+    fn answer(self: *Doh3Handler, conn: *core.Connection, stream_id: i64, state: *StreamState) void {
+        state.answered = true;
+        state.respond_now = false;
+        const h3conn = self.getH3(conn) orelse return;
+        // GET answers on end_headers (no body); POST answers on end_stream.
+        const is_get = state.method_len == 3 and std.mem.eql(u8, state.method[0..3], "GET");
+        const is_post = state.method_len == 4 and std.mem.eql(u8, state.method[0..4], "POST");
+        const body = state.body[0..state.body_len];
+        const target = state.target[0..state.target_len];
+        const ct: ?[]const u8 = if (state.has_content_type) state.content_type[0..state.content_type_len] else null;
+        if (state.head_too_large) return self.submitStatus(h3conn, conn, stream_id, state, .request_header_fields_too_large);
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
-        const is_odoh = state.method_is_post and state.content_type != null and std.mem.eql(u8, state.content_type.?, doh.odoh_media_type);
-        if (is_odoh) {
-            self.answerOdoh(session, stream_id, body);
-            return;
+        if (!state.seen_method or !state.seen_path or state.duplicate) {
+            return self.submitStatus(h3conn, conn, stream_id, state, .bad_request);
         }
-        const query = doh.dnsQueryFromParts(
-            arena.allocator(),
-            state.method_is_get,
-            state.method_is_post,
-            state.target,
-            state.content_type,
-            @constCast(body),
-        ) catch |err| {
-            self.respondStatus(session, stream_id, doh.statusForError(err));
+        if (!is_get and !is_post) {
+            return self.submitStatus(h3conn, conn, stream_id, state, .method_not_allowed);
+        }
+        if (is_get) return self.answerQuery(h3conn, conn, stream_id, state, arena.allocator(), target, null, false);
+        // POST body already bounded at recv_data time.
+        if (ct != null and std.mem.eql(u8, ct.?, doh.odoh_media_type)) {
+            return self.answerOdoh(h3conn, conn, stream_id, state, arena.allocator(), body);
+        }
+        return self.answerQuery(h3conn, conn, stream_id, state, arena.allocator(), target, ct, true);
+    }
+
+    fn answerQuery(self: *Doh3Handler, h3conn: *H3Conn, conn: *core.Connection, stream_id: i64, state: *StreamState, arena: std.mem.Allocator, target: []const u8, ct: ?[]const u8, is_post: bool) void {
+        const qbody: []u8 = @constCast(state.body[0..state.body_len]);
+        const query = doh.dnsQueryFromParts(arena, !is_post, is_post, target, ct, qbody) catch |err| {
+            return self.submitStatus(h3conn, conn, stream_id, state, doh.statusForError(err));
+        };
+        const request_message = dns_message.Message.parseQuery(arena, query) catch {
+            return self.submitStatus(h3conn, conn, stream_id, state, .bad_request);
+        };
+        const peer = core.ipAddressFromStorage(&conn.peer_addr) orelse {
+            return self.submitStatus(h3conn, conn, stream_id, state, .internal_error);
+        };
+        self.runtime.maybeRefreshManagedAnchors(@intCast(std.Io.Clock.real.now(self.io).nanoseconds));
+        _ = self.runtime.reloadZoneIfRequested(self.io);
+        _ = self.runtime.refreshCatalogIfRequested(self.io);
+        const response_buffer = arena.alloc(u8, MAX_BODY_LEN) catch {
+            return self.submitStatus(h3conn, conn, stream_id, state, .internal_error);
+        };
+        if (self.counters) |counters| metrics.bump(&counters.doh3_queries_total);
+        const response_bytes = self.runtime.answerFromTcp(query, response_buffer, &peer, self.counters) catch |err| {
+            return self.submitStatus(h3conn, conn, stream_id, state, if (err == error.BadQuery) .bad_request else .internal_error);
+        };
+        const answer_bytes = (dns_padding.padResponse(arena, &request_message, response_bytes) catch {
+            return self.submitStatus(h3conn, conn, stream_id, state, .internal_error);
+        }) orelse response_bytes;
+        const response_message = dns_message.Message.parse(arena, answer_bytes) catch {
+            return self.submitStatus(h3conn, conn, stream_id, state, .internal_error);
+        };
+        self.submitOk(h3conn, conn, stream_id, state, answer_bytes, doh.minTtl(&response_message), false);
+        self.completed += 1;
+    }
+
+    fn answerOdoh(self: *Doh3Handler, h3conn: *H3Conn, conn: *core.Connection, stream_id: i64, state: *StreamState, arena: std.mem.Allocator, body: []const u8) void {
+        const t = self.odoh_target orelse {
+            self.submitStatus(h3conn, conn, stream_id, state, .not_found);
             self.completed += 1;
-            self.maybeStop();
             return;
         };
-        const request_message = dns_message.Message.parseQuery(arena.allocator(), query) catch {
-            self.respondStatus(session, stream_id, .bad_request);
+        const opened = odoh.openQuery(arena, t, body) catch |err| {
+            self.submitStatus(h3conn, conn, stream_id, state, if (err == error.UnknownKeyId) .unauthorized else .bad_request);
             self.completed += 1;
-            self.maybeStop();
+            return;
+        };
+        const request_message = dns_message.Message.parseQuery(arena, opened.dns_query) catch {
+            self.submitStatus(h3conn, conn, stream_id, state, .bad_request);
+            self.completed += 1;
+            return;
+        };
+        const peer = core.ipAddressFromStorage(&conn.peer_addr) orelse {
+            self.submitStatus(h3conn, conn, stream_id, state, .internal_error);
+            self.completed += 1;
             return;
         };
         self.runtime.maybeRefreshManagedAnchors(@intCast(std.Io.Clock.real.now(self.io).nanoseconds));
         _ = self.runtime.reloadZoneIfRequested(self.io);
         _ = self.runtime.refreshCatalogIfRequested(self.io);
-        const client = doq.peerAddress(session) orelse {
-            self.respondStatus(session, stream_id, .internal_error);
+        const response_buffer = arena.alloc(u8, MAX_BODY_LEN) catch {
+            self.submitStatus(h3conn, conn, stream_id, state, .internal_error);
             self.completed += 1;
-            self.maybeStop();
-            return;
-        };
-        const response_buffer = arena.allocator().alloc(u8, MAX_BODY_LEN) catch {
-            self.respondStatus(session, stream_id, .internal_error);
-            self.completed += 1;
-            self.maybeStop();
             return;
         };
         if (self.counters) |counters| metrics.bump(&counters.doh3_queries_total);
-        // One runtime entry point serves every DoH query, and it takes the
-        // peer address: the recursion policy, the cookie check, and the
-        // locally served zones apply as they do on the cleartext port.
-        const response_bytes = self.runtime.answerFromTcp(query, response_buffer, &client, self.counters) catch |err| {
-            self.respondStatus(session, stream_id, if (err == error.BadQuery) .bad_request else .internal_error);
+        const response_bytes = self.runtime.answerFromTcp(opened.dns_query, response_buffer, &peer, self.counters) catch |err| {
+            self.submitStatus(h3conn, conn, stream_id, state, if (err == error.BadQuery) .bad_request else .internal_error);
             self.completed += 1;
-            self.maybeStop();
             return;
         };
-        // RFC 7830 section 4: the responder pads the answer when the query
-        // carried the Padding option. Only this path calls the helper.
-        const answer_bytes = (dns_padding.padResponse(arena.allocator(), &request_message, response_bytes) catch {
-            self.respondStatus(session, stream_id, .internal_error);
+        const padded = (dns_padding.padResponse(arena, &request_message, response_bytes) catch {
+            self.submitStatus(h3conn, conn, stream_id, state, .internal_error);
             self.completed += 1;
-            self.maybeStop();
             return;
         }) orelse response_bytes;
-        const response_message = dns_message.Message.parse(arena.allocator(), answer_bytes) catch {
-            self.respondStatus(session, stream_id, .internal_error);
+        const sealed = odoh.sealResponse(arena, self.io, opened.exporter_secret, opened.q_plain, padded) catch {
+            self.submitStatus(h3conn, conn, stream_id, state, .internal_error);
             self.completed += 1;
-            self.maybeStop();
             return;
         };
-        self.respondOk(session, stream_id, answer_bytes, doh.minTtl(&response_message));
+        self.submitOk(h3conn, conn, stream_id, state, sealed, 0, true);
         self.completed += 1;
-        self.maybeStop();
     }
 
-    fn respondStatus(self: *Doh3Handler, session: *event_loop.Session, stream_id: u64, status: doh.Status) void {
-        _ = self;
-        var status_text: [4]u8 = undefined;
-        const status_value = std.fmt.bufPrint(&status_text, "{d}", .{@backingInt(status)}) catch unreachable;
+    fn submitStatus(self: *Doh3Handler, h3conn: *H3Conn, conn: *core.Connection, stream_id: i64, state: *StreamState, status: doh.Status) void {
+        var text: [4]u8 = undefined;
+        const value = std.fmt.bufPrint(&text, "{d}", .{@backingInt(status)}) catch unreachable;
+        const nva = [_]h3abi.nv{
+            .{ .name = ":status", .namelen = 7, .value = value.ptr, .valuelen = value.len, .flags = h3abi.NV_FLAG_NEVER_INDEX },
+        };
+        const allow: []const u8 = "GET, POST";
+        var n: usize = 1;
+        var nva_full: [2]h3abi.nv = undefined;
+        nva_full[0] = nva[0];
         if (status == .method_not_allowed) {
-            const headers = [_]qpack.Header{
-                .{ .name = ":status", .value = status_value },
-                .{ .name = "allow", .value = "GET, POST" },
-            };
-            session.sendResponseHeaders(stream_id, &headers) catch return;
-        } else {
-            const headers = [_]qpack.Header{
-                .{ .name = ":status", .value = status_value },
-            };
-            session.sendResponseHeaders(stream_id, &headers) catch return;
+            nva_full[1] = .{ .name = "allow", .namelen = 5, .value = allow.ptr, .valuelen = allow.len, .flags = h3abi.NV_FLAG_NEVER_INDEX };
+            n = 2;
         }
-        session.finishResponse(stream_id, null) catch {};
-    }
+        state.response_ready = false;
+        state.answered = true;
+        _ = h3abi.nghttp3_conn_submit_response(h3conn.h3, stream_id, &nva_full, n, null);
+        _ = conn;
 
-    fn answerOdoh(self: *Doh3Handler, session: *event_loop.Session, stream_id: u64, body: []const u8) void {
-        const state = self.stateForId(session, stream_id) orelse return;
-        state.responded = true;
-        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        defer arena.deinit();
-        const fail = struct {
-            fn fail(handler: *Doh3Handler, sess: *event_loop.Session, sid: u64, status: doh.Status) void {
-                handler.respondStatus(sess, sid, status);
-                handler.completed += 1;
-                handler.maybeStop();
-            }
-        }.fail;
-        const t = self.odoh_target orelse return fail(self, session, stream_id, .not_found);
-        const opened = odoh.openQuery(arena.allocator(), t, body) catch |err| {
-            return fail(self, session, stream_id, if (err == error.UnknownKeyId) .unauthorized else .bad_request);
-        };
-        const request_message = dns_message.Message.parseQuery(arena.allocator(), opened.dns_query) catch {
-            return fail(self, session, stream_id, .bad_request);
-        };
-        self.runtime.maybeRefreshManagedAnchors(@intCast(std.Io.Clock.real.now(self.io).nanoseconds));
-        _ = self.runtime.reloadZoneIfRequested(self.io);
-        _ = self.runtime.refreshCatalogIfRequested(self.io);
-        const client = doq.peerAddress(session) orelse {
-            return fail(self, session, stream_id, .internal_error);
-        };
-        const response_buffer = arena.allocator().alloc(u8, MAX_BODY_LEN) catch {
-            return fail(self, session, stream_id, .internal_error);
-        };
-        if (self.counters) |counters| metrics.bump(&counters.doh3_queries_total);
-        const response_bytes = self.runtime.answerFromTcp(opened.dns_query, response_buffer, &client, self.counters) catch |err| {
-            return fail(self, session, stream_id, if (err == error.BadQuery) .bad_request else .internal_error);
-        };
-        const padded = (dns_padding.padResponse(arena.allocator(), &request_message, response_bytes) catch {
-            return fail(self, session, stream_id, .internal_error);
-        }) orelse response_bytes;
-        const sealed = odoh.sealResponse(arena.allocator(), self.io, opened.exporter_secret, opened.q_plain, padded) catch {
-            return fail(self, session, stream_id, .internal_error);
-        };
-        self.respondOdohOk(session, stream_id, sealed);
         self.completed += 1;
-        self.maybeStop();
     }
 
-    fn respondOk(self: *Doh3Handler, session: *event_loop.Session, stream_id: u64, body: []const u8, max_age: u32) void {
-        _ = self;
-        var max_age_text: [16]u8 = undefined;
-        const max_age_value = std.fmt.bufPrint(&max_age_text, "max-age={d}", .{max_age}) catch unreachable;
-        const headers = [_]qpack.Header{
-            .{ .name = ":status", .value = "200" },
-            .{ .name = "content-type", .value = doh.dns_message_media_type },
-            .{ .name = "cache-control", .value = max_age_value },
+    fn submitOk(self: *Doh3Handler, h3conn: *H3Conn, conn: *core.Connection, stream_id: i64, state: *StreamState, body: []const u8, max_age: u32, is_odoh: bool) void {
+        const take = @min(body.len, state.response.len);
+        @memcpy(state.response[0..take], body[0..take]);
+        state.response_len = take;
+        state.response_sent = 0;
+        state.response_ready = true;
+        state.is_odoh = is_odoh;
+        state.max_age = max_age;
+        const status_text: []const u8 = "200";
+        var cc_buf: [32]u8 = undefined;
+        const cc: []const u8 = if (is_odoh) "no-store" else std.fmt.bufPrint(&cc_buf, "max-age={d}", .{max_age}) catch "max-age=0";
+        const ct: []const u8 = if (is_odoh) doh.odoh_media_type else doh.dns_message_media_type;
+        const nva = [_]h3abi.nv{
+            .{ .name = ":status", .namelen = 7, .value = status_text.ptr, .valuelen = status_text.len, .flags = h3abi.NV_FLAG_NEVER_INDEX },
+            .{ .name = "content-type", .namelen = 12, .value = ct.ptr, .valuelen = ct.len, .flags = h3abi.NV_FLAG_NEVER_INDEX },
+            .{ .name = "cache-control", .namelen = 13, .value = cc.ptr, .valuelen = cc.len, .flags = h3abi.NV_FLAG_NEVER_INDEX },
         };
-        session.sendResponseHeaders(stream_id, &headers) catch return;
-        session.sendResponseData(stream_id, body) catch {};
-        session.finishResponse(stream_id, null) catch {};
-    }
+        var reader = h3abi.data_reader{ .read_data = h3ReadData };
+        _ = h3abi.nghttp3_conn_set_stream_user_data(h3conn.h3, stream_id, state);
+        _ = h3abi.nghttp3_conn_submit_response(h3conn.h3, stream_id, &nva, nva.len, &reader);
 
-    fn respondOdohOk(self: *Doh3Handler, session: *event_loop.Session, stream_id: u64, body: []const u8) void {
-        // RFC 9230 section 4.1: an Oblivious DoH response carries no cacheable
-        // plaintext, so it says no-store instead of the max-age plain DoH uses.
         _ = self;
-        const headers = [_]qpack.Header{
-            .{ .name = ":status", .value = "200" },
-            .{ .name = "content-type", .value = doh.odoh_media_type },
-            .{ .name = "cache-control", .value = "no-store" },
-        };
-        session.sendResponseHeaders(stream_id, &headers) catch return;
-        session.sendResponseData(stream_id, body) catch {};
-        session.finishResponse(stream_id, null) catch {};
-    }
-
-    fn maybeStop(self: *Doh3Handler) void {
-        if (self.max_requests) |max| {
-            if (self.completed >= max) {
-                if (self.server) |srv| {
-                    if (self.request_stop) |stop| stop(srv);
-                }
-            }
-        }
+        _ = conn;
     }
 };
 
+/// The nghttp3 body reader: serves the response staged in StreamState.
+/// Runs inside `writev_stream` during our own flush, never inside an
+/// ngtcp2 callback.
+fn h3ReadData(h3: ?*h3abi.conn_t, stream_id: i64, vec: [*c]h3abi.vec, veccnt: usize, pflags: [*c]u32, conn_user_data: ?*anyopaque, stream_user_data: ?*anyopaque) callconv(.c) isize {
+    _ = h3;
+    _ = stream_id;
+    _ = conn_user_data;
+    if (veccnt == 0) return 0;
+    const state: *StreamState = @ptrCast(@alignCast(stream_user_data orelse return h3abi.ERR_WOULDBLOCK));
+    if (!state.response_ready) return h3abi.ERR_WOULDBLOCK;
+    if (state.response_sent >= state.response_len) {
+        pflags.* |= h3abi.DATA_FLAG_EOF;
+        return 0;
+    }
+    vec[0].base = state.response[state.response_sent..].ptr;
+    vec[0].len = state.response_len - state.response_sent;
+    state.response_sent = state.response_len;
+    pflags.* |= h3abi.DATA_FLAG_EOF;
+    return 1;
+}
+
+fn rcbufBytes(rc: ?*h3abi.rcbuf_t) []const u8 {
+    if (rc == null) return &.{};
+    const v = h3abi.nghttp3_rcbuf_get_buf(rc);
+    if (v.len == 0) return &.{};
+    return v.base[0..v.len];
+}
+
+fn h3Lookup(handler: *Doh3Handler, stream_id: i64) ?*StreamState {
+    const conn = handler.active orelse return null;
+    return handler.ensureState(conn, stream_id);
+}
+
+fn h3BeginHeaders(_: ?*h3abi.conn_t, _: i64, _: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
+    return 0;
+}
+
+fn h3RecvHeader(_: ?*h3abi.conn_t, stream_id: i64, _: i32, name: ?*h3abi.rcbuf_t, value: ?*h3abi.rcbuf_t, _: u8, conn_user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
+    const handler: *Doh3Handler = @ptrCast(@alignCast(conn_user_data orelse return 0));
+    const state = h3Lookup(handler, stream_id) orelse return 0;
+    const n = rcbufBytes(name);
+    const v = rcbufBytes(value);
+    state.head_bytes += n.len + v.len + 2;
+    if (state.head_bytes > MAX_HEADER_BYTES) {
+        state.head_too_large = true;
+        return 0;
+    }
+    if (std.mem.eql(u8, n, ":method")) {
+        if (state.seen_method) state.duplicate = true;
+        state.seen_method = true;
+        const take = @min(v.len, state.method.len);
+        @memcpy(state.method[0..take], v[0..take]);
+        state.method_len = take;
+    } else if (std.mem.eql(u8, n, ":path")) {
+        if (state.seen_path) state.duplicate = true;
+        state.seen_path = true;
+        const take = @min(v.len, state.target.len);
+        @memcpy(state.target[0..take], v[0..take]);
+        state.target_len = take;
+        if (take != v.len) state.head_too_large = true;
+    } else if (n.len == 12 and std.ascii.eqlIgnoreCase(n, "content-type")) {
+        if (state.has_content_type) state.duplicate = true;
+        state.has_content_type = true;
+        const take = @min(v.len, state.content_type.len);
+        @memcpy(state.content_type[0..take], v[0..take]);
+        state.content_type_len = take;
+        if (take != v.len) state.head_too_large = true;
+    }
+    return 0;
+}
+
+fn h3EndHeaders(_: ?*h3abi.conn_t, stream_id: i64, fin: c_int, conn_user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
+    const handler: *Doh3Handler = @ptrCast(@alignCast(conn_user_data orelse return 0));
+    const state = h3Lookup(handler, stream_id) orelse return 0;
+    const is_get = state.method_len == 3 and std.mem.eql(u8, state.method[0..3], "GET");
+    if (is_get or fin != 0) state.respond_now = true;
+    return 0;
+}
+
+fn h3RecvData(_: ?*h3abi.conn_t, stream_id: i64, data: [*c]const u8, datalen: usize, conn_user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
+    const handler: *Doh3Handler = @ptrCast(@alignCast(conn_user_data orelse return 0));
+    const state = h3Lookup(handler, stream_id) orelse return 0;
+    if (state.answered) return 0;
+    if (state.body_len + datalen > MAX_BODY_LEN) {
+        state.head_too_large = true;
+        state.respond_now = true;
+        return 0;
+    }
+    if (datalen > 0) @memcpy(state.body[state.body_len..][0..datalen], data[0..datalen]);
+    state.body_len += datalen;
+    return 0;
+}
+
+fn h3DeferredConsume(_: ?*h3abi.conn_t, _: i64, _: usize, _: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
+    return 0;
+}
+
+fn h3EndStream(_: ?*h3abi.conn_t, stream_id: i64, conn_user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
+    const handler: *Doh3Handler = @ptrCast(@alignCast(conn_user_data orelse return 0));
+    const state = h3Lookup(handler, stream_id) orelse return 0;
+    state.post_end = true;
+    state.respond_now = true;
+    return 0;
+}
+
+fn h3AckedData(_: ?*h3abi.conn_t, _: i64, _: u64, _: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
+    return 0;
+}
+
+fn h3StopSending(_: ?*h3abi.conn_t, _: i64, _: u64, _: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
+    return 0;
+}
+
+fn h3ResetStream(_: ?*h3abi.conn_t, _: i64, _: u64, _: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
+    return 0;
+}
+
+fn h3StreamClose(_: ?*h3abi.conn_t, _: u32, _: i64, _: u64, _: u64, _: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
+    return 0;
+}
+
+fn h3Rand(dest: [*c]u8, destlen: usize) callconv(.c) void {
+    // QPACK seed material; the Io CSPRNG never fails, fall back to
+    // zeros only if the platform reports no entropy source.
+    if (destlen == 0) return;
+    std.Io.Threaded.global_single_threaded.io().random(dest[0..destlen]);
+}
+
 /// Binds the DoH/3 port and serves DNS-over-HTTPS over HTTP/3. The
-/// handshake selects the `h3` ALPN token (RFC 9114 section 3.1) before
-/// any DNS byte is written, so the port never answers cleartext DNS. The
-/// server runs on its own thread with its own event loop, joined before
-/// this function returns, so the runtime outlives every use of it.
+/// handshake selects the `h3` ALPN token before any DNS byte is
+/// written, so the port never answers cleartext DNS.
 pub fn serveDoh3LoopOnAddress(
     io: std.Io,
     runtime: *Runtime,
@@ -390,8 +622,8 @@ pub fn serveDoh3LoopOnAddress(
     odoh_target: ?*const odoh.Target,
 ) !void {
     const allocator = std.heap.page_allocator;
-    var address_buf: [64]u8 = undefined;
-    const address_text = try doq.addressToString(address, &address_buf);
+    var creds = gnutls.ServerCredentials.load(cert_path, key_path) catch return error.TlsIdentityFailed;
+    defer creds.deinit();
     var handler = Doh3Handler{
         .allocator = allocator,
         .runtime = runtime,
@@ -401,516 +633,101 @@ pub fn serveDoh3LoopOnAddress(
         .odoh_target = odoh_target,
     };
     defer handler.streams.deinit(allocator, Doh3Handler.destroyState);
-    var server = try event_loop.Server(Doh3Handler).init(allocator, &handler, .{
-        .address = address_text,
-        .port = address.getPort(),
-        .cert_path = cert_path,
-        .key_path = key_path,
-        .alpn = &.{DOH3_ALPN},
-        .max_connections = MAX_CONNECTION_WORKERS,
-    });
-    defer server.deinit();
-    handler.server = &server;
-    handler.request_stop = requestStopServer;
-    var thread = try std.Thread.spawn(.{}, runDoh3Server, .{&server});
-    // The loop runs on its own thread until the quota is served or the
-    // process asks it to stop; joining here is what keeps the runtime
-    // alive for every use of it, and the join returns only after the loop
-    // stopped.
-    thread.join();
-}
-
-fn requestStopServer(server: *anyopaque) void {
-    const typed: *event_loop.Server(Doh3Handler) = @ptrCast(@alignCast(server));
-    typed.requestStop();
-}
-
-fn runDoh3Server(server: *event_loop.Server(Doh3Handler)) void {
-    // The loop cannot report an I/O failure through the serve signature
-    // once it is on its own thread; name it on stderr instead of exiting
-    // silently.
-    server.run() catch |err| std.debug.print("DoH/3 server stopped: {s}\n", .{@errorName(err)});
-}
-
-/// The serve-thread entry point the tests drive: one accepted QUIC
-/// connection, served by the same serve function main runs.
-fn serveDoh3Once(
-    io: std.Io,
-    runtime: *Runtime,
-    address: std.Io.net.IpAddress,
-    cert_path: []const u8,
-    key_path: []const u8,
-) !void {
-    try serveDoh3LoopOnAddress(io, runtime, &address, cert_path, key_path, 1, null, null);
-}
-
-fn serveDoh3OnceWithTarget(
-    io: std.Io,
-    runtime: *Runtime,
-    address: std.Io.net.IpAddress,
-    cert_path: []const u8,
-    key_path: []const u8,
-    odoh_target: ?*const odoh.Target,
-) !void {
-    try serveDoh3LoopOnAddress(io, runtime, &address, cert_path, key_path, 1, null, odoh_target);
-}
-
-/// Finds a free UDP port for a test server bind.
-fn freeUdpPort(io: std.Io) !u16 {
-    var bind_address = std.Io.net.IpAddress{ .ip4 = .loopback(0) };
-    var socket = try std.Io.net.IpAddress.bind(&bind_address, io, .{ .mode = .dgram, .protocol = .udp });
-    defer socket.close(io);
-    return socket.address.getPort();
-}
-
-fn writeTestIdentity(dir: std.Io.Dir, io: std.Io) !void {
-    try dir.writeFile(io, .{
-        .sub_path = "cert.pem",
-        .data = tls_server.test_identity.cert_pem,
-        .flags = .{},
-    });
-    try dir.writeFile(io, .{
-        .sub_path = "key.pem",
-        .data = tls_server.test_identity.key_pem,
-        .flags = .{},
-    });
-}
-
-/// One completed HTTP/3 exchange as the client saw it.
-const Exchange = struct {
-    status: [3]u8 = .{ 0, 0, 0 },
-    has_allow: bool = false,
-    has_plain_media_type: bool = false,
-    has_odoh_media_type: bool = false,
-    has_max_age: bool = false,
-    has_no_store: bool = false,
-    body: [MAX_BODY_LEN]u8 = undefined,
-    body_len: usize = 0,
-    finished: bool = false,
-};
-
-/// The client handler that drives one H3 exchange and records the answer.
-const H3ClientHandler = struct {
-    pub const protocol = event_loop.Protocol.h3;
-    request: []const qpack.Header,
-    request_body: ?[]const u8,
-    exchange: Exchange = .{},
-    failed: bool = false,
-
-    pub fn onConnected(self: *H3ClientHandler, session: *event_loop.ClientSession) void {
-        _ = session.sendRequest(self.request, self.request_body) catch {
-            self.failed = true;
-        };
-    }
-
-    pub fn onHeaders(self: *H3ClientHandler, _: *event_loop.ClientSession, _: u64, headers: []const qpack.Header) void {
-        for (headers) |h| {
-            if (std.mem.eql(u8, h.name, ":status") and h.value.len == 3) @memcpy(&self.exchange.status, h.value);
-            if (std.mem.eql(u8, h.name, "allow") and std.mem.eql(u8, h.value, "GET, POST")) self.exchange.has_allow = true;
-            if (std.ascii.eqlIgnoreCase(h.name, "content-type") and std.mem.eql(u8, h.value, doh.dns_message_media_type)) self.exchange.has_plain_media_type = true;
-            if (std.ascii.eqlIgnoreCase(h.name, "content-type") and std.mem.eql(u8, h.value, doh.odoh_media_type)) self.exchange.has_odoh_media_type = true;
-            if (std.ascii.eqlIgnoreCase(h.name, "cache-control") and std.mem.indexOf(u8, h.value, "max-age=") != null) self.exchange.has_max_age = true;
-            if (std.ascii.eqlIgnoreCase(h.name, "cache-control") and std.mem.eql(u8, h.value, "no-store")) self.exchange.has_no_store = true;
+    defer {
+        var it = handler.conns.valueIterator();
+        while (it.next()) |h| {
+            if (h.*.h3) |c| h3abi.nghttp3_conn_del(c);
+            allocator.destroy(h.*);
         }
+        handler.conns.deinit(allocator);
     }
-
-    pub fn onData(self: *H3ClientHandler, session: *event_loop.ClientSession, _: u64, _: usize) void {
-        var buf: [4096]u8 = undefined;
-        while (true) {
-            const n = session.recvBody(&buf);
-            if (n == 0) break;
-            const room = self.exchange.body.len - self.exchange.body_len;
-            if (room == 0) break;
-            const take = @min(n, room);
-            @memcpy(self.exchange.body[self.exchange.body_len .. self.exchange.body_len + take], buf[0..take]);
-            self.exchange.body_len += take;
-        }
-    }
-
-    pub fn onFinished(self: *H3ClientHandler, session: *event_loop.ClientSession, _: u64) void {
-        self.exchange.finished = true;
-        session.closeConnection();
-    }
-
-    fn done(self: *const H3ClientHandler) bool {
-        return self.exchange.finished and !self.failed;
-    }
-};
-
-fn runH3Client(client: *event_loop.Client(H3ClientHandler)) void {
-    client.run() catch {};
-}
-
-/// Drives one H3 exchange against the test server and returns what the
-/// client saw.
-fn h3Exchange(
-    io: std.Io,
-    port: u16,
-    request: []const qpack.Header,
-    request_body: ?[]const u8,
-) !Exchange {
-    var handler = H3ClientHandler{ .request = request, .request_body = request_body };
-    const Client = event_loop.Client(H3ClientHandler);
-    var client = try Client.init(std.heap.page_allocator, &handler, .{
-        .address = "127.0.0.1",
-        .port = port,
-        .server_name = "localhost",
-        .alpn = "h3",
-        .skip_cert_verify = true,
-    });
-    defer client.deinit();
-    const thread = try std.Thread.spawn(.{}, runH3Client, .{&client});
-    // The client runs on its own thread until the handler closes it; the
-    // wait here is bounded so a silent server fails the test instead of
-    // hanging it.
-    const start = std.Io.Clock.real.now(io).nanoseconds;
-    while (!handler.done() and !handler.failed) {
-        if (std.Io.Clock.real.now(io).nanoseconds - start > std.time.ns_per_s * 15) {
-            client.requestStop();
-            return error.H3NoResponse;
-        }
-        std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
-    }
-    client.requestStop();
-    thread.join();
-    return handler.exchange;
-}
-
-const test_zone =
-    \\$ORIGIN home.arpa.
-    \\$TTL 3600
-    \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
-    \\@ IN NS ns1.home.arpa.
-    \\dns IN A 192.168.1.1
-    \\
-;
-
-fn requestHeaders(method: []const u8, path: []const u8) []const qpack.Header {
-    // Headers the event loop hands over are poisoned after the callback,
-    // but this helper only feeds the client side here, where the slice
-    // lives in this function frame until `h3Exchange` copies it into the
-    // request before returning. The client owns its loop on its own
-    // thread, so the frame outlives the send.
-    return &.{
-        .{ .name = ":method", .value = method },
-        .{ .name = ":scheme", .value = "https" },
-        .{ .name = ":authority", .value = "localhost" },
-        .{ .name = ":path", .value = path },
+    const core_handler = core.Handler{
+        .ptr = &handler,
+        .onStream = Doh3Handler.onStream,
+        .onHandshake = Doh3Handler.onHandshake,
+        .onStreamClose = Doh3Handler.onStreamClose,
+        .onStreamReset = Doh3Handler.onStreamReset,
+        .onAck = Doh3Handler.onAck,
+        .onStopSending = Doh3Handler.onStopSending,
+        .flush = Doh3Handler.flushConn,
     };
-}
-
-test "DoH/3 GET serves a base64url query over a real QUIC handshake with the h3 ALPN token" {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var runtime = try Runtime.fromZoneText(test_zone);
-    defer runtime.deinit();
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try writeTestIdentity(tmp.dir, io);
-    const cert_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache/tmp", &tmp.sub_path, "cert.pem" });
-    const key_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache/tmp", &tmp.sub_path, "key.pem" });
-    defer std.testing.allocator.free(cert_path);
-    defer std.testing.allocator.free(key_path);
-    const port = try freeUdpPort(io);
-    const address = std.Io.net.IpAddress{ .ip4 = .loopback(port) };
-    const server_thread = try std.Thread.spawn(.{}, serveDoh3Once, .{ io, &runtime, address, cert_path, key_path });
-
-    var query_buffer: [512]u8 = undefined;
-    const query = try cli_query.buildQueryPacket(&query_buffer, 0xabcd, "dns.home.arpa.", .A, false);
-    var encoded: [1024]u8 = undefined;
-    const encoded_query = std.base64.url_safe_no_pad.Encoder.encode(&encoded, query);
-    var path_buffer: [2048]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buffer, "/dns-query?dns={s}", .{encoded_query});
-    const request = requestHeaders("GET", path);
-    const exchange = try h3Exchange(io, port, request, null);
-    try std.testing.expectEqualStrings("200", &exchange.status);
-    try std.testing.expect(exchange.has_plain_media_type);
-    try std.testing.expect(!exchange.has_odoh_media_type);
-    try std.testing.expect(exchange.has_max_age);
-    try std.testing.expect(!exchange.has_no_store);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const message = try dns_message.Message.parse(arena.allocator(), exchange.body[0..exchange.body_len]);
-    try std.testing.expectEqual(@as(u16, 0xabcd), message.header.id);
-    try std.testing.expectEqual(@as(u16, 1), message.header.answer_count);
-
-    // The server's quota was one request, so it stops on its own.
-    server_thread.join();
-}
-
-test "DoH/3 POST serves an application/dns-message body" {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var runtime = try Runtime.fromZoneText(test_zone);
-    defer runtime.deinit();
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try writeTestIdentity(tmp.dir, io);
-    const cert_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache/tmp", &tmp.sub_path, "cert.pem" });
-    const key_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache/tmp", &tmp.sub_path, "key.pem" });
-    defer std.testing.allocator.free(cert_path);
-    defer std.testing.allocator.free(key_path);
-    const port = try freeUdpPort(io);
-    const address = std.Io.net.IpAddress{ .ip4 = .loopback(port) };
-    const server_thread = try std.Thread.spawn(.{}, serveDoh3Once, .{ io, &runtime, address, cert_path, key_path });
-
-    var query_buffer: [512]u8 = undefined;
-    const query = try cli_query.buildQueryPacket(&query_buffer, 0xdcba, "dns.home.arpa.", .A, false);
-    const request = [_]qpack.Header{ .{ .name = ":method", .value = "POST" }, .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" }, .{ .name = ":path", .value = "/dns-query" }, .{ .name = "content-type", .value = doh.dns_message_media_type } };
-    const exchange = try h3Exchange(io, port, &request, query);
-    try std.testing.expectEqualStrings("200", &exchange.status);
-    try std.testing.expect(exchange.has_plain_media_type);
-    try std.testing.expect(!exchange.has_odoh_media_type);
-    try std.testing.expect(exchange.has_max_age);
-    try std.testing.expect(!exchange.has_no_store);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const message = try dns_message.Message.parse(arena.allocator(), exchange.body[0..exchange.body_len]);
-    try std.testing.expectEqual(@as(u16, 0xdcba), message.header.id);
-    try std.testing.expectEqual(@as(u16, 1), message.header.answer_count);
-    server_thread.join();
-}
-
-test "DoH/3 answers 404 for a wrong path, 405 for a wrong method, 415 for a wrong media type" {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var runtime = try Runtime.fromZoneText(test_zone);
-    defer runtime.deinit();
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try writeTestIdentity(tmp.dir, io);
-    const cert_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache/tmp", &tmp.sub_path, "cert.pem" });
-    const key_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache/tmp", &tmp.sub_path, "key.pem" });
-    defer std.testing.allocator.free(cert_path);
-    defer std.testing.allocator.free(key_path);
-
-    {
-        const port = try freeUdpPort(io);
-        const address = std.Io.net.IpAddress{ .ip4 = .loopback(port) };
-        const server_thread = try std.Thread.spawn(.{}, serveDoh3Once, .{ io, &runtime, address, cert_path, key_path });
-        const exchange = try h3Exchange(io, port, requestHeaders("GET", "/not-dns-query?dns=abcd"), null);
-        try std.testing.expectEqualStrings("404", &exchange.status);
-        server_thread.join();
-    }
-    {
-        const port = try freeUdpPort(io);
-        const address = std.Io.net.IpAddress{ .ip4 = .loopback(port) };
-        const server_thread = try std.Thread.spawn(.{}, serveDoh3Once, .{ io, &runtime, address, cert_path, key_path });
-        const exchange = try h3Exchange(io, port, requestHeaders("PUT", "/dns-query"), null);
-        try std.testing.expectEqualStrings("405", &exchange.status);
-        try std.testing.expect(exchange.has_allow);
-        server_thread.join();
-    }
-    {
-        const port = try freeUdpPort(io);
-        const address = std.Io.net.IpAddress{ .ip4 = .loopback(port) };
-        const server_thread = try std.Thread.spawn(.{}, serveDoh3Once, .{ io, &runtime, address, cert_path, key_path });
-        var query_buffer: [512]u8 = undefined;
-        const query = try cli_query.buildQueryPacket(&query_buffer, 0x9999, "dns.home.arpa.", .A, false);
-        const exchange = try h3Exchange(io, port, &[_]qpack.Header{ .{ .name = ":method", .value = "POST" }, .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" }, .{ .name = ":path", .value = "/dns-query" }, .{ .name = "content-type", .value = "text/plain" } }, query);
-        try std.testing.expectEqualStrings("415", &exchange.status);
-        server_thread.join();
-    }
-}
-
-test "a bad base64url query is 400 and a missing :method is 400" {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var runtime = try Runtime.fromZoneText(test_zone);
-    defer runtime.deinit();
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try writeTestIdentity(tmp.dir, io);
-    const cert_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache/tmp", &tmp.sub_path, "cert.pem" });
-    const key_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache/tmp", &tmp.sub_path, "key.pem" });
-    defer std.testing.allocator.free(cert_path);
-    defer std.testing.allocator.free(key_path);
-
-    {
-        const port = try freeUdpPort(io);
-        const address = std.Io.net.IpAddress{ .ip4 = .loopback(port) };
-        const server_thread = try std.Thread.spawn(.{}, serveDoh3Once, .{ io, &runtime, address, cert_path, key_path });
-        const exchange = try h3Exchange(io, port, requestHeaders("GET", "/dns-query?dns=!!!"), null);
-        try std.testing.expectEqualStrings("400", &exchange.status);
-        server_thread.join();
-    }
-    {
-        const port = try freeUdpPort(io);
-        const address = std.Io.net.IpAddress{ .ip4 = .loopback(port) };
-        const server_thread = try std.Thread.spawn(.{}, serveDoh3Once, .{ io, &runtime, address, cert_path, key_path });
-        // A request with no :method is malformed HTTP/3: the QPACK layer
-        // refuses it with H3_REQUEST_REJECTED before `onRequest` ever runs,
-        // so the client observes a cancelled request rather than a 400.
-        // The handler's own missing-:method 400 covers the same case for
-        // the library's own client, which cannot emit it; cover a missing
-        // :path-shaped equivalent that does pass through: a request with
-        // no :path.
-        const request = [_]qpack.Header{
-            .{ .name = ":method", .value = "GET" },
-            .{ .name = ":scheme", .value = "https" },
-            .{ .name = ":authority", .value = "localhost" },
-        };
-        // The library's own client cannot emit a request with no :path:
-        // its QPACK encoder requires the pseudo-headers, so `h3Exchange`
-        // only proves the server refuses malformed requests at the H3
-        // layer (no 200). The handler's missing-:path 400 is the same
-        // refusal for the mapping; cover it through the shared mapping
-        // instead by asserting the handler branch directly below.
-        const exchange = h3Exchange(io, port, &request, null) catch |err| {
-            // The client refused it locally: an H3 request_rejected is
-            // still a refusal, not a 200.
-            try std.testing.expect(err == error.H3NoResponse);
-            // The server's quota was one request, but a locally-refused
-            // request never reached it; stop it through the quota path
-            // with a real exchange instead.
-            var encoded: [1024]u8 = undefined;
-            var qbuf: [512]u8 = undefined;
-            const q = try cli_query.buildQueryPacket(&qbuf, 0x7777, "dns.home.arpa.", .A, false);
-            const enc = std.base64.url_safe_no_pad.Encoder.encode(&encoded, q);
-            var pb: [2048]u8 = undefined;
-            const path = try std.fmt.bufPrint(&pb, "/dns-query?dns={s}", .{enc});
-            const real = try h3Exchange(io, port, requestHeaders("GET", path), null);
-            try std.testing.expectEqualStrings("200", &real.status);
-            server_thread.join();
-            return;
-        };
-        try std.testing.expect(!std.mem.eql(u8, &exchange.status, "200"));
-        server_thread.join();
-    }
-}
-
-test "a cleartext UDP datagram gets no DNS answer from the DoH/3 port" {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var runtime = try Runtime.fromZoneText(test_zone);
-    defer runtime.deinit();
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try writeTestIdentity(tmp.dir, io);
-    const cert_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache/tmp", &tmp.sub_path, "cert.pem" });
-    const key_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache/tmp", &tmp.sub_path, "key.pem" });
-    defer std.testing.allocator.free(cert_path);
-    defer std.testing.allocator.free(key_path);
-    const port = try freeUdpPort(io);
-    const address = std.Io.net.IpAddress{ .ip4 = .loopback(port) };
-    // Quota one: the server stops after the real exchange at the end.
-    const server_thread = try std.Thread.spawn(.{}, serveDoh3Once, .{ io, &runtime, address, cert_path, key_path });
-    // Give the server a moment to bind.
-    std.Io.sleep(io, .fromMilliseconds(100), .awake) catch {};
-
-    // A cleartext DNS/UDP frame on a QUIC port has no cleartext fallback:
-    // the QUIC handshake comes first, so the probe draws no DNS answer.
-    // Poll for 500 ms: no datagram may come back carrying our query id.
-    var query_buffer: [512]u8 = undefined;
-    const query = try cli_query.buildQueryPacket(&query_buffer, 0x1234, "dns.home.arpa.", .A, false);
-    var client_addr = std.Io.net.IpAddress{ .ip4 = .loopback(0) };
-    var socket = try std.Io.net.IpAddress.bind(&client_addr, io, .{ .mode = .dgram, .protocol = .udp });
-    defer socket.close(io);
-    try socket.send(io, &address, query);
-    var response_poll_fds = [_]std.posix.pollfd{.{ .fd = socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
-    const ready = try std.posix.poll(&response_poll_fds, 500);
-    try std.testing.expectEqual(@as(usize, 0), ready);
-
-    // The port still serves real HTTP/3: one GET, then the quota server stops.
-    var encoded: [1024]u8 = undefined;
-    var query2_buffer: [512]u8 = undefined;
-    const query2 = try cli_query.buildQueryPacket(&query2_buffer, 0x5678, "dns.home.arpa.", .A, false);
-    const encoded_query2 = std.base64.url_safe_no_pad.Encoder.encode(&encoded, query2);
-    var path_buffer: [2048]u8 = undefined;
-    const path2 = try std.fmt.bufPrint(&path_buffer, "/dns-query?dns={s}", .{encoded_query2});
-    const exchange = try h3Exchange(io, port, requestHeaders("GET", path2), null);
-    try std.testing.expectEqualStrings("200", &exchange.status);
-    server_thread.join();
-}
-
-test "DoH/3 ODoH POST round trip is 200 with the ODoH media type" {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    var runtime = try Runtime.fromZoneText(test_zone);
-    defer runtime.deinit();
-    var priv: [32]u8 = undefined;
-    _ = std.fmt.hexToBytes(&priv, "4612c550263fc8ad58375df3f557aac531d26850903e55a9f23f21d8534e8ac8") catch unreachable;
-    var target = odoh.makeTarget(priv);
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try writeTestIdentity(tmp.dir, io);
-    const cert_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache/tmp", &tmp.sub_path, "cert.pem" });
-    const key_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache/tmp", &tmp.sub_path, "key.pem" });
-    defer std.testing.allocator.free(cert_path);
-    defer std.testing.allocator.free(key_path);
-    const port = try freeUdpPort(io);
-    const address = std.Io.net.IpAddress{ .ip4 = .loopback(port) };
-    const server_thread = try std.Thread.spawn(.{}, serveDoh3OnceWithTarget, .{ io, &runtime, address, cert_path, key_path, &target });
-    var query_buffer: [512]u8 = undefined;
-    const inner = try cli_query.buildQueryPacket(&query_buffer, 0xabcd, "dns.home.arpa.", .A, false);
-    const q_plain = try odoh.buildPlaintext(alloc, inner, &.{});
-    const sealed_query = try odoh.sealQuery(alloc, io, target.public_key, &target.key_id, q_plain);
-    const request = [_]qpack.Header{ .{ .name = ":method", .value = "POST" }, .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" }, .{ .name = ":path", .value = "/dns-query" }, .{ .name = "content-type", .value = doh.odoh_media_type } };
-    const exchange = try h3Exchange(io, port, &request, sealed_query);
-    try std.testing.expectEqualStrings("200", &exchange.status);
-    try std.testing.expect(!exchange.has_plain_media_type);
-    try std.testing.expect(exchange.has_odoh_media_type);
-    try std.testing.expect(!exchange.has_max_age);
-    try std.testing.expect(exchange.has_no_store);
-    const r_parsed = try odoh.parseMessage(exchange.body[0..exchange.body_len]);
-    try std.testing.expectEqual(odoh.response_message_type, r_parsed.message_type);
-    server_thread.join();
-}
-
-test "DoH/3 ODoH with no target is 404, wrong key 401, corrupt 400" {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    var priv: [32]u8 = undefined;
-    _ = std.fmt.hexToBytes(&priv, "4612c550263fc8ad58375df3f557aac531d26850903e55a9f23f21d8534e8ac8") catch unreachable;
-    var target = odoh.makeTarget(priv);
-    var query_buffer: [512]u8 = undefined;
-    const inner = try @import("../cli/query.zig").buildQueryPacket(&query_buffer, 0x1234, "dns.home.arpa.", .A, false);
-    const q_plain = try odoh.buildPlaintext(alloc, inner, &.{});
-    const sealed_query = try odoh.sealQuery(alloc, io, target.public_key, &target.key_id, q_plain);
-
-    const runCase = struct {
-        fn run(tio: std.Io, rt: *Runtime, body: []const u8, tgt: ?*const odoh.Target) !Exchange {
-            var tmp = std.testing.tmpDir(.{});
-            defer tmp.cleanup();
-            try writeTestIdentity(tmp.dir, tio);
-            const cp = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache/tmp", &tmp.sub_path, "cert.pem" });
-            defer std.testing.allocator.free(cp);
-            const kp = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache/tmp", &tmp.sub_path, "key.pem" });
-            defer std.testing.allocator.free(kp);
-            const port = try freeUdpPort(tio);
-            const address = std.Io.net.IpAddress{ .ip4 = .loopback(port) };
-            const server_thread = try std.Thread.spawn(.{}, serveDoh3OnceWithTarget, .{ tio, rt, address, cp, kp, tgt });
-            const request = [_]qpack.Header{ .{ .name = ":method", .value = "POST" }, .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" }, .{ .name = ":path", .value = "/dns-query" }, .{ .name = "content-type", .value = doh.odoh_media_type } };
-            const exchange = try h3Exchange(tio, port, &request, body);
-            server_thread.join();
-            return exchange;
+    const State = struct {
+        handler: *Doh3Handler,
+        fn stop(ctx: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.handler.max_requests) |max| return self.handler.completed >= max;
+            return false;
         }
-    }.run;
-    {
-        var runtime = try Runtime.fromZoneText(test_zone);
-        defer runtime.deinit();
-        const ex = try runCase(io, &runtime, sealed_query, null);
-        try std.testing.expectEqualStrings("404", &ex.status);
-    }
-    {
-        var runtime = try Runtime.fromZoneText(test_zone);
-        defer runtime.deinit();
-        var wrong_key = target.key_id;
-        wrong_key[0] ^= 0xff;
-        const wrong_msg = try odoh.buildMessage(alloc, odoh.query_message_type, &wrong_key, (try odoh.parseMessage(sealed_query)).encrypted);
-        const ex = try runCase(io, &runtime, wrong_msg, &target);
-        try std.testing.expectEqualStrings("401", &ex.status);
-    }
-    {
-        var runtime = try Runtime.fromZoneText(test_zone);
-        defer runtime.deinit();
-        var corrupt = try alloc.dupe(u8, sealed_query);
-        corrupt[corrupt.len - 1] ^= 0xff;
-        const ex = try runCase(io, &runtime, corrupt, &target);
-        try std.testing.expectEqualStrings("400", &ex.status);
-    }
+    };
+    var state = State{ .handler = &handler };
+    try core.serve(allocator, io, address, &creds, core_handler, State.stop, &state, 30 * 1_000_000_000, DOH3_ALPN);
+}
+
+/// Handler-level mapping tests below drive `answer` through the same
+/// `dnsQueryFromParts` + `statusForError` seam `answerQuery` uses, so the
+/// status rules cannot drift from the HTTP/1.1 channel without a test
+/// failing. Transport proof (a real H3 client speaking to this server)
+/// lives in `test/interop/harness.py::check_doh3`, which exercises 200
+/// GET/POST, 404/405/415/400, ODoH 200, and the cleartext no-answer rule.
+const MapCase = struct {
+    method_is_get: bool,
+    method_is_post: bool,
+    target: []const u8,
+    content_type: ?[]const u8,
+    body_len: usize,
+};
+fn mapStatus(case: MapCase, dns_ok: bool) doh.Status {
+    var body_storage: [2]u8 = .{ 0, 0 };
+    const body = body_storage[0..@min(case.body_len, body_storage.len)];
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const query = doh.dnsQueryFromParts(arena.allocator(), case.method_is_get, case.method_is_post, case.target, case.content_type, body) catch |err| {
+        return doh.statusForError(err);
+    };
+    _ = query;
+    if (!dns_ok) return .bad_request;
+    return .ok;
+}
+
+test "DoH/3 mapping: GET answers, wrong path is 404, bad method/media is 415" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var qbuf: [512]u8 = undefined;
+    const q = try cli_query.buildQueryPacket(&qbuf, 0xabcd, "dns.home.arpa.", .A, false);
+    var enc: [1024]u8 = undefined;
+    const enc_q = std.base64.url_safe_no_pad.Encoder.encode(&enc, q);
+    const good_path = try std.fmt.allocPrint(alloc, "/dns-query?dns={s}", .{enc_q});
+    const good = try doh.dnsQueryFromParts(alloc, true, false, good_path, null, qbuf[0..0]);
+    try std.testing.expect(good.len > 0);
+    // Wrong path never reaches the resolver; a method that is neither
+    // GET nor POST without a content type fails the media check first.
+    try std.testing.expectError(error.BadTarget, doh.dnsQueryFromParts(alloc, true, false, "/not-dns-query?dns=abcd", null, qbuf[0..0]));
+    try std.testing.expectEqual(doh.Status.unsupported_media_type, mapStatus(.{ .method_is_get = false, .method_is_post = false, .target = "/dns-query", .content_type = null, .body_len = 0 }, true));
+    try std.testing.expectEqual(doh.Status.not_found, doh.statusForError(error.BadTarget));
+}
+
+test "DoH/3 mapping: media types, malformed bodies, and header limits" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var qbuf: [512]u8 = undefined;
+    const q = try cli_query.buildQueryPacket(&qbuf, 0xdcba, "dns.home.arpa.", .A, false);
+    // Wrong media type is 415; missing and empty bodies are 400.
+    try std.testing.expectError(error.BadContentType, doh.dnsQueryFromParts(alloc, false, true, "/dns-query", "text/plain", qbuf[0..q.len]));
+    try std.testing.expectError(error.BadContentType, doh.dnsQueryFromParts(alloc, false, true, "/dns-query", null, qbuf[0..q.len]));
+    try std.testing.expectError(error.BadDnsMessage, doh.dnsQueryFromParts(alloc, false, true, "/dns-query", doh.dns_message_media_type, qbuf[0..0]));
+    try std.testing.expectEqual(doh.Status.unsupported_media_type, doh.statusForError(error.BadContentType));
+    try std.testing.expectEqual(doh.Status.bad_request, doh.statusForError(error.BadDnsMessage));
+    // A bad base64url query is 400, and an empty query decodes to 400.
+    try std.testing.expectError(error.BadBase64, doh.dnsQueryFromParts(alloc, true, false, "/dns-query?dns=!!!", null, qbuf[0..0]));
+    try std.testing.expectEqual(doh.Status.bad_request, doh.statusForError(error.BadBase64));
+    // Oversize bodies and targets exceed the mapping caps.
+    var big: [MAX_BODY_LEN + 1]u8 = undefined;
+    try std.testing.expectError(error.BadDnsMessage, doh.dnsQueryFromParts(alloc, false, true, "/dns-query", doh.dns_message_media_type, &big));
+    try std.testing.expectEqual(doh.Status.bad_request, doh.statusForError(error.BadDnsMessage));
+    var long_target = try alloc.alloc(u8, MAX_HEADER_BYTES + 16);
+    @memset(long_target, 'a');
+    @memcpy(long_target[0.."/dns-query?dns=".len], "/dns-query?dns=");
+    try std.testing.expectError(error.BadDnsMessage, doh.dnsQueryFromParts(alloc, true, false, long_target, null, qbuf[0..0]));
 }

@@ -17,6 +17,11 @@ The configuration grammar and the loader that reads it.
 - A file the configuration names must stay inside the configuration's own
   directory. A path that leaves it is `Error.InvalidReferencedPath`, and a
   file that is not there is `Error.MissingReferencedFile`.
+- The loader opens its own handles on that directory for reload sources,
+  managed-anchor state, and the forwarder CA bundle, so the caller's handle
+  may close as soon as `load` returns; `takeRuntime` transfers those handles
+  to the resolver, which closes them at shutdown. This is why configuration
+  paths resolve against the configuration directory, not the process cwd.
 - `forwarder <address>:<port>` sends recursion to that server in cleartext.
   `forwarder <address>:<port> tls <name>` sends it over DNS over TLS instead
   (RFC 7858): the name is both the SNI value and the name the server

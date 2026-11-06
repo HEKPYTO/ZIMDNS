@@ -3,14 +3,7 @@
     .version = "0.0.0",
     .fingerprint = 0x3bb9b0b5ba8c89dd,
     .minimum_zig_version = "0.17.0",
-    .dependencies = .{
-        // DNS-over-QUIC server: endel/quic-zig, MIT licensed, pinned to one
-        // commit. The hash is the Zig package hash of that exact archive.
-        .quic = .{
-            .url = "https://github.com/endel/quic-zig/archive/e7dc3eee3086fc460db37a01535f2c1a4c0f023f.tar.gz",
-            .hash = "quic-0.6.0-TPyrNHx9NgAM-bAqex5ofX5r4czA8uKl72316fgY693v",
-        },
-    },
+    .dependencies = .{},
     .paths = .{
         "README.md",
         "build.zig",

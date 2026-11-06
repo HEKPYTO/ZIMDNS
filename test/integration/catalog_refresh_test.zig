@@ -161,8 +161,15 @@ test "a catalog consumer adds, replaces, and drops members on refresh" {
 
     var first_primary = try Runtime.fromZoneTexts(&.{ first_catalog_text, first_member_text });
     defer first_primary.deinit();
+    // The transfer ACL denies by default; these loopback grants permit the consumer's catalog/member AXFRs.
+    try first_primary.addTransferAllow("catalog.example.", try zimdns.config_parser.Cidr.parse("127.0.0.1/32"));
+    try first_primary.addTransferAllow("one.example.", try zimdns.config_parser.Cidr.parse("127.0.0.1/32"));
+    try first_primary.addTransferAllow("two.example.", try zimdns.config_parser.Cidr.parse("127.0.0.1/32"));
     var second_primary = try Runtime.fromZoneTexts(&.{ second_catalog_text, second_member_text });
     defer second_primary.deinit();
+    try second_primary.addTransferAllow("catalog.example.", try zimdns.config_parser.Cidr.parse("127.0.0.1/32"));
+    try second_primary.addTransferAllow("one.example.", try zimdns.config_parser.Cidr.parse("127.0.0.1/32"));
+    try second_primary.addTransferAllow("two.example.", try zimdns.config_parser.Cidr.parse("127.0.0.1/32"));
 
     // First catalog: one member, fetched once for the catalog and once for
     // the member.
@@ -222,6 +229,8 @@ test "a catalog consumer adds, replaces, and drops members on refresh" {
     try std.Io.sleep(io, .fromMilliseconds(catalog_window_ms + 100), .awake);
     var third_primary = try Runtime.fromZoneTexts(&.{ third_catalog_text, second_member_text });
     defer third_primary.deinit();
+    try third_primary.addTransferAllow("catalog.example.", try zimdns.config_parser.Cidr.parse("127.0.0.1/32"));
+    try third_primary.addTransferAllow("two.example.", try zimdns.config_parser.Cidr.parse("127.0.0.1/32"));
     var third_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     var third_server = try std.Io.net.IpAddress.listen(&third_addr, io, .{ .reuse_address = true });
     const third_args = try startPrimary(io, &third_server, &third_primary, 2);
@@ -242,6 +251,8 @@ test "a catalog consumer adds, replaces, and drops members on refresh" {
     try std.Io.sleep(io, .fromMilliseconds(catalog_window_ms + 100), .awake);
     var fourth_primary = try Runtime.fromZoneTexts(&.{ fourth_catalog_text, bad_digest_member_text });
     defer fourth_primary.deinit();
+    try fourth_primary.addTransferAllow("catalog.example.", try zimdns.config_parser.Cidr.parse("127.0.0.1/32"));
+    try fourth_primary.addTransferAllow("one.example.", try zimdns.config_parser.Cidr.parse("127.0.0.1/32"));
     var fourth_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     var fourth_server = try std.Io.net.IpAddress.listen(&fourth_addr, io, .{ .reuse_address = true });
     const fourth_args = try startPrimary(io, &fourth_server, &fourth_primary, 2);
@@ -366,8 +377,12 @@ test "secondary refresh pulls a changed member after the SOA refresh interval" {
 
     var primary_a = try Runtime.fromZoneTexts(&.{ first_catalog_text, refresh_member_v1_text });
     defer primary_a.deinit();
+    try primary_a.addTransferAllow("catalog.example.", try zimdns.config_parser.Cidr.parse("127.0.0.1/32"));
+    try primary_a.addTransferAllow("one.example.", try zimdns.config_parser.Cidr.parse("127.0.0.1/32"));
     var primary_b = try Runtime.fromZoneTexts(&.{ first_catalog_text, refresh_member_v2_text });
     defer primary_b.deinit();
+    try primary_b.addTransferAllow("catalog.example.", try zimdns.config_parser.Cidr.parse("127.0.0.1/32"));
+    try primary_b.addTransferAllow("one.example.", try zimdns.config_parser.Cidr.parse("127.0.0.1/32"));
 
     var first_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     var first_server = try std.Io.net.IpAddress.listen(&first_addr, io, .{ .reuse_address = true });

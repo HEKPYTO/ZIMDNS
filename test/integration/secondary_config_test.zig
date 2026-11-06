@@ -91,8 +91,11 @@ test "a standalone secondary serves the fetched zone and refreshes to the newer 
 
     var primary_a = try Runtime.fromZoneTexts(&.{zone_v1_text});
     defer primary_a.deinit();
+    // The transfer ACL denies by default; this loopback grant permits the secondary's AXFR.
+    try primary_a.addTransferAllow("one.example.", try zimdns.config_parser.Cidr.parse("127.0.0.1/32"));
     var primary_b = try Runtime.fromZoneTexts(&.{zone_v2_text});
     defer primary_b.deinit();
+    try primary_b.addTransferAllow("one.example.", try zimdns.config_parser.Cidr.parse("127.0.0.1/32"));
 
     var first_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     var first_server = try std.Io.net.IpAddress.listen(&first_addr, io, .{ .reuse_address = true });

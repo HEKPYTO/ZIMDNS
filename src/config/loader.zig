@@ -96,13 +96,11 @@ pub const ServerContext = struct {
     /// `managed-anchor-file` is configured. Moved into the runtime by
     /// `takeRuntime`.
     managed: ?*managed_mod.ManagedAnchors = null,
-    managed_dir: ?std.Io.Dir = null,
     managed_path: []u8 = &.{},
     /// RFC 9462 section 4: the PEM trust-anchor file the forwarder's
     /// TLS/DDR certificate verifies against (`forwarder-ca-file`), with the
     /// configuration directory it lives in. Moved into the policy by
     /// `takeRuntime`.
-    forwarder_ca_dir: ?std.Io.Dir = null,
     forwarder_ca_path: []u8 = &.{},
     /// The RFC 1995 delta journal the operator asked for. Null when the
     /// configuration names no journal file, and the delta log then lives in
@@ -264,7 +262,6 @@ pub const ServerContext = struct {
             // context's deinit would free has succeeded.
             const owned_path = try context.allocator.dupe(u8, managed_path);
             context.managed = managed;
-            context.managed_dir = dir;
             context.managed_path = owned_path;
         }
         // RFC 9462 section 4: the DDR client discovers designated
@@ -280,7 +277,6 @@ pub const ServerContext = struct {
             const ca_text = try readReferencedFile(dir, io, ca_path, allocator);
             defer allocator.free(ca_text);
             const owned_path = try allocator.dupe(u8, ca_path);
-            context.forwarder_ca_dir = dir;
             context.forwarder_ca_path = owned_path;
         }
         try loadOdohTarget(&context, dir, io, allocator);
@@ -465,12 +461,19 @@ pub const ServerContext = struct {
         // proven revocation plus every managed valid key.
         policy.managed = self.managed;
         self.managed = null;
-        policy.managed_dir = self.managed_dir;
-        self.managed_dir = null;
+        // Fresh handles, never the caller's: the server closes its own
+        // handle after load, while the resolver keeps these until deinit.
+        // Guarded until the runtime below takes ownership of the policy.
+        if (self.managed_path.len != 0) {
+            policy.managed_dir = self.config_dir.?.openDir(io, ".", .{}) catch return error.BadConfiguration;
+        }
+        errdefer if (policy.managed_dir) |*mbase| mbase.close(io);
+        if (self.forwarder_ca_path.len != 0) {
+            policy.forwarder_ca_dir = self.config_dir.?.openDir(io, ".", .{}) catch return error.BadConfiguration;
+        }
+        errdefer if (policy.forwarder_ca_dir) |*cbase| cbase.close(io);
         policy.managed_path = self.managed_path;
         self.managed_path = &.{};
-        policy.forwarder_ca_dir = self.forwarder_ca_dir;
-        self.forwarder_ca_dir = null;
         policy.forwarder_ca_path = self.forwarder_ca_path;
         self.forwarder_ca_path = &.{};
         policy.anchors_owned = policy.managed == null;
@@ -493,6 +496,8 @@ pub const ServerContext = struct {
             try auth_runtime.Runtime.fromZonesWithPolicyAndKeyring(self.allocator, &self.zones, self.blocklist, io, policy, &self.keyring)
         else
             auth_runtime.Runtime.fromZonesWithKeyring(self.allocator, &self.zones, self.blocklist, &self.keyring);
+        policy.managed_dir = null;
+        policy.forwarder_ca_dir = null;
         runtime.local_zones = self.config.local_zones;
         if (except_owned) |l| {
             runtime.local_zones_except = l;
@@ -724,12 +729,10 @@ pub const ServerContext = struct {
             self.allocator.free(self.managed_path);
             self.managed_path = &.{};
         }
-        self.managed_dir = null;
         if (self.forwarder_ca_path.len != 0) {
             self.allocator.free(self.forwarder_ca_path);
             self.forwarder_ca_path = &.{};
         }
-        self.forwarder_ca_dir = null;
         if (self.odoh_target) |*target| {
             std.crypto.secureZero(u8, &target.private_key);
             self.odoh_target = null;
@@ -2900,6 +2903,61 @@ test "server context seeds RFC 5011 managed state from the trust-anchor file" {
     const text = try dir.dir.readFileAlloc(io, "managed.txt", std.testing.allocator, .limited(managed_mod.max_state_bytes));
     defer std.testing.allocator.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, " valid ") != null);
+}
+
+test "managed-anchor writes survive the caller's closed handle" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    // The server closes its own handle after load; the managed-state
+    // directory the runtime keeps must not alias it, or the first
+    // refresh write fails on a reused file descriptor.
+    try dir.dir.writeFile(io, .{ .sub_path = "example.zone", .data = "$ORIGIN example.\n$TTL 300\n@ IN SOA ns host 1 3600 900 604800 3600\n@ IN NS ns\nns IN A 192.0.2.1\n" });
+    try dir.dir.writeFile(io, .{ .sub_path = "anchors.txt", .data = dnssec_test_anchor });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone example. primary example.zone\n" ++
+        "trust-anchor-file anchors.txt\nmanaged-anchor-file managed.txt\n" ++
+        "recursion allow 127.0.0.0/8\nforwarder 127.0.0.1:53\n" });
+
+    var base = try dir.dir.openDir(io, ".", .{});
+    var context = try ServerContext.load(base, io, "config.gdns", std.testing.allocator);
+    // The caller-owned handle goes away, the way the server's loader scope
+    // ends before serving starts.
+    base.close(io);
+    var runtime = try context.takeRuntime(io);
+    defer runtime.deinit();
+
+    const resolver = &(runtime.resolver orelse return error.TestUnexpectedResult);
+    const managed = resolver.policy.managed orelse return error.TestUnexpectedResult;
+    const mdir = resolver.policy.managed_dir orelse return error.TestUnexpectedResult;
+    const text = try managed.serialize(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try managed_mod.writeFile(io, mdir, std.testing.allocator, resolver.policy.managed_path, text);
+}
+
+test "forwarder CA reads survive the caller's closed handle" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    // The server closes its own handle after load; the CA directory the
+    // policy keeps must not alias it, or the first DDR verification
+    // fails on a reused file descriptor.
+    try dir.dir.writeFile(io, .{ .sub_path = "example.zone", .data = "$ORIGIN example.\n$TTL 300\n@ IN SOA ns host 1 3600 900 604800 3600\n@ IN NS ns\nns IN A 192.0.2.1\n" });
+    try dir.dir.writeFile(io, .{ .sub_path = "ca.pem", .data = "bundle-bytes" });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone example. primary example.zone\n" ++
+        "recursion allow 127.0.0.0/8\nforwarder 127.0.0.1:53\nforwarder-ca-file ca.pem\n" });
+
+    var base = try dir.dir.openDir(io, ".", .{});
+    var context = try ServerContext.load(base, io, "config.gdns", std.testing.allocator);
+    base.close(io);
+    var runtime = try context.takeRuntime(io);
+    defer runtime.deinit();
+
+    const resolver = &(runtime.resolver orelse return error.TestUnexpectedResult);
+    const cdir = resolver.policy.forwarder_ca_dir orelse return error.TestUnexpectedResult;
+    var abs: [std.fs.max_path_bytes]u8 = undefined;
+    _ = try cdir.realPathFile(io, resolver.policy.forwarder_ca_path, &abs);
 }
 
 test "server context refuses a malformed RFC 5011 state file" {
