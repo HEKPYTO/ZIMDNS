@@ -427,7 +427,7 @@ test "secondary refresh pulls a changed member after the SOA refresh interval" {
     try consumer.setCatalogConsumer(catalog_apex, second_server.socket.address, null);
     consumer.requestCatalogRefresh();
     try std.testing.expectEqual(@as(?zimdns.auth_runtime.CatalogRefreshOutcome, .unchanged), consumer.refreshCatalogIfRequested(io));
-    try consumer.maybeRefreshSecondaries(clock_now_ns + 2_000_000_000, Runtime.fetchSecondaryViaXfr, &consumer);
+    try consumer.maybeRefreshSecondaries(io, clock_now_ns + 2_000_000_000, Runtime.fetchSecondaryViaXfr, &consumer);
     try expectSoaSerial(io, &consumer, "one.example.", 2, 0x4b22);
     try joinPrimary(second_args, &second_joined);
 }

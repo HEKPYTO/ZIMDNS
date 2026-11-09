@@ -9,6 +9,7 @@
 /// than guessed at. With `tsig`, the request is TSIG-signed and every
 /// response frame's chained TSIG is verified before its records are used.
 const std = @import("std");
+const limits = @import("../dns/limits.zig");
 const dns_message = @import("../dns/message.zig");
 const dns_name = @import("../dns/name.zig");
 const dns_record = @import("../dns/record.zig");
@@ -24,7 +25,7 @@ const zone_update = @import("update.zig");
 /// primary from holding the startup open forever.
 pub const max_frames = 4096;
 /// The Do53/TCP frame limit is the 16-bit length prefix.
-const max_frame_bytes = 65535;
+const max_frame_bytes = limits.max_message_bytes;
 /// RFC 5936 lets one transfer run to `max_frames` full frames; the total cap
 /// keeps a compliant-but-huge primary from exhausting allocator memory.
 pub const max_total_bytes: usize = 64 * 1024 * 1024;
@@ -610,6 +611,7 @@ fn connectBounded(io: std.Io, primary: *const std.Io.net.IpAddress, deadline: st
 }
 
 fn writeRecord(writer: *std.Io.Writer, record: dns_record.ResourceRecord) Error!void {
+    if (record.class.value != dns_types.Class.IN.value) return Error.BadTransfer;
     var name_buffer: [256]u8 = undefined;
     const owner = record.owner.toText(&name_buffer) catch return Error.BadTransfer;
     var wire: [max_frame_bytes]u8 = undefined;
@@ -673,7 +675,7 @@ test "an AXFR over DNS/TCP returns the transferred zone as text" {
             var length_bytes: [2]u8 = undefined;
             readExact(&reader, &length_bytes) catch return;
             const length = std.mem.readInt(u16, &length_bytes, .big);
-            var query_buffer: [65535]u8 = undefined;
+            var query_buffer: [limits.max_message_bytes]u8 = undefined;
             readExact(&reader, query_buffer[0..length]) catch return;
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
@@ -684,7 +686,7 @@ test "an AXFR over DNS/TCP returns the transferred zone as text" {
                 std.heap.page_allocator.free(messages);
             }
             for (messages) |*message| {
-                var frame: [65535]u8 = undefined;
+                var frame: [limits.max_message_bytes]u8 = undefined;
                 var writer = dns_writer.Writer.init(&frame);
                 message.encode(&writer) catch return;
                 var prefix: [2]u8 = undefined;
@@ -743,7 +745,7 @@ const FrameServer = struct {
         var length_bytes: [2]u8 = undefined;
         readExact(&reader, &length_bytes) catch return;
         const length = std.mem.readInt(u16, &length_bytes, .big);
-        var query_buffer: [65535]u8 = undefined;
+        var query_buffer: [limits.max_message_bytes]u8 = undefined;
         readExact(&reader, query_buffer[0..length]) catch return;
         // Echo the query's ID into the canned answer: the fetch refuses any
         // response whose ID differs from the randomized query ID, so a
@@ -842,7 +844,7 @@ test "an incremental IXFR applies the delta to the served copy" {
     try response.answers.append(try testSoa(zone_name, 43));
     try response.answers.append(try testA("www.transferred.example.", .{ 192, 0, 2, 99 }));
     try response.answers.append(try testSoa(zone_name, 43));
-    var frame_buffer: [65535]u8 = undefined;
+    var frame_buffer: [limits.max_message_bytes]u8 = undefined;
     var frame_writer = dns_writer.Writer.init(&frame_buffer);
     try response.encode(&frame_writer);
 
@@ -925,7 +927,7 @@ test "an IXFR answered with the full zone is applied without a second connection
     try response.answers.append(try testA("dns.transferred.example.", .{ 192, 0, 2, 54 }));
     try response.answers.append(try testA("www.transferred.example.", .{ 192, 0, 2, 99 }));
     try response.answers.append(try testSoa(zone_name, 43));
-    var frame_buffer: [65535]u8 = undefined;
+    var frame_buffer: [limits.max_message_bytes]u8 = undefined;
     var frame_writer = dns_writer.Writer.init(&frame_buffer);
     try response.encode(&frame_writer);
 
@@ -994,7 +996,7 @@ test "an up-to-date IXFR keeps the served copy" {
         .answers = try dns_message.RecordSection.init(arena, 1),
     };
     try response.answers.append(try testSoa(zone_name, 42));
-    var frame_buffer: [65535]u8 = undefined;
+    var frame_buffer: [limits.max_message_bytes]u8 = undefined;
     var frame_writer = dns_writer.Writer.init(&frame_buffer);
     try response.encode(&frame_writer);
 
@@ -1059,7 +1061,7 @@ test "an IXFR with an older first SOA is rejected and the served copy is untouch
     try response.answers.append(try testSoa(zone_name, 42));
     try response.answers.append(try testA("evil.transferred.example.", .{ 192, 0, 2, 99 }));
     try response.answers.append(try testSoa(zone_name, 42));
-    var frame_buffer: [65535]u8 = undefined;
+    var frame_buffer: [limits.max_message_bytes]u8 = undefined;
     var frame_writer = dns_writer.Writer.init(&frame_buffer);
     try response.encode(&frame_writer);
     var listen_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
@@ -1109,7 +1111,7 @@ test "a single-SOA IXFR with a different serial is rejected" {
         .answers = try dns_message.RecordSection.init(arena, 1),
     };
     try response.answers.append(try testSoa(zone_name, 43));
-    var frame_buffer: [65535]u8 = undefined;
+    var frame_buffer: [limits.max_message_bytes]u8 = undefined;
     var frame_writer = dns_writer.Writer.init(&frame_buffer);
     try response.encode(&frame_writer);
     var listen_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
@@ -1167,7 +1169,7 @@ test "a two-delta IXFR falls back to AXFR rather than half-applying" {
     try delta.answers.append(try testA("b.transferred.example.", .{ 192, 0, 2, 2 }));
     try delta.answers.append(try testSoa(zone_name, 44));
     try delta.answers.append(try testSoa(zone_name, 44));
-    var delta_buffer: [65535]u8 = undefined;
+    var delta_buffer: [limits.max_message_bytes]u8 = undefined;
     var delta_writer = dns_writer.Writer.init(&delta_buffer);
     try delta.encode(&delta_writer);
     // The fallback AXFR the client requests on a fresh connection: the
@@ -1190,7 +1192,7 @@ test "a two-delta IXFR falls back to AXFR rather than half-applying" {
     try full.answers.append(try testA("a.transferred.example.", .{ 192, 0, 2, 1 }));
     try full.answers.append(try testA("b.transferred.example.", .{ 192, 0, 2, 2 }));
     try full.answers.append(try testSoa(zone_name, 44));
-    var full_buffer: [65535]u8 = undefined;
+    var full_buffer: [limits.max_message_bytes]u8 = undefined;
     var full_writer = dns_writer.Writer.init(&full_buffer);
     try full.encode(&full_writer);
     var listen_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
@@ -1217,7 +1219,7 @@ test "a two-delta IXFR falls back to AXFR rather than half-applying" {
             var length_bytes: [2]u8 = undefined;
             try FrameServer.readExact(&reader, &length_bytes);
             const length = std.mem.readInt(u16, &length_bytes, .big);
-            var query_buffer: [65535]u8 = undefined;
+            var query_buffer: [limits.max_message_bytes]u8 = undefined;
             try FrameServer.readExact(&reader, query_buffer[0..length]);
             if (length >= 2 and bytes.len >= 2) {
                 bytes[0] = query_buffer[0];
@@ -1263,7 +1265,7 @@ const TwoFrameServer = struct {
         var length_bytes: [2]u8 = undefined;
         FrameServer.readExact(&reader, &length_bytes) catch return;
         const length = std.mem.readInt(u16, &length_bytes, .big);
-        var query_buffer: [65535]u8 = undefined;
+        var query_buffer: [limits.max_message_bytes]u8 = undefined;
         FrameServer.readExact(&reader, query_buffer[0..length]) catch return;
         if (length >= 2) {
             if (args.first.len >= 2) {
@@ -1304,7 +1306,7 @@ test "an AXFR frame with TC set is rejected as a failed transfer" {
     };
     try response.answers.append(try testSoa(zone_name, 42));
     try response.answers.append(try testA("www.transferred.example.", .{ 192, 0, 2, 80 }));
-    var frame_buffer: [65535]u8 = undefined;
+    var frame_buffer: [limits.max_message_bytes]u8 = undefined;
     var frame_writer = dns_writer.Writer.init(&frame_buffer);
     try response.encode(&frame_writer);
     var listen_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
@@ -1358,7 +1360,7 @@ test "an IXFR first frame with TC set is rejected" {
     try response.answers.append(try testSoa(zone_name, 43));
     try response.answers.append(try testA("www.transferred.example.", .{ 192, 0, 2, 99 }));
     try response.answers.append(try testSoa(zone_name, 43));
-    var frame_buffer: [65535]u8 = undefined;
+    var frame_buffer: [limits.max_message_bytes]u8 = undefined;
     var frame_writer = dns_writer.Writer.init(&frame_buffer);
     try response.encode(&frame_writer);
     var listen_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
@@ -1415,11 +1417,11 @@ test "an IXFR with TC set on a later frame is rejected" {
         .answers = try dns_message.RecordSection.init(arena, 1),
     };
     try second.answers.append(try testA("www.transferred.example.", .{ 192, 0, 2, 99 }));
-    var first_buffer: [65535]u8 = undefined;
+    var first_buffer: [limits.max_message_bytes]u8 = undefined;
     var first_writer = dns_writer.Writer.init(&first_buffer);
     try first.encode(&first_writer);
     const first_bytes = first_writer.written();
-    var second_buffer: [65535]u8 = undefined;
+    var second_buffer: [limits.max_message_bytes]u8 = undefined;
     var second_writer = dns_writer.Writer.init(&second_buffer);
     try second.encode(&second_writer);
     const second_bytes = second_writer.written();
@@ -1455,7 +1457,7 @@ test "an AXFR with a wrong message ID is rejected" {
     };
     try response.answers.append(try testSoa(zone_name, 42));
     try response.answers.append(try testSoa(zone_name, 42));
-    var frame_buffer: [65535]u8 = undefined;
+    var frame_buffer: [limits.max_message_bytes]u8 = undefined;
     var frame_writer = dns_writer.Writer.init(&frame_buffer);
     try response.encode(&frame_writer);
     var server_threaded = std.Io.Threaded.init(std.heap.page_allocator, .{ .concurrent_limit = .limited(8) });
@@ -1481,7 +1483,7 @@ test "an AXFR with a wrong message ID is rejected" {
             var length_bytes: [2]u8 = undefined;
             FrameServer.readExact(&reader, &length_bytes) catch return;
             const length = std.mem.readInt(u16, &length_bytes, .big);
-            var query_buffer: [65535]u8 = undefined;
+            var query_buffer: [limits.max_message_bytes]u8 = undefined;
             FrameServer.readExact(&reader, query_buffer[0..length]) catch return;
             var prefix: [2]u8 = undefined;
             std.mem.writeInt(u16, &prefix, @intCast(args.bytes.len), .big);
@@ -1513,7 +1515,7 @@ test "an AXFR whose closing SOA differs is rejected" {
     // A closing SOA with a different owner and serial is a different zone
     // version smuggled into the transfer: refuse it.
     try response.answers.append(try testSoa("other.example.", 43));
-    var frame_buffer: [65535]u8 = undefined;
+    var frame_buffer: [limits.max_message_bytes]u8 = undefined;
     var frame_writer = dns_writer.Writer.init(&frame_buffer);
     try response.encode(&frame_writer);
     var server_threaded = std.Io.Threaded.init(std.heap.page_allocator, .{ .concurrent_limit = .limited(8) });
@@ -1556,7 +1558,7 @@ test "an AXFR past the total byte cap is rejected" {
     try response.answers.append(try testSoa(zone_name, 42));
     try response.answers.append(try testA("www.transferred.example.", .{ 192, 0, 2, 80 }));
     try response.answers.append(try testSoa(zone_name, 42));
-    var frame_buffer: [65535]u8 = undefined;
+    var frame_buffer: [limits.max_message_bytes]u8 = undefined;
     var frame_writer = dns_writer.Writer.init(&frame_buffer);
     try response.encode(&frame_writer);
     var server_threaded = std.Io.Threaded.init(std.heap.page_allocator, .{ .concurrent_limit = .limited(8) });
@@ -1599,7 +1601,7 @@ test "a signed AXFR against an unsigned server fails closed" {
     try response.answers.append(try testSoa(zone_name, 42));
     try response.answers.append(try testA("www.transferred.example.", .{ 192, 0, 2, 80 }));
     try response.answers.append(try testSoa(zone_name, 42));
-    var frame_buffer: [65535]u8 = undefined;
+    var frame_buffer: [limits.max_message_bytes]u8 = undefined;
     var frame_writer = dns_writer.Writer.init(&frame_buffer);
     try response.encode(&frame_writer);
     var server_threaded = std.Io.Threaded.init(std.heap.page_allocator, .{ .concurrent_limit = .limited(8) });
@@ -1707,7 +1709,7 @@ test "an AXFR whose first record is not the zone SOA is rejected" {
         .answers = try dns_message.RecordSection.init(arena, 1),
     };
     try response.answers.append(try testA("www.transferred.example.", .{ 192, 0, 2, 80 }));
-    var frame_buffer: [65535]u8 = undefined;
+    var frame_buffer: [limits.max_message_bytes]u8 = undefined;
     var frame_writer = dns_writer.Writer.init(&frame_buffer);
     try response.encode(&frame_writer);
     var listen_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };

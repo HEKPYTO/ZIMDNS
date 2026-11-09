@@ -215,7 +215,7 @@ pub const SecondaryState = struct {
     tsig_key_name: ?[]const u8 = null,
 };
 
-pub const SecondaryFetch = *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, zone_name: []const u8) anyerror!?[]const u8;
+pub const SecondaryFetch = *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, io: std.Io, zone_name: []const u8) anyerror!?[]const u8;
 
 /// Coordinates several serve loops sharing one runtime. The first loop
 /// that fails records its error, marks the stop, and shuts down every
@@ -332,6 +332,7 @@ pub const Runtime = struct {
     /// Secondary-lifecycle slice: this is a stopgap; a dedicated refresh
     /// scheduler should own these ticks instead of piggybacking serve loops.
     maintenance_mutex: std.Io.Mutex = .init,
+    secondary_refresh_mutex: std.Io.Mutex = .init,
     /// The io the read-write lock waits on. A runtime built without one falls
     /// back to the single-threaded instance, whose futex wait is a no-op, so
     /// only uncontended paths may run there: tests answer with readers only,
@@ -444,6 +445,14 @@ pub const Runtime = struct {
         return stop.shouldStop();
     }
 
+    fn reportMaintenanceError(io: std.Io, err: anyerror) void {
+        if (builtin.is_test) return;
+        var buffer: [256]u8 = undefined;
+        var stderr = std.Io.File.stderr().writer(io, &buffer);
+        stderr.interface.print("warning: maintenance tick failed: {t}\n", .{err}) catch {};
+        stderr.interface.flush() catch {};
+    }
+
     /// The one maintenance owner for every serve loop and answer worker:
     /// secondary refresh, managed anchors, reload, and catalog checks run
     /// here, only when no other loop is running them. Returns false when
@@ -452,11 +461,17 @@ pub const Runtime = struct {
     pub fn tryMaintenanceTick(self: *Runtime, io: std.Io) bool {
         if (!self.maintenance_mutex.tryLock()) return false;
         defer self.maintenance_mutex.unlock(io);
-        const tick_ns: u64 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
-        _ = self.maybeRefreshSecondaries(tick_ns, fetchSecondaryViaXfr, self) catch {};
         self.maybeRefreshManagedAnchors(@intCast(std.Io.Clock.real.now(io).nanoseconds));
         _ = self.reloadZoneIfRequested(io);
         _ = self.refreshCatalogIfRequested(io);
+        return true;
+    }
+
+    pub fn trySecondaryRefresh(self: *Runtime, io: std.Io) bool {
+        if (!self.secondary_refresh_mutex.tryLock()) return false;
+        defer self.secondary_refresh_mutex.unlock(io);
+        const tick_ns: u64 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
+        _ = self.maybeRefreshSecondaries(io, tick_ns, fetchSecondaryViaXfr, self) catch |err| reportMaintenanceError(io, err);
         return true;
     }
 
@@ -467,7 +482,7 @@ pub const Runtime = struct {
         if (self.stopRequested()) return error.ServerStopping;
     }
 
-    pub fn maybeRefreshSecondaries(self: *Runtime, now_ns: u64, fetch: SecondaryFetch, fetch_ctx: *anyopaque) !void {
+    pub fn maybeRefreshSecondaries(self: *Runtime, io: std.Io, now_ns: u64, fetch: SecondaryFetch, fetch_ctx: *anyopaque) !void {
         // Snapshot due apexes under the shared lock, fetch outside it, and
         // install under the exclusive lock. Expiry is terminal but not
         // final: an expired zone keeps refreshing (retry cadence), answers
@@ -490,8 +505,8 @@ pub const Runtime = struct {
             });
             switch (action) {
                 .idle => {},
-                .expired => due.append(self.allocator, .{ .apex = secondary.apex, .expired = true }) catch {},
-                .refresh_due, .retry_due => due.append(self.allocator, .{ .apex = secondary.apex, .expired = secondary.expired }) catch {},
+                .expired => due.append(self.allocator, .{ .apex = secondary.apex, .expired = true }) catch |err| reportMaintenanceError(self.io, err),
+                .refresh_due, .retry_due => due.append(self.allocator, .{ .apex = secondary.apex, .expired = secondary.expired }) catch |err| reportMaintenanceError(self.io, err),
             }
         }
         self.unlockShared();
@@ -510,7 +525,8 @@ pub const Runtime = struct {
         }
         for (due.items) |item| {
             const attempt_ns: i64 = @intCast(now_ns);
-            const text = fetch(fetch_ctx, self.allocator, item.apex) catch {
+            const text = fetch(fetch_ctx, self.allocator, io, item.apex) catch |err| {
+                reportReload(io, "secondary {s} refresh failed: {s}", .{ item.apex, @errorName(err) });
                 self.lockExclusive();
                 if (self.zoneIndexForSecondary(item.apex)) |index| self.secondary_zones.items[index].last_attempt_failed = true;
                 self.unlockExclusive();
@@ -633,7 +649,7 @@ pub const Runtime = struct {
         }
     }
 
-    pub fn fetchSecondaryViaXfr(ctx: *anyopaque, allocator: std.mem.Allocator, zone_name: []const u8) anyerror!?[]const u8 {
+    pub fn fetchSecondaryViaXfr(ctx: *anyopaque, allocator: std.mem.Allocator, io: std.Io, zone_name: []const u8) anyerror!?[]const u8 {
         const self: *Runtime = @ptrCast(@alignCast(ctx));
         // Snapshot everything the fetch needs under the shared lock, then
         // release before the I/O: never hand a `*Zone` outside the lock.
@@ -641,6 +657,7 @@ pub const Runtime = struct {
         // concurrent install.
         const Snapshot = struct { primary: std.Io.net.IpAddress, serial: ?u32, has_tsig: bool, tsig_owner_text: [256]u8, tsig_owner_len: usize, tsig_algorithm: u8, tsig_secret: [64]u8, tsig_secret_len: usize };
         var snapshot: ?Snapshot = null;
+        defer if (snapshot) |*stored| std.crypto.secureZero(u8, stored.tsig_secret[0..]);
         self.lockShared();
         for (self.secondary_zones.items) |secondary| {
             if (!std.ascii.eqlIgnoreCase(secondary.apex, zone_name)) continue;
@@ -660,10 +677,14 @@ pub const Runtime = struct {
                 }
             }
             snapshot = snap;
+            // The loop copy is dead after this point; only the snapshot and
+            // the post-lock copy below may hold the secret.
+            std.crypto.secureZero(u8, snap.tsig_secret[0..]);
             break;
         }
         self.unlockShared();
-        const snap = snapshot orelse return null;
+        var snap = snapshot orelse return null;
+        defer std.crypto.secureZero(u8, snap.tsig_secret[0..]);
         const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(60), .clock = .awake } };
         var tsig_key: ?xfr_client.TsigKey = null;
         var tsig_owner: dns_name_mod.Name = undefined;
@@ -689,10 +710,10 @@ pub const Runtime = struct {
                 defer zone_file.deinit();
                 var current = zone_index.Zone.fromZoneFile(&zone_file) catch return null;
                 defer current.deinit();
-                return xfr_client.fetchIxfrSigned(allocator, self.io, &snap.primary, zone_name, &current, timeout, tsig_key) catch return null;
+                return xfr_client.fetchIxfrSigned(allocator, io, &snap.primary, zone_name, &current, timeout, tsig_key) catch return null;
             }
         }
-        return xfr_client.fetchSigned(allocator, self.io, &snap.primary, zone_name, timeout, tsig_key) catch return null;
+        return xfr_client.fetchSigned(allocator, io, &snap.primary, zone_name, timeout, tsig_key) catch return null;
     }
 
     pub fn deinit(self: *Runtime) void {
@@ -827,8 +848,10 @@ pub const Runtime = struct {
     pub fn setSecondaryTsigKey(self: *Runtime, apex: []const u8, key_name: []const u8) !void {
         for (self.secondary_zones.items) |*secondary| {
             if (!std.ascii.eqlIgnoreCase(secondary.apex, apex)) continue;
+            // Allocate first: on OOM the old name must still be valid to free.
+            const replacement = try self.allocator.dupe(u8, key_name);
             if (secondary.tsig_key_name) |old| self.allocator.free(old);
-            secondary.tsig_key_name = try self.allocator.dupe(u8, key_name);
+            secondary.tsig_key_name = replacement;
             return;
         }
         return error.UnknownZone;
@@ -1187,7 +1210,7 @@ pub const Runtime = struct {
         self.secondary_zones = .empty;
         for (consumer.members.items) |member| {
             var preserved: ?SecondaryState = null;
-            for (saved_secondary_zones.items) |old| {
+            for (saved_secondary_zones.items) |*old| {
                 if (std.ascii.eqlIgnoreCase(old.apex, member.name)) {
                     preserved = .{
                         .apex = "",
@@ -1199,8 +1222,9 @@ pub const Runtime = struct {
                         .retry_sec = old.retry_sec,
                         .expire_sec = old.expire_sec,
                         .expired = old.expired,
-                        .tsig_key_name = null,
+                        .tsig_key_name = old.tsig_key_name,
                     };
+                    old.tsig_key_name = null;
                     break;
                 }
             }
@@ -1229,6 +1253,7 @@ pub const Runtime = struct {
                 .retry_sec = retry_sec,
                 .expire_sec = expire_sec,
                 .expired = if (preserved) |value| value.expired else false,
+                .tsig_key_name = if (preserved) |value| value.tsig_key_name else null,
             }) catch return .failed;
         }
         for (saved_secondary_zones.items) |old| {
@@ -2144,9 +2169,14 @@ pub const Runtime = struct {
         try file.sync(io);
         try policy.dir.rename(temp_path, policy.dir, policy.path, io);
         // The rename is only durable once the directory entry is synced.
-        const dir_file = policy.dir.openFile(io, ".", .{ .mode = .read_only, .allow_directory = true }) catch return;
+        const dir_file = policy.dir.openFile(io, ".", .{ .mode = .read_only, .allow_directory = true }) catch |err| {
+            reportReload(io, "update persistence: directory open for sync failed: {s}", .{@errorName(err)});
+            return;
+        };
         defer dir_file.close(io);
-        try dir_file.sync(io);
+        dir_file.sync(io) catch |err| {
+            reportReload(io, "update persistence: directory sync failed after rename: {s}", .{@errorName(err)});
+        };
     }
 
     /// RFC 2136 section 3.8: the response echoes the zone section and carries
@@ -5815,7 +5845,8 @@ const SecondaryFetchStub = struct {
     calls: usize = 0,
     last_zone_name: ?[]const u8 = null,
 
-    fn fetch(ctx: *anyopaque, allocator: std.mem.Allocator, zone_name: []const u8) anyerror!?[]const u8 {
+    fn fetch(ctx: *anyopaque, allocator: std.mem.Allocator, io: std.Io, zone_name: []const u8) anyerror!?[]const u8 {
+        _ = io;
         const stub: *SecondaryFetchStub = @ptrCast(@alignCast(ctx));
         stub.calls += 1;
         stub.last_zone_name = zone_name;
@@ -5861,7 +5892,7 @@ test "a NOTIFY for a secondary marks it due for the next refresh tick" {
     var stub: SecondaryFetchStub = .{};
     // One second after the last success the refresh interval has not
     // elapsed, so the tick is idle before any NOTIFY.
-    try runtime.maybeRefreshSecondaries(6_000_000_000, SecondaryFetchStub.fetch, &stub);
+    try runtime.maybeRefreshSecondaries(std.Io.Threaded.global_single_threaded.io(), 6_000_000_000, SecondaryFetchStub.fetch, &stub);
     try std.testing.expectEqual(@as(usize, 0), stub.calls);
 
     var output: [1024]u8 = undefined;
@@ -5872,7 +5903,7 @@ test "a NOTIFY for a secondary marks it due for the next refresh tick" {
     // the secondary due.
     const primary_request = try encodeNotifyRequest(arena.allocator(), &request_buffer, "primary.example.", 11, .SOA);
     _ = try runtime.answerFrom(primary_request, &output, &master);
-    try runtime.maybeRefreshSecondaries(6_000_000_000, SecondaryFetchStub.fetch, &stub);
+    try runtime.maybeRefreshSecondaries(std.Io.Threaded.global_single_threaded.io(), 6_000_000_000, SecondaryFetchStub.fetch, &stub);
     try std.testing.expectEqual(@as(usize, 0), stub.calls);
 
     // RFC 1996 section 3.10: a NOTIFY from a host that is not the zone's
@@ -5883,7 +5914,7 @@ test "a NOTIFY for a secondary marks it due for the next refresh tick" {
     try std.testing.expectEqual(@as(@TypeOf(spoofed_response.header.rcode), .no_error), spoofed_response.header.rcode);
     try std.testing.expectEqual(@as(?i64, 5_000_000_000), runtime.secondary_zones.items[0].last_success_ns);
     try std.testing.expect(!runtime.secondary_zones.items[0].expired);
-    try runtime.maybeRefreshSecondaries(6_000_000_000, SecondaryFetchStub.fetch, &stub);
+    try runtime.maybeRefreshSecondaries(std.Io.Threaded.global_single_threaded.io(), 6_000_000_000, SecondaryFetchStub.fetch, &stub);
     try std.testing.expectEqual(@as(usize, 0), stub.calls);
 
     // A NOTIFY with no source context cannot be attributed to the master,
@@ -5901,7 +5932,7 @@ test "a NOTIFY for a secondary marks it due for the next refresh tick" {
     _ = try runtime.answerFrom(secondary_request, &output, &master);
     try std.testing.expect(runtime.secondary_zones.items[0].expired);
     try std.testing.expectEqual(@as(?i64, 5_000_000_000), runtime.secondary_zones.items[0].last_success_ns);
-    try runtime.maybeRefreshSecondaries(6_000_000_000, SecondaryFetchStub.fetch, &stub);
+    try runtime.maybeRefreshSecondaries(std.Io.Threaded.global_single_threaded.io(), 6_000_000_000, SecondaryFetchStub.fetch, &stub);
     try std.testing.expectEqual(@as(usize, 1), stub.calls);
     try std.testing.expectEqualStrings("example.", stub.last_zone_name.?);
     try std.testing.expectEqual(@as(?i64, 6_000_000_000), runtime.secondary_zones.items[0].last_success_ns);
@@ -5928,7 +5959,8 @@ test "a secondary refresh installs only a strictly newer serial" {
     });
     const Ctx = struct {
         var serial: u32 = 11;
-        fn fetch(ctx: *anyopaque, allocator: std.mem.Allocator, zone_name: []const u8) anyerror!?[]const u8 {
+        fn fetch(ctx: *anyopaque, allocator: std.mem.Allocator, io: std.Io, zone_name: []const u8) anyerror!?[]const u8 {
+            _ = io;
             _ = ctx;
             _ = zone_name;
             return try std.fmt.allocPrint(allocator, "$ORIGIN example.\n$TTL 3600\n@ IN SOA ns.example. hostmaster.example. {d} 3600 900 1209600 3600\n@ IN NS ns.example.\n@ IN A 192.0.2.1\n", .{serial});
@@ -5936,20 +5968,20 @@ test "a secondary refresh installs only a strictly newer serial" {
     };
     var fetch_ctx_byte: u8 = 0;
     // A newer serial installs and its data answers.
-    try runtime.maybeRefreshSecondaries(61_000_000_000, Ctx.fetch, &fetch_ctx_byte);
+    try runtime.maybeRefreshSecondaries(std.Io.Threaded.global_single_threaded.io(), 61_000_000_000, Ctx.fetch, &fetch_ctx_byte);
     try std.testing.expectEqual(@as(?u32, 11), runtime.zones.items[0].soaSerial());
     try std.testing.expect(!runtime.secondary_zones.items[0].last_attempt_failed);
     // An equal serial is a no-op success: the copy still answers serial 11.
     Ctx.serial = 11;
     runtime.secondary_zones.items[0].last_success_ns = null;
-    try runtime.maybeRefreshSecondaries(1_000_000_000, Ctx.fetch, &fetch_ctx_byte);
+    try runtime.maybeRefreshSecondaries(std.Io.Threaded.global_single_threaded.io(), 1_000_000_000, Ctx.fetch, &fetch_ctx_byte);
     try std.testing.expectEqual(@as(?u32, 11), runtime.zones.items[0].soaSerial());
     try std.testing.expect(!runtime.secondary_zones.items[0].last_attempt_failed);
     // An older serial is refused: the served copy keeps serial 11 and the
     // attempt is marked failed so the retry clock applies.
     Ctx.serial = 9;
     runtime.secondary_zones.items[0].last_success_ns = null;
-    try runtime.maybeRefreshSecondaries(2_000_000_000, Ctx.fetch, &fetch_ctx_byte);
+    try runtime.maybeRefreshSecondaries(std.Io.Threaded.global_single_threaded.io(), 2_000_000_000, Ctx.fetch, &fetch_ctx_byte);
     try std.testing.expectEqual(@as(?u32, 11), runtime.zones.items[0].soaSerial());
     try std.testing.expect(runtime.secondary_zones.items[0].last_attempt_failed);
 }
@@ -5986,7 +6018,8 @@ test "an expired secondary answers SERVFAIL while other zones keep answering" {
     // primary is unreachable here, so the tick's fetch fails and only the
     // expiry flag is set — no install clears it.
     const FailingFetch = struct {
-        fn fetch(ctx: *anyopaque, allocator: std.mem.Allocator, zone_name: []const u8) anyerror!?[]const u8 {
+        fn fetch(ctx: *anyopaque, allocator: std.mem.Allocator, io: std.Io, zone_name: []const u8) anyerror!?[]const u8 {
+            _ = io;
             _ = ctx;
             _ = allocator;
             _ = zone_name;
@@ -5994,7 +6027,7 @@ test "an expired secondary answers SERVFAIL while other zones keep answering" {
         }
     };
     var fetch_ctx_byte: u8 = 0;
-    try runtime.maybeRefreshSecondaries(3_601_000_000_000, FailingFetch.fetch, &fetch_ctx_byte);
+    try runtime.maybeRefreshSecondaries(std.Io.Threaded.global_single_threaded.io(), 3_601_000_000_000, FailingFetch.fetch, &fetch_ctx_byte);
     try std.testing.expect(runtime.secondary_zones.items[0].expired);
     // The expired zone answers SERVFAIL (RFC 1035 section 7.3: the data is
     // no longer authoritative) instead of its stale records.

@@ -307,6 +307,12 @@ pub const ServerContext = struct {
                     // and serve SERVFAIL for it until a refresh succeeds,
                     // while the other zones load and serve. The failure is
                     // logged for the operator.
+                    if (!builtin.is_test) {
+                        var error_buffer: [256]u8 = undefined;
+                        var stderr = std.Io.File.stderr().writer(io, &error_buffer);
+                        stderr.interface.print("warning: secondary {s} not loaded: {t}\n", .{ configured.nameText(), err }) catch {};
+                        stderr.interface.flush() catch {};
+                    }
                     const apex = lowerDot(allocator, configured.nameText()) catch return error.OutOfMemory;
                     const primary = std.Io.net.IpAddress.parse(configured.addressText(), configured.port) catch continue;
                     context.secondary_zones.append(allocator, .{
@@ -686,6 +692,7 @@ pub const ServerContext = struct {
         // The secondary TSIG names resolve against the transferred list:
         // the lookup needs the entries on the runtime, not the context.
         runtime.secondary_zones = self.secondary_zones;
+        self.secondary_zones = .empty;
         for (self.config.secondary_tsig_keys.items[0..self.config.secondary_tsig_keys.len]) |entry| {
             runtime.setSecondaryTsigKey(entry.apexText(), entry.keyText()) catch {
                 runtime.deinit();
@@ -708,7 +715,6 @@ pub const ServerContext = struct {
                 }
             }
         }
-        self.secondary_zones = .empty;
         self.blocklist = .{};
         self.config = .{};
         return runtime;

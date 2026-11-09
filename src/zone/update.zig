@@ -4,6 +4,7 @@
 /// the caller's to free; zone records are never mutated.
 /// Errors: OutOfMemory only; the RFC's own refusals travel in Outcome.rcode.
 const std = @import("std");
+const limits = @import("../dns/limits.zig");
 const header = @import("../dns/header.zig");
 const dns_name = @import("../dns/name.zig");
 const dns_rdata = @import("../dns/rdata.zig");
@@ -25,7 +26,7 @@ pub const Outcome = union(enum) {
 const CLASS_ANY: u16 = 255;
 const CLASS_NONE: u16 = 254;
 const CLASS_IN: u16 = 1;
-const MAX_RDATA: usize = 65535;
+const MAX_RDATA: usize = limits.max_message_bytes;
 const TEXT_BUFFER: usize = 512;
 
 const Expected = struct {

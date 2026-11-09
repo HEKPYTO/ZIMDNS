@@ -5,6 +5,7 @@
 /// Errors: Non-authoritative zones, missing SOA data, oversized frames, and
 /// over-long sequences are typed; transport I/O stays with platform listeners.
 const std = @import("std");
+const limits = @import("../dns/limits.zig");
 const dns_message = @import("../dns/message.zig");
 const dns_writer = @import("../dns/writer.zig");
 const dns_name = @import("../dns/name.zig");
@@ -19,7 +20,7 @@ const journal_mod = @import("journal.zig");
 
 /// Reuses the platform TCP profile bounds without importing the listener:
 /// one DNS message per length-prefixed frame, at most 65535 bytes each.
-pub const tcp_max_frame_size: usize = 65535;
+pub const tcp_max_frame_size: usize = limits.max_message_bytes;
 /// Default answer-section chunking for transfer messages: an upper bound on
 /// records per message on top of the wire-size bound. Tests override this
 /// to force multi-message sequences from small zones.

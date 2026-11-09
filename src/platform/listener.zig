@@ -3,6 +3,7 @@
 /// Ownership: Runtime is borrowed; socket streams are consumed/closed by the listener; wire buffers are local.
 /// Errors: DNS failures are typed; socket read/write and bind failures propagate as I/O errors.
 const std = @import("std");
+const dns_limits = @import("../dns/limits.zig");
 const builtin = @import("builtin");
 const auth_runtime = @import("../auth/runtime.zig");
 const Runtime = auth_runtime.Runtime;
@@ -22,7 +23,7 @@ const tcp_deadline = @import("tcp_deadline.zig");
 pub const UDP_CLASSIC_MESSAGE_SIZE: usize = response_mod.CLASSIC_UDP_MESSAGE_SIZE;
 pub const UDP_REQUEST_BUFFER_SIZE: usize = response_mod.DEFAULT_EDNS_UDP_PAYLOAD_SIZE;
 pub const UDP_RESPONSE_BUFFER_SIZE: usize = std.math.maxInt(u16);
-pub const TCP_MAX_FRAME_SIZE: usize = std.math.maxInt(u16);
+pub const TCP_MAX_FRAME_SIZE: usize = dns_limits.max_message_bytes;
 pub const TCP_MAX_FRAMES_PER_CONNECTION: usize = 16;
 pub const TCP_MAX_CONNECTION_WORKERS: usize = 64;
 pub const UDP_WORKER_COUNT: usize = 16;
@@ -239,7 +240,7 @@ fn udpPoolWork(args: *const UdpPoolWorker) void {
     // error is stored for a joiner to collect; joins only run on clean exit.
     if (args.counters) |counters| {
         serveUdpPoolBudgetedWithMetrics(args.socket, args.io, args.runtime, args.remaining, counters) catch |err| {
-            if (!isRecoverableRequestError(err)) {
+            if (err != error.ServerStopping and !isRecoverableRequestError(err)) {
                 var buffer: [256]u8 = undefined;
                 var writer = std.Io.File.stderr().writer(args.io, &buffer);
                 writer.interface.print("error: serve-udp pool failed: {t}\n", .{err}) catch {};
@@ -249,7 +250,7 @@ fn udpPoolWork(args: *const UdpPoolWorker) void {
         };
     } else {
         serveUdpPoolBudgeted(args.socket, args.io, args.runtime, args.remaining) catch |err| {
-            if (!isRecoverableRequestError(err)) {
+            if (err != error.ServerStopping and !isRecoverableRequestError(err)) {
                 var buffer: [256]u8 = undefined;
                 var writer = std.Io.File.stderr().writer(args.io, &buffer);
                 writer.interface.print("error: serve-udp pool failed: {t}\n", .{err}) catch {};

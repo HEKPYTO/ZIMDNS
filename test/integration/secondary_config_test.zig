@@ -144,7 +144,7 @@ test "a standalone secondary serves the fetched zone and refreshes to the newer 
         std.testing.allocator.destroy(second_args);
     }
 
-    try runtime.maybeRefreshSecondaries(clock_now_ns + 2_000_000_000, Runtime.fetchSecondaryViaXfr, &runtime);
+    try runtime.maybeRefreshSecondaries(io, clock_now_ns + 2_000_000_000, Runtime.fetchSecondaryViaXfr, &runtime);
     try expectSoaSerial(io, &runtime, "one.example.", 2, 0x5a02);
     try joinPrimary(second_args, &second_joined);
 }
@@ -195,7 +195,7 @@ test "signed secondary startup and refresh against a TSIG primary" {
     // A named-but-missing key fails the refresh instead of fetching
     // unsigned: the fetch reports UnknownKey and the served zone stays.
     try runtime.setSecondaryTsigKey("one.example.", "absent-key.");
-    try std.testing.expectError(error.UnknownKey, Runtime.fetchSecondaryViaXfr(&runtime, std.testing.allocator, "one.example."));
+    try std.testing.expectError(error.UnknownKey, Runtime.fetchSecondaryViaXfr(&runtime, std.testing.allocator, io, "one.example."));
     try expectSoaSerial(io, &runtime, "one.example.", 1, 0x5a03);
 }
 

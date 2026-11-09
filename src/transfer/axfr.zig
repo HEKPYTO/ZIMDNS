@@ -11,6 +11,7 @@
 /// Errors: Non-transfer qtypes report NotTransferQuery so callers can run the
 /// ordinary answer path; transfer shaping failures are typed.
 const std = @import("std");
+const limits = @import("../dns/limits.zig");
 const dns_message = @import("../dns/message.zig");
 const dns_writer = @import("../dns/writer.zig");
 const dns_types = @import("../dns/types.zig");
@@ -22,7 +23,7 @@ const dns_rdata = @import("../dns/rdata.zig");
 const dns_record = @import("../dns/record.zig");
 const dns_tsig = @import("../dns/tsig.zig");
 
-pub const max_transfer_message_len: usize = 65535;
+pub const max_transfer_message_len: usize = limits.max_message_bytes;
 const trial_encode_threshold: usize = 60000;
 
 pub const Error = error{

@@ -735,13 +735,28 @@ const MetricsListener = struct {
             // without a wakeup, so the owner can join this thread before it
             // frees the counters and io backend behind it.
             var poll_fds = [_]std.posix.pollfd{.{ .fd = server.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
-            const ready = std.posix.poll(&poll_fds, 200) catch return;
+            const ready = std.posix.poll(&poll_fds, 200) catch |err| {
+                if (self.stop.shouldStop()) return;
+                logMetricsListenerError(self.io, err);
+                continue;
+            };
             if (ready == 0) continue;
-            const stream = listener.acceptWithRetry(&server, self.io) catch return;
+            const stream = listener.acceptWithRetry(&server, self.io) catch |err| {
+                if (self.stop.shouldStop()) return;
+                logMetricsListenerError(self.io, err);
+                continue;
+            };
             serveMetricsConnection(stream, self.io, self.counters, self.serving);
         }
     }
 };
+
+fn logMetricsListenerError(io: std.Io, err: anyerror) void {
+    var buffer: [256]u8 = undefined;
+    var writer = std.Io.File.stderr().writer(io, &buffer);
+    writer.interface.print("warning: metrics listener: {t}\n", .{err}) catch {};
+    writer.interface.flush() catch {};
+}
 
 test "metrics addr parsing refuses non-loopback" {
     const loopback = try parseMetricsAddr("127.0.0.1:9090");
@@ -1038,8 +1053,27 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
     }
     // The read-write lock a reload waits on is woken through the serving io;
     // a runtime built from zone text carries none of its own.
-    runtime.io = io;
+    var server_backend = std.Io.Threaded.init(std.heap.page_allocator, .{
+        .concurrent_limit = .limited(listener.UDP_WORKER_COUNT + listener.TCP_MAX_CONNECTION_WORKERS + 4),
+    });
+    defer server_backend.deinit();
+    const server_io = server_backend.io();
+    runtime.io = server_io;
+    if (runtime.resolver) |*resolver_state| resolver_state.io = server_io;
+    defer {
+        runtime.io = io;
+        if (runtime.resolver) |*resolver_state| resolver_state.io = io;
+    }
     defer runtime.deinit();
+    var maintenance_state = MaintenanceState{ .runtime = &runtime, .io = server_io };
+    var maintenance_thread = std.Thread.spawn(.{}, maintenanceLoop, .{&maintenance_state}) catch |err| {
+        try writer.print("error: cannot start the maintenance thread: {t}\n", .{err});
+        try exitUsage(writer);
+    };
+    defer {
+        maintenance_state.stop.store(true, .release);
+        maintenance_thread.join();
+    }
     // The handler must not reach a runtime that is already gone.
     defer reload_runtime = null;
     // SIGHUP re-reads every configured zone file. The handler only sets a
@@ -1117,6 +1151,7 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
         if (metrics_thread) |thread| thread.join();
     }
     metrics_serving.store(true, .release);
+    defer metrics_serving.store(false, .release);
 
     if (multi_loop) {
         if (max_requests) |count| if (count == 0) {
@@ -1130,14 +1165,8 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
         // Multi-loop io: TCP-family loops need a threaded backend, and the
         // shared runtime lock wakes through the io it serves on, so one
         // threaded backend feeds every loop.
-        var io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{
-            .concurrent_limit = .limited(listener.TCP_MAX_CONNECTION_WORKERS),
-        });
-        defer io_backend.deinit();
-        const loop_io = io_backend.io();
-        runtime.io = loop_io;
         runtime.shared_stop = &stop;
-        serveConcurrentMulti(loop_io, &runtime, &counters, print_metrics, max_requests, odoh_target, tls_identities[0..tls_identity_count], tls_identity_modes[0..tls_identity_count], encrypted_cert_path, encrypted_key_path, addresses[0..loop_count], loop_modes[0..loop_count], &stop) catch |err| {
+        serveConcurrentMulti(server_io, &runtime, &counters, print_metrics, max_requests, odoh_target, tls_identities[0..tls_identity_count], tls_identity_modes[0..tls_identity_count], encrypted_cert_path, encrypted_key_path, addresses[0..loop_count], loop_modes[0..loop_count], &stop) catch |err| {
             // A duplicate address is a usage error, not a serving failure.
             if (err == error.DuplicateLoopAddress) {
                 try writer.writeAll("error: two selected loops share one listen address; give each loop its own listener\n");
@@ -1160,26 +1189,26 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
             const once_live: ?*metrics.Counters = if (metrics_addr != null) &counters else null;
             if (configured_address) |*address| {
                 if (print_metrics) {
-                    try listener.serveUdpCountOnAddressWithMetrics(io, &runtime, address, max_queries, &counters);
+                    try listener.serveUdpCountOnAddressWithMetrics(server_io, &runtime, address, max_queries, &counters);
                 } else if (once_live) |counting| {
-                    try listener.serveUdpCountOnAddressWithMetrics(io, &runtime, address, max_queries, counting);
+                    try listener.serveUdpCountOnAddressWithMetrics(server_io, &runtime, address, max_queries, counting);
                 } else if (max_queries == 1) {
-                    try listener.serveUdpOnceOnAddress(io, &runtime, address);
+                    try listener.serveUdpOnceOnAddress(server_io, &runtime, address);
                 } else {
-                    try listener.serveUdpCountOnAddress(io, &runtime, address, max_queries);
+                    try listener.serveUdpCountOnAddress(server_io, &runtime, address, max_queries);
                 }
             } else if (print_metrics) {
                 var address = defaultListenerAddress(port);
-                try listener.serveUdpCountOnAddressWithMetrics(io, &runtime, &address, max_queries, &counters);
+                try listener.serveUdpCountOnAddressWithMetrics(server_io, &runtime, &address, max_queries, &counters);
             } else if (once_live) |counting| {
                 var address = defaultListenerAddress(port);
-                try listener.serveUdpCountOnAddressWithMetrics(io, &runtime, &address, max_queries, counting);
+                try listener.serveUdpCountOnAddressWithMetrics(server_io, &runtime, &address, max_queries, counting);
             } else if (max_queries == 1) {
                 var address = defaultListenerAddress(port);
-                try listener.serveUdpOnceOnAddress(io, &runtime, &address);
+                try listener.serveUdpOnceOnAddress(server_io, &runtime, &address);
             } else {
                 var address = defaultListenerAddress(port);
-                try listener.serveUdpCountOnAddress(io, &runtime, &address, max_queries);
+                try listener.serveUdpCountOnAddress(server_io, &runtime, &address, max_queries);
             }
         },
         .tcp_once => {
@@ -1192,10 +1221,10 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
                 try exitUsage(writer);
             }
             if (configured_address) |*address| {
-                try listener.serveTcpOnceOnAddress(io, &runtime, address);
+                try listener.serveTcpOnceOnAddress(server_io, &runtime, address);
             } else {
                 var address = defaultListenerAddress(port);
-                try listener.serveTcpOnceOnAddress(io, &runtime, &address);
+                try listener.serveTcpOnceOnAddress(server_io, &runtime, &address);
             }
         },
         .udp_loop => {
@@ -1207,38 +1236,31 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
             // counts even without --print-metrics.
             const live: ?*metrics.Counters = if (metrics_addr != null) &counters else null;
             if (max_requests == null) {
-                // The caller's io may be single-threaded; the pool needs its
-                // own threaded backend, and those threads use runtime.io for
-                // recursion and transfer work.
-                var pool_backend = std.Io.Threaded.init(std.heap.page_allocator, .{ .concurrent_limit = .limited(listener.UDP_WORKER_COUNT) });
-                defer pool_backend.deinit();
-                const pool_io = pool_backend.io();
-                runtime.io = pool_io;
                 if (configured_address) |*address| {
-                    try listener.serveUdpPoolOnAddress(pool_io, &runtime, address, &counters);
+                    try listener.serveUdpPoolOnAddress(server_io, &runtime, address, &counters);
                 } else {
                     var address = defaultListenerAddress(port);
-                    try listener.serveUdpPoolOnAddress(pool_io, &runtime, &address, &counters);
+                    try listener.serveUdpPoolOnAddress(server_io, &runtime, &address, &counters);
                 }
             } else if (print_metrics) {
                 if (configured_address) |*address| {
-                    try listener.serveUdpLoopOnAddressWithMetrics(io, &runtime, address, max_requests, &counters);
+                    try listener.serveUdpLoopOnAddressWithMetrics(server_io, &runtime, address, max_requests, &counters);
                 } else {
                     var address = defaultListenerAddress(port);
-                    try listener.serveUdpLoopOnAddressWithMetrics(io, &runtime, &address, max_requests, &counters);
+                    try listener.serveUdpLoopOnAddressWithMetrics(server_io, &runtime, &address, max_requests, &counters);
                 }
             } else if (live) |counting| {
                 if (configured_address) |*address| {
-                    try listener.serveUdpLoopOnAddressWithMetrics(io, &runtime, address, max_requests, counting);
+                    try listener.serveUdpLoopOnAddressWithMetrics(server_io, &runtime, address, max_requests, counting);
                 } else {
                     var address = defaultListenerAddress(port);
-                    try listener.serveUdpLoopOnAddressWithMetrics(io, &runtime, &address, max_requests, counting);
+                    try listener.serveUdpLoopOnAddressWithMetrics(server_io, &runtime, &address, max_requests, counting);
                 }
             } else if (configured_address) |*address| {
-                try listener.serveUdpLoopOnAddress(io, &runtime, address, max_requests);
+                try listener.serveUdpLoopOnAddress(server_io, &runtime, address, max_requests);
             } else {
                 var address = defaultListenerAddress(port);
-                try listener.serveUdpLoopOnAddress(io, &runtime, &address, max_requests);
+                try listener.serveUdpLoopOnAddress(server_io, &runtime, &address, max_requests);
             }
         },
         .tcp_loop => {
@@ -1246,54 +1268,35 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
                 try writer.writeAll("error: --print-metrics is currently supported for UDP runs\n");
                 try exitUsage(writer);
             }
-            var io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{
-                .concurrent_limit = .limited(listener.TCP_MAX_CONNECTION_WORKERS),
-            });
-            defer io_backend.deinit();
-            const tcp_io = io_backend.io();
             const tcp_live: ?*metrics.Counters = if (metrics_addr != null) &counters else null;
             if (configured_address) |*address| {
-                try listener.serveTcpLoopOnAddress(tcp_io, &runtime, address, max_requests, tcp_live);
+                try listener.serveTcpLoopOnAddress(server_io, &runtime, address, max_requests, tcp_live);
             } else {
                 var address = defaultListenerAddress(port);
-                try listener.serveTcpLoopOnAddress(tcp_io, &runtime, &address, max_requests, tcp_live);
+                try listener.serveTcpLoopOnAddress(server_io, &runtime, &address, max_requests, tcp_live);
             }
         },
         .dot_loop => {
             var server = tls_identity orelse return error.MissingTlsIdentity;
-            // The encrypted listener runs on its own backend with the same
-            // worker bound the cleartext TCP listener uses.
-            var io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{
-                .concurrent_limit = .limited(transport_dot.MAX_CONNECTION_WORKERS),
-            });
-            defer io_backend.deinit();
-            const dot_io = io_backend.io();
             // The counters reach the port, so the DoT query counter moves in
             // a metrics run.
             const dot_counters: ?*metrics.Counters = &counters;
             if (configured_address) |*address| {
-                try transport_dot.serveDotLoopOnAddress(dot_io, &runtime, address, &server, max_requests, dot_counters);
+                try transport_dot.serveDotLoopOnAddress(server_io, &runtime, address, &server, max_requests, dot_counters);
             } else {
                 var address = defaultListenerAddress(port);
-                try transport_dot.serveDotLoopOnAddress(dot_io, &runtime, &address, &server, max_requests, dot_counters);
+                try transport_dot.serveDotLoopOnAddress(server_io, &runtime, &address, &server, max_requests, dot_counters);
             }
         },
         .doh_loop => {
             var server = tls_identity orelse return error.MissingTlsIdentity;
-            // The encrypted listener runs on its own backend with the same
-            // worker bound the cleartext TCP listener uses.
-            var io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{
-                .concurrent_limit = .limited(transport_doh.MAX_CONNECTION_WORKERS),
-            });
-            defer io_backend.deinit();
-            const doh_io = io_backend.io();
             // The DoH workers share the counters of the run, so the DoH
             // queries are counted the way the other transports count them.
             if (configured_address) |*address| {
-                try transport_doh.serveDohLoopOnAddress(doh_io, &runtime, address, &server, max_requests, &counters, odoh_target);
+                try transport_doh.serveDohLoopOnAddress(server_io, &runtime, address, &server, max_requests, &counters, odoh_target);
             } else {
                 var address = defaultListenerAddress(port);
-                try transport_doh.serveDohLoopOnAddress(doh_io, &runtime, &address, &server, max_requests, &counters, odoh_target);
+                try transport_doh.serveDohLoopOnAddress(server_io, &runtime, &address, &server, max_requests, &counters, odoh_target);
             }
         },
         .doq_loop => {
@@ -1305,10 +1308,10 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
             // so the DoQ query counter moves in a metrics run.
             const doq_counters: ?*metrics.Counters = &counters;
             if (configured_address) |*address| {
-                try transport_doq.serveDoqLoopOnAddress(io, &runtime, address, cert_path, key_path, max_requests, doq_counters);
+                try transport_doq.serveDoqLoopOnAddress(server_io, &runtime, address, cert_path, key_path, max_requests, doq_counters);
             } else {
                 var address = defaultListenerAddress(port);
-                try transport_doq.serveDoqLoopOnAddress(io, &runtime, &address, cert_path, key_path, max_requests, doq_counters);
+                try transport_doq.serveDoqLoopOnAddress(server_io, &runtime, &address, cert_path, key_path, max_requests, doq_counters);
             }
         },
         .doh3_loop => {
@@ -1320,26 +1323,21 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
             // so the DoH/3 query counter moves in a metrics run.
             const doh3_counters: ?*metrics.Counters = &counters;
             if (configured_address) |*address| {
-                try transport_doh3.serveDoh3LoopOnAddress(io, &runtime, address, cert_path, key_path, max_requests, doh3_counters, odoh_target);
+                try transport_doh3.serveDoh3LoopOnAddress(server_io, &runtime, address, cert_path, key_path, max_requests, doh3_counters, odoh_target);
             } else {
                 var address = defaultListenerAddress(port);
-                try transport_doh3.serveDoh3LoopOnAddress(io, &runtime, &address, cert_path, key_path, max_requests, doh3_counters, odoh_target);
+                try transport_doh3.serveDoh3LoopOnAddress(server_io, &runtime, &address, cert_path, key_path, max_requests, doh3_counters, odoh_target);
             }
         },
         // The strict-TLS transfer channel: the same handshake and the same
         // worker bound as the other encrypted listeners.
         .xfr_loop => {
             var server = tls_identity orelse return error.MissingTlsIdentity;
-            var io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{
-                .concurrent_limit = .limited(transfer_xfr_tls.MAX_CONNECTION_WORKERS),
-            });
-            defer io_backend.deinit();
-            const xfr_io = io_backend.io();
             if (configured_address) |*address| {
-                try transfer_xfr_tls.serveXfrLoopOnAddress(xfr_io, &runtime, address, &server, max_requests);
+                try transfer_xfr_tls.serveXfrLoopOnAddress(server_io, &runtime, address, &server, max_requests);
             } else {
                 var address = defaultListenerAddress(port);
-                try transfer_xfr_tls.serveXfrLoopOnAddress(xfr_io, &runtime, &address, &server, max_requests);
+                try transfer_xfr_tls.serveXfrLoopOnAddress(server_io, &runtime, &address, &server, max_requests);
             }
         },
         .none => unreachable,
@@ -1348,6 +1346,21 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
     if (print_metrics) {
         try metrics.formatPrometheus(&counters, writer);
     }
+}
+
+const MaintenanceState = struct {
+    runtime: *auth_runtime.Runtime,
+    io: std.Io,
+    stop: std.atomic.Value(bool) = .init(false),
+};
+
+fn maintenanceLoop(state: *MaintenanceState) void {
+    while (!state.stop.load(.acquire)) {
+        _ = state.runtime.trySecondaryRefresh(state.io);
+        _ = state.runtime.tryMaintenanceTick(state.io);
+        std.Io.sleep(state.io, .fromMilliseconds(250), .awake) catch {};
+    }
+    auth_runtime.releaseAnswerScratch();
 }
 
 fn countServeModes(selection: ServeSelection) usize {
