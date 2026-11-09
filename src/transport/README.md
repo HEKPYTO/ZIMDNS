@@ -74,6 +74,20 @@ Per-stream state for DoQ and DoH/3 is keyed by `{ connection, stream }` in
 every entry that connection owned, so stream ids never collide across
 connections and dead connections leave no state behind.
 
+## QUIC bounds
+
+- ngtcp2 caps: 32 connections, 16 bidirectional streams per connection,
+  advertised from the same constants (`MAX_CONNECTIONS`,
+  `MAX_STREAMS_PER_CONN`). The advertised flow windows
+  (`INITIAL_MAX_DATA` 1 MiB per connection, `INITIAL_MAX_STREAM_DATA_BIDI`
+  128 KiB, `INITIAL_MAX_STREAM_DATA_UNI` 16 KiB) bound the bytes in
+  flight. Worst case per QUIC port: 32 x (connection struct with its
+  64 KiB chunk scratch and bounded pending queue + 1 MiB connection
+  window + 16 x the larger handler stream state, DoQ parser ~64 KiB or
+  DoH3 state ~133 KiB), which the `@sizeOf` budget test in `doh3.zig`
+  holds under 150 MiB. Both QUIC ports (DoQ + DoH3) together stay under
+  300 MiB.
+
 The QUIC stack is ngtcp2 1.26.0 + nghttp3 1.19.0, vendored under
 `third_party/` and compiled with the Zig C compiler, with the GnuTLS crypto
 backend and system GnuTLS linked at build time. The migration from the

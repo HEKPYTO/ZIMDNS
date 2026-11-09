@@ -19,7 +19,9 @@
 /// the resolver; malformed streams are reset where the handler cannot
 /// answer them.
 const std = @import("std");
-const Runtime = @import("../auth/runtime.zig").Runtime;
+const runtime_mod = @import("../auth/runtime.zig");
+const Runtime = runtime_mod.Runtime;
+const SharedStop = runtime_mod.SharedStop;
 const cli_query = @import("../cli/query.zig");
 const metrics = @import("../metrics.zig");
 const dns_message = @import("../dns/message.zig");
@@ -76,6 +78,9 @@ const StreamState = struct {
     max_age: u32 = 0,
 };
 
+/// The per-stream memory each DoH3 request stream can pin. The budget
+/// test in this file sizes the QUIC worst case from this constant.
+pub const STREAM_STATE_SIZE: usize = @sizeOf(StreamState);
 /// Per-connection nghttp3 state. Created on handshake, destroyed with
 /// the core connection.
 const H3Conn = struct {
@@ -363,9 +368,7 @@ const Doh3Handler = struct {
         const peer = core.ipAddressFromStorage(&conn.peer_addr) orelse {
             return self.submitStatus(h3conn, conn, stream_id, state, .internal_error);
         };
-        self.runtime.maybeRefreshManagedAnchors(@intCast(std.Io.Clock.real.now(self.io).nanoseconds));
-        _ = self.runtime.reloadZoneIfRequested(self.io);
-        _ = self.runtime.refreshCatalogIfRequested(self.io);
+        _ = self.runtime.tryMaintenanceTick(self.io);
         const response_buffer = arena.alloc(u8, MAX_BODY_LEN) catch {
             return self.submitStatus(h3conn, conn, stream_id, state, .internal_error);
         };
@@ -404,9 +407,7 @@ const Doh3Handler = struct {
             self.completed += 1;
             return;
         };
-        self.runtime.maybeRefreshManagedAnchors(@intCast(std.Io.Clock.real.now(self.io).nanoseconds));
-        _ = self.runtime.reloadZoneIfRequested(self.io);
-        _ = self.runtime.refreshCatalogIfRequested(self.io);
+        _ = self.runtime.tryMaintenanceTick(self.io);
         const response_buffer = arena.alloc(u8, MAX_BODY_LEN) catch {
             self.submitStatus(h3conn, conn, stream_id, state, .internal_error);
             self.completed += 1;
@@ -621,6 +622,22 @@ pub fn serveDoh3LoopOnAddress(
     counters: ?*metrics.Counters,
     odoh_target: ?*const odoh.Target,
 ) !void {
+    return serveDoh3LoopOnAddressStop(io, runtime, address, cert_path, key_path, max_requests, counters, odoh_target, null);
+}
+
+/// Stop-aware DoH3 loop: `stop` ends the loop at the core's next boundary
+/// even with no `max_requests`, so a failing sibling loop ends this one.
+pub fn serveDoh3LoopOnAddressStop(
+    io: std.Io,
+    runtime: *Runtime,
+    address: *const std.Io.net.IpAddress,
+    cert_path: []const u8,
+    key_path: []const u8,
+    max_requests: ?usize,
+    counters: ?*metrics.Counters,
+    odoh_target: ?*const odoh.Target,
+    shared_stop: ?*const SharedStop,
+) !void {
     const allocator = std.heap.page_allocator;
     var creds = gnutls.ServerCredentials.load(cert_path, key_path) catch return error.TlsIdentityFailed;
     defer creds.deinit();
@@ -653,13 +670,15 @@ pub fn serveDoh3LoopOnAddress(
     };
     const State = struct {
         handler: *Doh3Handler,
+        shared: ?*const SharedStop,
         fn stop(ctx: *anyopaque) bool {
             const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.shared) |shared| if (shared.shouldStop()) return true;
             if (self.handler.max_requests) |max| return self.handler.completed >= max;
             return false;
         }
     };
-    var state = State{ .handler = &handler };
+    var state = State{ .handler = &handler, .shared = shared_stop };
     try core.serve(allocator, io, address, &creds, core_handler, State.stop, &state, 30 * 1_000_000_000, DOH3_ALPN);
 }
 
@@ -730,4 +749,17 @@ test "DoH/3 mapping: media types, malformed bodies, and header limits" {
     @memset(long_target, 'a');
     @memcpy(long_target[0.."/dns-query?dns=".len], "/dns-query?dns=");
     try std.testing.expectError(error.BadDnsMessage, doh.dnsQueryFromParts(alloc, true, false, long_target, null, qbuf[0..0]));
+}
+
+test "QUIC worst case stays within the per-port budget" {
+    const doq = @import("doq.zig");
+    const per_stream = @max(@sizeOf(doq.StreamParser), STREAM_STATE_SIZE);
+    const per_conn = @sizeOf(core.Connection) + core.Server.INITIAL_MAX_DATA + core.Server.MAX_STREAMS_PER_CONN * per_stream;
+    const worst_case = core.Server.MAX_CONNECTIONS * per_conn;
+    try std.testing.expectEqual(@as(usize, 32), core.Server.MAX_CONNECTIONS);
+    try std.testing.expectEqual(@as(usize, 16), core.Server.MAX_STREAMS_PER_CONN);
+    comptime {
+        if (core.Server.MAX_CONNECTIONS * (@sizeOf(core.Connection) + core.Server.INITIAL_MAX_DATA + core.Server.MAX_STREAMS_PER_CONN * @max(@sizeOf(doq.StreamParser), STREAM_STATE_SIZE)) > core.Server.MAX_STATE_BYTES_PER_PORT) @compileError("QUIC worst case exceeds per-port budget");
+    }
+    try std.testing.expect(worst_case <= core.Server.MAX_STATE_BYTES_PER_PORT);
 }

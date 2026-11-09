@@ -566,9 +566,9 @@ const DohChannel = struct {
 };
 
 fn serveDohStream(stream: std.Io.net.Stream, io: std.Io, runtime: *Runtime, counters: ?*metrics.Counters, odoh_target: ?*const odoh.Target) !void {
-    // Same RFC 5011 tick as the plaintext and DoT paths: a DoH-only server
-    // must still observe revocation and the hold-downs.
-    runtime.maybeRefreshManagedAnchors(@intCast(std.Io.Clock.real.now(io).nanoseconds));
+    // Same tick as the plaintext and DoT paths: one loop owns it across
+    // all loops sharing this runtime, and a DoH-only server runs it here.
+    _ = runtime.tryMaintenanceTick(io);
     if (comptime !listener.TCP_DEADLINES_SUPPORTED) return listener.Error.UnsupportedPlatform;
 
     var read_buffer: [MAX_HEADER_BYTES]u8 = undefined;
@@ -700,6 +700,9 @@ pub fn serveDohLoop(
     var sources = listener.SourceCounter{};
     var accepted: usize = 0;
     while (max_requests == null or accepted < max_requests.?) {
+        // A failing sibling ends this loop: the listener shutdown wakes
+        // the blocked accept, and the flag ends it even when idle.
+        try runtime.checkStop();
         const stream = try listener.acceptWithRetry(listener_socket, io);
         accepted += 1;
         // The encrypted listener holds the same bounds as the cleartext one: a

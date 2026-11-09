@@ -50,9 +50,16 @@ pub fn apply(
     const arena = arena_state.allocator();
     const encode_buffer = try arena.alloc(u8, MAX_RDATA);
 
+    // The served zone of a signed apex carries the signer's generated tail
+    // (DNSKEY/RRSIG/NSEC...). Prerequisite checks (§3.2) run against the
+    // full served data, but mutations apply to the loaded records only: the
+    // signing pass regenerates the tail, and a user-authored delegation DS
+    // is loaded data, not generated, so it stays.
+    const loaded_len = zone.records.len -| zone.generated.len;
+    const served = zone.records.items[0..zone.records.len];
     var records: std.ArrayList(parser.ZoneRecord) = .empty;
     defer records.deinit(allocator);
-    try records.appendSlice(allocator, zone.records.items[0..zone.records.len]);
+    try records.appendSlice(allocator, zone.records.items[0..loaded_len]);
 
     // RFC 2136 section 3.2: the prerequisite section first.
     var expected: std.ArrayList(Expected) = .empty;
@@ -69,15 +76,15 @@ pub fn apply(
         if (class == CLASS_ANY) {
             if (encodedLen(rr) != 0) return .{ .rcode = .formerr };
             if (rr.rrtype.eql(.ANY)) {
-                if (!nameInUse(records.items, name)) return .{ .rcode = .nxdomain };
-            } else if (!rrsetExists(records.items, name, rr.rrtype)) {
+                if (!nameInUse(served, name)) return .{ .rcode = .nxdomain };
+            } else if (!rrsetExists(served, name, rr.rrtype)) {
                 return .{ .rcode = .nxrrset };
             }
         } else if (class == CLASS_NONE) {
             if (encodedLen(rr) != 0) return .{ .rcode = .formerr };
             if (rr.rrtype.eql(.ANY)) {
-                if (nameInUse(records.items, name)) return .{ .rcode = .yxdomain };
-            } else if (rrsetExists(records.items, name, rr.rrtype)) {
+                if (nameInUse(served, name)) return .{ .rcode = .yxdomain };
+            } else if (rrsetExists(served, name, rr.rrtype)) {
                 return .{ .rcode = .yxrrset };
             }
         } else if (class == CLASS_IN) {
@@ -104,7 +111,7 @@ pub fn apply(
     // zone RRset exactly, member for member.
     for (expected.items) |entry| {
         var zone_members: usize = 0;
-        for (records.items) |record| {
+        for (served) |record| {
             if (!record.rrtype.eql(entry.rrtype)) continue;
             if (!std.ascii.eqlIgnoreCase(record.ownerText(), entry.name)) continue;
             zone_members += 1;
@@ -119,6 +126,7 @@ pub fn apply(
     }
 
     // RFC 2136 section 3.4.1: the update section prescan.
+    const signed = zone.generated.len != 0;
     for (updates) |rr| {
         var name_buffer: [TEXT_BUFFER]u8 = undefined;
         const name = rr.owner.toText(&name_buffer) catch return .{ .rcode = .formerr };
@@ -126,6 +134,20 @@ pub fn apply(
         const class = rr.class.code();
         if (class == CLASS_IN) {
             if (isQueryMetaType(rr.rrtype)) return .{ .rcode = .formerr };
+            // A bogus ZONEMD add reseals to null and bricks the next load, so refuse it here.
+            if (rr.rrtype.eql(.ZONEMD)) {
+                if (!std.ascii.eqlIgnoreCase(name, domain)) return .{ .rcode = .refused };
+                const value = switch (rr.rdata) {
+                    .ZONEMD => |v| v,
+                    else => return .{ .rcode = .formerr },
+                };
+                if (zonemd.schemeFromCode(value.scheme) == null or zonemd.hashFromCode(value.hash) == null) return .{ .rcode = .refused };
+            }
+            // The signer owns these types on a signed apex: persisting one
+            // would poison the file and refuse the next load, so the update
+            // is refused before anything is written. A delegation DS is not
+            // generated, so it stays updatable.
+            if (signed and isSignerOwnedType(rr.rrtype)) return .{ .rcode = .refused };
         } else if (class == CLASS_ANY) {
             if (rr.ttl != 0 or encodedLen(rr) != 0) return .{ .rcode = .formerr };
             if (!rr.rrtype.eql(.ANY) and isQueryMetaType(rr.rrtype)) return .{ .rcode = .formerr };
@@ -500,6 +522,15 @@ fn isQueryMetaType(rrtype: RecordType) bool {
     or code == 41; // OPT
 }
 
+/// The types the signer generates for a signed apex, mirroring its
+/// `alreadySigned` refusal set. An UPDATE that adds one while the zone is
+/// signed would persist signer output as zone data and poison the next load,
+/// so it is refused in the prescan. A delegation DS is never generated, so
+/// it is not in this set and stays updatable.
+fn isSignerOwnedType(rrtype: RecordType) bool {
+    return rrtype.eql(.DNSKEY) or rrtype.eql(.RRSIG) or rrtype.eql(.NSEC) or rrtype.eql(.NSEC3) or rrtype.eql(.NSEC3PARAM);
+}
+
 const test_zone_text =
     \\$ORIGIN example.com.
     \\$TTL 3600
@@ -588,6 +619,19 @@ test "an update reseals a published ZONEMD" {
     const message = try zonemd.verify(&rebuilt, std.testing.allocator, &report);
     try std.testing.expect(std.mem.startsWith(u8, message, "zone example.com.: ZONEMD verified"));
     try std.testing.expect(std.mem.indexOf(u8, text, "ZONEMD 8 1 1 0000000000") == null);
+}
+test "an update refuses an unverifiable ZONEMD" {
+    var zone = try buildZone(test_zone_text);
+    defer zone.deinit();
+    const before = try renderZoneText(std.testing.allocator, "example.com.", zone.records.items);
+    defer std.testing.allocator.free(before);
+    var bad = [_]dns_record.ResourceRecord{makeRecord("example.com.", .ZONEMD, CLASS_IN, 3600, .{ .ZONEMD = .{ .serial = 7, .scheme = 1, .hash = 99 } })};
+    try std.testing.expectEqual(header.Rcode.refused, zoneRcode(try apply(std.testing.allocator, &zone, "example.com.", &.{}, &bad)));
+    var off = [_]dns_record.ResourceRecord{makeRecord("sub.example.com.", .ZONEMD, CLASS_IN, 3600, .{ .ZONEMD = .{ .serial = 7, .scheme = 1, .hash = 1 } })};
+    try std.testing.expectEqual(header.Rcode.refused, zoneRcode(try apply(std.testing.allocator, &zone, "example.com.", &.{}, &off)));
+    const after = try renderZoneText(std.testing.allocator, "example.com.", zone.records.items);
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualStrings(before, after);
 }
 
 test "a duplicate add replaces the record's TTL" {
@@ -702,6 +746,71 @@ test "RFC 2136 section 3.4.1.2: a meta type cannot be added by an update" {
         const outcome = try apply(std.testing.allocator, &zone, "example.com.", &.{}, &updates);
         try std.testing.expectEqual(header.Rcode.formerr, zoneRcode(outcome));
     }
+}
+
+test "an update cannot add a signer-owned type to a signed zone" {
+    // The served zone carries the signer's generated tail: any class-IN add
+    // of a signer-owned type is refused in the prescan, before anything is
+    // persisted, so the file never carries one and the next load never trips
+    // the signer's AlreadySigned refusal.
+    var zone = try buildZone(test_zone_text);
+    defer zone.deinit();
+    var tail = [_]parser.ZoneRecord{.{
+        .owner = "example.com.",
+        .ttl = 3600,
+        .rrtype = .RRSIG,
+        .rdata = "bogus",
+    }};
+    var served = try std.testing.allocator.alloc(parser.ZoneRecord, zone.records.len + tail.len);
+    defer std.testing.allocator.free(served);
+    @memcpy(served[0..zone.records.len], zone.records.items[0..zone.records.len]);
+    @memcpy(served[zone.records.len..], tail[0..]);
+    zone.records.items = served;
+    zone.records.len = served.len;
+    zone.generated = served[served.len - tail.len ..];
+    const types = [_]RecordType{ .DNSKEY, .RRSIG, .NSEC, .NSEC3, .NSEC3PARAM };
+    for (types) |rrtype| {
+        const update = makeRecord("example.com.", rrtype, CLASS_IN, 3600, emptyRdata());
+        var updates = [_]dns_record.ResourceRecord{update};
+        const outcome = try apply(std.testing.allocator, &zone, "example.com.", &.{}, &updates);
+        try std.testing.expectEqual(header.Rcode.refused, zoneRcode(outcome));
+    }
+    // A delegation DS is not generated, so adding one is still accepted.
+    const ds = makeRecord("child.example.com.", .DS, CLASS_IN, 3600, emptyRdata());
+    var ds_updates = [_]dns_record.ResourceRecord{ds};
+    const ds_outcome = try apply(std.testing.allocator, &zone, "example.com.", &.{}, &ds_updates);
+    std.testing.allocator.free(zoneText(ds_outcome));
+    zone.generated = &.{};
+}
+
+test "prerequisites still see the generated RRsets of a signed zone" {
+    var zone = try buildZone(test_zone_text);
+    defer zone.deinit();
+    var tail = [_]parser.ZoneRecord{.{
+        .owner = "example.com.",
+        .ttl = 3600,
+        .rrtype = .DNSKEY,
+        .rdata = "256 3 15 AQID",
+    }};
+    var served = try std.testing.allocator.alloc(parser.ZoneRecord, zone.records.len + tail.len);
+    defer std.testing.allocator.free(served);
+    @memcpy(served[0..zone.records.len], zone.records.items[0..zone.records.len]);
+    @memcpy(served[zone.records.len..], tail[0..]);
+    zone.records.items = served;
+    zone.records.len = served.len;
+    zone.generated = served[served.len - tail.len ..];
+    // A prerequisite for the generated DNSKEY RRset must match: the §3.2
+    // check runs against the served data, not just the loaded records.
+    const exists = makeRecord("example.com.", .DNSKEY, CLASS_ANY, 0, emptyRdata());
+    var prerequisites = [_]dns_record.ResourceRecord{exists};
+    const matched = try apply(std.testing.allocator, &zone, "example.com.", &prerequisites, &.{});
+    std.testing.allocator.free(zoneText(matched));
+    // And a value-dependent prerequisite on it is honored too.
+    const missing = makeRecord("example.com.", .RRSIG, CLASS_ANY, 0, emptyRdata());
+    var missing_prerequisites = [_]dns_record.ResourceRecord{missing};
+    const refused = try apply(std.testing.allocator, &zone, "example.com.", &missing_prerequisites, &.{});
+    try std.testing.expectEqual(header.Rcode.nxrrset, zoneRcode(refused));
+    zone.generated = &.{};
 }
 
 test "prerequisites refuse with the RFC rcode" {

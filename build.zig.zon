@@ -1,6 +1,6 @@
 .{
     .name = .zimdns,
-    .version = "0.0.0",
+    .version = "0.1.0",
     .fingerprint = 0x3bb9b0b5ba8c89dd,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{},
@@ -9,6 +9,8 @@
         "build.zig",
         "build.zig.zon",
         "src",
+        "LICENSE",
+        "third_party",
         "docs",
         "examples",
         "test",

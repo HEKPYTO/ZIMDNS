@@ -54,6 +54,14 @@ pub const UDP_TIMEOUT: std.Io.Timeout = .{ .duration = .{
     .raw = .fromMilliseconds(1000),
     .clock = .awake,
 } };
+/// Absolute wall-clock budget for one client resolution (RFC 1035 §7: the
+/// resolver gives up rather than retrying forever). An upstream that sends
+/// junk re-arms the 1 s per-receive timeout, so the total caps the whole wait.
+/// policy: global recursion mutex serializes concurrent resolutions; split it if throughput matters.
+pub const RESOLUTION_TIMEOUT: std.Io.Timeout = .{ .duration = .{
+    .raw = .fromSeconds(8),
+    .clock = .awake,
+} };
 /// One-second upstream TCP connection and I/O budget.
 pub const TCP_TIMEOUT: std.Io.Timeout = UDP_TIMEOUT;
 pub const MAX_UPSTREAM_MESSAGE = std.math.maxInt(u16);
@@ -1420,6 +1428,9 @@ pub const Resolver = struct {
     // One forward at a time keeps the cache and the aggressive cache under a
     // single lock; split them if concurrent forwarding throughput matters.
     mutex: std.Io.Mutex = .init,
+    /// Absolute wall-clock end of the resolution in flight, set by `answer`
+    /// and read by every upstream wait. Zero means no resolution is running.
+    deadline_ns: i128 = 0,
     /// True when a managed-state write failed or the state moved after the
     /// last successful write; the next tick retries before doing any work.
     managed_state_dirty: bool = false,
@@ -1842,7 +1853,23 @@ pub const Resolver = struct {
     pub fn answer(self: *Resolver, query_bytes: []const u8, query: dns_message.Message, client: *const std.Io.net.IpAddress, output: []u8) ![]const u8 {
         self.lock();
         defer self.unlock();
+        self.deadline_ns = @as(i128, std.Io.Clock.awake.now(self.io).nanoseconds) + RESOLUTION_TIMEOUT.duration.raw.toNanoseconds();
+        defer self.deadline_ns = 0;
         return self.answerAtDepth(query_bytes, query, client, output, 0);
+    }
+
+    /// Time left on the resolution budget, or null when it ran out. Every
+    /// upstream receive is cut to what remains, so junk packets that re-arm
+    /// the per-receive timeout cannot stretch the wait past the total.
+    fn remainingTimeout(self: *const Resolver) ?std.Io.Timeout {
+        if (self.deadline_ns == 0) return UDP_TIMEOUT;
+        const left = self.deadline_ns - @as(i128, std.Io.Clock.awake.now(self.io).nanoseconds);
+        if (left <= 0) return null;
+        const ms: i64 = @intCast(@divTrunc(left + std.time.ns_per_ms - 1, std.time.ns_per_ms));
+        // Never longer than one per-receive wait: the budget only shortens
+        // the tail, it never stretches a single wait past UDP_TIMEOUT.
+        const capped = @min(ms, @as(i64, 1000));
+        return .{ .duration = .{ .raw = .fromMilliseconds(@intCast(capped)), .clock = .awake } };
     }
 
     /// The forward path at a given depth. RFC 9567 section 6.1: a report is
@@ -2872,7 +2899,7 @@ pub const Resolver = struct {
         try self.ensureTlsClient();
         var stream = try self.dialTcp(upstream);
         defer stream.close(self.io);
-        setTcpIoTimeout(stream);
+        if (!setBudgetedTcpIoTimeout(self, stream)) return Error.UpstreamFailure;
         // RFC 9462 section 6.3: a DDR-designated endpoint verifies the
         // iPAddress SAN without an IP-literal or `resolver.arpa` SNI.
         const sni = if (self.policy.forwarder_no_sni) "" else host;
@@ -2913,7 +2940,7 @@ pub const Resolver = struct {
         try self.ensureDohClient();
         var stream = try self.dialTcp(upstream);
         defer stream.close(self.io);
-        setTcpIoTimeout(stream);
+        if (!setBudgetedTcpIoTimeout(self, stream)) return Error.UpstreamFailure;
         // RFC 9462 section 6.3: a DDR-designated endpoint verifies the
         // iPAddress SAN without an IP-literal or `resolver.arpa` SNI.
         const sni = if (self.policy.forwarder_no_sni) "" else host;
@@ -2978,7 +3005,8 @@ pub const Resolver = struct {
             // instead of failing the hop.
             var retried_bad_cookie = false;
             while (true) {
-                const incoming = socket.receiveTimeout(self.io, &response_buffer, UDP_TIMEOUT) catch break;
+                const wait = self.remainingTimeout() orelse break;
+                const incoming = socket.receiveTimeout(self.io, &response_buffer, wait) catch break;
                 if (!incoming.from.eql(&upstream)) continue;
                 switch (classifyUpstreamPacket(self.allocator, query, expected_id, incoming.data, scope, self.client_cookie)) {
                     .ignore => continue,
@@ -3263,7 +3291,8 @@ pub const Resolver = struct {
         var response_buffer: [DDR_MAX_RESPONSE_LEN]u8 = undefined;
         var truncated = false;
         while (true) {
-            const incoming = socket.receiveTimeout(self.io, &response_buffer, UDP_TIMEOUT) catch break;
+            const wait = self.remainingTimeout() orelse break;
+            const incoming = socket.receiveTimeout(self.io, &response_buffer, wait) catch break;
             if (!incoming.from.eql(&upstream)) continue;
             switch (classifyUpstreamPacket(self.allocator, request, expected_id, incoming.data, null, cookie[0..8].*)) {
                 .ignore => continue,
@@ -3282,7 +3311,8 @@ pub const Resolver = struct {
     fn discoveryTcp(self: *Resolver, upstream: std.Io.net.IpAddress, query_bytes: []const u8, query: dns_message.Message, expected_id: u16) !dns_message.Message {
         var stream = try self.dialTcp(upstream);
         defer stream.close(self.io);
-        const frame_deadline = tcp_deadline.deadlineFromTimeout(self.io, TCP_TIMEOUT) orelse return Error.UpstreamFailure;
+        const wait = self.remainingTimeout() orelse return Error.UpstreamFailure;
+        const frame_deadline = tcp_deadline.deadlineFromTimeout(self.io, wait) orelse return Error.UpstreamFailure;
         setTcpIoTimeout(stream);
 
         var prefix: [2]u8 = undefined;
@@ -3330,7 +3360,7 @@ pub const Resolver = struct {
             try self.ensureDohClient();
             var stream = try self.dialTcp(target);
             defer stream.close(self.io);
-            setTcpIoTimeout(stream);
+            if (!setBudgetedTcpIoTimeout(self, stream)) return Error.UpstreamFailure;
             var response_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
             const body = self.doh_client_state.postWithVerification(stream, ip_text, "", designation.doh_path[0..designation.doh_path_len], request_bytes, &response_buffer) catch |err| switch (err) {
                 doh_client.Error.BadStatus,
@@ -3357,7 +3387,7 @@ pub const Resolver = struct {
         try self.ensureTlsClient();
         var stream = try self.dialTcp(target);
         defer stream.close(self.io);
-        setTcpIoTimeout(stream);
+        if (!setBudgetedTcpIoTimeout(self, stream)) return Error.UpstreamFailure;
         var response_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
         const response_bytes = self.tls_client_state.exchangeWithVerification(stream, ip_text, "", request_bytes, &response_buffer) catch |err| switch (err) {
             tls_client.Error.FrameTooLarge, tls_client.Error.HandshakeFailed => return Error.UpstreamFailure,
@@ -3694,18 +3724,32 @@ pub const Resolver = struct {
 
     /// One TCP connection to an upstream, honoring the RFC 5452 section 9.2
     /// source-port denylist on the platforms whose connector cannot.
+    /// Connect timeout cut to the resolution budget: null when exhausted.
+    fn dialTimeout(self: *const Resolver) ?std.Io.Timeout {
+        const wait = self.remainingTimeout() orelse return null;
+        const left: i128 = switch (wait) {
+            .none => 1000 * std.time.ns_per_ms,
+            .duration => |d| d.raw.toNanoseconds(),
+            .deadline => |d| d.durationFromNow(self.io).raw.toNanoseconds(),
+        };
+        if (left <= 0) return null;
+        const ms: i64 = @intCast(@divTrunc(left + std.time.ns_per_ms - 1, std.time.ns_per_ms));
+        return .{ .duration = .{ .raw = .fromMilliseconds(@intCast(@min(ms, @as(i64, 1000)))), .clock = .awake } };
+    }
+
     fn dialTcp(self: *Resolver, upstream: std.Io.net.IpAddress) !std.Io.net.Stream {
+        const timeout = self.dialTimeout() orelse return Error.UpstreamFailure;
         const stream = if (comptime UPSTREAM_TCP_DEADLINES_SUPPORTED)
             connectTcpWithTimeoutAvoiding(self.io, &upstream, .{
                 .mode = .stream,
                 .protocol = .tcp,
-                .timeout = TCP_TIMEOUT,
+                .timeout = timeout,
             }, self.policy.deny_ports[0..self.policy.deny_ports_len]) catch return Error.UpstreamFailure
         else
             std.Io.net.IpAddress.connect(&upstream, self.io, .{
                 .mode = .stream,
                 .protocol = .tcp,
-                .timeout = TCP_TIMEOUT,
+                .timeout = timeout,
             }) catch return Error.UpstreamFailure;
         if (comptime !UPSTREAM_TCP_DEADLINES_SUPPORTED) {
             // The plain connector binds its own source port, so a denied
@@ -3723,7 +3767,8 @@ pub const Resolver = struct {
         // forwarder; the caller resolved it.
         var stream = try self.dialTcp(upstream);
         defer stream.close(self.io);
-        const frame_deadline = tcp_deadline.deadlineFromTimeout(self.io, TCP_TIMEOUT) orelse return Error.UpstreamFailure;
+        const wait = self.remainingTimeout() orelse return Error.UpstreamFailure;
+        const frame_deadline = tcp_deadline.deadlineFromTimeout(self.io, wait) orelse return Error.UpstreamFailure;
         setTcpIoTimeout(stream);
 
         var prefix: [2]u8 = undefined;
@@ -4664,6 +4709,23 @@ fn setTcpIoTimeout(stream: std.Io.net.Stream) void {
     if (comptime UPSTREAM_TCP_DEADLINES_SUPPORTED) {
         tcp_deadline.setSocketTimeout(stream.socket.handle, .{ .seconds = 1 });
     }
+}
+
+/// Socket timeout for the TLS/DoH/DDR exchanges: cut to the resolution
+/// budget so an exhausted budget fails instead of blocking on the socket.
+fn setBudgetedTcpIoTimeout(self: *const Resolver, stream: std.Io.net.Stream) bool {
+    if (comptime !UPSTREAM_TCP_DEADLINES_SUPPORTED) return true;
+    const wait = self.remainingTimeout() orelse return false;
+    const left: i128 = switch (wait) {
+        .none => 1000 * std.time.ns_per_ms,
+        .duration => |d| d.raw.toNanoseconds(),
+        .deadline => |d| d.durationFromNow(self.io).raw.toNanoseconds(),
+    };
+    if (left <= 0) return false;
+    const ms: i64 = @intCast(@divTrunc(left + std.time.ns_per_ms - 1, std.time.ns_per_ms));
+    const secs: u32 = @intCast(@max(1, @divTrunc(@min(ms, @as(i64, 1000)) + 999, 1000)));
+    tcp_deadline.setSocketTimeout(stream.socket.handle, .{ .seconds = secs });
+    return true;
 }
 
 fn cloneMessage(allocator: std.mem.Allocator, source: dns_message.Message) !dns_message.Message {
@@ -8804,7 +8866,7 @@ test "RFC 2308 section 5: a denial without an SOA is not cached" {
         now,
         3600,
         null,
-        .{},
+        .{ .rrsig = try makeTestRrsigRecord("example.", "example.", 3600) },
     );
     resolver.dnssec_aggressive.insertNsec(
         try dns_name.Name.fromText("mail.example."),
@@ -8813,7 +8875,7 @@ test "RFC 2308 section 5: a denial without an SOA is not cached" {
         now,
         3600,
         null,
-        .{},
+        .{ .rrsig = try makeTestRrsigRecord("mail.example.", "example.", 3600) },
     );
 
     var client = try std.Io.net.IpAddress.parse("127.0.0.1", 42625);
@@ -8862,7 +8924,7 @@ test "aggressive NSEC answers SERVFAIL with bogus EDE on malformed bitmap" {
         &[_]u8{ 0x00, 0x01, 0x40 },
         now,
         3600,
-        null,
+        try makeTestSoa(3600, 3600),
         .{},
     );
     try std.testing.expectError(
@@ -11361,6 +11423,74 @@ fn serveFailingUpstream(args: *FailingUpstream) void {
         const bytes = buildFailingUpstreamAnswer(&response_buffer, query, args.rcode) catch return;
         args.udp.send(args.io, &incoming.from, bytes) catch return;
     }
+}
+
+/// A hostile upstream that trickles junk at every query: a short datagram
+/// the classifier ignores, every ~200 ms, for ~12 s per request. Each junk
+/// arrival re-arms the 1 s per-receive wait, so without a total budget one
+/// attempt burns the whole 12 s trickle and both attempts take ~24 s; with
+/// the 8 s RESOLUTION_TIMEOUT the wait ends at the budget instead.
+const JunkUpstream = struct {
+    io: std.Io,
+    udp: *const std.Io.net.Socket,
+    requests: usize = 0,
+    junk_sent: usize = 0,
+};
+
+const junk_trickle_ms: u64 = 200;
+const junk_trickle_count: usize = 60; // 60 x 200 ms = ~12 s per request.
+
+fn serveJunkUpstream(args: *JunkUpstream) void {
+    var request_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
+    while (true) {
+        const incoming = args.udp.receiveTimeout(args.io, &request_buffer, FailingUpstreamTimeout) catch return;
+        args.requests += 1;
+        var sent: usize = 0;
+        while (sent < junk_trickle_count) : (sent += 1) {
+            args.udp.send(args.io, &incoming.from, &[_]u8{ 0x00, 0x01, 0x02 }) catch return;
+            args.junk_sent += 1;
+            std.Io.sleep(args.io, .fromMilliseconds(@intCast(junk_trickle_ms)), .awake) catch return;
+        }
+    }
+}
+
+test "an upstream that trickles junk ends at the total budget" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    var upstream = JunkUpstream{ .io = io, .udp = &upstream_socket };
+    const thread = try std.Thread.spawn(.{}, serveJunkUpstream, .{&upstream});
+    // Joined explicitly after the wait below so the counters are settled
+    // before they are read; the upstream loop exits on its own timeout.
+
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = upstream_socket.address },
+    });
+    defer resolver.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x29F0, "junk.example.", true);
+    defer query.deinit();
+    var query_bytes: [1024]u8 = undefined;
+    const encoded = try encodeTestMessage(query, &query_bytes);
+    var output: [2048]u8 = undefined;
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42799);
+
+    const start = std.Io.Clock.awake.now(io).nanoseconds;
+    const result = resolver.answer(encoded, query, &client, &output);
+    const elapsed_ms = @divTrunc(std.Io.Clock.awake.now(io).nanoseconds - start, std.time.ns_per_ms);
+    thread.join();
+    // The runtime layer above maps this to SERVFAIL; here the wait itself
+    // must end at the total budget. Unbudgeted, one 12 s trickle per attempt
+    // stretches the wait to ~24 s; budgeted, the 8 s RESOLUTION_TIMEOUT wins.
+    try std.testing.expectError(Error.UpstreamFailure, result);
+    try std.testing.expect(elapsed_ms >= 7500);
+    try std.testing.expect(elapsed_ms < 11000);
+    try std.testing.expect(upstream.requests >= 1);
+    try std.testing.expect(upstream.junk_sent > 1);
 }
 
 /// The fake upstream a validation-failure test forwards to. It answers every

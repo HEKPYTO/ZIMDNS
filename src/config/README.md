@@ -58,3 +58,10 @@ The configuration grammar and the loader that reads it.
   misleads the operator). Rotation is the operator's action: replace the key
   file and restart. RFC 9230 §5 recommends daily rotation, not a MUST, so
   there is no background rotation timer.
+
+## Connection limits
+
+- `tcp-max-connections-per-source <n>` caps simultaneous connections per
+  source address (default 8 when unset). `tcp-max-connection-duration` and
+  `tcp-idle-timeout` keep their existing meanings. The shared worker cap is
+  64 across TCP, DoT, DoH, and XFR.

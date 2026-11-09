@@ -513,7 +513,11 @@ pub const ServerContext = struct {
             for (self.config.zones.items[0..self.config.zones.len]) |zone| {
                 if (std.ascii.eqlIgnoreCase(zone.nameText(), apex)) zone_path = zone.fileText();
             }
-            runtime.setUpdatePolicy(std.Io.Dir.cwd(), apex, entry.keyText(), zone_path) catch {
+            // UPDATE persistence resolves against the config directory, not
+            // the process cwd: running the server from anywhere else must
+            // still write back to the configured zone file.
+            const base = self.config_dir orelse return error.BadConfiguration;
+            runtime.setUpdatePolicy(base, apex, entry.keyText(), zone_path) catch {
                 runtime.deinit();
                 return error.BadConfiguration;
             };
@@ -2135,6 +2139,112 @@ test "allow-update for a zone or key the server does not hold fails the load" {
     var bad_key = try ServerContext.load(dir.dir, io, "bad-key.gdns", std.testing.allocator);
     defer bad_key.deinit();
     try std.testing.expectError(error.BadConfiguration, bad_key.takeRuntime(io));
+}
+
+test "allow-update resolves its zone file against the config dir" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.writeFile(io, .{ .sub_path = "one.zone", .data = "$ORIGIN one.example.\n$TTL 3600\n@ IN SOA ns.one.example. hostmaster.one.example. 1 3600 900 1209600 3600\n@ IN NS ns.one.example.\n" });
+    try dir.dir.writeFile(io, .{
+        .sub_path = "tsig.keys",
+        .data = "key \"update-key.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };\n",
+    });
+    try dir.dir.writeFile(io, .{
+        .sub_path = "config.gdns",
+        .data = "zone one.example primary one.zone\ntsig-key-file tsig.keys\nallow-update one.example update-key.\n",
+    });
+    var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+    defer context.deinit();
+    var runtime = try context.takeRuntime(io);
+    defer runtime.deinit();
+    // The policy holds the config-dir handle, not the process cwd: writing
+    // through it lands in the config dir even when the cwd is elsewhere.
+    try std.testing.expectEqual(@as(usize, 1), runtime.update_policies.items.len);
+    var elsewhere = std.testing.tmpDir(.{});
+    defer elsewhere.cleanup();
+    var change = try elsewhere.dir.createFile(io, "one.zone", .{ .truncate = true });
+    change.close(io);
+    try runtime.update_policies.items[0].dir.writeFile(io, .{ .sub_path = runtime.update_policies.items[0].path, .data = "probe" });
+    const back = try dir.dir.readFileAlloc(io, "one.zone", std.testing.allocator, .limited(64));
+    defer std.testing.allocator.free(back);
+    try std.testing.expectEqualStrings("probe", back);
+}
+
+test "a signed update survives a restart through the config dir" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    // A signed zone with a user-authored delegation DS, loaded the way the
+    // server loads it: signed at startup and served with a generated chain.
+    try dir.dir.writeFile(io, .{ .sub_path = "example.zone", .data = "$ORIGIN example.\n$TTL 3600\n@ IN SOA ns.example. hostmaster.example. 10 3600 900 1209600 3600\n@ IN NS ns.example.\nwww IN A 192.0.2.1\nchild IN NS ns.child.example.\nchild IN DS 12345 15 2 abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789\n" });
+    try dir.dir.writeFile(io, .{ .sub_path = "tsig.keys", .data = "key \"update-key.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };\n" });
+    try dir.dir.writeFile(io, .{ .sub_path = "zsk.key", .data = dnssec_test_key });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone example. primary example.zone\ntsig-key-file tsig.keys\ndnssec-key-file zsk.key\nallow-update example. update-key.\n" });
+    var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+    defer context.deinit();
+    var runtime = try context.takeRuntime(io);
+    defer runtime.deinit();
+    runtime.setTsigNow(1_700_000_000);
+    try std.testing.expect(runtime.zones.items[0].generated.len != 0);
+    // Apply a real signed UPDATE through the answer path: the served zone
+    // moves, the serial rises, and the file is rewritten before the reply.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const dns_writer = @import("../dns/writer.zig");
+    const dns_rdata = @import("../dns/rdata.zig");
+    var request = dns_message.Message{
+        .allocator = arena.allocator(),
+        .header = .{ .id = 0x7777, .opcode = .update, .question_count = 1, .authority_count = 1, .additional_count = 1 },
+        .question = .{ .name = try dns_name.Name.fromText("example."), .qtype = .SOA, .qclass = .IN },
+        .answers = try dns_message.RecordSection.init(arena.allocator(), 0),
+        .authorities = try dns_message.RecordSection.init(arena.allocator(), 1),
+        .additionals = try dns_message.RecordSection.init(arena.allocator(), 1),
+    };
+    try request.authorities.append(.{
+        .owner = try dns_name.Name.fromText("new.example."),
+        .rrtype = .A,
+        .class = .IN,
+        .ttl = 60,
+        .rdata = .{ .A = .{ 192, 0, 2, 9 } },
+    });
+    var zeros: [64]u8 = @splat(0);
+    try request.additionals.append(.{
+        .owner = try dns_name.Name.fromText("update-key."),
+        .rrtype = .TSIG,
+        .class = .ANY,
+        .ttl = 0,
+        .rdata = .{ .TSIG = try dns_rdata.Tsig.init(try dns_name.Name.fromText("hmac-sha256."), 1_700_000_000, 300, zeros[0..32], 0x7777, 0, &.{}) },
+    });
+    var request_buffer: [1024]u8 = undefined;
+    var writer = dns_writer.Writer.init(&request_buffer);
+    try request.encode(&writer);
+    const final = (try tsig.parseFinalAdditional(writer.written())).?;
+    const signed = try tsig.sign(writer.written(), "01234567890123456789012345678901", final.owner, final.tsig, null);
+    try tsig.patchMac(request_buffer[0..writer.len()], final, signed.slice());
+    var output: [4096]u8 = undefined;
+    const response_bytes = try runtime.answer(writer.written(), &output);
+    const response = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@as(@TypeOf(response.header.rcode), .no_error), response.header.rcode);
+    try std.testing.expectEqual(@as(?u32, 11), runtime.zones.items[0].soaSerial());
+    // The file keeps the unsigned data with the delegation DS and no
+    // generated records.
+    const persisted = try dir.dir.readFileAlloc(io, "example.zone", std.testing.allocator, .limited(1 << 20));
+    defer std.testing.allocator.free(persisted);
+    try std.testing.expect(std.mem.indexOf(u8, persisted, "new.example.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, persisted, " DS ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, persisted, "RRSIG") == null);
+    try std.testing.expect(std.mem.indexOf(u8, persisted, "DNSKEY") == null);
+    runtime.deinit();
+    context.deinit();
+    // A fresh load signs the persisted text again at the new serial: the
+    // chain is back, the update survived, and the delegation DS with it.
+    var reloaded_context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+    defer reloaded_context.deinit();
+    var reloaded = try reloaded_context.takeRuntime(io);
+    defer reloaded.deinit();
+    try std.testing.expect(reloaded.zones.items[0].generated.len != 0);
+    try std.testing.expectEqual(@as(?u32, 11), reloaded.zones.items[0].soaSerial());
 }
 
 test "server context loads the configured TSIG key file during startup" {

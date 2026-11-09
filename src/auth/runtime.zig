@@ -214,6 +214,42 @@ pub const SecondaryState = struct {
 
 pub const SecondaryFetch = *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, zone_name: []const u8) anyerror!?[]const u8;
 
+/// Coordinates several serve loops sharing one runtime. The first loop
+/// that fails records its error, marks the stop, and shuts down every
+/// registered listener so a loop blocked in accept wakes and exits; the
+/// owner joins all loop threads exactly once and returns the recorded
+/// error. Loops that only wait on timeouts (UDP, QUIC core) observe the
+/// flag at their next boundary instead.
+/// Coordinates several serve loops sharing one runtime. Loops that only
+/// wait on timeouts (UDP, QUIC core) observe the stop flag cooperatively
+/// and return normally. A loop that fails after startup is fail-fast: it
+/// prints its error and ends the process with a nonzero status, so a
+/// supervisor restarts it instead of leaving a sibling to serve half the
+/// transports. No thread ever wakes or joins another loop, and no listener
+/// fd is ever touched from a thread that does not own it.
+pub const SharedStop = struct {
+    stopped: std.atomic.Value(bool) = .init(false),
+
+    pub fn shouldStop(self: *const SharedStop) bool {
+        return self.stopped.load(.acquire);
+    }
+
+    pub fn requestStop(self: *SharedStop) void {
+        self.stopped.store(true, .release);
+    }
+
+    /// Fail-fast: records the error on stderr and ends the process. Never
+    /// returns. Tests never call this; they assert on the runner's `err`.
+    pub fn failFast(self: *SharedStop, io: std.Io, err: anyerror, loop_name: []const u8) noreturn {
+        self.requestStop();
+        var buffer: [256]u8 = undefined;
+        var writer = std.Io.File.stderr().writer(io, &buffer);
+        writer.interface.print("error: {s} loop failed: {t}\n", .{ loop_name, err }) catch {};
+        writer.interface.flush() catch {};
+        std.process.exit(1);
+    }
+};
+
 pub const Runtime = struct {
     allocator: std.mem.Allocator = std.heap.page_allocator,
     zones: std.ArrayList(zone_index.Zone) = .empty,
@@ -283,6 +319,16 @@ pub const Runtime = struct {
     reload_requested: std.atomic.Value(bool) = .init(false),
     // ceiling: global runtime lock serializes all zone reads; use per-zone or read/write locks if contention matters.
     mutex: std.Io.RwLock = .init,
+    /// Set by the multi-loop owner; every loop observes it and every
+    /// maintenance tick funnels through tryMaintenanceTick. Null in tests
+    /// and one-shot runs, which never stop early.
+    shared_stop: ?*const SharedStop = null,
+    /// Serializes periodic maintenance (secondary refresh, managed anchors,
+    /// catalog/reload checks) when several serve loops share one runtime.
+    /// Loops hold it only around the maintenance tick, never around serving.
+    /// Secondary-lifecycle slice: this is a stopgap; a dedicated refresh
+    /// scheduler should own these ticks instead of piggybacking serve loops.
+    maintenance_mutex: std.Io.Mutex = .init,
     /// The io the read-write lock waits on. A runtime built without one falls
     /// back to the single-threaded instance, whose futex wait is a no-op, so
     /// only uncontended paths may run there: tests answer with readers only,
@@ -380,6 +426,42 @@ pub const Runtime = struct {
         self.lockExclusive();
         defer self.unlockExclusive();
         if (self.resolver) |*resolver| resolver.maybeRefreshManagedAnchors(now_ns);
+    }
+
+    /// Runs the maintenance tick only if no other loop is running it.
+    /// Returns true when the tick ran, false when another loop owned it.
+    /// All maintenance a serve loop performs (secondary refresh, managed
+    /// anchors, reload/catalog checks) funnels through here so concurrent
+    /// loops never run it twice. Secondary-lifecycle slice: replace with a
+    /// dedicated scheduler that owns these ticks.
+    /// True when another loop asked every loop to stop. Null stop means
+    /// run: one-shot runs and tests never stop early.
+    pub fn stopRequested(self: *const Runtime) bool {
+        const stop = self.shared_stop orelse return false;
+        return stop.shouldStop();
+    }
+
+    /// The one maintenance owner for every serve loop and answer worker:
+    /// secondary refresh, managed anchors, reload, and catalog checks run
+    /// here, only when no other loop is running them. Returns false when
+    /// another loop owns the tick. Secondary-lifecycle slice: replace with
+    /// a dedicated scheduler that owns these ticks.
+    pub fn tryMaintenanceTick(self: *Runtime, io: std.Io) bool {
+        if (!self.maintenance_mutex.tryLock()) return false;
+        defer self.maintenance_mutex.unlock(io);
+        const tick_ns: u64 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
+        _ = self.maybeRefreshSecondaries(tick_ns, fetchSecondaryViaXfr, self) catch {};
+        self.maybeRefreshManagedAnchors(@intCast(std.Io.Clock.real.now(io).nanoseconds));
+        _ = self.reloadZoneIfRequested(io);
+        _ = self.refreshCatalogIfRequested(io);
+        return true;
+    }
+
+    /// Stops the loop with a typed error when another loop asked for it.
+    /// Loops call this at each receive/accept boundary so a failing sibling
+    /// ends every loop; the runner that failed already recorded its error.
+    pub fn checkStop(self: *const Runtime) !void {
+        if (self.stopRequested()) return error.ServerStopping;
     }
 
     pub fn maybeRefreshSecondaries(self: *Runtime, now_ns: u64, fetch: SecondaryFetch, fetch_ctx: *anyopaque) !void {
@@ -1684,9 +1766,11 @@ pub const Runtime = struct {
     /// first, then the operator's policy and the request's TSIG, then the
     /// prerequisite and update sections are applied, the new zone text is
     /// persisted to the zone file, and only then does the served zone swap.
-    /// A zone with no local policy that this server serves as a secondary is
-    /// forwarded to its primary instead (RFC 2136 section 3.1.1): the primary
-    /// owns the write, so nothing is applied here and no serial moves.
+    /// A zone this server serves as a secondary is relayed to its primary
+    /// (RFC 2136 section 3.1.1) only when the operator named that secondary
+    /// in `allow-update` and the request carries that key's TSIG; otherwise
+    /// it is REFUSED with no outbound connect. The primary owns the relayed
+    /// write, so nothing is applied here and no serial moves.
     fn answerUpdate(
         self: *Runtime,
         allocator: std.mem.Allocator,
@@ -1704,14 +1788,51 @@ pub const Runtime = struct {
         }
         var apex_buffer: [512]u8 = undefined;
         const apex = q.name.toText(&apex_buffer) catch return self.encodeUpdateReply(query, incoming.auth, .formerr, output);
-        if (self.updatePolicyFor(apex) == null) {
-            if (self.secondaryFor(apex)) |secondary| {
-                const primary = secondary.primary;
-                return self.forwardUpdateToPrimary(&primary, query_bytes, incoming, output);
-            }
-            return self.encodeUpdateReply(query, incoming.auth, .notimp, output);
+        // A secondary never applies an UPDATE itself: it relays to its
+        // primary when the relay policy allows, and refuses otherwise. The
+        // secondary check comes first, so a secondary that also carries a
+        // policy for the apex still relays instead of applying locally.
+        if (self.secondaryFor(apex)) |secondary| {
+            return self.forwardSecondaryUpdate(apex, &secondary.primary, query_bytes, incoming, output);
         }
-        const policy = self.updatePolicyFor(apex).?;
+        if (self.updatePolicyFor(apex)) |policy| {
+            return self.applyPrimaryUpdate(allocator, output, incoming, policy, apex);
+        }
+        return self.encodeUpdateReply(query, incoming.auth, .notimp, output);
+    }
+    /// A secondary never applies an UPDATE itself: it relays the wire message
+    /// to the primary only when the operator named that secondary in
+    /// `allow-update` and the request carries that key's TSIG. Anything else
+    /// is REFUSED before any outbound connect, so an unauthenticated client
+    /// cannot make this server open a connection to the primary.
+    fn forwardSecondaryUpdate(
+        self: *Runtime,
+        apex: []const u8,
+        primary: *const std.Io.net.IpAddress,
+        query_bytes: []const u8,
+        incoming: Incoming,
+        output: []u8,
+    ) ![]const u8 {
+        const policy = self.updatePolicyFor(apex) orelse return self.encodeUpdateReply(incoming.query, incoming.auth, .refused, output);
+        const auth = incoming.auth orelse return self.encodeUpdateReply(incoming.query, incoming.auth, .refused, output);
+        var key_buffer: [512]u8 = undefined;
+        const key_name = auth.key.name.toText(&key_buffer) catch return self.encodeUpdateReply(incoming.query, incoming.auth, .refused, output);
+        if (!std.ascii.eqlIgnoreCase(key_name, policy.key_name)) {
+            return self.encodeUpdateReply(incoming.query, incoming.auth, .refused, output);
+        }
+        return self.forwardUpdateToPrimary(primary, query_bytes, incoming, output);
+    }
+    /// The primary applies the UPDATE itself; the caller already selected the
+    /// policy for this apex above.
+    fn applyPrimaryUpdate(
+        self: *Runtime,
+        allocator: std.mem.Allocator,
+        output: []u8,
+        incoming: Incoming,
+        policy: *const UpdatePolicy,
+        apex: []const u8,
+    ) ![]const u8 {
+        const query = incoming.query;
         const auth = incoming.auth orelse return self.encodeUpdateReply(query, incoming.auth, .refused, output);
         var key_buffer: [512]u8 = undefined;
         const key_name = auth.key.name.toText(&key_buffer) catch return self.encodeUpdateReply(query, incoming.auth, .refused, output);
@@ -1721,7 +1842,6 @@ pub const Runtime = struct {
         if (self.zoneIndexForOrigin(apex) == null) {
             return self.encodeUpdateReply(query, incoming.auth, .notauth, output);
         }
-
         // The lock is exclusive from the first read of the zone to the swap:
         // one update at a time, and no answer sees a half-applied change.
         self.lockExclusive();
@@ -1739,8 +1859,13 @@ pub const Runtime = struct {
             .zone_text => |text| text,
         };
         defer allocator.free(text);
+        // `apply` works on the loaded records only, so the text is already
+        // unsigned: the file keeps what a reload can sign again, and the
+        // user-authored delegation DS stays.
         self.persistZoneText(self.io, policy, text) catch return self.encodeUpdateReply(query, incoming.auth, .servfail, output);
 
+        // The swap installs the same unsigned data: the signing pass below
+        // regenerates the chain from the loaded records.
         var zone_file = zone_parser.ZoneFile.parse(text) catch return self.encodeUpdateReply(query, incoming.auth, .servfail, output);
         var zone = zone_index.Zone.fromZoneFile(&zone_file) catch {
             zone_file.deinit();
@@ -1767,13 +1892,20 @@ pub const Runtime = struct {
     ) ![]const u8 {
         const query = incoming.query;
         if (query_bytes.len == 0 or query_bytes.len > 65535) return self.encodeUpdateReply(query, incoming.auth, .servfail, output);
-        // The relay is bounded, but ten seconds leaves room for a primary
-        // that is slow to schedule under a loaded host; the client's own
-        // retry decides what happens after it.
-        const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } };
-        var stream = std.Io.net.IpAddress.connect(primary, self.io, .{ .mode = .stream, .protocol = .tcp }) catch return self.encodeUpdateReply(query, incoming.auth, .servfail, output);
+        // The whole relay is capped at ten seconds from this instant: one
+        // absolute deadline bounds the connect and every I/O frame after it,
+        // so a slow handshake cannot stretch the exchange past the bound. No
+        // lock is held here, so other queries keep serving while one relay
+        // waits; the UDP receive loop itself still waits for the relay, which
+        // the availability work must bound further or offload.
+        const relay_timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } };
+        const deadline = tcp_deadline.deadlineFromTimeout(self.io, relay_timeout) orelse return self.encodeUpdateReply(query, incoming.auth, .servfail, output);
+        const remaining = deadline.durationFromNow(self.io).raw.nanoseconds;
+        if (remaining <= 0) return self.encodeUpdateReply(query, incoming.auth, .servfail, output);
+        const connect_ms: i64 = @intCast(@divTrunc(remaining + std.time.ns_per_ms - 1, std.time.ns_per_ms));
+        const connect_timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(connect_ms), .clock = .awake } };
+        var stream = resolver_mod.connectTcpWithTimeout(self.io, primary, .{ .mode = .stream, .protocol = .tcp, .timeout = connect_timeout }) catch return self.encodeUpdateReply(query, incoming.auth, .servfail, output);
         defer stream.close(self.io);
-        const deadline = tcp_deadline.deadlineFromTimeout(self.io, timeout) orelse return self.encodeUpdateReply(query, incoming.auth, .servfail, output);
         var prefix: [2]u8 = undefined;
         std.mem.writeInt(u16, &prefix, @intCast(query_bytes.len), .big);
         tcp_deadline.writeExact(stream.socket.handle, self.io, &prefix, deadline) catch return self.encodeUpdateReply(query, incoming.auth, .servfail, output);
@@ -4524,6 +4656,108 @@ test "authoritative runtime answers RFC 2136 UPDATE with NOTIMP" {
     try std.testing.expectEqual(@as(@TypeOf(zoneless_parsed.header.rcode), .notimp), zoneless_parsed.header.rcode);
     try std.testing.expectEqual(@as(u16, 0), zoneless_parsed.header.question_count);
 }
+test "a secondary refuses an unsigned update without contacting its primary" {
+    const now = 1_700_000_000;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var keyring = try keyring_mod.Keyring.parse("key \"key.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };");
+    var runtime = try Runtime.fromZoneTextWithKeyring(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
+        \\
+    , &keyring);
+    defer runtime.deinit();
+    runtime.setTsigNow(now);
+    // A primary that never answers: 192.0.2.1 is TEST-NET-1, and nothing
+    // listens there, so any outbound connect would hang or fail instead of
+    // answering REFUSED.
+    try runtime.secondary_zones.append(runtime.allocator, .{
+        .apex = try runtime.allocator.dupe(u8, "home.arpa."),
+        .primary = try std.Io.net.IpAddress.parse("192.0.2.1", 5353),
+    });
+    const updates = [_]dns_record_mod.ResourceRecord{.{
+        .owner = try dns_name_mod.Name.fromText("www.home.arpa."),
+        .rrtype = dns_types.RecordType.A,
+        .class = dns_types.Class.IN,
+        .ttl = 60,
+        .rdata = .{ .A = .{ 192, 168, 1, 9 } },
+    }};
+    var update_message = dns_message.Message{
+        .allocator = arena.allocator(),
+        .header = .{ .id = 0x7779, .opcode = .update, .question_count = 1, .authority_count = 1 },
+        .question = .{
+            .name = try dns_name_mod.Name.fromText("home.arpa."),
+            .qtype = dns_types.RecordType.SOA,
+            .qclass = dns_types.Class.IN,
+        },
+        .answers = try dns_message.RecordSection.init(arena.allocator(), 0),
+        .authorities = try dns_message.RecordSection.init(arena.allocator(), 1),
+        .additionals = try dns_message.RecordSection.init(arena.allocator(), 0),
+    };
+    defer update_message.deinit();
+    for (updates) |record| try update_message.authorities.append(record);
+    var request_buffer: [1024]u8 = undefined;
+    var writer = dns_writer.Writer.init(&request_buffer);
+    try update_message.encode(&writer);
+    // No `allow-update` for this secondary: REFUSED with no outbound connect.
+    var output: [1024]u8 = undefined;
+    const denied = try runtime.answer(writer.written(), &output);
+    const parsed = try dns_message.Message.parse(arena.allocator(), denied);
+    try std.testing.expectEqual(@as(@TypeOf(parsed.header.rcode), .refused), parsed.header.rcode);
+    // The served copy is unchanged: REFUSED applied nothing.
+    try std.testing.expectEqual(@as(u32, 1), runtime.zones.items[0].soaSerial().?);
+}
+
+test "a relay to a blackholed primary fails within the bound" {
+    const now = 1_700_000_000;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var keyring = try keyring_mod.Keyring.parse("key \"key.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };");
+    var runtime = try Runtime.fromZoneTextWithKeyring(
+        \\$ORIGIN home.arpa.
+        \\$TTL 3600
+        \\@ IN SOA ns1.home.arpa. hostmaster.home.arpa. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.home.arpa.
+        \\dns IN A 192.168.1.1
+        \\
+    , &keyring);
+    defer runtime.deinit();
+    runtime.setTsigNow(now);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try runtime.setUpdatePolicy(tmp.dir, "home.arpa.", "key.", "zone.db");
+    // 192.0.2.1 is TEST-NET-1: packets to it are dropped, so a blocking
+    // connect would hang. The relay must fail SERVFAIL within the bound.
+    try runtime.secondary_zones.append(runtime.allocator, .{
+        .apex = try runtime.allocator.dupe(u8, "home.arpa."),
+        .primary = try std.Io.net.IpAddress.parse("192.0.2.1", 5353),
+    });
+    var request_buffer: [1024]u8 = undefined;
+    const updates = [_]dns_record_mod.ResourceRecord{.{
+        .owner = try dns_name_mod.Name.fromText("www.home.arpa."),
+        .rrtype = dns_types.RecordType.A,
+        .class = dns_types.Class.IN,
+        .ttl = 60,
+        .rdata = .{ .A = .{ 192, 168, 1, 9 } },
+    }};
+    const request = try encodeSignedUpdateRequest(arena.allocator(), &request_buffer, "home.arpa.", &.{}, &updates, now, .{
+        .algorithm = "hmac-sha256.",
+        .secret = "01234567890123456789012345678901",
+    });
+    var output: [65535]u8 = undefined;
+    const started: i96 = std.Io.Clock.awake.now(runtime.io).nanoseconds;
+    const response_bytes = try runtime.answer(request, &output);
+    const elapsed = std.Io.Clock.awake.now(runtime.io).nanoseconds - started;
+    const blackhole_response = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@as(@TypeOf(blackhole_response.header.rcode), .servfail), blackhole_response.header.rcode);
+    // The relay is capped at ten seconds total, connect plus I/O: the
+    // blackhole proves the whole exchange stays inside the bound.
+    try std.testing.expect(elapsed < 12 * std.time.ns_per_s);
+}
+
 test "a secondary forwards a signed RFC 2136 update to its primary" {
     // The fixture runs a primary on its own thread. The two sides get
     // separate threaded Io backends so a blocked accept and a blocked client
@@ -4563,6 +4797,9 @@ test "a secondary forwards a signed RFC 2136 update to its primary" {
     defer secondary.deinit();
     secondary.io = io;
     secondary.setTsigNow(now);
+    var secondary_tmp = std.testing.tmpDir(.{});
+    defer secondary_tmp.cleanup();
+    try secondary.setUpdatePolicy(secondary_tmp.dir, "home.arpa.", "key.", "zone.db");
     try secondary.secondary_zones.append(secondary.allocator, .{
         .apex = try secondary.allocator.dupe(u8, "home.arpa."),
         .primary = try std.Io.net.IpAddress.parse("127.0.0.1", port),
@@ -4635,6 +4872,56 @@ test "a secondary forwards a signed RFC 2136 update to its primary" {
     var secondary_lookup = secondary.zones.items[0].lookup(std.testing.allocator, "www.home.arpa.", .A);
     defer secondary_lookup.deinit(std.testing.allocator);
     try std.testing.expect(secondary_lookup.kind != zone_index.LookupKind.answer);
+}
+
+test "a signed update persists unsigned data the next load can sign" {
+    const now = 1_700_000_000;
+    var keyring = try keyring_mod.Keyring.parse("key \"key.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };");
+    // A delegation DS is user-authored zone data, not a generated record: the
+    // update must keep it while dropping the signer's own DNSKEY/RRSIG/NSEC.
+    var runtime = try Runtime.fromZoneTextWithKeyring(dnssec_reload_zone_delegated, &keyring);
+    defer runtime.deinit();
+    var key = try zone_signer.parseKey(dnssec_reload_key);
+    defer key.deinit();
+    try zone_signer.signZone(runtime.allocator, &runtime.zones.items[0], &key, dnssec_reload_window);
+    runtime.dnssec_session = zone_signer.Session.start(&key, dnssec_reload_window);
+    runtime.setTsigNow(now);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try runtime.setUpdatePolicy(tmp.dir, "example.", "key.", "zone.db");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var request_buffer: [1024]u8 = undefined;
+    var updates = [_]dns_record_mod.ResourceRecord{.{
+        .owner = try dns_name_mod.Name.fromText("www.example."),
+        .rrtype = dns_types.RecordType.A,
+        .class = dns_types.Class.IN,
+        .ttl = 60,
+        .rdata = .{ .A = .{ 192, 0, 2, 9 } },
+    }};
+    const request = try encodeSignedUpdateRequest(arena.allocator(), &request_buffer, "example.", &.{}, &updates, now, .{
+        .algorithm = "hmac-sha256.",
+        .secret = "01234567890123456789012345678901",
+    });
+    var output: [1024]u8 = undefined;
+    const response_bytes = try runtime.answer(request, &output);
+    const parsed_response = try dns_message.Message.parse(arena.allocator(), response_bytes);
+    try std.testing.expectEqual(@as(@TypeOf(parsed_response.header.rcode), .no_error), parsed_response.header.rcode);
+    // The file keeps no generated records, so a fresh load signs it again.
+    const persisted = try tmp.dir.readFileAlloc(runtime.io, "zone.db", std.testing.allocator, .limited(1 << 20));
+    defer std.testing.allocator.free(persisted);
+    try std.testing.expect(std.mem.indexOf(u8, persisted, "www.example.") != null);
+    // The delegation DS is user data and stays; only the signer's records go.
+    try std.testing.expect(std.mem.indexOf(u8, persisted, "child.example.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, persisted, " DS ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, persisted, "RRSIG") == null);
+    try std.testing.expect(std.mem.indexOf(u8, persisted, "NSEC") == null);
+    try std.testing.expect(std.mem.indexOf(u8, persisted, "DNSKEY") == null);
+    var reloaded = try Runtime.fromZoneText(persisted);
+    defer reloaded.deinit();
+    var reload_key = try zone_signer.parseKey(dnssec_reload_key);
+    defer reload_key.deinit();
+    try zone_signer.signZone(reloaded.allocator, &reloaded.zones.items[0], &reload_key, dnssec_reload_window);
 }
 
 test "authoritative runtime applies configured Cookie validation" {
@@ -5904,6 +6191,20 @@ const dnssec_reload_zone =
     \\@ IN SOA ns.example. hostmaster.example. 10 3600 900 1209600 3600
     \\@ IN NS ns.example.
     \\www IN A 192.0.2.1
+    \\
+;
+
+/// The same zone with a user-authored delegation: the DS at the cut is zone
+/// data the parent vouches for, not a generated record, so an update must
+/// keep it while the signing pass regenerates its own chain around it.
+const dnssec_reload_zone_delegated =
+    \\$ORIGIN example.
+    \\$TTL 3600
+    \\@ IN SOA ns.example. hostmaster.example. 10 3600 900 1209600 3600
+    \\@ IN NS ns.example.
+    \\www IN A 192.0.2.1
+    \\child IN NS ns.child.example.
+    \\child IN DS 12345 15 2 abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789
     \\
 ;
 

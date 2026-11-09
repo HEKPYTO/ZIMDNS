@@ -19,11 +19,16 @@ RUN set -eux; \
     mkdir -p /opt/zig; \
     tar -xf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
 
+ARG VERSION=0.1.0
 WORKDIR /workspace
 COPY . .
-RUN /opt/zig/zig build -Doptimize=ReleaseSafe
+RUN /opt/zig/zig build -Doptimize=ReleaseSafe -Dversion="$VERSION"
 
 FROM alpine:3.22 AS runtime
+
+ARG VERSION=0.1.0
+ARG REVISION=unknown
+ARG SOURCE=unknown
 
 # OpenSSL is linked dynamically, so the runtime keeps libssl/libcrypto
 # beside the CA bundle the system-trust client paths verify against.
@@ -34,9 +39,18 @@ RUN apk add --no-cache ca-certificates gnutls libssl3 \
     && chown -R zimdns:zimdns /etc/zimdns /run/zimdns
 
 COPY --from=build /workspace/zig-out/bin/zimdns /usr/local/bin/zimdns
+COPY LICENSE /usr/share/doc/zimdns/AGPL-3.0-only.txt
+COPY third_party/ngtcp2/COPYING /usr/share/doc/zimdns/ngtcp2-COPYING
+COPY third_party/nghttp3/COPYING /usr/share/doc/zimdns/nghttp3-COPYING
 COPY examples/config.gdns /etc/zimdns/config.gdns
 COPY examples/blocklists /etc/zimdns/blocklists
 COPY examples/zones /etc/zimdns/zones
+
+LABEL org.opencontainers.image.title="zimdns" \
+    org.opencontainers.image.version="${VERSION:-0.1.0}" \
+    org.opencontainers.image.revision="${REVISION:-unknown}" \
+    org.opencontainers.image.source="${SOURCE:-unknown}" \
+    org.opencontainers.image.licenses="AGPL-3.0-only AND MIT"
 
 USER 10001:10001
 WORKDIR /
@@ -49,4 +63,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
 
 ENTRYPOINT ["/usr/local/bin/zimdns"]
 # Relative --config path: the loader confines all paths beneath the working directory and rejects absolute paths.
-CMD ["server", "run", "--config", "etc/zimdns/config.gdns", "--serve-udp"]
+CMD ["server", "run", "--config", "etc/zimdns/config.gdns", "--serve-udp", "--serve-tcp"]

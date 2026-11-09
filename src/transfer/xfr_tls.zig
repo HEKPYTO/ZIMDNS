@@ -122,8 +122,7 @@ fn serveXfrFrames(channel: *const channel_mod.Channel, client: std.Io.net.IpAddr
         // that waited for the request, the second one answers a request that
         // arrived while the flag was set, so the answer that follows a
         // reload always comes from the new zone.
-        _ = runtime.reloadZoneIfRequested(channel.io);
-        _ = runtime.refreshCatalogIfRequested(channel.io);
+        _ = runtime.tryMaintenanceTick(channel.io);
         // One deadline for the whole frame: a peer that stalls in the middle
         // of a frame loses the frame, not the server.
         if (!channel.applyFrameDeadline()) return;
@@ -137,8 +136,7 @@ fn serveXfrFrames(channel: *const channel_mod.Channel, client: std.Io.net.IpAddr
         };
         var frame_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer frame_arena.deinit();
-        _ = runtime.reloadZoneIfRequested(channel.io);
-        _ = runtime.refreshCatalogIfRequested(channel.io);
+        _ = runtime.tryMaintenanceTick(channel.io);
         // The answer gets its own deadline: the read took time, and the
         // connection may be nearly over.
         if (!channel.applyFrameDeadline()) return;
@@ -263,6 +261,9 @@ pub fn serveXfrLoop(
     var sources = listener.SourceCounter{};
     var accepted: usize = 0;
     while (max_requests == null or accepted < max_requests.?) {
+        // A failing sibling ends this loop: the listener shutdown wakes
+        // the blocked accept, and the flag ends it even when idle.
+        try runtime.checkStop();
         const stream = try listener.acceptWithRetry(listener_socket, io);
         accepted += 1;
         // The encrypted listener holds the same bounds as the cleartext one: a

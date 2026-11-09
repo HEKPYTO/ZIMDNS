@@ -37,6 +37,11 @@
 #endif /* defined(WIN32) */
 
 void nghttp3_unreachable_fail(const char *file, int line, const char *func) {
+  /* Local patch: silence -Wunused-parameter under -Werror when
+     NGHTTP3_UNREACHABLE_LOG is undefined; params are used when defined. */
+  (void)file;
+  (void)line;
+  (void)func;
 #ifdef NGHTTP3_UNREACHABLE_LOG
   char *buf;
   size_t buflen;

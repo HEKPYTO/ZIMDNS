@@ -318,10 +318,20 @@ pub fn serve(
 pub const Server = struct {
     /// Hard cap on live connections per listener. Enforced with a
     /// stateless close, never by dropping state.
-    pub const MAX_CONNECTIONS: usize = 128;
+    pub const MAX_CONNECTIONS: usize = 32;
     /// One client may open this many bidirectional streams per
     /// connection; matches the advertised transport parameters.
-    pub const MAX_STREAMS_PER_CONN: usize = 100;
+    pub const MAX_STREAMS_PER_CONN: usize = 16;
+    /// Advertised QUIC flow-control windows. The connection window bounds
+    /// every byte in flight on one connection; the per-stream window fits
+    /// a full 64 KiB DNS message with framing plus headroom.
+    pub const INITIAL_MAX_DATA: usize = 1024 * 1024;
+    pub const INITIAL_MAX_STREAM_DATA_BIDI: usize = 128 * 1024;
+    pub const INITIAL_MAX_STREAM_DATA_UNI: usize = 16 * 1024;
+    /// Worst-case state budget per QUIC port: connection structs (chunk
+    /// scratch plus the bounded pending queue) plus the connection flow
+    /// window plus every stream's handler state, for all connections.
+    pub const MAX_STATE_BYTES_PER_PORT: usize = 150 * 1024 * 1024;
     allocator: std.mem.Allocator,
     io: std.Io,
     fd: std.posix.fd_t,
@@ -623,10 +633,10 @@ pub const Server = struct {
 
         var params = std.mem.zeroes(abi.transport_params);
         abi.transport_params_default(abi.TRANSPORT_PARAMS_VERSION, &params);
-        params.initial_max_stream_data_bidi_local = 6 * 1024 * 1024;
-        params.initial_max_stream_data_bidi_remote = 6 * 1024 * 1024;
-        params.initial_max_stream_data_uni = 1024 * 1024;
-        params.initial_max_data = 16 * 1024 * 1024;
+        params.initial_max_stream_data_bidi_local = INITIAL_MAX_STREAM_DATA_BIDI;
+        params.initial_max_stream_data_bidi_remote = INITIAL_MAX_STREAM_DATA_BIDI;
+        params.initial_max_stream_data_uni = INITIAL_MAX_STREAM_DATA_UNI;
+        params.initial_max_data = INITIAL_MAX_DATA;
         params.initial_max_streams_bidi = MAX_STREAMS_PER_CONN;
         params.initial_max_streams_uni = MAX_STREAMS_PER_CONN;
         params.max_idle_timeout = self.idle_timeout;
@@ -1341,4 +1351,9 @@ test "pending queue answers and resets without growing" {
     try std.testing.expect(!queue.entries[0].reset);
     try std.testing.expectEqual(@as(usize, 2), queue.entries[0].response_len);
     try std.testing.expect(queue.entries[1].reset);
+}
+
+test "QUIC caps keep the advertised limits consistent" {
+    try std.testing.expectEqual(@as(usize, 32), Server.MAX_CONNECTIONS);
+    try std.testing.expectEqual(@as(usize, 16), Server.MAX_STREAMS_PER_CONN);
 }

@@ -244,7 +244,7 @@ fn buildNgtcp2(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     // No config.h is generated; the vendored headers gate their system
     // includes behind HAVE_* defines, so declare the two portable POSIX
     // byte-order headers directly (musl and glibc both ship them).
-    const flags: []const []const u8 = &.{ "-std=c11", "-DHAVE_ARPA_INET_H", "-DHAVE_NETINET_IN_H" };
+    const flags: []const []const u8 = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-DHAVE_ARPA_INET_H", "-DHAVE_NETINET_IN_H" };
     const roots: []const []const u8 = &.{
         "third_party/ngtcp2/lib",
         "third_party/nghttp3/lib",
@@ -271,7 +271,6 @@ fn buildNgtcp2(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
         "third_party/ngtcp2/crypto/gnutls/gnutls.c",
         "third_party/nghttp3/lib/sfparse/sfparse.c",
     }) |file| lib_root.addCSourceFile(.{ .file = b.path(file), .flags = flags });
-    lib_root.linkSystemLibrary("gnutls", .{});
     return b.addLibrary(.{ .name = "ngtcp2", .root_module = lib_root });
 }
 

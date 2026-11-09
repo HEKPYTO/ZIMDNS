@@ -48,6 +48,60 @@ pub const zone_signer = @import("zone/signer.zig");
 
 const ServerRunMode = enum { none, udp_once, tcp_once, udp_loop, tcp_loop, dot_loop, doh_loop, doq_loop, doh3_loop, xfr_loop };
 
+/// Which loops one `server run` serves. Every `--serve-*` flag adds a loop;
+/// all selected loops run at once in one process against the same runtime.
+const ServeSelection = struct {
+    once: ?ServerRunMode = null,
+    udp: bool = false,
+    tcp: bool = false,
+    dot: bool = false,
+    doh: bool = false,
+    doq: bool = false,
+    doh3: bool = false,
+    xfr: bool = false,
+
+    fn anyServe(self: ServeSelection) bool {
+        return self.udp or self.tcp or self.dot or self.doh or self.doq or self.doh3 or self.xfr;
+    }
+
+    fn anyEncrypted(self: ServeSelection) bool {
+        return self.dot or self.doh or self.doq or self.doh3 or self.xfr;
+    }
+
+    fn loopModes(self: ServeSelection, out: *[7]ServerRunMode) usize {
+        var count: usize = 0;
+        if (self.udp) {
+            out[count] = .udp_loop;
+            count += 1;
+        }
+        if (self.tcp) {
+            out[count] = .tcp_loop;
+            count += 1;
+        }
+        if (self.dot) {
+            out[count] = .dot_loop;
+            count += 1;
+        }
+        if (self.doh) {
+            out[count] = .doh_loop;
+            count += 1;
+        }
+        if (self.doq) {
+            out[count] = .doq_loop;
+            count += 1;
+        }
+        if (self.doh3) {
+            out[count] = .doh3_loop;
+            count += 1;
+        }
+        if (self.xfr) {
+            out[count] = .xfr_loop;
+            count += 1;
+        }
+        return count;
+    }
+};
+
 /// The runtime a SIGHUP asks to reload its zone. A signal handler cannot
 /// take user data, so the running server is a process-wide pointer.
 var reload_runtime: ?*auth_runtime.Runtime = null;
@@ -400,6 +454,111 @@ fn printHelpIfRequested(args: []const []const u8, writer: *std.Io.Writer) !bool 
     return false;
 }
 
+/// The parsed `server run` command line. Pure data: parsing never touches
+/// io or exits, so tests exercise the same path production dispatches from.
+const ServerArgs = struct {
+    config_file: ?[]const u8 = null,
+    zone_file: ?[]const u8 = null,
+    selection: ServeSelection = .{},
+    port_set: bool = false,
+    port: u16 = 1053,
+    max_queries: usize = 1,
+    max_requests: ?usize = null,
+    print_metrics: bool = false,
+    encrypted_dns_flag: bool = false,
+    tls_cert_file: ?[]const u8 = null,
+    tls_key_file: ?[]const u8 = null,
+
+    const Error = error{
+        MissingValue,
+        InvalidPort,
+        InvalidCount,
+        UnknownOption,
+        DuplicateOneShot,
+        OneShotWithServe,
+    };
+
+    fn parse(args: []const []const u8) Error!ServerArgs {
+        var parsed = ServerArgs{};
+        var index: usize = 0;
+        while (index < args.len) {
+            const arg = args[index];
+            if (std.mem.eql(u8, arg, "--config")) {
+                index += 1;
+                if (index >= args.len) return error.MissingValue;
+                parsed.config_file = args[index];
+            } else if (std.mem.eql(u8, arg, "--zone-file")) {
+                index += 1;
+                if (index >= args.len) return error.MissingValue;
+                parsed.zone_file = args[index];
+            } else if (std.mem.eql(u8, arg, "--once-udp")) {
+                if (parsed.selection.once != null) return error.DuplicateOneShot;
+                if (parsed.selection.anyServe()) return error.OneShotWithServe;
+                parsed.selection.once = .udp_once;
+                if (index + 1 < args.len and !std.mem.startsWith(u8, args[index + 1], "--")) {
+                    index += 1;
+                    parsed.port = std.fmt.parseInt(u16, args[index], 10) catch return error.InvalidPort;
+                    parsed.port_set = true;
+                }
+            } else if (std.mem.eql(u8, arg, "--once-tcp")) {
+                if (parsed.selection.once != null) return error.DuplicateOneShot;
+                if (parsed.selection.anyServe()) return error.OneShotWithServe;
+                parsed.selection.once = .tcp_once;
+                if (index + 1 < args.len and !std.mem.startsWith(u8, args[index + 1], "--")) {
+                    index += 1;
+                    parsed.port = std.fmt.parseInt(u16, args[index], 10) catch return error.InvalidPort;
+                    parsed.port_set = true;
+                }
+            } else if (std.mem.eql(u8, arg, "--serve-udp")) {
+                if (parsed.selection.once != null) return error.OneShotWithServe;
+                parsed.selection.udp = true;
+            } else if (std.mem.eql(u8, arg, "--serve-tcp")) {
+                if (parsed.selection.once != null) return error.OneShotWithServe;
+                parsed.selection.tcp = true;
+            } else if (std.mem.eql(u8, arg, "--serve-dot")) {
+                if (parsed.selection.once != null) return error.OneShotWithServe;
+                parsed.selection.dot = true;
+            } else if (std.mem.eql(u8, arg, "--serve-doh")) {
+                if (parsed.selection.once != null) return error.OneShotWithServe;
+                parsed.selection.doh = true;
+            } else if (std.mem.eql(u8, arg, "--serve-doq")) {
+                if (parsed.selection.once != null) return error.OneShotWithServe;
+                parsed.selection.doq = true;
+            } else if (std.mem.eql(u8, arg, "--serve-doh3")) {
+                if (parsed.selection.once != null) return error.OneShotWithServe;
+                parsed.selection.doh3 = true;
+            } else if (std.mem.eql(u8, arg, "--serve-xfr")) {
+                if (parsed.selection.once != null) return error.OneShotWithServe;
+                parsed.selection.xfr = true;
+            } else if (std.mem.eql(u8, arg, "--enable-encrypted-dns")) {
+                parsed.encrypted_dns_flag = true;
+            } else if (std.mem.eql(u8, arg, "--tls-cert-file")) {
+                index += 1;
+                if (index >= args.len) return error.MissingValue;
+                parsed.tls_cert_file = args[index];
+            } else if (std.mem.eql(u8, arg, "--tls-key-file")) {
+                index += 1;
+                if (index >= args.len) return error.MissingValue;
+                parsed.tls_key_file = args[index];
+            } else if (std.mem.eql(u8, arg, "--max-queries")) {
+                index += 1;
+                if (index >= args.len) return error.MissingValue;
+                parsed.max_queries = std.fmt.parseInt(usize, args[index], 10) catch return error.InvalidCount;
+            } else if (std.mem.eql(u8, arg, "--max-requests")) {
+                index += 1;
+                if (index >= args.len) return error.MissingValue;
+                parsed.max_requests = std.fmt.parseInt(usize, args[index], 10) catch return error.InvalidCount;
+            } else if (std.mem.eql(u8, arg, "--print-metrics")) {
+                parsed.print_metrics = true;
+            } else {
+                return error.UnknownOption;
+            }
+            index += 1;
+        }
+        return parsed;
+    }
+};
+
 fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocator, writer: *std.Io.Writer) !void {
     if (try printHelpIfRequested(args, writer)) return;
     if (args.len < 3) {
@@ -411,114 +570,39 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
         try exitUsage(writer);
     }
 
-    var config_file: ?[]const u8 = null;
-    var zone_file: ?[]const u8 = null;
+    const cli = ServerArgs.parse(args[3..]) catch |err| {
+        const message: []const u8 = switch (err) {
+            error.MissingValue => "error: a server option is missing its value\n",
+            error.InvalidPort => "error: invalid port\n",
+            error.InvalidCount => "error: invalid count\n",
+            error.UnknownOption => "error: unknown server option\n",
+            error.DuplicateOneShot => "error: only one --once-udp/--once-tcp flag is accepted\n",
+            error.OneShotWithServe => "error: --once-udp/--once-tcp cannot be combined with a --serve-* flag\n",
+        };
+        try writer.writeAll(message);
+        try exitUsage(writer);
+    };
+    const config_file = cli.config_file;
+    const zone_file = cli.zone_file;
+    var selection = cli.selection;
+    // The scalar is the one-shot or the single selected loop; multi-loop
+    // runs dispatch on the selection and leave it unset.
     var mode: ServerRunMode = .none;
-    var port_set = false;
-    var port: u16 = 1053;
-    var configured_address: ?std.Io.net.IpAddress = null;
-    var max_queries: usize = 1;
-    var max_requests: ?usize = null;
-    var print_metrics = false;
-    var encrypted_dns_flag = false;
-    var tls_cert_file: ?[]const u8 = null;
-    var tls_key_file: ?[]const u8 = null;
-
-    var index: usize = 3;
-    while (index < args.len) {
-        const arg = args[index];
-        if (std.mem.eql(u8, arg, "--config")) {
-            index += 1;
-            if (index >= args.len) {
-                try writer.writeAll("error: --config requires a path\n");
-                try exitUsage(writer);
-            }
-            config_file = args[index];
-        } else if (std.mem.eql(u8, arg, "--zone-file")) {
-            index += 1;
-            if (index >= args.len) {
-                try writer.writeAll("error: --zone-file requires a path\n");
-                try exitUsage(writer);
-            }
-            zone_file = args[index];
-        } else if (std.mem.eql(u8, arg, "--once-udp")) {
-            mode = .udp_once;
-            if (index + 1 < args.len and !std.mem.startsWith(u8, args[index + 1], "--")) {
-                index += 1;
-                port = std.fmt.parseInt(u16, args[index], 10) catch {
-                    try writer.writeAll("error: invalid UDP port\n");
-                    try exitUsage(writer);
-                };
-                port_set = true;
-            }
-        } else if (std.mem.eql(u8, arg, "--once-tcp")) {
-            mode = .tcp_once;
-            if (index + 1 < args.len and !std.mem.startsWith(u8, args[index + 1], "--")) {
-                index += 1;
-                port = std.fmt.parseInt(u16, args[index], 10) catch {
-                    try writer.writeAll("error: invalid TCP port\n");
-                    try exitUsage(writer);
-                };
-                port_set = true;
-            }
-        } else if (std.mem.eql(u8, arg, "--serve-udp")) {
-            mode = .udp_loop;
-        } else if (std.mem.eql(u8, arg, "--serve-tcp")) {
-            mode = .tcp_loop;
-        } else if (std.mem.eql(u8, arg, "--serve-dot")) {
-            mode = .dot_loop;
-        } else if (std.mem.eql(u8, arg, "--serve-doh")) {
-            mode = .doh_loop;
-        } else if (std.mem.eql(u8, arg, "--serve-doq")) {
-            mode = .doq_loop;
-        } else if (std.mem.eql(u8, arg, "--serve-doh3")) {
-            mode = .doh3_loop;
-        } else if (std.mem.eql(u8, arg, "--serve-xfr")) {
-            mode = .xfr_loop;
-        } else if (std.mem.eql(u8, arg, "--enable-encrypted-dns")) {
-            encrypted_dns_flag = true;
-        } else if (std.mem.eql(u8, arg, "--tls-cert-file")) {
-            index += 1;
-            if (index >= args.len) {
-                try writer.writeAll("error: --tls-cert-file requires a path\n");
-                try exitUsage(writer);
-            }
-            tls_cert_file = args[index];
-        } else if (std.mem.eql(u8, arg, "--tls-key-file")) {
-            index += 1;
-            if (index >= args.len) {
-                try writer.writeAll("error: --tls-key-file requires a path\n");
-                try exitUsage(writer);
-            }
-            tls_key_file = args[index];
-        } else if (std.mem.eql(u8, arg, "--max-queries")) {
-            index += 1;
-            if (index >= args.len) {
-                try writer.writeAll("error: --max-queries requires a count\n");
-                try exitUsage(writer);
-            }
-            max_queries = std.fmt.parseInt(usize, args[index], 10) catch {
-                try writer.writeAll("error: invalid max query count\n");
-                try exitUsage(writer);
-            };
-        } else if (std.mem.eql(u8, arg, "--max-requests")) {
-            index += 1;
-            if (index >= args.len) {
-                try writer.writeAll("error: --max-requests requires a count\n");
-                try exitUsage(writer);
-            }
-            max_requests = std.fmt.parseInt(usize, args[index], 10) catch {
-                try writer.writeAll("error: invalid max request count\n");
-                try exitUsage(writer);
-            };
-        } else if (std.mem.eql(u8, arg, "--print-metrics")) {
-            print_metrics = true;
-        } else {
-            try writer.print("error: unknown server option '{s}'\n", .{arg});
-            try exitUsage(writer);
-        }
-        index += 1;
+    if (cli.selection.once) |once| {
+        mode = once;
+    } else {
+        var single: [7]ServerRunMode = undefined;
+        if (cli.selection.loopModes(&single) == 1) mode = single[0];
     }
+    const port_set = cli.port_set;
+    var port: u16 = cli.port;
+    var configured_address: ?std.Io.net.IpAddress = null;
+    const max_queries: usize = cli.max_queries;
+    const max_requests: ?usize = cli.max_requests;
+    const print_metrics = cli.print_metrics;
+    const encrypted_dns_flag = cli.encrypted_dns_flag;
+    const tls_cert_file = cli.tls_cert_file;
+    const tls_key_file = cli.tls_key_file;
 
     const explicit_zone_file = zone_file != null;
     var server_context: ?config_loader.ServerContext = null;
@@ -543,7 +627,12 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
         }
     }
 
-    if (mode == .none) {
+    // The selection the arg loop built is the dispatch source of truth:
+    // a one-shot never mixes with a serve flag (rejected above), and the
+    // scalar keeps the one-shot or the single serve flag for the paths below.
+    if (selection.once) |once| {
+        mode = once;
+    } else if (!selection.anyServe()) {
         try writer.writeAll("error: server run currently requires --once-udp, --once-tcp, --serve-udp, --serve-tcp, --serve-dot, --serve-doh, --serve-doq, --serve-doh3, or --serve-xfr\n");
         try exitUsage(writer);
     }
@@ -552,11 +641,15 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
     // bound: a broken identity refuses the run instead of leaving a port
     // open.
     var tls_identity: ?transport_tls_server.Server = null;
+    var tls_identities: [7]transport_tls_server.Server = undefined;
+    var tls_identity_modes: [7]ServerRunMode = undefined;
+    var tls_identity_count: usize = 0;
     var encrypted_cert_path: ?[]const u8 = null;
     var encrypted_key_path: ?[]const u8 = null;
     defer if (tls_identity) |*server| server.deinit();
+    defer for (tls_identities[0..tls_identity_count]) |*server| server.deinit();
 
-    if (mode == .dot_loop or mode == .doh_loop or mode == .doq_loop or mode == .doh3_loop or mode == .xfr_loop) {
+    if (selection.anyEncrypted()) {
         const cert_path = tls_cert_file orelse (if (server_context) |*context| context.config.tlsCertFileText() else null);
         const key_path = tls_key_file orelse (if (server_context) |*context| context.config.tlsKeyFileText() else null);
         const enabled = encrypted_dns_flag or (if (server_context) |*context| context.config.encrypted_dns else false);
@@ -568,14 +661,7 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
         encrypted_key_path = key_path;
         // Every encrypted transport this build accepts has a listener of its
         // own, so the transport decides the ALPN token the handshake selects.
-        const transport: transport_tls.Transport = switch (mode) {
-            .dot_loop => .dot,
-            .doh_loop => .doh,
-            .doq_loop => .doq,
-            .doh3_loop => .doh3,
-            .xfr_loop => .xfr,
-            else => unreachable,
-        };
+        const single_transport: transport_tls.Transport = if (selection.dot) .dot else if (selection.doh) .doh else if (selection.doq) .doq else if (selection.doh3) .doh3 else .xfr;
         if (cert_path == null or key_path == null) {
             try writer.writeAll("error: encrypted listeners require --tls-cert-file and --tls-key-file (or tls-cert-file/tls-key-file)\n");
             try exitUsage(writer);
@@ -602,13 +688,52 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
         // that cannot be loaded refuses the run and binds no port. DoQ and
         // DoH/3 load their own identity inside the vendored ngtcp2 stack from
         // the same two paths, so they need the validation above but no TCP TLS server object.
-        if (mode != .doq_loop and mode != .doh3_loop) {
+        const single_count = countServeModes(selection);
+        const single_needs_server = single_count == 1 and (selection.dot or selection.doh or selection.xfr);
+        if (single_needs_server) {
             var server: transport_tls_server.Server = undefined;
-            server.init(allocator, io, std.Io.Dir.cwd(), cert_path.?, key_path.?, transport_tls.alpnFor(transport)) catch {
+            server.init(allocator, io, std.Io.Dir.cwd(), cert_path.?, key_path.?, transport_tls.alpnFor(single_transport)) catch {
                 try writer.writeAll("error: cannot load the TLS certificate and key\n");
                 try exitUsage(writer);
             };
             tls_identity = server;
+        }
+        // Multi-loop runs need one identity per TCP-TLS loop (ALPN differs
+        // per transport: "dot" vs "http/1.1"), all sharing the same cert.
+        if (selection.once == null and countServeModes(selection) > 1) {
+            var multi_modes: [7]ServerRunMode = undefined;
+            const multi_count = selection.loopModes(&multi_modes);
+            for (multi_modes[0..multi_count]) |loop_mode| {
+                const needs_server = loop_mode == .dot_loop or loop_mode == .doh_loop or loop_mode == .xfr_loop;
+                if (!needs_server) continue;
+                const loop_transport: transport_tls.Transport = switch (loop_mode) {
+                    .dot_loop => .dot,
+                    .doh_loop => .doh,
+                    .xfr_loop => .xfr,
+                    else => unreachable,
+                };
+                tls_identities[tls_identity_count].init(allocator, io, std.Io.Dir.cwd(), cert_path.?, key_path.?, transport_tls.alpnFor(loop_transport)) catch {
+                    try writer.writeAll("error: cannot load the TLS certificate and key\n");
+                    try exitUsage(writer);
+                };
+                tls_identity_modes[tls_identity_count] = loop_mode;
+                tls_identity_count += 1;
+            }
+        }
+    }
+
+    // Multi-loop listen addresses resolve here: taking the runtime below
+    // moves the configuration out of the context (`self.config = .{}`), so
+    // anything resolved after would see no listeners and fall back to the
+    // default port on every loop.
+    const multi_loop = selection.once == null and countServeModes(selection) > 1;
+    var loop_modes: [7]ServerRunMode = undefined;
+    var addresses: [7]std.Io.net.IpAddress = undefined;
+    var loop_count: usize = 0;
+    if (multi_loop) {
+        loop_count = selection.loopModes(&loop_modes);
+        for (loop_modes[0..loop_count], 0..) |loop_mode, i| {
+            addresses[i] = try resolveLoopAddress(config_file, if (server_context) |*context| &context.config else null, loop_mode, port_set, port);
         }
     }
 
@@ -650,6 +775,41 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
     }
     installReloadHandler(&runtime);
     var counters = metrics.Counters{};
+    const odoh_target: ?*const dns_odoh.Target = if (server_context) |*context| if (context.odoh_target) |*target| target else null else null;
+
+    if (multi_loop) {
+        if (max_requests) |count| if (count == 0) {
+            try writer.writeAll("error: --max-requests must be greater than zero\n");
+            try exitUsage(writer);
+        };
+        if (print_metrics and selection.tcp) {
+            try writer.writeAll("error: --print-metrics is currently supported for UDP runs\n");
+            try exitUsage(writer);
+        }
+        // Multi-loop io: TCP-family loops need a threaded backend, and the
+        // shared runtime lock wakes through the io it serves on, so one
+        // threaded backend feeds every loop.
+        var io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{
+            .concurrent_limit = .limited(listener.TCP_MAX_CONNECTION_WORKERS),
+        });
+        defer io_backend.deinit();
+        const loop_io = io_backend.io();
+        runtime.io = loop_io;
+        var stop = auth_runtime.SharedStop{};
+        runtime.shared_stop = &stop;
+        serveConcurrentMulti(loop_io, &runtime, &counters, print_metrics, max_requests, odoh_target, tls_identities[0..tls_identity_count], tls_identity_modes[0..tls_identity_count], encrypted_cert_path, encrypted_key_path, addresses[0..loop_count], loop_modes[0..loop_count], &stop) catch |err| {
+            // A duplicate address is a usage error, not a serving failure.
+            if (err == error.DuplicateLoopAddress) {
+                try writer.writeAll("error: two selected loops share one listen address; give each loop its own listener\n");
+                try exitUsage(writer);
+            }
+            return err;
+        };
+        if (print_metrics) {
+            try metrics.formatPrometheus(counters, writer);
+        }
+        return;
+    }
 
     switch (mode) {
         .udp_once => {
@@ -758,7 +918,6 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
             const doh_io = io_backend.io();
             // The DoH workers share the counters of the run, so the DoH
             // queries are counted the way the other transports count them.
-            const odoh_target: ?*const dns_odoh.Target = if (server_context) |*context| if (context.odoh_target) |*target| target else null else null;
             if (configured_address) |*address| {
                 try transport_doh.serveDohLoopOnAddress(doh_io, &runtime, address, &server, max_requests, &counters, odoh_target);
             } else {
@@ -789,7 +948,6 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
             // runtime outlives every use of it. The counters reach the port,
             // so the DoH/3 query counter moves in a metrics run.
             const doh3_counters: ?*metrics.Counters = if (print_metrics) &counters else null;
-            const odoh_target: ?*const dns_odoh.Target = if (server_context) |*context| if (context.odoh_target) |*target| target else null else null;
             if (configured_address) |*address| {
                 try transport_doh3.serveDoh3LoopOnAddress(io, &runtime, address, cert_path, key_path, max_requests, doh3_counters, odoh_target);
             } else {
@@ -819,6 +977,218 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
     if (print_metrics) {
         try metrics.formatPrometheus(counters, writer);
     }
+}
+
+fn countServeModes(selection: ServeSelection) usize {
+    var modes: [7]ServerRunMode = undefined;
+    return selection.loopModes(&modes);
+}
+
+/// Shared state for one serve-loop thread. Every loop serves the same
+/// runtime, counters, and TLS identity pointer; the identity outlives all
+/// threads because the owner joins every thread before its defer frees it.
+/// Runners bind their own listener, register its fd with the shared stop,
+/// and run the serve function on the bound socket, so a bind failure in any
+/// loop surfaces through the stop and wakes the loops already serving.
+const LoopRunner = struct {
+    io: std.Io,
+    runtime: *auth_runtime.Runtime,
+    counters: *metrics.Counters,
+    print_metrics: bool,
+    max_requests: ?usize,
+    odoh_target: ?*const dns_odoh.Target,
+    tls_server: ?*transport_tls_server.Server,
+    cert_path: ?[]const u8,
+    key_path: ?[]const u8,
+    address: std.Io.net.IpAddress,
+    mode: ServerRunMode,
+    stop: *auth_runtime.SharedStop,
+    err: ?anyerror = null,
+
+    fn run(self: *LoopRunner) void {
+        // Fail-fast: a loop that fails after startup prints its error and
+        // ends the process with a nonzero status, so a supervisor restarts
+        // it instead of leaving a sibling to serve half the transports.
+        // No thread ever wakes or joins another loop: blocked accepts die
+        // with the process. Normal `--max-requests` completion returns and
+        // the owner joins every thread.
+        self.serve() catch |err| {
+            self.err = err;
+            self.stop.failFast(self.io, err, loopName(self.mode));
+        };
+    }
+
+    fn serve(self: *LoopRunner) !void {
+        switch (self.mode) {
+            .udp_loop => {
+                var bind_address = self.address;
+                var socket = try std.Io.net.IpAddress.bind(&bind_address, self.io, .{ .mode = .dgram, .protocol = .udp });
+                defer socket.close(self.io);
+                if (self.print_metrics) {
+                    try listener.serveUdpLoopWithMetrics(&socket, self.io, self.runtime, self.max_requests, self.counters);
+                } else {
+                    try listener.serveUdpLoop(&socket, self.io, self.runtime, self.max_requests);
+                }
+            },
+            .tcp_loop => {
+                var bind_address = self.address;
+                var server = try std.Io.net.IpAddress.listen(&bind_address, self.io, .{ .reuse_address = true });
+                defer server.deinit(self.io);
+                try listener.serveTcpLoop(&server, self.io, self.runtime, self.max_requests);
+            },
+            .dot_loop => {
+                const server = self.tls_server orelse return error.MissingTlsIdentity;
+                var bind_address = self.address;
+                var listener_socket = try std.Io.net.IpAddress.listen(&bind_address, self.io, .{ .reuse_address = true });
+                defer listener_socket.deinit(self.io);
+                const dot_counters: ?*metrics.Counters = if (self.print_metrics) self.counters else null;
+                try transport_dot.serveDotLoop(&listener_socket, self.io, self.runtime, server, self.max_requests, dot_counters);
+            },
+            .doh_loop => {
+                const server = self.tls_server orelse return error.MissingTlsIdentity;
+                var bind_address = self.address;
+                var listener_socket = try std.Io.net.IpAddress.listen(&bind_address, self.io, .{ .reuse_address = true });
+                defer listener_socket.deinit(self.io);
+                try transport_doh.serveDohLoop(&listener_socket, self.io, self.runtime, server, self.max_requests, self.counters, self.odoh_target);
+            },
+            .doq_loop => {
+                const cert_path = self.cert_path orelse return error.MissingTlsIdentity;
+                const key_path = self.key_path orelse return error.MissingTlsIdentity;
+                // The QUIC core observes the shared stop at its own boundary.
+                const doq_counters: ?*metrics.Counters = if (self.print_metrics) self.counters else null;
+                try transport_doq.serveDoqLoopOnAddressStop(self.io, self.runtime, &self.address, cert_path, key_path, self.max_requests, doq_counters, self.stop);
+            },
+            .doh3_loop => {
+                const cert_path = self.cert_path orelse return error.MissingTlsIdentity;
+                const key_path = self.key_path orelse return error.MissingTlsIdentity;
+                const doh3_counters: ?*metrics.Counters = if (self.print_metrics) self.counters else null;
+                try transport_doh3.serveDoh3LoopOnAddressStop(self.io, self.runtime, &self.address, cert_path, key_path, self.max_requests, doh3_counters, self.odoh_target, self.stop);
+            },
+            .xfr_loop => {
+                const server = self.tls_server orelse return error.MissingTlsIdentity;
+                var bind_address = self.address;
+                var listener_socket = try std.Io.net.IpAddress.listen(&bind_address, self.io, .{ .reuse_address = true });
+                defer listener_socket.deinit(self.io);
+                try transfer_xfr_tls.serveXfrLoop(&listener_socket, self.io, self.runtime, server, self.max_requests);
+            },
+            else => unreachable,
+        }
+    }
+};
+
+/// Flag name for a loop mode, for fail-fast error reports.
+fn loopName(mode: ServerRunMode) []const u8 {
+    return switch (mode) {
+        .udp_once => "once-udp",
+        .tcp_once => "once-tcp",
+        .udp_loop => "serve-udp",
+        .tcp_loop => "serve-tcp",
+        .dot_loop => "serve-dot",
+        .doh_loop => "serve-doh",
+        .doq_loop => "serve-doq",
+        .doh3_loop => "serve-doh3",
+        .xfr_loop => "serve-xfr",
+        .none => "none",
+    };
+}
+
+/// True for loops that listen on TCP: they share one port namespace, so two
+/// of them on the same address would collide no matter what SO_REUSEPORT
+/// allows. UDP loops (plain DNS, DoQ, DoH3) share the datagram namespace.
+fn isStreamLoop(mode: ServerRunMode) bool {
+    return switch (mode) {
+        .tcp_loop, .dot_loop, .doh_loop, .xfr_loop => true,
+        else => false,
+    };
+}
+
+/// Runs all selected loops at once on one thread per loop against the same
+/// runtime. Binds happen in the runners, so a bad bind surfaces through the
+/// shared stop and wakes the loops already serving instead of stranding
+/// them on a join. The first failing loop's error ends the run after every
+/// thread joins exactly once; surviving loops observe the stop at their
+/// next receive/accept boundary. `--max-requests` applies per loop;
+/// `--print-metrics` prints once after every loop ends.
+fn serveConcurrentMulti(
+    io: std.Io,
+    runtime: *auth_runtime.Runtime,
+    counters: *metrics.Counters,
+    print_metrics: bool,
+    max_requests: ?usize,
+    odoh_target: ?*const dns_odoh.Target,
+    tls_servers: []transport_tls_server.Server,
+    tls_modes: []ServerRunMode,
+    cert_path: ?[]const u8,
+    key_path: ?[]const u8,
+    addresses: []const std.Io.net.IpAddress,
+    modes: []const ServerRunMode,
+    stop: *auth_runtime.SharedStop,
+) !void {
+    std.debug.assert(addresses.len == modes.len);
+    // Two stream loops on one address would collide; two datagram loops
+    // would split traffic under SO_REUSEPORT. UDP and TCP never collide:
+    // they are different port namespaces.
+    for (modes, 0..) |a, ai| {
+        for (modes[0..ai], 0..) |b, bi| {
+            if (isStreamLoop(a) == isStreamLoop(b) and addresses[ai].eql(&addresses[bi])) {
+                return error.DuplicateLoopAddress;
+            }
+        }
+    }
+    var runners: [7]LoopRunner = undefined;
+    var threads: [7]std.Thread = undefined;
+    // Each TCP-TLS loop gets the identity with its own ALPN ("dot" vs
+    // "http/1.1"); DoQ/DoH3 carry paths and load their own QUIC identity.
+    for (modes, 0..) |loop_mode, i| {
+        var loop_tls: ?*transport_tls_server.Server = null;
+        for (tls_servers, 0..) |*server, k| {
+            if (tls_modes[k] == loop_mode) loop_tls = server;
+        }
+        runners[i] = .{
+            .io = io,
+            .runtime = runtime,
+            .counters = counters,
+            .print_metrics = print_metrics,
+            .max_requests = max_requests,
+            .odoh_target = odoh_target,
+            .tls_server = loop_tls,
+            .cert_path = cert_path,
+            .key_path = key_path,
+            .address = addresses[i],
+            .mode = loop_mode,
+            .stop = stop,
+        };
+    }
+
+    var started: usize = 0;
+    errdefer {
+        // Spawn failed after failFast ended the process: this only runs in
+        // tests that stub the exit. Joins exactly the threads that exist;
+        // the normal path resets `started` after its own join, so a later
+        // error return cannot join twice.
+        for (threads[0..started]) |thread| thread.join();
+    }
+    for (runners[0..modes.len], 0..) |*runner, i| {
+        threads[i] = std.Thread.spawn(.{}, LoopRunner.run, .{runner}) catch |err| {
+            stop.failFast(io, err, loopName(modes[i]));
+            return err;
+        };
+        started += 1;
+    }
+    for (threads[0..modes.len]) |thread| thread.join();
+    started = 0;
+}
+
+/// Address for one loop: the config listener with the same transport,
+/// or the loopback default on the shared port when unconfigured.
+fn resolveLoopAddress(config_file: ?[]const u8, config: ?*const config_parser.Config, mode: ServerRunMode, port_set: bool, port: u16) !std.Io.net.IpAddress {
+    _ = config_file;
+    if (!port_set) {
+        if (config) |parsed| {
+            if (try findListenerAddress(parsed, mode)) |address| return address;
+        }
+    }
+    return defaultListenerAddress(port);
 }
 
 fn findListenerAddress(config: *const config_parser.Config, mode: ServerRunMode) !?std.Io.net.IpAddress {
@@ -895,6 +1265,88 @@ test "configured loop modes use their transport listener endpoint" {
     const expected_doh3 = try std.Io.net.IpAddress.parse("127.0.0.1", 12058);
     const doh3 = try findListenerAddress(&config, .doh3_loop) orelse return error.TestExpectedEqual;
     try std.testing.expect(doh3.eql(&expected_doh3));
+}
+
+test "the real arg path combines serve flags and rejects one-shots" {
+    // The production parser: serve flags combine freely into one selection.
+    const udp_tcp = [_][]const u8{ "--serve-udp", "--serve-tcp" };
+    const both = try ServerArgs.parse(&udp_tcp);
+    try std.testing.expect(both.selection.udp and both.selection.tcp and both.selection.once == null);
+    var modes: [7]ServerRunMode = undefined;
+    try std.testing.expectEqual(@as(usize, 2), both.selection.loopModes(&modes));
+    try std.testing.expect(modes[0] == .udp_loop and modes[1] == .tcp_loop);
+
+    // The same path production dispatches from: a one-shot with a serve
+    // flag, and two one-shots, are both refused.
+    const clash = [_][]const u8{ "--serve-udp", "--once-udp" };
+    try std.testing.expectError(error.OneShotWithServe, ServerArgs.parse(&clash));
+    const clash_port = [_][]const u8{ "--once-udp", "1053", "--serve-tcp" };
+    try std.testing.expectError(error.OneShotWithServe, ServerArgs.parse(&clash_port));
+    const dup = [_][]const u8{ "--once-udp", "--once-tcp" };
+    try std.testing.expectError(error.DuplicateOneShot, ServerArgs.parse(&dup));
+    const dup_port = [_][]const u8{ "--once-udp", "1053", "--once-tcp", "1054" };
+    try std.testing.expectError(error.DuplicateOneShot, ServerArgs.parse(&dup_port));
+
+    // A one-shot keeps its port operand on the same path.
+    const once = [_][]const u8{ "--once-udp", "1053" };
+    const parsed_once = try ServerArgs.parse(&once);
+    try std.testing.expect(parsed_once.selection.once == .udp_once and parsed_once.port == 1053 and parsed_once.port_set);
+}
+
+test "maintenance tick is single-owner" {
+    var runtime = try auth_runtime.Runtime.fromZoneText("$ORIGIN example.\n$TTL 3600\n@ IN SOA ns admin 1 3600 900 1209600 3600\n@ IN NS ns\n");
+    defer runtime.deinit();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try std.testing.expect(runtime.tryMaintenanceTick(io));
+    // A held maintenance mutex means a second loop skips the tick.
+    runtime.maintenance_mutex.lockUncancelable(io);
+    defer runtime.maintenance_mutex.unlock(io);
+    try std.testing.expect(!runtime.tryMaintenanceTick(io));
+}
+
+test "two stream loops on one address are rejected, udp plus tcp are not" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var runtime = try auth_runtime.Runtime.fromZoneText("$ORIGIN example.\n$TTL 3600\n@ IN SOA ns admin 1 3600 900 1209600 3600\n@ IN NS ns\n");
+    defer runtime.deinit();
+    var counters = metrics.Counters{};
+    var stop = auth_runtime.SharedStop{};
+    runtime.shared_stop = &stop;
+    const addr = std.Io.net.IpAddress{ .ip4 = .loopback(1053) };
+    const dup_addrs = [_]std.Io.net.IpAddress{ addr, addr };
+    const dup_modes = [_]ServerRunMode{ .tcp_loop, .dot_loop };
+    // Same address for two stream loops: usage-level refusal, no thread starts.
+    try std.testing.expectError(error.DuplicateLoopAddress, serveConcurrentMulti(io, &runtime, &counters, false, @as(?usize, 0), null, &.{}, &.{}, null, null, &dup_addrs, &dup_modes, &stop));
+    // UDP and TCP share one port number in different namespaces: accepted.
+    const ok_modes = [_]ServerRunMode{ .udp_loop, .tcp_loop };
+    try serveConcurrentMulti(io, &runtime, &counters, false, @as(?usize, 0), null, &.{}, &.{}, null, null, &dup_addrs, &ok_modes, &stop);
+}
+
+test "a bad TLS identity fails the loop before it serves" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var runtime = try auth_runtime.Runtime.fromZoneText("$ORIGIN example.\n$TTL 3600\n@ IN SOA ns admin 1 3600 900 1209600 3600\n@ IN NS ns\n");
+    defer runtime.deinit();
+    var stop = auth_runtime.SharedStop{};
+    runtime.shared_stop = &stop;
+    // A DoT loop with no identity fails in its own runner: the error is
+    // recorded on the runner (production prints it and exits nonzero via
+    // failFast, which tests never call).
+    var counters = metrics.Counters{};
+    var runner = LoopRunner{
+        .io = io,
+        .runtime = &runtime,
+        .counters = &counters,
+        .print_metrics = false,
+        .max_requests = null,
+        .odoh_target = null,
+        .tls_server = null,
+        .cert_path = null,
+        .key_path = null,
+        .address = .{ .ip4 = .loopback(0) },
+        .mode = .dot_loop,
+        .stop = &stop,
+    };
+    const result = runner.serve();
+    try std.testing.expectError(error.MissingTlsIdentity, result);
 }
 
 test "no-config listener default is loopback" {
@@ -1220,7 +1672,7 @@ test "query command renders a maximum escaped URI target" {
     var server = try std.Io.net.IpAddress.listen(&server_addr, io, .{ .reuse_address = true });
     defer server.deinit(io);
 
-    const ServerArgs = struct {
+    const QueryServer = struct {
         io: std.Io,
         server: *std.Io.net.Server,
         runtime: *auth_runtime.Runtime,
@@ -1233,8 +1685,8 @@ test "query command renders a maximum escaped URI target" {
             self.ok = true;
         }
     };
-    var server_args = ServerArgs{ .io = io, .server = &server, .runtime = &runtime };
-    const server_thread = try std.Thread.spawn(.{}, ServerArgs.run, .{&server_args});
+    var server_args = QueryServer{ .io = io, .server = &server, .runtime = &runtime };
+    const server_thread = try std.Thread.spawn(.{}, QueryServer.run, .{&server_args});
 
     var port_buffer: [5]u8 = undefined;
     const port_text = try std.fmt.bufPrint(&port_buffer, "{}", .{server.socket.address.getPort()});

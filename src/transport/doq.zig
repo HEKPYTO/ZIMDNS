@@ -11,7 +11,9 @@
 /// Errors: protocol errors queue a 0x2 stream reset; bind and TLS failures
 /// propagate as I/O errors.
 const std = @import("std");
-const Runtime = @import("../auth/runtime.zig").Runtime;
+const runtime_mod = @import("../auth/runtime.zig");
+const Runtime = runtime_mod.Runtime;
+const SharedStop = runtime_mod.SharedStop;
 const abi = @import("ngtcp2_abi.zig");
 const metrics = @import("../metrics.zig");
 const listener = @import("../platform/listener.zig");
@@ -142,12 +144,9 @@ const DoqHandler = struct {
     fn answer(self: *DoqHandler, conn: *core.Connection, stream_id: i64, parser: *StreamParser, peer: std.Io.net.IpAddress) void {
         const query = parser.takeMessage();
         parser.markAnswered();
-        // The managed trust anchors refresh on wall-clock seconds, the same
-        // tick the other serve loops run; a DoQ-only server has no other loop
-        // to carry it.
-        self.runtime.maybeRefreshManagedAnchors(@intCast(std.Io.Clock.real.now(self.io).nanoseconds));
-        _ = self.runtime.reloadZoneIfRequested(self.io);
-        _ = self.runtime.refreshCatalogIfRequested(self.io);
+        // One loop owns the maintenance tick across all loops sharing this
+        // runtime; a DoQ-only server still runs it here.
+        _ = self.runtime.tryMaintenanceTick(self.io);
         var response_buffer: [listener.TCP_MAX_FRAME_SIZE]u8 = undefined;
         const response = self.runtime.answerFrom(query, &response_buffer, &peer) catch {
             conn.pending.resetStream(stream_id, DOQ_PROTOCOL_ERROR);
@@ -264,6 +263,21 @@ pub fn serveDoqLoopOnAddress(
     max_requests: ?usize,
     counters: ?*metrics.Counters,
 ) !void {
+    return serveDoqLoopOnAddressStop(io, runtime, address, cert_path, key_path, max_requests, counters, null);
+}
+
+/// Stop-aware DoQ loop: `stop` ends the loop at the core's next boundary
+/// even with no `max_requests`, so a failing sibling loop ends this one.
+pub fn serveDoqLoopOnAddressStop(
+    io: std.Io,
+    runtime: *Runtime,
+    address: *const std.Io.net.IpAddress,
+    cert_path: []const u8,
+    key_path: []const u8,
+    max_requests: ?usize,
+    counters: ?*metrics.Counters,
+    shared_stop: ?*const SharedStop,
+) !void {
     const allocator = std.heap.page_allocator;
     var creds = gnutls.ServerCredentials.load(cert_path, key_path) catch return error.TlsIdentityFailed;
     defer creds.deinit();
@@ -278,13 +292,15 @@ pub fn serveDoqLoopOnAddress(
     const core_handler = core.Handler{ .ptr = &handler, .onStream = DoqHandler.onStream, .onHandshake = DoqHandler.onHandshake, .onClose = DoqHandler.onClose };
     const State = struct {
         handler: *DoqHandler,
+        shared: ?*const SharedStop,
         fn stop(ctx: *anyopaque) bool {
             const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.shared) |shared| if (shared.shouldStop()) return true;
             if (self.handler.max_requests) |max| return self.handler.completed >= max;
             return false;
         }
     };
-    var state = State{ .handler = &handler };
+    var state = State{ .handler = &handler, .shared = shared_stop };
     _ = listener.UDP_IDLE_TIMEOUT;
     // QUIC max_idle_timeout: 30s, matching the ngtcp2 example. The UDP
     // timeout above is for stateless receives, not connection lifetime.

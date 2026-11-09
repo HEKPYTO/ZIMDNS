@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   quality:
     runs-on: ubuntu-latest
@@ -92,5 +95,8 @@ jobs:
           fi
 
       - name: Build Docker image
-        run: docker build -t zimdns:ci .
+        run: docker build --build-arg VERSION=0.1.0 --build-arg REVISION=${GITHUB_SHA} --build-arg SOURCE=${{ github.server_url }}/${{ github.repository }} -t zimdns:ci .
+
+      - name: Validate compose config
+        run: ZIMDNS_CONFIG_DIR=/tmp/zimdns-config ZIMDNS_IMAGE=zimdns:ci docker compose -f docker-compose.yml config
 

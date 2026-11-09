@@ -14,5 +14,10 @@ Sockets, listeners, and deadlines.
   the io's own socket read surfaces a timed-out read as `EAGAIN`, which the
   threaded backend treats as a programmer bug. The socket timeout is set on
   the descriptor as well, but it is only a backstop.
-- The per-source connection limit is checked when a connection is accepted, and
+- The shared TCP-family worker cap is 64 (`TCP_MAX_CONNECTION_WORKERS`),
+  enforced by TCP, DoT, DoH, and XFR as a clean close on
+  `ConcurrencyUnavailable`. The per-source cap defaults to 8
+  (`tcp-max-connections-per-source`; unset means 8). The 64-slot source
+  table covers every worker, so a full table refuses only at the real
+  worker cap. The limit is checked when a connection is accepted, and
   the count is live rather than sampled.

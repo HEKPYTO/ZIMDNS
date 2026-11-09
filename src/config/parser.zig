@@ -263,7 +263,8 @@ pub const PortRange = struct {
 /// RFC 9210 section 4.2: the connection limits an operator may set. A null
 /// field is the project's own policy, which the operator did not change.
 pub const TcpLimits = struct {
-    /// The connections one source address may hold at once.
+    /// The connections one source address may hold at once. Null means the
+    /// production default of 8 applies (see listener.effectiveMaxConnectionsPerSource).
     max_connections_per_source: ?u32 = null,
     /// The total duration of one connection, in seconds.
     max_connection_duration: ?u32 = null,

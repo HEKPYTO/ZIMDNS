@@ -89,9 +89,9 @@ pub fn serveDotStreamOnceWithMetrics(
 /// DoT port never uses this path; it exists for the framing tests.
 fn serveDotStream(stream: std.Io.net.Stream, io: std.Io, runtime: *Runtime, counters: ?*metrics.Counters) !void {
     if (comptime !listener.TCP_DEADLINES_SUPPORTED) return listener.Error.UnsupportedPlatform;
-    // RFC 5011 timers live in wall-clock seconds, and a DoT-only server
-    // otherwise never runs the managed-anchor refresh.
-    runtime.maybeRefreshManagedAnchors(@intCast(std.Io.Clock.real.now(io).nanoseconds));
+    // One loop owns the maintenance tick across all loops sharing this
+    // runtime; a DoT-only server still runs it here.
+    _ = runtime.tryMaintenanceTick(io);
 
     var read_buffer: [STREAM_BUFFER_SIZE]u8 = undefined;
     var write_buffer: [STREAM_BUFFER_SIZE]u8 = undefined;
@@ -135,8 +135,7 @@ fn serveDotFrames(
         // that waited for the request, the second one answers a request that
         // arrived while the flag was set, so the answer that follows a
         // reload always comes from the new zone.
-        _ = runtime.reloadZoneIfRequested(channel.io);
-        _ = runtime.refreshCatalogIfRequested(channel.io);
+        _ = runtime.tryMaintenanceTick(channel.io);
         // One deadline for the whole frame: a peer that stalls in the middle
         // of a frame loses the frame, not the server. The write of the answer
         // shares it, so one frame cannot take two windows.
@@ -149,8 +148,7 @@ fn serveDotFrames(
             if (err == error.Truncated) return listener.Error.BadTcpFrame;
             return err;
         };
-        _ = runtime.reloadZoneIfRequested(channel.io);
-        _ = runtime.refreshCatalogIfRequested(channel.io);
+        _ = runtime.tryMaintenanceTick(channel.io);
         // RFC 9210 section 3: the answer comes from the same entry point the
         // cleartext TCP path uses, so the peer address reaches the recursion
         // policy, the local-zone table, and the cookie validation.
@@ -297,6 +295,9 @@ pub fn serveDotLoop(
     var sources = listener.SourceCounter{};
     var accepted: usize = 0;
     while (max_requests == null or accepted < max_requests.?) {
+        // A failing sibling ends this loop: the listener shutdown wakes
+        // the blocked accept, and the flag ends it even when idle.
+        try runtime.checkStop();
         const stream = try listener.acceptWithRetry(listener_socket, io);
         accepted += 1;
         // The encrypted listener holds the same bounds as the cleartext one: a

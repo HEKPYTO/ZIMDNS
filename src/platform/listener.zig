@@ -24,7 +24,8 @@ pub const UDP_REQUEST_BUFFER_SIZE: usize = response_mod.DEFAULT_EDNS_UDP_PAYLOAD
 pub const UDP_RESPONSE_BUFFER_SIZE: usize = std.math.maxInt(u16);
 pub const TCP_MAX_FRAME_SIZE: usize = std.math.maxInt(u16);
 pub const TCP_MAX_FRAMES_PER_CONNECTION: usize = 16;
-pub const TCP_MAX_CONNECTION_WORKERS: usize = 8;
+pub const TCP_MAX_CONNECTION_WORKERS: usize = 64;
+pub const UDP_WORKER_COUNT: usize = 16;
 pub const UDP_IDLE_TIMEOUT: std.Io.Timeout = .{ .duration = .{
     .raw = .fromSeconds(5),
     .clock = .awake,
@@ -100,14 +101,10 @@ fn serveUdpOnceWithTimeout(socket: *const std.Io.net.Socket, io: std.Io, runtime
     // outside the signal handler. The first check answers an idle server,
     // the second one answers a request that arrived while the flag was set,
     // so the answer that follows a reload always comes from the new zone.
-    _ = runtime.reloadZoneIfRequested(io);
-    _ = runtime.refreshCatalogIfRequested(io);
-    const tick_ns: u64 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
-    _ = runtime.maybeRefreshSecondaries(tick_ns, Runtime.fetchSecondaryViaXfr, runtime) catch {};
-    // RFC 5011 section 2.3 refresh timers are compared with RRSIG
-    // inception/expiration times, so they live in wall-clock seconds; the
-    // monotonic tick above must not leak into the managed store.
-    runtime.maybeRefreshManagedAnchors(@intCast(std.Io.Clock.real.now(io).nanoseconds));
+    // One loop owns the maintenance tick across all loops sharing this
+    // runtime; a sibling's fatal error ends this loop at the next request.
+    try runtime.checkStop();
+    _ = runtime.tryMaintenanceTick(io);
     var request_buffer: [UDP_REQUEST_BUFFER_SIZE]u8 = undefined;
     const incoming = try socket.receiveTimeout(io, &request_buffer, timeout);
     // A NOTIFY handled by the last answer set the catalog flag; its fetch
@@ -127,14 +124,10 @@ pub fn serveUdpOnce(socket: *const std.Io.net.Socket, io: std.Io, runtime: *Runt
 fn serveUdpOnceWithMetricsTimeout(socket: *const std.Io.net.Socket, io: std.Io, runtime: *Runtime, counters: *metrics.Counters, timeout: std.Io.Timeout) !void {
     // The same reload the plain UDP path performs, so a metrics run reloads
     // its zone on the same trigger.
-    _ = runtime.reloadZoneIfRequested(io);
-    _ = runtime.refreshCatalogIfRequested(io);
-    const tick_ns: u64 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
-    _ = runtime.maybeRefreshSecondaries(tick_ns, Runtime.fetchSecondaryViaXfr, runtime) catch {};
-    // RFC 5011 section 2.3 refresh timers are compared with RRSIG
-    // inception/expiration times, so they live in wall-clock seconds; the
-    // monotonic tick above must not leak into the managed store.
-    runtime.maybeRefreshManagedAnchors(@intCast(std.Io.Clock.real.now(io).nanoseconds));
+    // One loop owns the maintenance tick across all loops sharing this
+    // runtime; a sibling's fatal error ends this loop at the next request.
+    try runtime.checkStop();
+    _ = runtime.tryMaintenanceTick(io);
     var request_buffer: [UDP_REQUEST_BUFFER_SIZE]u8 = undefined;
     const incoming = try socket.receiveTimeout(io, &request_buffer, timeout);
     // A NOTIFY handled by the last answer set the catalog flag; its fetch
@@ -195,6 +188,114 @@ fn serveUdpLoopWithMetricsTimeout(socket: *const std.Io.net.Socket, io: std.Io, 
     }
 }
 
+/// Bounded pool for the unbounded production `--serve-udp` loop: 16 threads
+/// share one bound datagram socket (kernel distributes datagrams; sendto is
+/// thread-safe) so one slow recursion cannot stall authoritative answers.
+/// Bounded `--max-requests` runs keep the single-threaded loop above.
+const UdpPoolWorker = struct {
+    socket: *const std.Io.net.Socket,
+    io: std.Io,
+    runtime: *Runtime,
+    counters: ?*metrics.Counters,
+    // Pool-wide remaining budget shared by all workers; null = unbounded
+    // (production). Workers claim one slot each before serving.
+    remaining: ?*std.atomic.Value(usize),
+};
+
+fn poolClaim(remaining: ?*std.atomic.Value(usize)) bool {
+    const budget = remaining orelse return true;
+    var current = budget.load(.acquire);
+    while (current > 0) {
+        if (budget.cmpxchgWeak(current, current - 1, .acq_rel, .acquire)) |actual| {
+            current = actual;
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
+
+fn serveUdpPoolBudgeted(socket: *const std.Io.net.Socket, io: std.Io, runtime: *Runtime, remaining: ?*std.atomic.Value(usize)) !void {
+    while (poolClaim(remaining)) {
+        serveUdpOnce(socket, io, runtime) catch |err| {
+            if (isRecoverableRequestError(err)) continue;
+            return err;
+        };
+    }
+}
+
+fn serveUdpPoolBudgetedWithMetrics(socket: *const std.Io.net.Socket, io: std.Io, runtime: *Runtime, remaining: ?*std.atomic.Value(usize), counters: *metrics.Counters) !void {
+    while (poolClaim(remaining)) {
+        serveUdpOnceWithMetrics(socket, io, runtime, counters) catch |err| {
+            if (isRecoverableRequestError(err)) continue;
+            return err;
+        };
+    }
+}
+
+fn udpPoolWork(args: *const UdpPoolWorker) void {
+    // Fail-fast like every other serve loop: a fatal error prints and ends
+    // the process, so a dead worker never leaves a silent partial pool. No
+    // error is stored for a joiner to collect; joins only run on clean exit.
+    if (args.counters) |counters| {
+        serveUdpPoolBudgetedWithMetrics(args.socket, args.io, args.runtime, args.remaining, counters) catch |err| {
+            if (!isRecoverableRequestError(err)) {
+                var buffer: [256]u8 = undefined;
+                var writer = std.Io.File.stderr().writer(args.io, &buffer);
+                writer.interface.print("error: serve-udp pool failed: {t}\n", .{err}) catch {};
+                writer.interface.flush() catch {};
+                std.process.exit(1);
+            }
+        };
+    } else {
+        serveUdpPoolBudgeted(args.socket, args.io, args.runtime, args.remaining) catch |err| {
+            if (!isRecoverableRequestError(err)) {
+                var buffer: [256]u8 = undefined;
+                var writer = std.Io.File.stderr().writer(args.io, &buffer);
+                writer.interface.print("error: serve-udp pool failed: {t}\n", .{err}) catch {};
+                writer.interface.flush() catch {};
+                std.process.exit(1);
+            }
+        };
+    }
+    // serveUdpLoop only returns on clean --max-requests completion or a
+    // stop flag; release this worker's thread-local answer scratch.
+    auth_runtime.releaseAnswerScratch();
+}
+
+/// Runs the unbounded loop on UDP_WORKER_COUNT threads sharing one socket.
+pub fn serveUdpPoolOnAddress(io: std.Io, runtime: *Runtime, address: *const std.Io.net.IpAddress, counters: ?*metrics.Counters) !void {
+    return serveUdpPoolOnAddressBounded(io, runtime, address, counters, null);
+}
+
+/// Bounded test seam for the production pool: every worker shares one bound
+/// socket exactly as in production; `max_requests` caps each worker so the
+/// test serves exactly the requests it sent and then joins. Production
+/// passes null (unbounded). A shared atomic counts served requests across
+/// all workers.
+pub fn serveUdpPoolOnAddressBounded(io: std.Io, runtime: *Runtime, address: *const std.Io.net.IpAddress, counters: ?*metrics.Counters, max_requests: ?usize) !void {
+    var bind_address = address.*;
+    var socket = try std.Io.net.IpAddress.bind(&bind_address, io, .{ .mode = .dgram, .protocol = .udp });
+    defer socket.close(io);
+    var budget: std.atomic.Value(usize) = .init(max_requests orelse 0);
+    const shared: ?*std.atomic.Value(usize) = if (max_requests == null) null else &budget;
+    var workers: [UDP_WORKER_COUNT]UdpPoolWorker = undefined;
+    for (&workers) |*worker| worker.* = .{ .socket = &socket, .io = io, .runtime = runtime, .counters = counters, .remaining = shared };
+    var threads: [UDP_WORKER_COUNT]std.Thread = undefined;
+    // A spawn failure must not unwind: unwinding would close the socket and
+    // free runtime storage while earlier workers still serve on them. Print
+    // and exit immediately with no workers leaked behind.
+    for (&threads, &workers) |*thread, *worker| thread.* = std.Thread.spawn(.{}, udpPoolWork, .{worker}) catch |err| {
+        var buffer: [256]u8 = undefined;
+        var writer = std.Io.File.stderr().writer(io, &buffer);
+        writer.interface.print("error: serve-udp pool spawn failed: {t}\n", .{err}) catch {};
+        writer.interface.flush() catch {};
+        std.process.exit(1);
+    };
+    for (&threads) |*thread| thread.join();
+    try runtime.checkStop();
+}
+
 pub fn serveUdpOnceOnAddress(io: std.Io, runtime: *Runtime, address: *const std.Io.net.IpAddress) !void {
     var bind_address = address.*;
     var socket = try std.Io.net.IpAddress.bind(&bind_address, io, .{ .mode = .dgram, .protocol = .udp });
@@ -243,14 +344,10 @@ fn serveTcpStreamOnceWithTimeout(stream: std.Io.net.Stream, io: std.Io, runtime:
     // A SIGHUP asks for the zone to be re-read. The reload happens here,
     // outside the signal handler, so the answer that follows it comes from
     // the new zone.
-    _ = runtime.reloadZoneIfRequested(io);
-    _ = runtime.refreshCatalogIfRequested(io);
-    const tick_ns: u64 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
-    _ = runtime.maybeRefreshSecondaries(tick_ns, Runtime.fetchSecondaryViaXfr, runtime) catch {};
-    // RFC 5011 section 2.3 refresh timers are compared with RRSIG
-    // inception/expiration times, so they live in wall-clock seconds; the
-    // monotonic tick above must not leak into the managed store.
-    runtime.maybeRefreshManagedAnchors(@intCast(std.Io.Clock.real.now(io).nanoseconds));
+    // One loop owns the maintenance tick across all loops sharing this
+    // runtime; a sibling's fatal error ends this loop at the next request.
+    try runtime.checkStop();
+    _ = runtime.tryMaintenanceTick(io);
     return unix_tcp_deadlines.serve(stream, io, runtime, timeout, counters);
 }
 
@@ -298,6 +395,9 @@ fn serveTcpLoopWithTimeout(server: anytype, io: std.Io, runtime: *Runtime, max_r
     var sources = SourceCounter{};
     var accepted: usize = 0;
     while (max_requests == null or accepted < max_requests.?) {
+        // A failing sibling ends this loop: the listener shutdown wakes
+        // the blocked accept, and the flag ends it even when idle.
+        try runtime.checkStop();
         const stream = try acceptWithRetry(server, io);
         accepted += 1;
         // RFC 9210 section 4.2: a source address holds only so many
@@ -322,6 +422,10 @@ fn serveTcpLoopWithTimeout(server: anytype, io: std.Io, runtime: *Runtime, max_r
 /// holds only so many connections at once. The cleartext and the encrypted
 /// listeners share it, so the same bound applies to both.
 pub const SourceCounter = struct {
+    // One slot per simultaneously tracked source. Tracked sources never
+    // exceed live workers: each admitted connection holds a worker, so
+    // refusing only when the table is full never locks out beyond the
+    // real worker cap.
     const max_sources = 64;
 
     const Key = struct {
@@ -342,10 +446,13 @@ pub const SourceCounter = struct {
     entries: [max_sources]Entry = @splat(.{}),
     len: usize = 0,
 
+    /// The per-source connection cap: the operator's value, or the
+    /// production default of 8 when unset.
+    pub const DEFAULT_MAX_CONNECTIONS_PER_SOURCE: u32 = 8;
     /// Takes a slot for the source of a connection, or refuses the
     /// connection when the source already holds as many as the limit allows.
     pub fn admit(self: *SourceCounter, address: *const std.Io.net.IpAddress) bool {
-        const limit = tcp_limits.max_connections_per_source orelse return true;
+        const limit = effectiveMaxConnectionsPerSource();
         const key = sourceKey(address);
         self.lock();
         defer self.unlock();
@@ -356,7 +463,8 @@ pub const SourceCounter = struct {
             return true;
         }
         // A source that cannot be counted is refused rather than served
-        // without a count.
+        // without a count. max_sources covers every live worker, so this
+        // only fires at the real worker cap.
         if (self.len >= self.entries.len) return false;
         self.entries[self.len] = .{ .key = key, .count = 1 };
         self.len += 1;
@@ -387,6 +495,12 @@ pub const SourceCounter = struct {
         std.Io.Threaded.mutexUnlock(&self.mutex);
     }
 };
+comptime {
+    if (SourceCounter.max_sources < TCP_MAX_CONNECTION_WORKERS) @compileError("source table must cover every worker");
+}
+pub fn effectiveMaxConnectionsPerSource() u32 {
+    return tcp_limits.max_connections_per_source orelse SourceCounter.DEFAULT_MAX_CONNECTIONS_PER_SOURCE;
+}
 
 /// The address a connection comes from: its IP address without the port.
 fn sourceKey(address: *const std.Io.net.IpAddress) SourceCounter.Key {
@@ -1173,7 +1287,7 @@ test "TCP connection is closed after the configured idle timeout" {
     try std.testing.expect(elapsed < @as(i96, 4) * std.time.ns_per_s);
 }
 
-test "TCP loop without a configured per-source limit serves two connections of one source" {
+test "TCP loop under the default per-source limit serves two connections of one source" {
     var io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{
         .concurrent_limit = .limited(TCP_MAX_CONNECTION_WORKERS),
     });
@@ -1457,6 +1571,102 @@ test "RFC 7766 section 7: a pipelined answer is not held behind a slow forwarded
     try std.testing.expectEqual(@as(u16, 1), second.header.answer_count);
 }
 
+test "a slow recursive query on one UDP pool worker does not delay an authoritative one" {
+    // Drives the production `serveUdpPoolOnAddress` path through its bounded
+    // test seam: 16 workers on one socket, one pool-wide request budget so
+    // the pool joins. The slow recursion (1.5 s upstream) is queued first;
+    // the authoritative answer must still arrive first through the pool.
+    var io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{ .concurrent_limit = .limited(20) });
+    defer io_backend.deinit();
+    const io = io_backend.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+    var upstream = IsolationUpstream{ .io = io, .udp = &upstream_socket, .delay_ms = 400, .done = .init(false) };
+    var sender_slots: [4]IsolationSender = undefined;
+    const upstream_thread = try std.Thread.spawn(.{}, serveIsolationUpstream, .{ &upstream, &sender_slots });
+
+    var runtime = try Runtime.fromZoneText(test_zone);
+    defer runtime.deinit();
+    runtime.resolver = try resolver_mod.Resolver.init(std.testing.allocator, io, try forwarding_policy(upstream_socket.address, "127.0.0.0/8"));
+
+    // Ephemeral pool port: reserve it by binding, read it back, then
+    // release it for the pool to bind. Loopback-only test; the race is
+    // accepted and the ready-poll below retries the whole pool on collision.
+    var probe_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var probe = try std.Io.net.IpAddress.bind(&probe_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    const pool_port = probe.address.getPort();
+    probe.close(io);
+    const pool_address = try std.Io.net.IpAddress.parse("127.0.0.1", pool_port);
+
+    const PoolDriver = struct {
+        io: std.Io,
+        runtime: *Runtime,
+        address: std.Io.net.IpAddress,
+        err: ?anyerror = null,
+        fn run(self: *@This()) void {
+            serveUdpPoolOnAddressBounded(self.io, self.runtime, &self.address, null, 2) catch |err| {
+                self.err = err;
+                std.debug.print("pool error: {t}\n", .{err});
+            };
+        }
+    };
+    var driver = PoolDriver{ .io = io, .runtime = &runtime, .address = pool_address };
+    const pool_thread = try std.Thread.spawn(.{}, PoolDriver.run, .{&driver});
+
+    var client_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var client_socket = try std.Io.net.IpAddress.bind(&client_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer client_socket.close(io);
+
+    // Readiness wait: the pool binds on its own thread, so a send issued
+    // before the bind lands on a dead port. Poll by attempting the same
+    // bind: AddressInUse means the pool owns the port now. Bounded at ~5 s,
+    // well inside the 10 s join-before-assert receive windows below.
+    const ready_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(pool_port) };
+    var waits: usize = 0;
+    while (waits < 50) : (waits += 1) {
+        var probe_bind = ready_addr;
+        const probe_socket = std.Io.net.IpAddress.bind(&probe_bind, io, .{ .mode = .dgram, .protocol = .udp }) catch |err| {
+            if (err == error.AddressInUse) break;
+            return err;
+        };
+        probe_socket.close(io);
+        std.Io.sleep(io, .fromMilliseconds(100), .awake) catch {};
+    } else return error.TestUnexpectedResult;
+
+    var slow_buffer: [512]u8 = undefined;
+    const slow_query = try @import("../cli/query.zig").buildQueryPacket(&slow_buffer, 0x7301, "example.com.", .A, false);
+    var fast_buffer: [512]u8 = undefined;
+    const fast_query = try @import("../cli/query.zig").buildQueryPacket(&fast_buffer, 0x7302, "dns.home.arpa.", .A, false);
+    var target = try std.Io.net.IpAddress.parse("127.0.0.1", pool_port);
+    try client_socket.send(io, &target, slow_query);
+    try client_socket.send(io, &target, fast_query);
+
+    // Join-before-assert: every thread is reaped before any `try` can
+    // return early, so no thread ever touches the socket after teardown.
+    var first_buffer: [512]u8 = undefined;
+    const first = client_socket.receiveTimeout(io, &first_buffer, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } }) catch null;
+    var second_buffer: [512]u8 = undefined;
+    const second = client_socket.receiveTimeout(io, &second_buffer, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } }) catch null;
+    pool_thread.join();
+    upstream.done.store(true, .release);
+    upstream_thread.join();
+    for (upstream.senders[0..upstream.sender_count]) |*sender| sender.join();
+    try std.testing.expect(driver.err == null);
+    // The authoritative answer arrives first even though the slow recursion
+    // was queued first: on a single-threaded loop the slow answer would ar‐
+    // rive first instead, so this order proves the pool served concurrently.
+    const first_response = try dns_message.Message.parse(arena.allocator(), (first orelse return error.TestUnexpectedResult).data);
+    try std.testing.expectEqual(@as(u16, 0x7302), first_response.header.id);
+    // The slow recursion still completes correctly through the pool.
+    const second_response = try dns_message.Message.parse(arena.allocator(), (second orelse return error.TestUnexpectedResult).data);
+    try std.testing.expectEqual(@as(u16, 0x7301), second_response.header.id);
+    try std.testing.expectEqual(@as(u16, 1), second_response.header.answer_count);
+}
+
 test "the same forwarding query over UDP is answered the same way" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1646,6 +1856,58 @@ fn serveForwardingUpstream(args: *ForwardingUpstream) void {
     const bytes = buildForwardingAnswer(&response_buffer, query, false) catch return;
     if (args.delay_ms != 0) std.Io.sleep(args.io, .fromMilliseconds(@intCast(args.delay_ms)), .awake) catch {};
     args.udp.send(args.io, &incoming.from, bytes) catch return;
+}
+
+/// Upstream dedicated to the pool-isolation test: every request is answered
+/// after the configured delay, each on its own sender thread, so a resolver
+/// retry issued while an earlier delay still elapses is still answered. The
+/// test joins the listener before signalling `done`, and joins every sender
+/// before closing the socket, so no thread touches a freed socket.
+const IsolationUpstream = struct {
+    io: std.Io,
+    udp: *const std.Io.net.Socket,
+    delay_ms: u64,
+    done: std.atomic.Value(bool),
+    senders: [4]std.Thread = undefined,
+    sender_count: usize = 0,
+};
+
+const IsolationSender = struct {
+    io: std.Io,
+    udp: *const std.Io.net.Socket,
+    delay_ms: u64,
+    query_data: [512]u8,
+    query_len: usize,
+    from: std.Io.net.IpAddress,
+    fn run(self: *IsolationSender) void {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const query = dns_message.Message.parseQuery(arena.allocator(), self.query_data[0..self.query_len]) catch return;
+        var response_buffer: [512]u8 = undefined;
+        const bytes = buildForwardingAnswer(&response_buffer, query, false) catch return;
+        if (self.delay_ms != 0) std.Io.sleep(self.io, .fromMilliseconds(@intCast(self.delay_ms)), .awake) catch return;
+        self.udp.send(self.io, &self.from, bytes) catch {};
+    }
+};
+
+fn serveIsolationUpstream(args: *IsolationUpstream, slots: *[4]IsolationSender) void {
+    var request_buffer: [512]u8 = undefined;
+    while (!args.done.load(.acquire)) {
+        const incoming = args.udp.receiveTimeout(args.io, &request_buffer, upstream_timeout) catch continue;
+        if (args.sender_count >= slots.len) continue;
+        const slot = &slots[args.sender_count];
+        slot.* = .{
+            .io = args.io,
+            .udp = args.udp,
+            .delay_ms = args.delay_ms,
+            .query_data = undefined,
+            .query_len = incoming.data.len,
+            .from = incoming.from,
+        };
+        @memcpy(slot.query_data[0..incoming.data.len], incoming.data);
+        args.senders[args.sender_count] = std.Thread.spawn(.{}, IsolationSender.run, .{slot}) catch continue;
+        args.sender_count += 1;
+    }
 }
 
 /// The fake upstream that truncates its UDP answer and answers the retry
@@ -2077,4 +2339,44 @@ test "acceptRetryAction classifies transient and fatal accept errors" {
     try std.testing.expectEqual(.retry_paused, acceptRetryAction(error.ProcessFdQuotaExceeded));
     try std.testing.expectEqual(.retry_paused, acceptRetryAction(error.SystemFdQuotaExceeded));
     try std.testing.expectEqual(.propagate, acceptRetryAction(error.SocketNotListening));
+}
+
+test "SourceCounter refuses a new source when its table is full" {
+    try std.testing.expect(SourceCounter.max_sources >= TCP_MAX_CONNECTION_WORKERS);
+    const previous_limits = tcpLimits();
+    defer setTcpLimits(previous_limits);
+    setTcpLimits(.{ .max_connections_per_source = 1 });
+    var counter = SourceCounter{};
+    var i: u32 = 0;
+    while (i < 64) : (i += 1) {
+        const addr: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 10, 0, @truncate(i >> 8), @truncate(i) }, .port = 0 } };
+        try std.testing.expect(counter.admit(&addr));
+    }
+    try std.testing.expectEqual(@as(usize, 64), counter.len);
+    // The 65th source has no slot: fail-closed refuses it. The table
+    // covers every worker, so this only fires at the real worker cap.
+    const extra: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 0 } };
+    try std.testing.expect(!counter.admit(&extra));
+    try std.testing.expectEqual(@as(usize, 64), counter.len);
+    counter.release(&extra); // no-op: refused sources release nothing.
+    try std.testing.expectEqual(@as(usize, 64), counter.len);
+    // Tracked sources still enforce the per-source limit.
+    const first: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 10, 0, 0, 0 }, .port = 0 } };
+    try std.testing.expect(!counter.admit(&first));
+}
+
+test "per-source limit defaults to 8 when unset" {
+    const previous_limits = tcpLimits();
+    defer setTcpLimits(previous_limits);
+    setTcpLimits(.{});
+    try std.testing.expectEqual(@as(u32, 8), effectiveMaxConnectionsPerSource());
+    var counter = SourceCounter{};
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 9 }, .port = 0 } };
+    var n: u32 = 0;
+    while (n < 8) : (n += 1) try std.testing.expect(counter.admit(&addr));
+    try std.testing.expect(!counter.admit(&addr));
+}
+
+test "UDP worker pool is fixed at 16 sharing one socket" {
+    try std.testing.expectEqual(@as(usize, 16), UDP_WORKER_COUNT);
 }

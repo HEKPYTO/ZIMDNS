@@ -1615,7 +1615,7 @@ test "configured two-zone TCP loop accepts bounded independent connections" {
     try expectAddress(child_response, .{ 192, 0, 2, 2 });
 }
 
-test "authoritative TCP loop caps active connections at eight" {
+test "authoritative TCP loop caps active connections at the worker cap" {
     var io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{
         .concurrent_limit = .limited(listener.TCP_MAX_CONNECTION_WORKERS),
     });
@@ -1626,6 +1626,13 @@ test "authoritative TCP loop caps active connections at eight" {
 
     var runtime = try Runtime.fromZoneText(fixture_zone);
     defer runtime.deinit();
+
+    // One loopback source holds every worker: the override covers all 64
+    // workers plus the excess connection, so the 65th is rejected by the
+    // worker cap (group.concurrent), not SourceCounter.
+    const previous_limits = listener.tcpLimits();
+    defer listener.setTcpLimits(previous_limits);
+    listener.setTcpLimits(.{ .max_connections_per_source = listener.TCP_MAX_CONNECTION_WORKERS + 1 });
 
     var listen_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     var server = try std.Io.net.IpAddress.listen(&listen_addr, io, .{ .reuse_address = true });
@@ -1646,7 +1653,7 @@ test "authoritative TCP loop caps active connections at eight" {
     try cli_query.sendTcpQuery(excess_client.?, io, excess_query);
     try excess_client.?.shutdown(io, .send);
 
-    var args = BoundedTcpArgs{ .io = io, .server = &server, .runtime = &runtime, .max_requests = 9 };
+    var args = BoundedTcpArgs{ .io = io, .server = &server, .runtime = &runtime, .max_requests = listener.TCP_MAX_CONNECTION_WORKERS + 1 };
     const server_thread = try std.Thread.spawn(.{}, serveBoundedTcp, .{&args});
     var joined = false;
     defer {
@@ -1710,6 +1717,12 @@ test "concurrent TCP connections each answer every pipelined frame while workers
 
     var runtime = try Runtime.fromZoneText(fixture_zone);
     defer runtime.deinit();
+
+    // Every connection below shares one loopback source: raise the
+    // per-source cap for the test and restore the default afterwards.
+    const previous_limits = listener.tcpLimits();
+    defer listener.setTcpLimits(previous_limits);
+    listener.setTcpLimits(.{ .max_connections_per_source = listener.TCP_MAX_CONNECTION_WORKERS });
 
     var listen_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     var server = try std.Io.net.IpAddress.listen(&listen_addr, io, .{ .reuse_address = true });

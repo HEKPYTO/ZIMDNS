@@ -8,9 +8,17 @@
   SHA-256 `228e17f5cc3d4de7bfced9912bd09de30e7f45741cc47503cf88d3fa9209e155`.
   Copied: `lib/`, `lib/includes/`.
 
-Both release tarballs were extracted and compared against the vendored trees: every
-copied source and header is byte-identical; only the autotools/CMake files were
-omitted. The licenses match the release `COPYING` files byte-for-byte.
+Both release tarballs were extracted and compared against the vendored trees:
+every copied source and header was byte-identical except the two local patches
+below; only the autotools/CMake files were omitted. The licenses match the
+release `COPYING` files byte-for-byte.
+
+Local patches beyond the release tarballs (required for -Wall -Wextra -Werror):
+- `ngtcp2/lib/ngtcp2_unreachable.c` — `(void)file; (void)line; (void)func;` at
+  the top of `ngtcp2_unreachable_fail`, silencing -Wunused-parameter when
+  NGTCP2_UNREACHABLE_LOG is undefined (this build defines no config.h).
+- `nghttp3/lib/nghttp3_unreachable.c` — same `(void)` casts in
+  `nghttp3_unreachable_fail` for NGHTTP3_UNREACHABLE_LOG.
 
 Only the GnuTLS crypto backend is vendored; the OpenSSL/BoringSSL/PicoTLS/QuicTLS/wolfSSL
 backends were dropped. No `config.h` is generated (`HAVE_CONFIG_H` is not defined);
