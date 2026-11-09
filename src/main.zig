@@ -241,7 +241,9 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, command, "server")) {
-        try handleServer(args, io, arena, stdout);
+        // The server outlives startup: its cache and resolver must return
+        // freed memory, so it cannot use the process arena.
+        try handleServer(args, io, std.heap.smp_allocator, stdout);
         return;
     }
 

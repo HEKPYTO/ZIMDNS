@@ -312,6 +312,8 @@ pub const Runtime = struct {
     /// The last refresh attempt, so a NOTIFY storm cannot drive one transfer
     /// per packet through the serving thread.
     catalog_refresh_attempted_ns: ?i64 = null,
+    /// RFC 9432 section 5.4: the minimum gap between catalog refresh attempts.
+    catalog_refresh_window_ns: i64 = catalog_refresh_window_ns,
     /// RFC 9461 service-binding RDATA (wire form) the resolver publishes at
     /// `_dns.resolver.arpa.` for RFC 9462 discovery. Empty unless `ddr` is
     /// configured; every slice is owned.
@@ -427,12 +429,11 @@ pub const Runtime = struct {
     /// RFC 5011 section 2.3: the forwarding path refreshes its managed trust
     /// points on the serve-loop tick, next to the secondary refresh.
     pub fn maybeRefreshManagedAnchors(self: *Runtime, now_ns: u64) void {
-        // The refresh mutates the managed state and the live anchor set while
-        // answer workers read them under a shared lock, so it is the single
-        // writer and takes the exclusive side.
+        const resolver = if (self.resolver) |*value| value else return;
+        if (resolver.policy.managed == null) return;
         self.lockExclusive();
         defer self.unlockExclusive();
-        if (self.resolver) |*resolver| resolver.maybeRefreshManagedAnchors(now_ns);
+        resolver.maybeRefreshManagedAnchors(now_ns);
     }
 
     /// Runs the maintenance tick only if no other loop is running it.
@@ -980,7 +981,7 @@ pub const Runtime = struct {
         if (!self.catalog_refresh_requested.swap(false, .acq_rel)) return null;
         const now: i64 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
         if (self.catalog_refresh_attempted_ns) |last| {
-            if (now - last < catalog_refresh_window_ns) {
+            if (now - last < self.catalog_refresh_window_ns) {
                 self.catalog_refresh_requested.store(true, .release);
                 return null;
             }

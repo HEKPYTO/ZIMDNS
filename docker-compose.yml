@@ -1,0 +1,35 @@
+services:
+  zimdns:
+    image: ${ZIMDNS_IMAGE:-zimdns:0.1.0}
+    user: "10001:10001"
+    ports:
+      - "${ZIMDNS_DNS_PORT:-53}:1053/udp"
+      - "${ZIMDNS_DNS_PORT:-53}:1053/tcp"
+    volumes:
+      - ${ZIMDNS_CONFIG_DIR:?set ZIMDNS_CONFIG_DIR to the operator config tree containing config.gdns}:/etc/zimdns:ro
+    read_only: true
+    tmpfs:
+      - /run/zimdns
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    mem_limit: ${ZIMDNS_MEM_LIMIT:-2g}
+    mem_reservation: ${ZIMDNS_MEM_RESERVATION:-256m}
+    cpus: ${ZIMDNS_CPUS:-4.0}
+    pids_limit: 256
+    command: ["server", "run", "--config", "/etc/zimdns/config.gdns", "--serve-udp", "--serve-tcp"]
+    stop_grace_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/zimdns", "query", "@127.0.0.1", "-p", "1053", "--require-answer", "--tcp", "home.arpa.", "SOA"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s

@@ -187,6 +187,7 @@ test "a catalog consumer adds, replaces, and drops members on refresh" {
 
     var consumer = try Runtime.fromZoneTexts(&.{boot_text});
     defer consumer.deinit();
+    consumer.catalog_refresh_window_ns = 50 * std.time.ns_per_ms;
     try consumer.setCatalogConsumer(catalog_apex, first_server.socket.address, null);
     consumer.requestCatalogRefresh();
     try std.testing.expectEqual(@as(?zimdns.auth_runtime.CatalogRefreshOutcome, .updated), consumer.refreshCatalogIfRequested(io));
@@ -199,7 +200,7 @@ test "a catalog consumer adds, replaces, and drops members on refresh" {
     // answers; the second refresh finds an unchanged serial and fetches only
     // the catalog.
     // The refresh window has to pass before the next attempt starts.
-    try std.Io.sleep(io, .fromMilliseconds(catalog_window_ms + 100), .awake);
+    try std.Io.sleep(io, .fromMilliseconds(60), .awake);
     var second_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     var second_server = try std.Io.net.IpAddress.listen(&second_addr, io, .{ .reuse_address = true });
     const second_args = try startPrimary(io, &second_server, &second_primary, 3);
@@ -219,14 +220,14 @@ test "a catalog consumer adds, replaces, and drops members on refresh" {
 
     // A second read of the same catalog changes nothing and fetches no
     // member. The refresh window has to pass again.
-    try std.Io.sleep(io, .fromMilliseconds(catalog_window_ms + 100), .awake);
+    try std.Io.sleep(io, .fromMilliseconds(60), .awake);
     consumer.requestCatalogRefresh();
     try std.testing.expectEqual(@as(?zimdns.auth_runtime.CatalogRefreshOutcome, .unchanged), consumer.refreshCatalogIfRequested(io));
     try joinPrimary(second_args, &second_joined);
 
     // The same member under a new label is removed and added again with
     // fresh state (RFC 9432 section 5.4).
-    try std.Io.sleep(io, .fromMilliseconds(catalog_window_ms + 100), .awake);
+    try std.Io.sleep(io, .fromMilliseconds(60), .awake);
     var third_primary = try Runtime.fromZoneTexts(&.{ third_catalog_text, second_member_text });
     defer third_primary.deinit();
     try third_primary.addTransferAllow("catalog.example.", try zimdns.config_parser.Cidr.parse("127.0.0.1/32"));
@@ -248,7 +249,7 @@ test "a catalog consumer adds, replaces, and drops members on refresh" {
 
     // A member whose ZONEMD digest does not match is refused and the served
     // set stays as it was.
-    try std.Io.sleep(io, .fromMilliseconds(catalog_window_ms + 100), .awake);
+    try std.Io.sleep(io, .fromMilliseconds(60), .awake);
     var fourth_primary = try Runtime.fromZoneTexts(&.{ fourth_catalog_text, bad_digest_member_text });
     defer fourth_primary.deinit();
     try fourth_primary.addTransferAllow("catalog.example.", try zimdns.config_parser.Cidr.parse("127.0.0.1/32"));
@@ -397,6 +398,7 @@ test "secondary refresh pulls a changed member after the SOA refresh interval" {
 
     var consumer = try Runtime.fromZoneTexts(&.{boot_text});
     defer consumer.deinit();
+    consumer.catalog_refresh_window_ns = 50 * std.time.ns_per_ms;
     try consumer.setCatalogConsumer(catalog_apex, first_server.socket.address, null);
     consumer.requestCatalogRefresh();
     try std.testing.expectEqual(@as(?zimdns.auth_runtime.CatalogRefreshOutcome, .updated), consumer.refreshCatalogIfRequested(io));
@@ -413,7 +415,7 @@ test "secondary refresh pulls a changed member after the SOA refresh interval" {
     // The catalog refresh window has to pass before the next attempt runs.
     // The synthetic refresh clock stays anchored to provisioning so the
     // 2s advance lands inside the (1,3) refresh-to-expire window.
-    try std.Io.sleep(io, .fromMilliseconds(catalog_window_ms + 100), .awake);
+    try std.Io.sleep(io, .fromMilliseconds(60), .awake);
     var second_addr = shared_addr;
     var second_server = try std.Io.net.IpAddress.listen(&second_addr, io, .{ .reuse_address = true });
     const second_args = try startPrimary(io, &second_server, &primary_b, 2);

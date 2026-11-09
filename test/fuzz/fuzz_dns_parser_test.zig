@@ -192,7 +192,7 @@ fn fuzzZone(input: []const u8) !void {
 }
 
 fn fuzzConfig(input: []const u8) !void {
-    _ = config.Config.parse(input) catch |err| switch (err) {
+    var parsed = config.Config.parse(input) catch |err| switch (err) {
         error.UnknownDirective,
         error.BadDirective,
         error.BadPort,
@@ -202,8 +202,10 @@ fn fuzzConfig(input: []const u8) !void {
         error.BadExcludedRange,
         error.TextTooLong,
         error.TooManyItems,
+        error.OutOfMemory,
         => return,
     };
+    parsed.deinit();
 }
 
 fn fuzzBlocklist(input: []const u8) !void {

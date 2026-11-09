@@ -1,4 +1,4 @@
-FROM alpine:3.22 AS build
+FROM alpine:3.22@sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f AS build
 
 ARG TARGETARCH
 ARG ZIG_VERSION=0.17.0
@@ -24,7 +24,7 @@ WORKDIR /workspace
 COPY . .
 RUN /opt/zig/zig build -Doptimize=ReleaseSafe -Dversion="$VERSION"
 
-FROM alpine:3.22 AS runtime
+FROM alpine:3.22@sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f AS runtime
 
 ARG VERSION=0.1.0
 ARG REVISION=unknown

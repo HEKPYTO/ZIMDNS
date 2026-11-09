@@ -1,0 +1,179 @@
+name: Release
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    # Development phase: a manual dispatch on a branch must do nothing. The
+    # release runs only from a v* tag on GitHub.
+    if: ${{ startsWith(github.ref, 'refs/tags/v') && github.server_url == 'https://github.com' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Zig 0.17.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          zig_version=0.17.0
+          # The checksums are the ones published in
+          # https://ziglang.org/download/index.json for this release.
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64)
+              zig_target=x86_64-linux
+              zig_sha=1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
+              ;;
+            Linux-aarch64|Linux-arm64)
+              zig_target=aarch64-linux
+              zig_sha=9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8
+              ;;
+            *)
+              echo "unsupported runner: $(uname -s) $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+          zig_archive="$RUNNER_TEMP/zig.tar.xz"
+          zig_dir="$RUNNER_TEMP/zig"
+          curl --fail --location --retry 3 --output "$zig_archive" \
+            "https://ziglang.org/download/$zig_version/zig-$zig_target-$zig_version.tar.xz"
+          # openssl ships on the runner, so one check covers the archive.
+          zig_sha_actual="$(openssl dgst -sha256 "$zig_archive")"
+          zig_sha_actual="${zig_sha_actual##* }"
+          if [ "$zig_sha_actual" != "$zig_sha" ]; then
+            echo "zig archive checksum mismatch: $zig_sha_actual != $zig_sha" >&2
+            exit 1
+          fi
+          mkdir -p "$zig_dir"
+          tar -xJf "$zig_archive" --strip-components=1 --directory "$zig_dir"
+          echo "$zig_dir" >> "$GITHUB_PATH"
+          "$zig_dir/zig" version
+
+      - name: Install TLS headers
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev libgnutls28-dev
+
+      - name: Check formatting
+        run: zig fmt --check --exclude zig-pkg .
+
+      - name: Build
+        run: zig build
+
+      - name: Run unit tests
+        run: zig build test
+
+      - name: Run golden tests
+        run: zig build test-golden
+
+      - name: Run config tests
+        run: zig build test-config
+
+      - name: Run parser fuzz tests
+        run: zig build test-fuzz
+
+      - name: Run socket integration tests
+        run: zig build test-integration
+
+      - name: Run documented CLI invocation tests
+        run: zig build test-cli
+
+  image:
+    needs: gate
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    # GitHub-only release: the gate already skips other forges; this guard is
+    # defense-in-depth for the image, attestation and release jobs.
+    if: ${{ github.server_url == 'https://github.com' }}
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Lowercase image name
+        id: meta
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          sbom: true
+          provenance: mode=max
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            REVISION=${{ github.sha }}
+            SOURCE=${{ github.server_url }}/${{ github.repository }}
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ github.ref_name }}
+
+  sign:
+    needs: image
+    timeout-minutes: 15
+    if: ${{ needs.image.outputs.digest != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3.9.1
+
+      - name: Sign image
+        run: cosign sign --yes ${{ needs.image.outputs.image }}@${{ needs.image.outputs.digest }}
+
+  release:
+    needs: [image, sign]
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ github.ref_name }}
+    permissions:
+      contents: write
+    steps:
+      - name: Create GitHub release
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" --verify-tag --generate-notes --title "$TAG"
+          gh release view "$TAG" --json body -q .body > /tmp/body.md
+          {
+            echo ""
+            echo "Container image: ${{ needs.image.outputs.image }}:$TAG"
+            echo "Image digest: ${{ needs.image.outputs.digest }}"
+            echo "Full reference: ${{ needs.image.outputs.image }}@${{ needs.image.outputs.digest }}"
+            echo "SBOM and provenance attestation are attached to the image manifest."
+          } >> /tmp/body.md
+          gh release edit "$TAG" --notes-file /tmp/body.md

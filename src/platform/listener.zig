@@ -1605,49 +1605,31 @@ test "a slow recursive query on one UDP pool worker does not delay an authoritat
     defer runtime.deinit();
     runtime.resolver = try resolver_mod.Resolver.init(std.testing.allocator, io, try forwarding_policy(upstream_socket.address, "127.0.0.0/8"));
 
-    // Ephemeral pool port: reserve it by binding, read it back, then
-    // release it for the pool to bind. Loopback-only test; the race is
-    // accepted and the ready-poll below retries the whole pool on collision.
-    var probe_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
-    var probe = try std.Io.net.IpAddress.bind(&probe_addr, io, .{ .mode = .dgram, .protocol = .udp });
-    const pool_port = probe.address.getPort();
-    probe.close(io);
-    const pool_address = try std.Io.net.IpAddress.parse("127.0.0.1", pool_port);
+    // Bind the pool socket here so the test never races another process for
+    // the ephemeral port; the pool serves the already-bound socket.
+    var pool_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var pool_socket = try std.Io.net.IpAddress.bind(&pool_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer pool_socket.close(io);
+    const pool_port = pool_socket.address.getPort();
 
     const PoolDriver = struct {
         io: std.Io,
         runtime: *Runtime,
-        address: std.Io.net.IpAddress,
+        socket: *const std.Io.net.Socket,
         err: ?anyerror = null,
         fn run(self: *@This()) void {
-            serveUdpPoolOnAddressBounded(self.io, self.runtime, &self.address, null, 2) catch |err| {
+            serveUdpPoolOnSocketBudgeted(self.socket, self.io, self.runtime, null, 2) catch |err| {
                 self.err = err;
                 std.debug.print("pool error: {t}\n", .{err});
             };
         }
     };
-    var driver = PoolDriver{ .io = io, .runtime = &runtime, .address = pool_address };
+    var driver = PoolDriver{ .io = io, .runtime = &runtime, .socket = &pool_socket };
     const pool_thread = try std.Thread.spawn(.{}, PoolDriver.run, .{&driver});
 
     var client_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     var client_socket = try std.Io.net.IpAddress.bind(&client_addr, io, .{ .mode = .dgram, .protocol = .udp });
     defer client_socket.close(io);
-
-    // Readiness wait: the pool binds on its own thread, so a send issued
-    // before the bind lands on a dead port. Poll by attempting the same
-    // bind: AddressInUse means the pool owns the port now. Bounded at ~5 s,
-    // well inside the 10 s join-before-assert receive windows below.
-    const ready_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(pool_port) };
-    var waits: usize = 0;
-    while (waits < 50) : (waits += 1) {
-        var probe_bind = ready_addr;
-        const probe_socket = std.Io.net.IpAddress.bind(&probe_bind, io, .{ .mode = .dgram, .protocol = .udp }) catch |err| {
-            if (err == error.AddressInUse) break;
-            return err;
-        };
-        probe_socket.close(io);
-        std.Io.sleep(io, .fromMilliseconds(100), .awake) catch {};
-    } else return error.TestUnexpectedResult;
 
     var slow_buffer: [512]u8 = undefined;
     const slow_query = try @import("../cli/query.zig").buildQueryPacket(&slow_buffer, 0x7301, "example.com.", .A, false);
@@ -1655,8 +1637,12 @@ test "a slow recursive query on one UDP pool worker does not delay an authoritat
     const fast_query = try @import("../cli/query.zig").buildQueryPacket(&fast_buffer, 0x7302, "dns.home.arpa.", .A, false);
     var target = try std.Io.net.IpAddress.parse("127.0.0.1", pool_port);
     try client_socket.send(io, &target, slow_query);
+    var waited_ms: u32 = 0;
+    while (!upstream.started.load(.acquire) and waited_ms < 2000) : (waited_ms += 1) {
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(upstream.started.load(.acquire));
     try client_socket.send(io, &target, fast_query);
-
     // Join-before-assert: every thread is reaped before any `try` can
     // return early, so no thread ever touches the socket after teardown.
     var first_buffer: [512]u8 = undefined;
@@ -1880,6 +1866,7 @@ const IsolationUpstream = struct {
     udp: *const std.Io.net.Socket,
     delay_ms: u64,
     done: std.atomic.Value(bool),
+    started: std.atomic.Value(bool) = .init(false),
     senders: [4]std.Thread = undefined,
     sender_count: usize = 0,
 };
@@ -1917,6 +1904,7 @@ fn serveIsolationUpstream(args: *IsolationUpstream, slots: *[4]IsolationSender) 
             .from = incoming.from,
         };
         @memcpy(slot.query_data[0..incoming.data.len], incoming.data);
+        args.started.store(true, .release);
         args.senders[args.sender_count] = std.Thread.spawn(.{}, IsolationSender.run, .{slot}) catch continue;
         args.sender_count += 1;
     }

@@ -28,7 +28,8 @@ const tcp_deadline = @import("platform/tcp_deadline.zig");
 const tls_client = @import("transport/tls_client.zig");
 const doh_client = @import("transport/doh_client.zig");
 
-pub const MAX_CACHE_ENTRIES = 64;
+// shortcut: linear scan is fine at 1024 entries; add an open-addressing index above ~4096.
+pub const MAX_CACHE_ENTRIES = 1024;
 /// RFC 9520 section 3.2: the resolution-failure cache is bounded too, so a
 /// flood of failing names cannot grow it without limit.
 pub const MAX_FAILURE_CACHE_ENTRIES = 64;
@@ -889,14 +890,16 @@ const FailureCache = struct {
 
 const Cache = struct {
     allocator: std.mem.Allocator,
-    entries: [MAX_CACHE_ENTRIES]CacheEntry = @splat(CacheEntry{}),
+    entries: []CacheEntry,
     len: usize = 0,
     replacement: usize = 0,
     /// RFC 9520 section 3.2: the resolution failures this resolver holds.
     failures: FailureCache = .{},
 
-    fn init(allocator: std.mem.Allocator, failure_ttl: u32) Cache {
-        return .{ .allocator = allocator, .failures = FailureCache.init(failure_ttl) };
+    fn init(allocator: std.mem.Allocator, failure_ttl: u32) !Cache {
+        const entries = try allocator.alloc(CacheEntry, MAX_CACHE_ENTRIES);
+        @memset(entries, .{});
+        return .{ .allocator = allocator, .entries = entries, .failures = FailureCache.init(failure_ttl) };
     }
 
     fn deinit(self: *Cache) void {
@@ -906,6 +909,7 @@ const Cache = struct {
             self.entries[index].response = null;
         }
         self.len = 0;
+        self.allocator.free(self.entries);
     }
 
     /// The scope is the one the upstream answered with (RFC 7871 section 6),
@@ -1422,15 +1426,17 @@ fn stripOptions(message: *dns_message.Message) void {
     message.edns = null;
 }
 
+const Resolution = struct {
+    resolver: *Resolver,
+    deadline_ns: i128 = 0,
+};
+
 pub const Resolver = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     // One forward at a time keeps the cache and the aggressive cache under a
     // single lock; split them if concurrent forwarding throughput matters.
     mutex: std.Io.Mutex = .init,
-    /// Absolute wall-clock end of the resolution in flight, set by `answer`
-    /// and read by every upstream wait. Zero means no resolution is running.
-    deadline_ns: i128 = 0,
     /// True when a managed-state write failed or the state moved after the
     /// last successful write; the next tick retries before doing any work.
     managed_state_dirty: bool = false,
@@ -1490,7 +1496,7 @@ pub const Resolver = struct {
             .io = io,
             .policy = policy,
             .upstream = if (policy.forwarder) |forwarder| forwarder.address else null,
-            .cache = Cache.init(allocator, policy.failure_cache_seconds),
+            .cache = try Cache.init(allocator, policy.failure_cache_seconds),
         };
         _ = iterate_mod.rootHints(&resolver.root_hints);
         return resolver;
@@ -1691,7 +1697,7 @@ pub const Resolver = struct {
 
     fn refreshManagedPoint(self: *Resolver, managed: *managed_mod.ManagedAnchors, index: usize, now: u64) !void {
         const point = &managed.points.items[index];
-        var response = try self.fetchManagedDnskey(point.owner);
+        var response = try self.fetchManagedDnskey(null, point.owner);
         defer response.deinit();
 
         var keys: std.ArrayList([]const u8) = .empty;
@@ -1746,7 +1752,7 @@ pub const Resolver = struct {
 
     /// One DNSKEY query for a trust point, with DO set so the answer carries
     /// the RRSIGs the RFC 5011 state machine verifies.
-    fn fetchManagedDnskey(self: *Resolver, apex: dns_name.Name) !dns_message.Message {
+    fn fetchManagedDnskey(self: *Resolver, res: ?*const Resolution, apex: dns_name.Name) !dns_message.Message {
         var request = dns_message.Message{
             .allocator = self.allocator,
             .header = .{ .id = 0, .question_count = 1, .recursion_desired = true },
@@ -1763,7 +1769,7 @@ pub const Resolver = struct {
         defer parsed.deinit();
         // `queryUpstream` composes the upstream query (DO bit, cookie, key
         // tags) from the client bytes, so the raw query is what it gets.
-        const upstream_answer = try self.queryUpstream(writer.written(), parsed, null, .udp);
+        const upstream_answer = try self.queryUpstream(res, writer.written(), parsed, null, .udp);
         return upstream_answer.response;
     }
 
@@ -1853,17 +1859,17 @@ pub const Resolver = struct {
     pub fn answer(self: *Resolver, query_bytes: []const u8, query: dns_message.Message, client: *const std.Io.net.IpAddress, output: []u8) ![]const u8 {
         self.lock();
         defer self.unlock();
-        self.deadline_ns = @as(i128, std.Io.Clock.awake.now(self.io).nanoseconds) + RESOLUTION_TIMEOUT.duration.raw.toNanoseconds();
-        defer self.deadline_ns = 0;
-        return self.answerAtDepth(query_bytes, query, client, output, 0);
+        var res = Resolution{ .resolver = self, .deadline_ns = @as(i128, std.Io.Clock.awake.now(self.io).nanoseconds) + RESOLUTION_TIMEOUT.duration.raw.toNanoseconds() };
+        return self.answerAtDepth(&res, query_bytes, query, client, output, 0);
     }
 
     /// Time left on the resolution budget, or null when it ran out. Every
     /// upstream receive is cut to what remains, so junk packets that re-arm
     /// the per-receive timeout cannot stretch the wait past the total.
-    fn remainingTimeout(self: *const Resolver) ?std.Io.Timeout {
-        if (self.deadline_ns == 0) return UDP_TIMEOUT;
-        const left = self.deadline_ns - @as(i128, std.Io.Clock.awake.now(self.io).nanoseconds);
+    fn remainingTimeout(self: *const Resolver, res: ?*const Resolution) ?std.Io.Timeout {
+        const deadline = if (res) |r| r.deadline_ns else 0;
+        if (deadline == 0) return UDP_TIMEOUT;
+        const left = deadline - @as(i128, std.Io.Clock.awake.now(self.io).nanoseconds);
         if (left <= 0) return null;
         const ms: i64 = @intCast(@divTrunc(left + std.time.ns_per_ms - 1, std.time.ns_per_ms));
         // Never longer than one per-receive wait: the budget only shortens
@@ -1877,7 +1883,7 @@ pub const Resolver = struct {
     /// so the depth bounds the reports one client query can cause. A report
     /// travels over TCP when the platform can reach the upstream over TCP,
     /// because a UDP source address is easy to forge.
-    fn answerAtDepth(self: *Resolver, query_bytes: []const u8, query: dns_message.Message, client: *const std.Io.net.IpAddress, output: []u8, depth: u32) ![]const u8 {
+    fn answerAtDepth(self: *Resolver, res: *Resolution, query_bytes: []const u8, query: dns_message.Message, client: *const std.Io.net.IpAddress, output: []u8, depth: u32) ![]const u8 {
         const transport: UpstreamTransport = if (depth == 0) .udp else .tcp;
         if (query.header.opcode != .query) return Error.UnsupportedOpcode;
         const cookie = self.clientCookie(query, client);
@@ -1959,7 +1965,7 @@ pub const Resolver = struct {
                 return bytes;
             }
         }
-        const exchange = self.queryUpstream(query_bytes, query, scope, transport) catch |err| switch (err) {
+        const exchange = self.queryUpstream(res, query_bytes, query, scope, transport) catch |err| switch (err) {
             Error.UpstreamFailure,
             Error.NoReachableAuthority,
             Error.BadUpstreamResponse,
@@ -2037,7 +2043,7 @@ pub const Resolver = struct {
         // verified rides on the answer the client still gets.
         var insecure_ede: u16 = 0;
         if (validated) {
-            const result = try self.checkDnssec(query, response, @intCast(@max(now, 0)));
+            const result = try self.checkDnssec(res, query, response, @intCast(@max(now, 0)));
             switch (result.status) {
                 .secure => {
                     // RFC 6147 section 5.5 item 1: with CD clear and DO
@@ -2063,7 +2069,7 @@ pub const Resolver = struct {
                     // RFC 9567 section 4.1: the resolver detected the
                     // failure itself, so the code it reports is the one the
                     // validator produced.
-                    self.sendErrorReport(depth, query, client, upstream_report, result.ede);
+                    self.sendErrorReport(res, depth, query, client, upstream_report, result.ede);
                     return self.relayBogus(query, cookie, result.ede, output);
                 },
                 .insecure => {
@@ -2084,7 +2090,7 @@ pub const Resolver = struct {
         // RFC 6147 section 5.1.2 runs before this: an error RCODE other than
         // NXDOMAIN is treated as an empty answer, so a synthesis that
         // answers the client with a record is not a resolution failure.
-        switch (try synthesizeDns64Answer(self, query, &response, exchange.scope, transport, now)) {
+        switch (try synthesizeDns64Answer(self, res, query, &response, exchange.scope, transport, now)) {
             .none => {},
             .synthesized => |answer_scope| upstream_scope = answer_scope,
             .bogus => |ede| {
@@ -2096,14 +2102,14 @@ pub const Resolver = struct {
                 // RFC 9567 section 4.1: the resolver detected the failure
                 // itself, so the code it reports is the one the validator
                 // produced.
-                self.sendErrorReport(depth, query, client, upstream_report, ede);
+                self.sendErrorReport(res, depth, query, client, upstream_report, ede);
                 return self.relayBogus(query, cookie, ede, output);
             },
         }
         // RFC 9567 section 4.1: the upstream's answer reported an error, so
         // the agent domain it named is told about it.
         if (upstream_report.ede_code != 0) {
-            self.sendErrorReport(depth, query, client, upstream_report, upstream_report.ede_code);
+            self.sendErrorReport(res, depth, query, client, upstream_report, upstream_report.ede_code);
         }
         switch (response.header.rcode) {
             .servfail => {
@@ -2214,7 +2220,7 @@ pub const Resolver = struct {
         return self.policy.anchors.len != 0 and !query.header.checking_disabled;
     }
 
-    fn checkDnssec(self: *Resolver, query: dns_message.Message, response: dns_message.Message, now: u32) !validate.Result {
+    fn checkDnssec(self: *Resolver, res: ?*const Resolution, query: dns_message.Message, response: dns_message.Message, now: u32) !validate.Result {
         if (!hasRrsig(response)) {
             // RFC 4035 section 5.2: an unsigned answer is relayed as insecure
             // when the parent's signed DS denial proves an insecure
@@ -2223,7 +2229,7 @@ pub const Resolver = struct {
             // it runs that check. A forwarded answer does not name its zone,
             // and a DS probe of the wrong name would fail an unsigned
             // domain, so it stays honestly insecure.
-            if (self.upstream == null) return self.unsignedVerdict(self.iterate_zone, now);
+            if (self.upstream == null) return self.unsignedVerdict(res, self.iterate_zone, now);
             // A forwarded answer does not name the zone that should have
             // signed it. An anchor that names an ancestor below the root is
             // a zone that must sign its answers, so an unsigned one lost its
@@ -2245,9 +2251,9 @@ pub const Resolver = struct {
         var extra: std.ArrayList(dns_record.ResourceRecord) = .empty;
         defer extra.deinit(self.allocator);
         if (self.upstream == null) {
-            try self.fetchChain(response, @intCast(now), &extra, .iterate);
+            try self.fetchChain(res, response, @intCast(now), &extra, .iterate);
         } else if (hasRrsig(response)) {
-            try self.fetchChain(response, @intCast(now), &extra, .forward);
+            try self.fetchChain(res, response, @intCast(now), &extra, .forward);
         }
         return validate.validate(self.allocator, &self.policy.anchors, query, response, extra.items, now);
     }
@@ -2287,7 +2293,7 @@ pub const Resolver = struct {
     /// the unsigned answer is a stripped signature; a signed denial of the DS
     /// means the delegation is insecure; a DS answer that cannot be validated
     /// keeps the failure closed.
-    fn unsignedVerdict(self: *Resolver, apex: dns_name.Name, now: u32) !validate.Result {
+    fn unsignedVerdict(self: *Resolver, res: ?*const Resolution, apex: dns_name.Name, now: u32) !validate.Result {
         var ds_query = dns_message.Message{
             .allocator = self.allocator,
             .header = .{ .id = 0, .question_count = 1 },
@@ -2298,7 +2304,8 @@ pub const Resolver = struct {
         };
         defer ds_query.deinit();
         const options: iterate_mod.Options = .{ .now = @intCast(now), .dnssec_ok = true, .qname_minimization = true };
-        var ds_response = iterate_mod.resolve(self.allocator, .{ .context = self, .send = iterateSend }, self.rootServers(@intCast(now)), .{
+        var hop_ctx = Resolution{ .resolver = self, .deadline_ns = if (res) |r| r.deadline_ns else 0 };
+        var ds_response = iterate_mod.resolve(self.allocator, .{ .context = &hop_ctx, .send = iterateSend }, self.rootServers(res, @intCast(now)), .{
             .name = apex,
             .qtype = .DS,
             .qclass = .IN,
@@ -2314,7 +2321,7 @@ pub const Resolver = struct {
         if (!hasRrsig(ds_response)) return .{ .status = .insecure, .ede = 0 };
         var extra: std.ArrayList(dns_record.ResourceRecord) = .empty;
         defer extra.deinit(self.allocator);
-        try self.fetchChain(ds_response, @intCast(now), &extra, .iterate);
+        try self.fetchChain(res, ds_response, @intCast(now), &extra, .iterate);
         const result = validate.validate(self.allocator, &self.policy.anchors, ds_query, ds_response, extra.items, now) catch return .{ .status = .bogus, .ede = dnssec.EDE_DNSSEC_BOGUS };
         switch (result.status) {
             // The DS RRset is present and authenticated, so the zone is
@@ -2358,7 +2365,7 @@ pub const Resolver = struct {
     /// from each RRSIG signer up to the root, so the validator can walk the
     /// chain itself. Best effort: a zone that does not answer leaves its
     /// part of the chain absent and the answer insecure, never bogus.
-    fn fetchChain(self: *Resolver, response: dns_message.Message, now: i64, extra: *std.ArrayList(dns_record.ResourceRecord), source: ChainSource) !void {
+    fn fetchChain(self: *Resolver, res: ?*const Resolution, response: dns_message.Message, now: i64, extra: *std.ArrayList(dns_record.ResourceRecord), source: ChainSource) !void {
         var signers: [max_chain_signers]dns_name.Name = undefined;
         var signer_count: usize = 0;
         for ([_][]const dns_record.ResourceRecord{ response.answers.slice(), response.authorities.slice() }) |section| {
@@ -2383,19 +2390,19 @@ pub const Resolver = struct {
             var ancestor = signer;
             var steps: usize = 0;
             while (steps < max_chain_zones) : (steps += 1) {
-                try self.fetchZoneRecords(ancestor, .DNSKEY, now, extra, source);
+                try self.fetchZoneRecords(res, ancestor, .DNSKEY, now, extra, source);
                 // An anchor that names this zone is the trust root for it: the
                 // DS a parent would publish is redundant, and every RRset above
                 // the anchor is outside the chain the validator can reach, so
                 // fetching it would only add insecure RRsets that withhold AD.
                 if (self.dnskeyAnchorFor(ancestor) or self.dsAnchorFor(ancestor)) break;
-                try self.fetchZoneRecords(ancestor, .DS, now, extra, source);
+                try self.fetchZoneRecords(res, ancestor, .DS, now, extra, source);
                 ancestor = parentOf(ancestor) orelse break;
             }
         }
     }
 
-    fn fetchZoneRecords(self: *Resolver, apex: dns_name.Name, qtype: dns_types.RecordType, now: i64, extra: *std.ArrayList(dns_record.ResourceRecord), source: ChainSource) !void {
+    fn fetchZoneRecords(self: *Resolver, res: ?*const Resolution, apex: dns_name.Name, qtype: dns_types.RecordType, now: i64, extra: *std.ArrayList(dns_record.ResourceRecord), source: ChainSource) !void {
         // RFC 4035 section 5.2: the DS for a zone lives in the parent, so the
         // query must reach the parent's servers. A cached delegation for the
         // zone would start the walk inside the child, which cannot answer
@@ -2421,13 +2428,14 @@ pub const Resolver = struct {
                             .dnssec_ok = false,
                             .qname_minimization = true,
                         };
-                        break :blk iterate_mod.resolve(self.allocator, .{ .context = self, .send = iterateSend }, self.rootServers(now), .{
+                        var hop_ctx = Resolution{ .resolver = self, .deadline_ns = if (res) |r| r.deadline_ns else 0 };
+                        break :blk iterate_mod.resolve(self.allocator, .{ .context = &hop_ctx, .send = iterateSend }, self.rootServers(res, now), .{
                             .name = kt_name,
                             .qtype = dns_types.RecordType.NULL,
                             .qclass = .IN,
                         }, options) catch null;
                     },
-                    .forward => self.forwardZoneQuery(kt_name, dns_types.RecordType.NULL) catch null,
+                    .forward => self.forwardZoneQuery(res, kt_name, dns_types.RecordType.NULL) catch null,
                 };
                 if (kt_answer) |*a| a.deinit();
             }
@@ -2440,13 +2448,14 @@ pub const Resolver = struct {
                     .dnssec_ok = true,
                     .qname_minimization = true,
                 };
-                break :blk iterate_mod.resolve(self.allocator, .{ .context = self, .send = iterateSend }, self.rootServers(now), .{
+                var hop_ctx = Resolution{ .resolver = self, .deadline_ns = if (res) |r| r.deadline_ns else 0 };
+                break :blk iterate_mod.resolve(self.allocator, .{ .context = &hop_ctx, .send = iterateSend }, self.rootServers(res, now), .{
                     .name = apex,
                     .qtype = qtype,
                     .qclass = .IN,
                 }, options) catch return;
             },
-            .forward => self.forwardZoneQuery(apex, qtype) catch return,
+            .forward => self.forwardZoneQuery(res, apex, qtype) catch return,
         };
         defer chain_answer.deinit();
         var collected: [max_chain_zone_records]dns_record.ResourceRecord = undefined;
@@ -2469,7 +2478,7 @@ pub const Resolver = struct {
     /// One chain query through the configured forwarder. The response is the
     /// answer the forwarder gives for the zone's DS or DNSKEY RRset, with the
     /// records the validator needs to chain it.
-    fn forwardZoneQuery(self: *Resolver, apex: dns_name.Name, qtype: dns_types.RecordType) !dns_message.Message {
+    fn forwardZoneQuery(self: *Resolver, res: ?*const Resolution, apex: dns_name.Name, qtype: dns_types.RecordType) !dns_message.Message {
         const upstream = self.upstream orelse return Error.NoForwarder;
         var request = dns_message.Message{
             .allocator = self.allocator,
@@ -2491,9 +2500,9 @@ pub const Resolver = struct {
         // RFC 7858 section 3.1 and RFC 8484 section 4.1: an encrypted
         // forwarder has no cleartext path, so the chain query travels the same
         // channel as the answer.
-        if (self.policy.forwarder_tls) return self.queryUpstreamTls(bytes, parsed, null);
-        if (self.policy.forwarder_doh) return self.queryUpstreamDoh(bytes, parsed, null);
-        return self.queryUdp(upstream, bytes, parsed, null, true);
+        if (self.policy.forwarder_tls) return self.queryUpstreamTls(res, bytes, parsed, null);
+        if (self.policy.forwarder_doh) return self.queryUpstreamDoh(res, bytes, parsed, null);
+        return self.queryUdp(res, upstream, bytes, parsed, null, true);
     }
     fn keyTagQueryName(self: *Resolver, apex: dns_name.Name) ?dns_name.Name {
         return keyTagQueryNameFor(&self.policy.anchors, apex);
@@ -2519,7 +2528,7 @@ pub const Resolver = struct {
     /// path, so its answer is validated and cached like any other answer,
     /// and its answer is never returned to the client. The report is best
     /// effort: a failure to send it never changes the client's answer.
-    fn sendErrorReport(self: *Resolver, depth: u32, query: dns_message.Message, client: *const std.Io.net.IpAddress, upstream_report: UpstreamReport, ede_code: u16) void {
+    fn sendErrorReport(self: *Resolver, res: *Resolution, depth: u32, query: dns_message.Message, client: *const std.Io.net.IpAddress, upstream_report: UpstreamReport, ede_code: u16) void {
         // RFC 9567 section 6.1: a report is sent only for a client query, so
         // the answer to a report query never produces a second report.
         if (depth != 0) return;
@@ -2547,7 +2556,7 @@ pub const Resolver = struct {
         var writer = dns_writer.Writer.init(&query_bytes);
         report_query.encode(&writer) catch return;
         var output: [2048]u8 = undefined;
-        _ = self.answerAtDepth(writer.written(), report_query, client, &output, depth + 1) catch {};
+        _ = self.answerAtDepth(res, writer.written(), report_query, client, &output, depth + 1) catch {};
     }
 
     /// RFC 9520 section 3.2: the cached failure is answered with the RCODE
@@ -2837,12 +2846,12 @@ pub const Resolver = struct {
     /// ADDRESS, so it can answer the question without the scope. The retry is
     /// bounded: it happens once, and a second REFUSED ends the exchange the
     /// way it ends without a client subnet.
-    fn queryUpstream(self: *Resolver, query_bytes: []const u8, query: dns_message.Message, scope: ?EcsScope, transport: UpstreamTransport) !UpstreamAnswer {
+    fn queryUpstream(self: *Resolver, res: ?*const Resolution, query_bytes: []const u8, query: dns_message.Message, scope: ?EcsScope, transport: UpstreamTransport) !UpstreamAnswer {
         // RFC 9567 section 6.1: an error report travels over TCP when the
         // platform can reach the upstream over TCP, because a UDP source
         // address is easy to forge. A platform that cannot waits no longer
         // than the ordinary path.
-        const upstream = self.upstream orelse return .{ .response = try self.iterate(query), .scope = scope };
+        const upstream = self.upstream orelse return .{ .response = try self.iterate(res, query), .scope = scope };
         // RFC 7858 section 3.1 and RFC 8484 section 4.1: an encrypted
         // forwarder carries every upstream query over its channel; there is
         // no cleartext fallback.
@@ -2851,21 +2860,21 @@ pub const Resolver = struct {
         // after a failed discovery's retry interval. A verified designation
         // carries the current query over the encrypted endpoint and
         // switches every later query with it.
-        if (try self.discoverDdr(query_bytes, query, scope)) |verified| {
+        if (try self.discoverDdr(res, query_bytes, query, scope)) |verified| {
             return .{ .response = verified, .scope = scope };
         }
         if (self.policy.forwarder_tls) {
-            return .{ .response = try self.queryUpstreamTls(query_bytes, query, scope), .scope = scope };
+            return .{ .response = try self.queryUpstreamTls(res, query_bytes, query, scope), .scope = scope };
         }
         if (self.policy.forwarder_doh) {
-            return .{ .response = try self.queryUpstreamDoh(query_bytes, query, scope), .scope = scope };
+            return .{ .response = try self.queryUpstreamDoh(res, query_bytes, query, scope), .scope = scope };
         }
         if (transport == .tcp) {
             if (comptime UPSTREAM_TCP_DEADLINES_SUPPORTED) {
-                return .{ .response = try self.queryUpstreamTcp(query_bytes, query, scope), .scope = scope };
+                return .{ .response = try self.queryUpstreamTcp(res, query_bytes, query, scope), .scope = scope };
             }
         }
-        var response = try self.queryUdp(upstream, query_bytes, query, scope, true);
+        var response = try self.queryUdp(res, upstream, query_bytes, query, scope, true);
         const sent = scope orelse return .{ .response = response, .scope = scope };
         if (sent.prefix == 0 or response.header.rcode != .refused) return .{ .response = response, .scope = scope };
         // RFC 7871 section 6: an option whose SOURCE PREFIX-LENGTH is 0
@@ -2873,7 +2882,7 @@ pub const Resolver = struct {
         var without_address = sent;
         without_address.prefix = 0;
         response.deinit();
-        return .{ .response = try self.queryUdp(upstream, query_bytes, query, without_address, true), .scope = without_address };
+        return .{ .response = try self.queryUdp(res, upstream, query_bytes, query, without_address, true), .scope = without_address };
     }
 
     /// RFC 9567 section 6.1: the error report travels over TCP. The query
@@ -2883,7 +2892,7 @@ pub const Resolver = struct {
     /// certificate name and the SNI are the operator's configured name, and
     /// the response passes the same identity checks as a plain upstream
     /// answer before it is relayed.
-    fn queryUpstreamTls(self: *Resolver, query_bytes: []const u8, query: dns_message.Message, scope: ?EcsScope) !dns_message.Message {
+    fn queryUpstreamTls(self: *Resolver, res: ?*const Resolution, query_bytes: []const u8, query: dns_message.Message, scope: ?EcsScope) !dns_message.Message {
         const upstream = self.upstream orelse return Error.NoForwarder;
         if (!self.policy.forwarder_tls or self.policy.forwarder_tls_name_len == 0) return Error.NoForwarder;
         const host = self.policy.forwarder_tls_name[0..self.policy.forwarder_tls_name_len];
@@ -2897,9 +2906,9 @@ pub const Resolver = struct {
         const expected_id = std.mem.readInt(u16, &randomized_id, .big);
 
         try self.ensureTlsClient();
-        var stream = try self.dialTcp(upstream);
+        var stream = try self.dialTcp(res, upstream);
         defer stream.close(self.io);
-        if (!setBudgetedTcpIoTimeout(self, stream)) return Error.UpstreamFailure;
+        if (!setBudgetedTcpIoTimeout(self, res, stream)) return Error.UpstreamFailure;
         // RFC 9462 section 6.3: a DDR-designated endpoint verifies the
         // iPAddress SAN without an IP-literal or `resolver.arpa` SNI.
         const sni = if (self.policy.forwarder_no_sni) "" else host;
@@ -2923,7 +2932,7 @@ pub const Resolver = struct {
     /// RFC 8484 section 4.1: one forwarding exchange over DNS over HTTPS
     /// (POST, `application/dns-message`). The answer passes the same identity
     /// checks as a plain upstream answer before it is relayed.
-    fn queryUpstreamDoh(self: *Resolver, query_bytes: []const u8, query: dns_message.Message, scope: ?EcsScope) !dns_message.Message {
+    fn queryUpstreamDoh(self: *Resolver, res: ?*const Resolution, query_bytes: []const u8, query: dns_message.Message, scope: ?EcsScope) !dns_message.Message {
         const upstream = self.upstream orelse return Error.NoForwarder;
         if (!self.policy.forwarder_doh or self.policy.forwarder_tls_name_len == 0 or self.policy.forwarder_doh_path_len == 0) return Error.NoForwarder;
         const host = self.policy.forwarder_tls_name[0..self.policy.forwarder_tls_name_len];
@@ -2938,9 +2947,9 @@ pub const Resolver = struct {
         const expected_id = std.mem.readInt(u16, &randomized_id, .big);
 
         try self.ensureDohClient();
-        var stream = try self.dialTcp(upstream);
+        var stream = try self.dialTcp(res, upstream);
         defer stream.close(self.io);
-        if (!setBudgetedTcpIoTimeout(self, stream)) return Error.UpstreamFailure;
+        if (!setBudgetedTcpIoTimeout(self, res, stream)) return Error.UpstreamFailure;
         // RFC 9462 section 6.3: a DDR-designated endpoint verifies the
         // iPAddress SAN without an IP-literal or `resolver.arpa` SNI.
         const sni = if (self.policy.forwarder_no_sni) "" else host;
@@ -2967,7 +2976,7 @@ pub const Resolver = struct {
         return cloneMessage(self.allocator, response);
     }
 
-    fn queryUpstreamTcp(self: *Resolver, query_bytes: []const u8, query: dns_message.Message, scope: ?EcsScope) !dns_message.Message {
+    fn queryUpstreamTcp(self: *Resolver, res: ?*const Resolution, query_bytes: []const u8, query: dns_message.Message, scope: ?EcsScope) !dns_message.Message {
         const upstream = self.upstream orelse return Error.NoForwarder;
         var query_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
         if (query_bytes.len < 2 or query_bytes.len > query_buffer.len) return Error.UpstreamFailure;
@@ -2977,10 +2986,10 @@ pub const Resolver = struct {
         const upstream_query = try buildUpstreamQuery(query_bytes, query, &query_buffer, &self.policy.anchors, scope, true, try self.outgoingCookie(upstream, now));
         @memcpy(query_buffer[0..2], &randomized_id);
         const expected_id = std.mem.readInt(u16, &randomized_id, .big);
-        return self.queryTcp(upstream, query_buffer[0..upstream_query.len], query, expected_id, scope);
+        return self.queryTcp(res, upstream, query_buffer[0..upstream_query.len], query, expected_id, scope);
     }
 
-    fn queryUdp(self: *Resolver, upstream: std.Io.net.IpAddress, query_bytes: []const u8, query: dns_message.Message, scope: ?EcsScope, dnssec_ok: bool) !dns_message.Message {
+    fn queryUdp(self: *Resolver, res: ?*const Resolution, upstream: std.Io.net.IpAddress, query_bytes: []const u8, query: dns_message.Message, scope: ?EcsScope, dnssec_ok: bool) !dns_message.Message {
         var query_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
         if (query_bytes.len < 2 or query_bytes.len > query_buffer.len) return Error.UpstreamFailure;
         // RFC 5452 §9.2: each attempt binds its own socket so the
@@ -3005,12 +3014,12 @@ pub const Resolver = struct {
             // instead of failing the hop.
             var retried_bad_cookie = false;
             while (true) {
-                const wait = self.remainingTimeout() orelse break;
+                const wait = self.remainingTimeout(res) orelse break;
                 const incoming = socket.receiveTimeout(self.io, &response_buffer, wait) catch break;
                 if (!incoming.from.eql(&upstream)) continue;
                 switch (classifyUpstreamPacket(self.allocator, query, expected_id, incoming.data, scope, self.client_cookie)) {
                     .ignore => continue,
-                    .truncated => return self.queryTcpAfterTruncation(upstream, query_buffer[0..upstream_query.len], query, expected_id, UPSTREAM_TCP_DEADLINES_SUPPORTED, scope),
+                    .truncated => return self.queryTcpAfterTruncation(res, upstream, query_buffer[0..upstream_query.len], query, expected_id, UPSTREAM_TCP_DEADLINES_SUPPORTED, scope),
                     .ready => |message| {
                         var received = message;
                         // RFC 7873 section 5.3: one retry with the returned
@@ -3128,7 +3137,7 @@ pub const Resolver = struct {
         };
     }
 
-    fn iterate(self: *Resolver, query: dns_message.Message) !dns_message.Message {
+    fn iterate(self: *Resolver, res: ?*const Resolution, query: dns_message.Message) !dns_message.Message {
         const question = query.question orelse return Error.UpstreamFailure;
         const now: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(self.io).nanoseconds, std.time.ns_per_s));
         var answer_zone = dns_name.Name.root();
@@ -3143,7 +3152,8 @@ pub const Resolver = struct {
             .zone_out = &answer_zone,
             .qname_minimization = true,
         };
-        const resolved = iterate_mod.resolve(self.allocator, .{ .context = self, .send = iterateSend }, self.rootServers(now), question, options) catch |err| return mapIterateError(err);
+        var hop_ctx = Resolution{ .resolver = self, .deadline_ns = if (res) |r| r.deadline_ns else 0 };
+        const resolved = iterate_mod.resolve(self.allocator, .{ .context = &hop_ctx, .send = iterateSend }, self.rootServers(res, now), question, options) catch |err| return mapIterateError(err);
         self.iterate_zone = answer_zone;
         return resolved;
     }
@@ -3153,11 +3163,11 @@ pub const Resolver = struct {
     /// priming query refreshes them, and the built-in hints answer when it
     /// fails. A test seam that narrows the hints skips priming, so a fake
     /// root answers the walk directly.
-    fn rootServers(self: *Resolver, now: i64) []const std.Io.net.IpAddress {
+    fn rootServers(self: *Resolver, res: ?*const Resolution, now: i64) []const std.Io.net.IpAddress {
         if (self.hint_count != iterate_mod.root_hint_text.len) return self.root_hints[0..self.hint_count];
         // RFC 8806: the local root zone answers, so no priming query is sent.
         if (self.local_root_zone and self.root_server_count != 0) return self.root_servers[0..self.root_server_count];
-        if (self.root_server_count == 0 or now >= self.root_servers_expires_at) self.primeRootServers(now);
+        if (self.root_server_count == 0 or now >= self.root_servers_expires_at) self.primeRootServers(res, now);
         if (self.root_server_count != 0) return self.root_servers[0..self.root_server_count];
         return self.root_hints[0..self.hint_count];
     }
@@ -3166,7 +3176,7 @@ pub const Resolver = struct {
     /// root's own addresses in the additional section, asked of the first
     /// hint that answers. Only the addresses the NS RRset names are kept, so
     /// an off-bailiwick record cannot enter the list.
-    fn primeRootServers(self: *Resolver, now: i64) void {
+    fn primeRootServers(self: *Resolver, res: ?*const Resolution, now: i64) void {
         self.root_server_count = 0;
         const root = dns_name.Name.root();
         var query = dns_message.Message{
@@ -3208,7 +3218,8 @@ pub const Resolver = struct {
         var step: usize = 0;
         while (step < self.hint_count) : (step += 1) {
             const hint = self.root_hints[(random_index[0] +% step) % self.hint_count];
-            var primed = iterateSend(self, self.allocator, hint, writer.written(), false) catch continue;
+            var priming_ctx = Resolution{ .resolver = self, .deadline_ns = if (res) |r| r.deadline_ns else 0 };
+            var primed = iterateSend(&priming_ctx, self.allocator, hint, writer.written(), false) catch continue;
             defer primed.deinit();
             if (self.adoptRootServers(primed, now)) return;
         }
@@ -3219,14 +3230,14 @@ pub const Resolver = struct {
     /// the plaintext forwarder. A designation is adopted only when the
     /// designated endpoint answers over its encrypted channel with a
     /// certificate whose iPAddress SAN carries this resolver's IP.
-    fn discoverDdr(self: *Resolver, query_bytes: []const u8, query: dns_message.Message, scope: ?EcsScope) !?dns_message.Message {
+    fn discoverDdr(self: *Resolver, res: ?*const Resolution, query_bytes: []const u8, query: dns_message.Message, scope: ?EcsScope) !?dns_message.Message {
         if (!self.policy.ddr_client) return null;
         if (self.policy.forwarder_tls or self.policy.forwarder_doh) return null;
         const upstream = self.upstream orelse return null;
         const now: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(self.io).nanoseconds, std.time.ns_per_s));
         if (now < self.policy.ddr_next_attempt) return null;
 
-        var response = self.discoveryExchange(upstream) catch {
+        var response = self.discoveryExchange(res, upstream) catch {
             self.policy.ddr_next_attempt = now + DDR_MAX_RETRY_SECONDS;
             return null;
         };
@@ -3239,7 +3250,7 @@ pub const Resolver = struct {
         }
         const chosen = designation.?;
 
-        const verified = self.verifiedDdrExchange(upstream, chosen, query_bytes, query, scope) catch {
+        const verified = self.verifiedDdrExchange(res, upstream, chosen, query_bytes, query, scope) catch {
             self.policy.ddr_next_attempt = now + Resolver.ddrRetrySeconds(discTtl(response));
             return null;
         };
@@ -3251,7 +3262,7 @@ pub const Resolver = struct {
     /// One DDR discovery exchange over the plaintext resolver, bounded to
     /// the 1232-octet discovery response. The exchange never re-enters
     /// `queryUpstream`, so the discovery query itself is never discovered.
-    fn discoveryExchange(self: *Resolver, upstream: std.Io.net.IpAddress) !dns_message.Message {
+    fn discoveryExchange(self: *Resolver, res: ?*const Resolution, upstream: std.Io.net.IpAddress) !dns_message.Message {
         const discovery_name = dns_name.Name.fromText(DDR_DISCOVERY_NAME) catch return Error.UpstreamFailure;
         var request = dns_message.Message{
             .allocator = self.allocator,
@@ -3291,7 +3302,7 @@ pub const Resolver = struct {
         var response_buffer: [DDR_MAX_RESPONSE_LEN]u8 = undefined;
         var truncated = false;
         while (true) {
-            const wait = self.remainingTimeout() orelse break;
+            const wait = self.remainingTimeout(res) orelse break;
             const incoming = socket.receiveTimeout(self.io, &response_buffer, wait) catch break;
             if (!incoming.from.eql(&upstream)) continue;
             switch (classifyUpstreamPacket(self.allocator, request, expected_id, incoming.data, null, cookie[0..8].*)) {
@@ -3302,16 +3313,16 @@ pub const Resolver = struct {
             break;
         }
         if (!truncated) return Error.UpstreamFailure;
-        return self.discoveryTcp(upstream, writer.written(), request, expected_id);
+        return self.discoveryTcp(res, upstream, writer.written(), request, expected_id);
     }
 
     /// The TCP half of the DDR discovery exchange, for a truncated UDP
     /// answer. The frame is capped at the discovery response bound before
     /// the body is read.
-    fn discoveryTcp(self: *Resolver, upstream: std.Io.net.IpAddress, query_bytes: []const u8, query: dns_message.Message, expected_id: u16) !dns_message.Message {
-        var stream = try self.dialTcp(upstream);
+    fn discoveryTcp(self: *Resolver, res: ?*const Resolution, upstream: std.Io.net.IpAddress, query_bytes: []const u8, query: dns_message.Message, expected_id: u16) !dns_message.Message {
+        var stream = try self.dialTcp(res, upstream);
         defer stream.close(self.io);
-        const wait = self.remainingTimeout() orelse return Error.UpstreamFailure;
+        const wait = self.remainingTimeout(res) orelse return Error.UpstreamFailure;
         const frame_deadline = tcp_deadline.deadlineFromTimeout(self.io, wait) orelse return Error.UpstreamFailure;
         setTcpIoTimeout(stream);
 
@@ -3338,7 +3349,7 @@ pub const Resolver = struct {
     /// query over the designated endpoint with the original IP as the
     /// certificate name and no SNI on the wire. Only a verified answer
     /// switches the resolver; anything else stays on plaintext.
-    fn verifiedDdrExchange(self: *Resolver, upstream: std.Io.net.IpAddress, designation: DdrDesignation, query_bytes: []const u8, query: dns_message.Message, scope: ?EcsScope) !dns_message.Message {
+    fn verifiedDdrExchange(self: *Resolver, res: ?*const Resolution, upstream: std.Io.net.IpAddress, designation: DdrDesignation, query_bytes: []const u8, query: dns_message.Message, scope: ?EcsScope) !dns_message.Message {
         var ip_buffer: [64]u8 = undefined;
         const ip_text = try formatIpAddress(upstream, &ip_buffer);
         var target = upstream;
@@ -3358,9 +3369,9 @@ pub const Resolver = struct {
 
         if (designation.is_doh) {
             try self.ensureDohClient();
-            var stream = try self.dialTcp(target);
+            var stream = try self.dialTcp(res, target);
             defer stream.close(self.io);
-            if (!setBudgetedTcpIoTimeout(self, stream)) return Error.UpstreamFailure;
+            if (!setBudgetedTcpIoTimeout(self, res, stream)) return Error.UpstreamFailure;
             var response_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
             const body = self.doh_client_state.postWithVerification(stream, ip_text, "", designation.doh_path[0..designation.doh_path_len], request_bytes, &response_buffer) catch |err| switch (err) {
                 doh_client.Error.BadStatus,
@@ -3385,9 +3396,9 @@ pub const Resolver = struct {
         }
 
         try self.ensureTlsClient();
-        var stream = try self.dialTcp(target);
+        var stream = try self.dialTcp(res, target);
         defer stream.close(self.io);
-        if (!setBudgetedTcpIoTimeout(self, stream)) return Error.UpstreamFailure;
+        if (!setBudgetedTcpIoTimeout(self, res, stream)) return Error.UpstreamFailure;
         var response_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
         const response_bytes = self.tls_client_state.exchangeWithVerification(stream, ip_text, "", request_bytes, &response_buffer) catch |err| switch (err) {
             tls_client.Error.FrameTooLarge, tls_client.Error.HandshakeFailed => return Error.UpstreamFailure,
@@ -3698,10 +3709,13 @@ pub const Resolver = struct {
     }
 
     fn iterateSend(context: *anyopaque, allocator: std.mem.Allocator, server: std.Io.net.IpAddress, query_bytes: []const u8, dnssec_ok: bool) anyerror!dns_message.Message {
-        const self: *Resolver = @ptrCast(@alignCast(context));
+        // Priming outside a resolution and managed refresh pass a deadline-0
+        // context, keeping UDP_TIMEOUT; in-resolution hops carry the deadline.
+        const res: *Resolution = @ptrCast(@alignCast(context));
+        const self = res.resolver;
         var hop = try dns_message.Message.parse(allocator, query_bytes);
         defer hop.deinit();
-        return self.queryUdp(server, query_bytes, hop, null, dnssec_ok);
+        return self.queryUdp(res, server, query_bytes, hop, null, dnssec_ok);
     }
 
     fn bindSourceSocket(self: *Resolver, upstream: std.Io.net.IpAddress) !std.Io.net.Socket {
@@ -3717,16 +3731,16 @@ pub const Resolver = struct {
         }
         return Error.UpstreamFailure;
     }
-    fn queryTcpAfterTruncation(self: *Resolver, upstream: std.Io.net.IpAddress, query_bytes: []const u8, query: dns_message.Message, expected_id: u16, comptime deadline_support: bool, scope: ?EcsScope) !dns_message.Message {
+    fn queryTcpAfterTruncation(self: *Resolver, res: ?*const Resolution, upstream: std.Io.net.IpAddress, query_bytes: []const u8, query: dns_message.Message, expected_id: u16, comptime deadline_support: bool, scope: ?EcsScope) !dns_message.Message {
         if (comptime !deadline_support) return Error.UpstreamFailure;
-        return self.queryTcp(upstream, query_bytes, query, expected_id, scope);
+        return self.queryTcp(res, upstream, query_bytes, query, expected_id, scope);
     }
 
     /// One TCP connection to an upstream, honoring the RFC 5452 section 9.2
     /// source-port denylist on the platforms whose connector cannot.
     /// Connect timeout cut to the resolution budget: null when exhausted.
-    fn dialTimeout(self: *const Resolver) ?std.Io.Timeout {
-        const wait = self.remainingTimeout() orelse return null;
+    fn dialTimeout(self: *const Resolver, res: ?*const Resolution) ?std.Io.Timeout {
+        const wait = self.remainingTimeout(res) orelse return null;
         const left: i128 = switch (wait) {
             .none => 1000 * std.time.ns_per_ms,
             .duration => |d| d.raw.toNanoseconds(),
@@ -3737,8 +3751,8 @@ pub const Resolver = struct {
         return .{ .duration = .{ .raw = .fromMilliseconds(@intCast(@min(ms, @as(i64, 1000)))), .clock = .awake } };
     }
 
-    fn dialTcp(self: *Resolver, upstream: std.Io.net.IpAddress) !std.Io.net.Stream {
-        const timeout = self.dialTimeout() orelse return Error.UpstreamFailure;
+    fn dialTcp(self: *Resolver, res: ?*const Resolution, upstream: std.Io.net.IpAddress) !std.Io.net.Stream {
+        const timeout = self.dialTimeout(res) orelse return Error.UpstreamFailure;
         const stream = if (comptime UPSTREAM_TCP_DEADLINES_SUPPORTED)
             connectTcpWithTimeoutAvoiding(self.io, &upstream, .{
                 .mode = .stream,
@@ -3762,12 +3776,12 @@ pub const Resolver = struct {
         return stream;
     }
 
-    fn queryTcp(self: *Resolver, upstream: std.Io.net.IpAddress, query_bytes: []const u8, query: dns_message.Message, expected_id: u16, scope: ?EcsScope) !dns_message.Message {
+    fn queryTcp(self: *Resolver, res: ?*const Resolution, upstream: std.Io.net.IpAddress, query_bytes: []const u8, query: dns_message.Message, expected_id: u16, scope: ?EcsScope) !dns_message.Message {
         // The upstream address is the delegation server or the configured
         // forwarder; the caller resolved it.
-        var stream = try self.dialTcp(upstream);
+        var stream = try self.dialTcp(res, upstream);
         defer stream.close(self.io);
-        const wait = self.remainingTimeout() orelse return Error.UpstreamFailure;
+        const wait = self.remainingTimeout(res) orelse return Error.UpstreamFailure;
         const frame_deadline = tcp_deadline.deadlineFromTimeout(self.io, wait) orelse return Error.UpstreamFailure;
         setTcpIoTimeout(stream);
 
@@ -3850,7 +3864,7 @@ const Dns64Outcome = union(enum) {
 /// that refuses it is asked again with no ADDRESS (RFC 7871 section 7.1.3).
 /// Returns `.none` when nothing is synthesized, which leaves the answer as
 /// the upstream sent it.
-fn synthesizeDns64Answer(self: *Resolver, query: dns_message.Message, response: *dns_message.Message, scope: ?EcsScope, transport: UpstreamTransport, now: i64) !Dns64Outcome {
+fn synthesizeDns64Answer(self: *Resolver, res: ?*const Resolution, query: dns_message.Message, response: *dns_message.Message, scope: ?EcsScope, transport: UpstreamTransport, now: i64) !Dns64Outcome {
     // RFC 6147 section 5.2: with no configured prefix, the algorithm uses
     // the Well-Known Prefix 64:ff9b::/96 of RFC 6052 section 2.1.
     if (!self.policy.dns64 and self.policy.nat64_prefixes.len == 0) return .none;
@@ -3863,7 +3877,7 @@ fn synthesizeDns64Answer(self: *Resolver, query: dns_message.Message, response: 
     // RFC 6147 section 5.3.1 option 2: a PTR query for an address one of the
     // configured prefixes embeds is answered with a CNAME into IN-ADDR.ARPA
     // before the AAAA synthesis, which only accepts AAAA, is considered.
-    if (try synthesizeDns64Reverse(self, query, response, scope, transport)) |outcome| return outcome;
+    if (try synthesizeDns64Reverse(self, res, query, response, scope, transport)) |outcome| return outcome;
     if (!dns64Applies(query, response.*)) return .none;
     // RFC 6147 section 5.1.4: an AAAA record inside the excluded ranges is
     // not real AAAA data. The offending records are dropped, and an answer
@@ -3902,13 +3916,13 @@ fn synthesizeDns64Answer(self: *Resolver, query: dns_message.Message, response: 
         // RFC 7871 section 7.1.3: the A query carries the scope the AAAA
         // query carried, so an upstream that refuses it is asked once more
         // with no ADDRESS, exactly as the AAAA query is.
-        var a_answer = self.queryUpstream(a_writer.written(), a_query, scope, .udp) catch return .none;
+        var a_answer = self.queryUpstream(res, a_writer.written(), a_query, scope, .udp) catch return .none;
         defer a_answer.response.deinit();
         const a_response = a_answer.response;
         if (validating) {
             // RFC 6147 section 5.5: "If the data does not validate, the
             // vDNS64 MUST respond with RCODE=2 (Server failure)".
-            const result = try self.checkDnssec(a_query, a_response, @intCast(@max(now, 0)));
+            const result = try self.checkDnssec(res, a_query, a_response, @intCast(@max(now, 0)));
             if (result.status == .bogus) return .{ .bogus = result.ede };
             a_authenticated = result.status == .secure;
         }
@@ -3940,7 +3954,7 @@ fn synthesizeDns64Answer(self: *Resolver, query: dns_message.Message, response: 
 /// own, so the chain points at real data and is not made longer. Returns
 /// null when nothing is synthesized, which leaves the answer as the
 /// upstream sent it.
-fn synthesizeDns64Reverse(self: *Resolver, query: dns_message.Message, response: *dns_message.Message, scope: ?EcsScope, transport: UpstreamTransport) !?Dns64Outcome {
+fn synthesizeDns64Reverse(self: *Resolver, res: ?*const Resolution, query: dns_message.Message, response: *dns_message.Message, scope: ?EcsScope, transport: UpstreamTransport) !?Dns64Outcome {
     // RFC 6147 section 5.5 item 3: a client that set CD does the synthesis
     // itself, and section 5.1 keeps this server out of classes other than
     // IN.
@@ -3962,7 +3976,7 @@ fn synthesizeDns64Reverse(self: *Resolver, query: dns_message.Message, response:
     var query_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
     var writer = dns_writer.Writer.init(&query_buffer);
     ptr_query.encode(&writer) catch return null;
-    var answer = self.queryUpstream(writer.written(), ptr_query, scope, transport) catch return null;
+    var answer = self.queryUpstream(res, writer.written(), ptr_query, scope, transport) catch return null;
     defer answer.response.deinit();
     const reverse = answer.response;
     // RFC 6147 section 5.3.1 option 2: the IN-ADDR.ARPA name must have PTR
@@ -4713,9 +4727,9 @@ fn setTcpIoTimeout(stream: std.Io.net.Stream) void {
 
 /// Socket timeout for the TLS/DoH/DDR exchanges: cut to the resolution
 /// budget so an exhausted budget fails instead of blocking on the socket.
-fn setBudgetedTcpIoTimeout(self: *const Resolver, stream: std.Io.net.Stream) bool {
+fn setBudgetedTcpIoTimeout(self: *const Resolver, res: ?*const Resolution, stream: std.Io.net.Stream) bool {
     if (comptime !UPSTREAM_TCP_DEADLINES_SUPPORTED) return true;
-    const wait = self.remainingTimeout() orelse return false;
+    const wait = self.remainingTimeout(res) orelse return false;
     const left: i128 = switch (wait) {
         .none => 1000 * std.time.ns_per_ms,
         .duration => |d| d.raw.toNanoseconds(),
@@ -5168,7 +5182,7 @@ test "resolver ACL and cookie contracts" {
 }
 
 test "cache ages positive and negative responses and emits stale EDE" {
-    try std.testing.expectEqual(@as(usize, 64), MAX_CACHE_ENTRIES);
+    try std.testing.expectEqual(@as(usize, 1024), MAX_CACHE_ENTRIES);
     try std.testing.expectEqual(@as(i64, 86400), STALE_WINDOW_SECONDS);
     try std.testing.expectEqual(@as(u32, 30), STALE_TTL);
 
@@ -5177,7 +5191,7 @@ test "cache ages positive and negative responses and emits stale EDE" {
     var query = try makeTestQuery(arena.allocator(), 0x2200, "example.com.", true);
     defer query.deinit();
     const key = try CacheKey.fromQuestion(query);
-    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    var cache = try Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
     defer cache.deinit();
 
     var positive = try makePositiveResponse(arena.allocator(), 60);
@@ -5224,7 +5238,7 @@ test "the answer cache excludes failures truncation and upstream option data" {
     var query = try makeTestQuery(arena.allocator(), 0x2300, "example.com.", false);
     defer query.deinit();
     const key = try CacheKey.fromQuestion(query);
-    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    var cache = try Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
     defer cache.deinit();
     var output: [2048]u8 = undefined;
 
@@ -5261,7 +5275,7 @@ test "the answer cache excludes failures truncation and upstream option data" {
 test "cache reuses an expired slot instead of evicting a live entry" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    var cache = try Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
     defer cache.deinit();
     var output: [2048]u8 = undefined;
 
@@ -5325,7 +5339,7 @@ test "cache reuses an expired slot instead of evicting a live entry" {
 test "RFC 8020 section 2: a cached NXDOMAIN cuts the names below it" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    var cache = try Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
     defer cache.deinit();
     var output: [2048]u8 = undefined;
 
@@ -5373,7 +5387,7 @@ test "RFC 8020 section 2: a cached NXDOMAIN cuts the names below it" {
 test "RFC 8020 section 2: a cached answer below a cut name still wins" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    var cache = try Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
     defer cache.deinit();
     var output: [2048]u8 = undefined;
 
@@ -5401,7 +5415,7 @@ test "RFC 8020 section 2: a cached answer below a cut name still wins" {
 test "RFC 8020 section 2: the cut expires with the cached entry" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    var cache = try Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
     defer cache.deinit();
     var output: [2048]u8 = undefined;
 
@@ -5424,7 +5438,7 @@ test "RFC 8020 section 2: the cut expires with the cached entry" {
 test "RFC 2308 section 5: the negative TTL is the smaller of the SOA TTL and the SOA MINIMUM" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    var cache = try Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
     defer cache.deinit();
     var output: [2048]u8 = undefined;
 
@@ -5465,7 +5479,7 @@ test "RFC 2308 section 5: the negative TTL is the smaller of the SOA TTL and the
 test "RFC 9520 section 4: a lookup past the TTL keeps the entry for the stale path" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    var cache = try Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
     defer cache.deinit();
     var output: [2048]u8 = undefined;
 
@@ -5488,7 +5502,7 @@ test "RFC 9520 section 4: a lookup past the TTL keeps the entry for the stale pa
 test "RFC 2308 section 2.2: a CNAME with NODATA is cached by the SOA, not the chain" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    var cache = try Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
     defer cache.deinit();
     var output: [2048]u8 = undefined;
 
@@ -5515,7 +5529,7 @@ test "RFC 2308 section 2.2: a CNAME with NODATA is cached by the SOA, not the ch
 test "RFC 2308 section 5: an upstream negative TTL is capped at three hours" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    var cache = try Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
     defer cache.deinit();
     var output: [2048]u8 = undefined;
 
@@ -5830,7 +5844,7 @@ test "TC fallback is fail closed without deadline support" {
     defer resolver.deinit();
     var query = try makeTestQuery(std.testing.allocator, 0x2580, "example.com.", false);
     defer query.deinit();
-    try std.testing.expectError(Error.UpstreamFailure, resolver.queryTcpAfterTruncation(.{ .ip4 = .loopback(53) }, &.{}, query, 0, false, null));
+    try std.testing.expectError(Error.UpstreamFailure, resolver.queryTcpAfterTruncation(null, .{ .ip4 = .loopback(53) }, &.{}, query, 0, false, null));
 }
 
 test "resolver rejects non-query opcodes before cache or upstream" {
@@ -6084,7 +6098,7 @@ test "a cached answer reports the scope the upstream answered with" {
 
     var response = try makePositiveResponse(arena.allocator(), 60);
     defer response.deinit();
-    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    var cache = try Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
     defer cache.deinit();
     try cache.put(try CacheKey.fromQuestion(scoped), &response, 4000, 20, 20, 0);
 
@@ -6116,7 +6130,7 @@ test "RFC 7871 section 7.3.1: a scope-0 answer is served to every client" {
 
     var response = try makePositiveResponse(arena.allocator(), 60);
     defer response.deinit();
-    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    var cache = try Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
     defer cache.deinit();
     // The upstream answered with SCOPE PREFIX-LENGTH 0: the answer holds for
     // every client, not only for the one whose address was sent.
@@ -6148,7 +6162,7 @@ test "RFC 7871 section 7.3.2: the longest covering scope answers" {
     defer wide_response.deinit();
     var narrow_response = try makePositiveResponse(arena.allocator(), 120);
     defer narrow_response.deinit();
-    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    var cache = try Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
     defer cache.deinit();
     // The upstream answered the /16 query with scope 16, and the /24 query
     // with scope 24: a client inside both networks takes the /24 answer.
@@ -6192,7 +6206,7 @@ test "RFC 7871 section 7.3: an unusable upstream scope is reported as 0 and conf
     try std.testing.expectEqual(@as(u8, 0), info.report);
     try std.testing.expect(info.store == null);
 
-    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    var cache = try Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
     defer cache.deinit();
     try cache.put(key, &response, 4000, info.store, info.report, 0);
 
@@ -6226,7 +6240,7 @@ test "RFC 7871 section 7.3.2: a client that disclosed fewer bits than the scope 
 
     var response = try makePositiveResponse(arena.allocator(), 60);
     defer response.deinit();
-    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    var cache = try Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
     defer cache.deinit();
     try cache.put(try CacheKey.fromQuestion(narrow), &response, 4000, 24, 24, 0);
 
@@ -6250,7 +6264,7 @@ test "a client without the client subnet option keeps today's behavior" {
 
     var response = try makePositiveResponse(arena.allocator(), 60);
     defer response.deinit();
-    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    var cache = try Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
     defer cache.deinit();
     try cache.put(try CacheKey.fromQuestion(plain), &response, 4000, 0, 0, 0);
 
@@ -6632,7 +6646,7 @@ test "cache separates CD and EDNS DO variants" {
 
     var response = try makePositiveResponse(arena.allocator(), 60);
     defer response.deinit();
-    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    var cache = try Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
     defer cache.deinit();
     try cache.put(try CacheKey.fromQuestion(base), &response, 4000, 0, 0, 0);
 
@@ -6742,7 +6756,7 @@ test "RFC 8914 section 4.14: a client served the cached failure is told the erro
     var query = try makeTestQuery(arena.allocator(), 0x2921, "fail.example.", true);
     defer query.deinit();
     const key = try CacheKey.fromQuestion(query);
-    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    var cache = try Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
     defer cache.deinit();
     cache.failures.put(key, .{ .rcode = .servfail, .ede = EDE_NETWORK_ERROR }, 1000);
     const failure = cache.failures.lookup(&key, 1001).?.failure;
@@ -6768,7 +6782,7 @@ test "RFC 8914 section 2: a query without EDNS gets no EDE option and the same b
     var query = try makeTestQuery(arena.allocator(), 0x2922, "fail.example.", false);
     defer query.deinit();
     const key = try CacheKey.fromQuestion(query);
-    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    var cache = try Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
     defer cache.deinit();
     cache.failures.put(key, .{ .rcode = .servfail, .ede = EDE_NETWORK_ERROR }, 1000);
     const failure = cache.failures.lookup(&key, 1001).?.failure;
@@ -11681,7 +11695,7 @@ test "RFC 9520 section 3.2: a cached failure is answered as the failure it is" {
     var query = try makeTestQuery(arena.allocator(), 0x2911, "fail.example.", true);
     defer query.deinit();
     const key = try CacheKey.fromQuestion(query);
-    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    var cache = try Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
     defer cache.deinit();
     var output: [2048]u8 = undefined;
 
@@ -11707,7 +11721,7 @@ test "RFC 9520 section 3.2: a cached failure expires at the maximum cache time" 
     var query = try makeTestQuery(arena.allocator(), 0x2912, "fail.example.", false);
     defer query.deinit();
     const key = try CacheKey.fromQuestion(query);
-    var cache = Cache.init(std.testing.allocator, config.FAILURE_CACHE_MAX_SECONDS);
+    var cache = try Cache.init(std.testing.allocator, config.FAILURE_CACHE_MAX_SECONDS);
     defer cache.deinit();
     cache.failures.put(key, .{ .rcode = .servfail }, 1000);
 
@@ -11722,7 +11736,7 @@ test "RFC 9520 section 3.2: a failure that keeps repeating is held longer" {
     var query = try makeTestQuery(arena.allocator(), 0x2914, "fail.example.", false);
     defer query.deinit();
     const key = try CacheKey.fromQuestion(query);
-    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    var cache = try Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
     defer cache.deinit();
 
     // The first failure of the question is held for the operator's minimum.
@@ -11742,7 +11756,7 @@ test "RFC 9520 section 3.2: the backoff never holds a failure past the five-minu
     var query = try makeTestQuery(arena.allocator(), 0x2915, "fail.example.", false);
     defer query.deinit();
     const key = try CacheKey.fromQuestion(query);
-    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    var cache = try Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
     defer cache.deinit();
     const ceiling: i64 = config.FAILURE_CACHE_MAX_SECONDS;
 
@@ -11803,7 +11817,7 @@ test "RFC 9520 section 3.2: a question that resolves again forgets its failure c
 test "RFC 9520 section 3.2: the failure cache keeps the answer cache's own bounds" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    var cache = try Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
     defer cache.deinit();
     var output: [2048]u8 = undefined;
 
@@ -12057,7 +12071,7 @@ test "RFC 1035 section 4.1.1: the upstream query never carries the reserved Z bi
 test "RFC 1035 section 2.3.3: the NXDOMAIN cut ignores the case of the ancestor" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var cache = Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    var cache = try Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
     defer cache.deinit();
     var output: [2048]u8 = undefined;
 
@@ -14166,7 +14180,7 @@ test "RFC 8806: a local root zone supplies the root servers with no priming quer
     // The walk starts from the local list, and reading it sends no priming
     // query: a prime would clear the count and go to the network for the
     // built-in hints instead.
-    const started = resolver.rootServers(now);
+    const started = resolver.rootServers(null, now);
     try std.testing.expectEqual(@as(usize, 2), started.len);
     try std.testing.expectEqual(@as(usize, 2), resolver.root_server_count);
     // The `com.` delegation is already known, with its in-zone glue.
@@ -14191,7 +14205,7 @@ test "RFC 8806: a query under a TLD reaches that TLD server, not a root server" 
     var answer = try iterate_mod.resolve(
         arena.allocator(),
         .{ .context = &stub, .send = RootStub.send },
-        resolver.rootServers(now),
+        resolver.rootServers(null, now),
         query.question.?,
         .{ .cache = &resolver.delegations, .now = now },
     );

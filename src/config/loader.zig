@@ -35,6 +35,7 @@ const tsig = @import("../dns/tsig.zig");
 const signature_validity_seconds: u32 = 30 * 24 * 60 * 60;
 
 pub const Error = error{
+    OutOfMemory,
     MissingReferencedFile,
     InvalidReferencedPath,
     NoPrimaryZone,

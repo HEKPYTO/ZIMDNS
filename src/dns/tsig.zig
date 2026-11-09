@@ -63,6 +63,10 @@ pub const FinalAdditional = struct {
 pub fn parseFinalAdditional(packet: []const u8) Error!?FinalAdditional {
     var reader = Reader.init(packet);
     const header = Header.parse(&reader) catch return Error.EndOfInput;
+    // A TSIG must be the final additional record. With no record in any
+    // section there is nothing to find; a TSIG misplaced in the answer or
+    // authority section still has to report TsigNotFinal.
+    if (header.additional_count == 0 and header.answer_count == 0 and header.authority_count == 0) return null;
     var offset = reader.position();
 
     offset = skipQuestions(packet, offset, header.question_count) catch return Error.EndOfInput;
