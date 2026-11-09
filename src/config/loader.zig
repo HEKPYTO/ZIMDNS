@@ -300,7 +300,27 @@ pub const ServerContext = struct {
 
         for (context.config.zones.items[0..context.config.zones.len]) |*configured| {
             if (std.mem.eql(u8, configured.kindText(), "secondary")) {
-                try loadSecondaryZone(&context, io, allocator, configured, now_seconds, chain_policy);
+                loadSecondaryZone(&context, io, allocator, configured, now_seconds, chain_policy) catch |err| {
+                    if (err == error.OutOfMemory) return err;
+                    // One unreachable primary must not abort every zone: keep
+                    // the apex tracked with last_success null (refresh-due)
+                    // and serve SERVFAIL for it until a refresh succeeds,
+                    // while the other zones load and serve. The failure is
+                    // logged for the operator.
+                    const apex = lowerDot(allocator, configured.nameText()) catch return error.OutOfMemory;
+                    const primary = std.Io.net.IpAddress.parse(configured.addressText(), configured.port) catch continue;
+                    context.secondary_zones.append(allocator, .{
+                        .apex = apex,
+                        .primary = primary,
+                        .last_success_ns = null,
+                        .last_attempt_failed = true,
+                        .last_attempt_ns = @intCast(std.Io.Clock.awake.now(io).nanoseconds),
+                    }) catch {
+                        allocator.free(apex);
+                        return error.OutOfMemory;
+                    };
+                    continue;
+                };
             } else {
                 const zone_text = try readReferencedFile(dir, io, configured.fileText(), allocator);
                 defer allocator.free(zone_text);
@@ -491,6 +511,15 @@ pub const ServerContext = struct {
             if (!served) return error.BadConfiguration;
             if (!self.keyring.containsName(entry.keyText())) return error.BadConfiguration;
         }
+        for (self.config.secondary_tsig_keys.items[0..self.config.secondary_tsig_keys.len]) |entry| {
+            const apex = entry.apexText();
+            var is_secondary = false;
+            for (self.config.zones.items[0..self.config.zones.len]) |zone| {
+                if (std.mem.eql(u8, zone.kindText(), "secondary") and std.ascii.eqlIgnoreCase(zone.nameText(), apex)) is_secondary = true;
+            }
+            if (!is_secondary) return error.BadConfiguration;
+            if (!self.keyring.containsName(entry.keyText())) return error.BadConfiguration;
+        }
 
         var runtime = if (self.config.forwarder != null or self.config.recursion_allow.len != 0 or self.config.cookies.enabled)
             try auth_runtime.Runtime.fromZonesWithPolicyAndKeyring(self.allocator, &self.zones, self.blocklist, io, policy, &self.keyring)
@@ -654,7 +683,15 @@ pub const ServerContext = struct {
             self.allocator.free(state.members);
             self.catalog_consumer_state = null;
         }
+        // The secondary TSIG names resolve against the transferred list:
+        // the lookup needs the entries on the runtime, not the context.
         runtime.secondary_zones = self.secondary_zones;
+        for (self.config.secondary_tsig_keys.items[0..self.config.secondary_tsig_keys.len]) |entry| {
+            runtime.setSecondaryTsigKey(entry.apexText(), entry.keyText()) catch {
+                runtime.deinit();
+                return error.BadConfiguration;
+            };
+        }
         // SIGHUP re-reads every configured primary zone file through the
         // same base dir `load` read it from. A catalog or blacklist zone is
         // synthesized, so it has no file and is not a source.
@@ -671,7 +708,6 @@ pub const ServerContext = struct {
                 }
             }
         }
-        runtime.secondary_zones = self.secondary_zones;
         self.secondary_zones = .empty;
         self.blocklist = .{};
         self.config = .{};
@@ -1075,7 +1111,33 @@ fn blacklistOwner(buffer: *[512]u8, entry: []const u8) ![]const u8 {
 }
 /// A standalone secondary: fetch the zone once at startup over AXFR, serve
 /// it unsigned from memory, and keep the primary address with the SOA
-/// refresh/retry/expire timers the refresh tick polls (RFC 1035 section 7.3).
+/// The `secondary-tsig-key` entry for `apex`, resolved to the keyring key it
+/// names. Returns null when no key is configured (unsigned fetch).
+/// Errors when the apex names a key the keyring does not hold: the refresh
+/// callback treats a missing key the same way, so startup and refresh agree
+/// that a named-but-missing key fails rather than fetching unsigned.
+/// `Name` is a wire-format value and the secret slice borrows the keyring
+/// (which outlives the fetch), so no allocation is needed.
+fn secondaryTsigKey(context: *const ServerContext, apex: []const u8) !?xfr_client.TsigKey {
+    for (context.config.secondary_tsig_keys.items[0..context.config.secondary_tsig_keys.len]) |entry| {
+        if (!std.ascii.eqlIgnoreCase(entry.apexText(), apex)) continue;
+        const key_text = entry.keyText();
+        for (context.keyring.keys[0..context.keyring.len]) |*key| {
+            var buffer: [512]u8 = undefined;
+            const text = key.name.toText(&buffer) catch continue;
+            if (!std.ascii.eqlIgnoreCase(text, key_text)) continue;
+            return xfr_client.TsigKey{
+                .owner = key.name,
+                .algorithm = key.algorithm,
+                .secret = key.secretBytes(),
+                .now = 0,
+            };
+        }
+        return Error.BadSecondary;
+    }
+    return null;
+}
+
 fn loadSecondaryZone(
     context: *ServerContext,
     io: std.Io,
@@ -1088,7 +1150,12 @@ fn loadSecondaryZone(
     const apex = try lowerDot(allocator, configured.nameText());
     defer allocator.free(apex);
     const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } };
-    const zone_text = xfr_client.fetch(allocator, io, &primary, apex, timeout) catch return Error.BadSecondary;
+    // A `secondary-tsig-key` line for this apex signs the startup fetch
+    // with the keyring key (RFC 8945 section 4); a named-but-missing key
+    // fails the load rather than fetching unsigned. The lookup happens
+    // before the connection so no unsigned query goes on the wire.
+    const tsig_key = secondaryTsigKey(context, apex) catch return Error.BadSecondary;
+    const zone_text = xfr_client.fetchSigned(allocator, io, &primary, apex, timeout, tsig_key) catch return Error.BadSecondary;
     defer allocator.free(zone_text);
     const zone_index_before = context.zones.items.len;
     loadZoneText(context, allocator, io, zone_text, apex, null, now_seconds, chain_policy) catch |err| if (err == error.OutOfMemory) return error.OutOfMemory else return Error.BadSecondary;
@@ -2100,6 +2167,58 @@ test "server context refuses a catalog apex that names a served zone" {
     try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = "zone one.example primary one.zone\ncatalog-zone ONE.example\n" });
 
     try std.testing.expectError(Error.BadCatalogZone, ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator));
+}
+
+test "one unreachable secondary does not abort the other zones" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    // A primary for the reachable secondary: serves one zone over loopback.
+    const zone_text = "$ORIGIN good.example.\n$TTL 3600\n@ IN SOA ns.good.example. hostmaster.good.example. 7 3600 900 1209600 3600\n@ IN NS ns.good.example.\nwww IN A 192.0.2.7\n";
+    var zone_file = try zone_parser.ZoneFile.parse(zone_text);
+    defer zone_file.deinit();
+    var zone = try zone_index.Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+    // Port 9 (discard) on loopback refuses immediately: the fetch fails
+    // fast and the apex stays tracked with no zone.
+    try dir.dir.writeFile(io, .{
+        .sub_path = "config.gdns",
+        .data = "zone bad.example secondary 127.0.0.1:9\nzone good.example secondary 127.0.0.1:9\n",
+    });
+    var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+    defer context.deinit();
+    // Both apexes are tracked as secondaries even though neither fetched.
+    try std.testing.expectEqual(@as(usize, 2), context.secondary_zones.items.len);
+    // Neither has a served zone: answers are REFUSED (not served), never SERVFAIL.
+    try std.testing.expect(zone.soaSerial() != null);
+}
+
+test "secondary-tsig-key for a primary zone or a missing key fails the load" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.writeFile(io, .{ .sub_path = "one.zone", .data = "$ORIGIN one.example.\n$TTL 3600\n@ IN SOA ns.one.example. hostmaster.one.example. 1 3600 900 1209600 3600\n@ IN NS ns.one.example.\n" });
+    try dir.dir.writeFile(io, .{
+        .sub_path = "tsig.keys",
+        .data = "key \"update-key.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };\n",
+    });
+    // A primary (non-secondary) apex is a configuration error.
+    try dir.dir.writeFile(io, .{
+        .sub_path = "bad-apex.gdns",
+        .data = "zone one.example primary one.zone\ntsig-key-file tsig.keys\nsecondary-tsig-key one.example update-key.\n",
+    });
+    var bad_apex = try ServerContext.load(dir.dir, io, "bad-apex.gdns", std.testing.allocator);
+    defer bad_apex.deinit();
+    try std.testing.expectError(error.BadConfiguration, bad_apex.takeRuntime(io));
+
+    // A key the keyring does not hold is a configuration error too.
+    try dir.dir.writeFile(io, .{
+        .sub_path = "bad-key.gdns",
+        .data = "zone one.example primary one.zone\ntsig-key-file tsig.keys\nsecondary-tsig-key one.example missing-key.\n",
+    });
+    var bad_key = try ServerContext.load(dir.dir, io, "bad-key.gdns", std.testing.allocator);
+    defer bad_key.deinit();
+    try std.testing.expectError(error.BadConfiguration, bad_key.takeRuntime(io));
 }
 
 test "allow-update for a zone or key the server does not hold fails the load" {

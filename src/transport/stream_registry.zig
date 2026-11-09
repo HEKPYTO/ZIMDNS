@@ -146,6 +146,23 @@ test "the bound is per connection: a full client does not starve others" {
     try std.testing.expectEqual(@as(usize, 3), registry.count());
 }
 
+test "a full 16-stream QUIC connection does not starve the next connection" {
+    // Mirrors core.Server.MAX_STREAMS_PER_CONN (the per-connection cap the
+    // DoQ/DoH3 handlers pass as max_entries).
+    const per_conn: u64 = 16;
+    var registry = Registry(u64).init(per_conn);
+    defer registry.deinit(std.testing.allocator, destroyU64);
+    var i: u64 = 0;
+    while (i < per_conn) : (i += 1) try putEntry(&registry, std.testing.allocator, 1, i, i);
+    // Second connection registers despite the first sitting at its cap.
+    try putEntry(&registry, std.testing.allocator, 2, 0, 999);
+    try std.testing.expectEqual(@as(u64, 999), registry.get(.{ .connection = 2, .stream = 0 }).?.*);
+    const owned = try std.testing.allocator.create(u64);
+    owned.* = 1000;
+    defer std.testing.allocator.destroy(owned);
+    try std.testing.expectError(error.TooManyStreams, registry.insert(std.testing.allocator, .{ .connection = 1, .stream = 99 }, owned));
+}
+
 test "removeConnection on an unknown id is a no-op" {
     var registry = Registry(u64).init(64);
     defer registry.deinit(std.testing.allocator, destroyU64);

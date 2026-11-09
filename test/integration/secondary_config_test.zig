@@ -149,7 +149,57 @@ test "a standalone secondary serves the fetched zone and refreshes to the newer 
     try joinPrimary(second_args, &second_joined);
 }
 
-test "a standalone secondary refuses to start when the primary does not answer" {
+test "signed secondary startup and refresh against a TSIG primary" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+
+    // The primary holds the zone and the key; the secondary names the same
+    // key, so the signed startup request verifies and the signed answer
+    // verifies on return (RFC 8945 sections 4 and 5.3.1).
+    const key_text = "key \"secondary-key.\" { algorithm hmac-sha256; secret \"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=\"; };\n";
+    var primary_ring = try zimdns.auth_keyring.Keyring.parse(key_text);
+    var primary_a = try Runtime.fromZoneTextWithKeyring(zone_v1_text, &primary_ring);
+    defer primary_a.deinit();
+    try primary_a.addTransferAllow("one.example.", try zimdns.config_parser.Cidr.parse("127.0.0.1/32"));
+
+    var addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try std.Io.net.IpAddress.listen(&addr, io, .{ .reuse_address = true });
+    const port = switch (server.socket.address) {
+        .ip4 => |ip4| ip4.port,
+        .ip6 => |ip6| ip6.port,
+    };
+    const args = try startPrimary(io, &server, &primary_a, 1);
+    var joined = false;
+    defer {
+        server.deinit(io);
+        if (!joined) args.thread.join();
+        std.testing.allocator.destroy(args);
+    }
+
+    var config_buffer: [512]u8 = undefined;
+    const config_text = try std.fmt.bufPrint(&config_buffer, "tsig-key-file tsig.keys\nzone one.example. secondary 127.0.0.1:{d}\nsecondary-tsig-key one.example. secondary-key.\n", .{port});
+    try dir.dir.writeFile(io, .{ .sub_path = "tsig.keys", .data = key_text });
+    try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = config_text });
+
+    var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 1), context.zones.items.len);
+    try std.testing.expectEqual(@as(usize, 1), context.secondary_zones.items.len);
+
+    var runtime = try context.takeRuntime(io);
+    defer runtime.deinit();
+    try expectSoaSerial(io, &runtime, "one.example.", 1, 0x5a01);
+    try joinPrimary(args, &joined);
+
+    // A named-but-missing key fails the refresh instead of fetching
+    // unsigned: the fetch reports UnknownKey and the served zone stays.
+    try runtime.setSecondaryTsigKey("one.example.", "absent-key.");
+    try std.testing.expectError(error.UnknownKey, Runtime.fetchSecondaryViaXfr(&runtime, std.testing.allocator, "one.example."));
+    try expectSoaSerial(io, &runtime, "one.example.", 1, 0x5a03);
+}
+
+test "a standalone secondary starts tracked when the primary does not answer" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var dir = std.testing.tmpDir(.{});
     defer dir.cleanup();
@@ -165,5 +215,14 @@ test "a standalone secondary refuses to start when the primary does not answer" 
     var config_buffer: [256]u8 = undefined;
     const config_text = try std.fmt.bufPrint(&config_buffer, "zone one.example. secondary 127.0.0.1:{d}\n", .{port});
     try dir.dir.writeFile(io, .{ .sub_path = "config.gdns", .data = config_text });
-    try std.testing.expectError(zimdns.config_loader.Error.BadSecondary, ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator));
+    // One unreachable primary must not abort the load: the apex stays
+    // tracked with no served zone (answers REFUSED, never SERVFAIL) until
+    // a refresh succeeds.
+    var context = try ServerContext.load(dir.dir, io, "config.gdns", std.testing.allocator);
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.zones.items.len);
+    try std.testing.expectEqual(@as(usize, 1), context.secondary_zones.items.len);
+    try std.testing.expectEqualStrings("one.example.", context.secondary_zones.items[0].apex);
+    try std.testing.expect(context.secondary_zones.items[0].last_success_ns == null);
+    try std.testing.expect(context.secondary_zones.items[0].last_attempt_failed);
 }

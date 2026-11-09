@@ -59,6 +59,14 @@ The configuration grammar and the loader that reads it.
   file and restart. RFC 9230 §5 recommends daily rotation, not a MUST, so
   there is no background rotation timer.
 
+## Secondary transfers
+
+- `secondary-tsig-key <apex> <key-name>` signs that secondary's AXFR/IXFR
+  requests with the key from `tsig-key-file` and verifies every response
+  frame's chained TSIG; a key the keyring does not hold fails the load or
+  refresh instead of falling back to an unsigned transfer. At most four
+  entries are accepted (the fixed configuration budget).
+
 ## Connection limits
 
 - `tcp-max-connections-per-source <n>` caps simultaneous connections per

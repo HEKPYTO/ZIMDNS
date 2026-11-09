@@ -1605,7 +1605,7 @@ test "configured two-zone TCP loop accepts bounded independent connections" {
     try parent_client.shutdown(io, .send);
     try child_client.shutdown(io, .send);
 
-    try listener.serveTcpLoop(&server, io, &runtime, 2);
+    try listener.serveTcpLoop(&server, io, &runtime, 2, null);
 
     var parent_response_buffer: [512]u8 = undefined;
     var child_response_buffer: [512]u8 = undefined;
@@ -2691,7 +2691,7 @@ fn serveCliTcp(args: *CliTcpArgs) void {
 }
 
 fn serveBoundedTcp(args: *BoundedTcpArgs) void {
-    listener.serveTcpLoop(args.server, args.io, args.runtime, args.max_requests) catch return;
+    listener.serveTcpLoop(args.server, args.io, args.runtime, args.max_requests, null) catch return;
     args.ok = true;
 }
 

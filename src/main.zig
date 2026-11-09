@@ -121,6 +121,48 @@ fn installReloadHandler(runtime: *auth_runtime.Runtime) void {
     };
     std.posix.sigaction(std.posix.SIG.HUP, &action, null);
 }
+/// Every serve loop observes this stop: SIGTERM/SIGINT set it and exit 0
+/// at once, so the process never waits out the compose grace period.
+/// There is no in-flight drain: blocked accepts die with the process.
+var signal_stop = std.atomic.Value(?*auth_runtime.SharedStop).init(null);
+///
+/// SIGTERM/SIGINT end the process at once: the shared stop is set so a
+/// sibling that already observes it can finish its boundary, then exit(0)
+/// ends the process without waiting. In-flight queries are not drained.
+fn onTerminate(_: std.posix.SIG) callconv(.c) void {
+    if (signal_stop.load(.acquire)) |stop| stop.requestStop();
+    // Async-signal-safe: `_exit` skips atexit handlers and stdio flushes,
+    // which `std.process.exit` runs and which are not safe in a handler.
+    std.c._exit(0);
+}
+///
+fn installTerminateHandlers(stop: *auth_runtime.SharedStop) void {
+    signal_stop.store(stop, .release);
+    const action = std.posix.Sigaction{
+        .handler = .{ .handler = onTerminate },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.TERM, &action, null);
+    std.posix.sigaction(std.posix.SIG.INT, &action, null);
+}
+
+test "terminate handler path sets the shared stop" {
+    var old_term: std.posix.Sigaction = undefined;
+    var old_int: std.posix.Sigaction = undefined;
+    std.posix.sigaction(std.posix.SIG.TERM, null, &old_term);
+    std.posix.sigaction(std.posix.SIG.INT, null, &old_int);
+    defer {
+        std.posix.sigaction(std.posix.SIG.TERM, &old_term, null);
+        std.posix.sigaction(std.posix.SIG.INT, &old_int, null);
+        signal_stop.store(null, .release);
+    }
+    var stop = auth_runtime.SharedStop{};
+    installTerminateHandlers(&stop);
+    try std.testing.expect(signal_stop.load(.acquire) == &stop);
+    signal_stop.load(.acquire).?.requestStop();
+    try std.testing.expect(stop.shouldStop());
+}
 
 test {
     _ = @import("dns/reader.zig");
@@ -286,6 +328,21 @@ fn printHelp(writer: *std.Io.Writer) !void {
         \\  certificate and key. An Oblivious DoH target is one config line:
         \\  'odoh-target on' with 'odoh-key-file <path>' (RFC 9230).
         \\
+        \\  The server prints one startup banner on stderr: the version, the
+        \\  config path, the selected transports with their listen addresses,
+        \\  and every zone origin with its SOA serial. A live metrics listener
+        \\  is one flag: '--metrics-addr 127.0.0.1:9090' serves the same
+        \\  Prometheus text as --print-metrics on GET /metrics and readiness
+        \\  on GET /healthz (200 once serving, 503 before). The address must
+        \\  be loopback; anything else is refused. SIGTERM and SIGINT end the
+        \\  process at once without waiting out the stop grace period, with
+        \\  no in-flight drain: blocked accepts die with the process.
+        \\
+        \\  A healthcheck asks the server about itself: 'query --require-noerror'
+        \\  fails on SERVFAIL, REFUSED and NXDOMAIN instead of printing them
+        \\  and exiting 0, and '--require-answer' additionally fails on an
+        \\  empty answer section. The default query behavior is unchanged.
+        \\
         \\Implemented now:
         \\  --help, --version, server run, query
         \\
@@ -301,6 +358,8 @@ fn handleQuery(args: []const []const u8, io: std.Io, allocator: std.mem.Allocato
     var use_case_randomization = false;
     var port: u16 = 1053;
     var use_tcp = false;
+    var require_noerror = false;
+    var require_answer = false;
     var name: ?[]const u8 = null;
     var qtype = @import("dns/types.zig").RecordType.A;
 
@@ -329,6 +388,10 @@ fn handleQuery(args: []const []const u8, io: std.Io, allocator: std.mem.Allocato
             use_nsid = true;
         } else if (std.mem.eql(u8, arg, "--0x20")) {
             use_case_randomization = true;
+        } else if (std.mem.eql(u8, arg, "--require-noerror")) {
+            require_noerror = true;
+        } else if (std.mem.eql(u8, arg, "--require-answer")) {
+            require_answer = true;
         } else if (name == null) {
             name = arg;
         } else {
@@ -379,6 +442,19 @@ fn handleQuery(args: []const []const u8, io: std.Io, allocator: std.mem.Allocato
     // wire, so it is printed only when the case was randomized.
     if (use_case_randomization) try cli_query.writeQuestion(response, writer);
     try cli_query.writeResponse(response, writer);
+    // A healthcheck fails on SERVFAIL/REFUSED/NXDOMAIN instead of printing
+    // them and exiting 0; `--require-answer` additionally fails on an empty
+    // answer section. Default query behavior is unchanged.
+    if (require_noerror and response.header.rcode != .no_error) {
+        try writer.print("error: query failed with rcode {t}\n", .{response.header.rcode});
+        try writer.flush();
+        std.process.exit(1);
+    }
+    if (require_answer and response.answers.len == 0) {
+        try writer.writeAll("error: query returned no answers\n");
+        try writer.flush();
+        std.process.exit(1);
+    }
 }
 
 fn parseQueryType(text: []const u8) !@import("dns/types.zig").RecordType {
@@ -465,6 +541,9 @@ const ServerArgs = struct {
     max_queries: usize = 1,
     max_requests: ?usize = null,
     print_metrics: bool = false,
+    // Optional live metrics listener `ip:port` (CLI only, no config
+    // directive). Loopback only; anything else is refused at startup.
+    metrics_addr: ?[]const u8 = null,
     encrypted_dns_flag: bool = false,
     tls_cert_file: ?[]const u8 = null,
     tls_key_file: ?[]const u8 = null,
@@ -550,6 +629,10 @@ const ServerArgs = struct {
                 parsed.max_requests = std.fmt.parseInt(usize, args[index], 10) catch return error.InvalidCount;
             } else if (std.mem.eql(u8, arg, "--print-metrics")) {
                 parsed.print_metrics = true;
+            } else if (std.mem.eql(u8, arg, "--metrics-addr")) {
+                index += 1;
+                if (index >= args.len) return error.MissingValue;
+                parsed.metrics_addr = args[index];
             } else {
                 return error.UnknownOption;
             }
@@ -558,6 +641,196 @@ const ServerArgs = struct {
         return parsed;
     }
 };
+
+/// Splits `ip:port` (`[v6]:port` for IPv6) the way `--metrics-addr` takes it.
+fn parseMetricsAddr(text: []const u8) !std.Io.net.IpAddress {
+    if (text.len > 0 and text[0] == '[') {
+        const end = std.mem.indexOfScalar(u8, text, ']') orelse return error.InvalidMetricsAddr;
+        if (end + 1 >= text.len or text[end + 1] != ':') return error.InvalidMetricsAddr;
+        const port = std.fmt.parseInt(u16, text[end + 2 ..], 10) catch return error.InvalidMetricsAddr;
+        if (port == 0) return error.InvalidMetricsAddr;
+        return std.Io.net.IpAddress.parse(text[1..end], port) catch return error.InvalidMetricsAddr;
+    }
+    const colon = std.mem.lastIndexOfScalar(u8, text, ':') orelse return error.InvalidMetricsAddr;
+    const port = std.fmt.parseInt(u16, text[colon + 1 ..], 10) catch return error.InvalidMetricsAddr;
+    if (port == 0) return error.InvalidMetricsAddr;
+    return std.Io.net.IpAddress.parse(text[0..colon], port) catch return error.InvalidMetricsAddr;
+}
+
+/// Only loopback listeners are allowed for now: the endpoint has no auth.
+fn isLoopbackAddress(address: *const std.Io.net.IpAddress) bool {
+    return switch (address.*) {
+        .ip4 => |ip4| ip4.bytes[0] == 127,
+        .ip6 => |ip6| std.mem.eql(u8, ip6.bytes[0..15], &.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }) and ip6.bytes[15] == 1,
+    };
+}
+
+/// One HTTP connection on the metrics listener: `GET /metrics` renders the
+/// same Prometheus text as `--print-metrics` from the same live counters,
+/// `GET /healthz` reports readiness, anything else is 404.
+fn serveMetricsConnection(stream: std.Io.net.Stream, io: std.Io, counters: *metrics.Counters, serving: *std.atomic.Value(bool)) void {
+    defer stream.close(io);
+    var request_buffer: [4096]u8 = undefined;
+    // A local client that connects and sends nothing must not wedge the
+    // listener: one short bounded read per connection, partial lines are
+    // malformed and close.
+    const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(2), .clock = .awake } };
+    const incoming = stream.socket.receiveTimeout(io, &request_buffer, timeout) catch return;
+    const newline = std.mem.indexOfScalar(u8, incoming.data, '\n') orelse return;
+    const line = std.mem.trimEnd(u8, incoming.data[0..newline], "\r");
+    const path: []const u8 = if (std.mem.startsWith(u8, line, "GET ")) path: {
+        const rest = line[4..];
+        const end = std.mem.indexOfScalar(u8, rest, ' ') orelse break :path "";
+        break :path rest[0..end];
+    } else "";
+    var response_buffer: [8192]u8 = undefined;
+    var writer = stream.writer(io, &response_buffer);
+    const out = &writer.interface;
+    if (std.mem.eql(u8, path, "/metrics")) {
+        var counter_buffer: [8192]u8 = undefined;
+        var counter_stream = std.Io.Writer.fixed(&counter_buffer);
+        metrics.formatPrometheus(counters, &counter_stream) catch return;
+        const body = counter_buffer[0..counter_stream.end];
+        out.print("HTTP/1.0 200 OK\r\ncontent-type: text/plain; version=0.0.4\r\nconnection: close\r\ncontent-length: {d}\r\n\r\n", .{body.len}) catch return;
+        out.writeAll(body) catch return;
+    } else if (std.mem.eql(u8, path, "/healthz")) {
+        if (serving.load(.acquire)) {
+            out.writeAll("HTTP/1.0 200 OK\r\ncontent-type: text/plain\r\nconnection: close\r\ncontent-length: 3\r\n\r\nok\n") catch return;
+        } else {
+            out.writeAll("HTTP/1.0 503 Service Unavailable\r\ncontent-type: text/plain\r\nconnection: close\r\ncontent-length: 9\r\n\r\nstarting\n") catch return;
+        }
+    } else {
+        out.writeAll("HTTP/1.0 404 Not Found\r\ncontent-type: text/plain\r\nconnection: close\r\ncontent-length: 10\r\n\r\nnot found\n") catch return;
+    }
+    out.flush() catch {};
+}
+
+/// The live metrics/health listener. Runs on its own thread against the same
+/// counters every serve loop shares, so `/metrics` reflects the running
+/// server (unlike `--print-metrics`, which prints once at the end). The
+/// thread is detached: a blocked accept dies with the process, the same as
+/// every other loop's blocked accept.
+const MetricsListener = struct {
+    io: std.Io,
+    counters: *metrics.Counters,
+    serving: *std.atomic.Value(bool),
+    address: std.Io.net.IpAddress,
+    stop: *const auth_runtime.SharedStop,
+    // Set when the bind fails, so startup can refuse the run instead of
+    // serving DNS with no metrics endpoint.
+    bind_err: ?anyerror = null,
+    bound: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *MetricsListener) void {
+        var bind_address = self.address;
+        var server = std.Io.net.IpAddress.listen(&bind_address, self.io, .{ .reuse_address = true }) catch |err| {
+            self.bind_err = err;
+            self.bound.store(true, .release);
+            return;
+        };
+        defer server.deinit(self.io);
+        self.bound.store(true, .release);
+        while (!self.stop.shouldStop()) {
+            // A poll with a short timeout makes the stop flag observable
+            // without a wakeup, so the owner can join this thread before it
+            // frees the counters and io backend behind it.
+            var poll_fds = [_]std.posix.pollfd{.{ .fd = server.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+            const ready = std.posix.poll(&poll_fds, 200) catch return;
+            if (ready == 0) continue;
+            const stream = listener.acceptWithRetry(&server, self.io) catch return;
+            serveMetricsConnection(stream, self.io, self.counters, self.serving);
+        }
+    }
+};
+
+test "metrics addr parsing refuses non-loopback" {
+    const loopback = try parseMetricsAddr("127.0.0.1:9090");
+    try std.testing.expect(isLoopbackAddress(&loopback));
+    const loopback2 = try parseMetricsAddr("127.0.0.2:9090");
+    try std.testing.expect(isLoopbackAddress(&loopback2));
+    try std.testing.expectError(error.InvalidMetricsAddr, parseMetricsAddr("127.0.0.1:0"));
+    const v6 = try parseMetricsAddr("[::1]:9090");
+    try std.testing.expect(isLoopbackAddress(&v6));
+    const public = try parseMetricsAddr("0.0.0.0:9090");
+    try std.testing.expect(!isLoopbackAddress(&public));
+    try std.testing.expectError(error.InvalidMetricsAddr, parseMetricsAddr("not-an-addr"));
+}
+
+/// One startup banner on stderr: version, config path if any, selected
+/// transports with their listen addresses, and every configured zone origin
+/// with its SOA serial. Key paths and other secrets never print.
+fn printStartupBanner(out: *std.Io.Writer, runtime: *const auth_runtime.Runtime, config_file: ?[]const u8, metrics_addr: ?std.Io.net.IpAddress, selection: ServeSelection, mode: ServerRunMode, multi: bool, modes: []const ServerRunMode, addresses: []const std.Io.net.IpAddress, configured: ?std.Io.net.IpAddress, port: u16) !void {
+    try out.print("zimdns {s} starting", .{build_options.version});
+    if (config_file) |path| try out.print(" config={s}", .{path});
+    try out.writeAll(" transports=");
+    if (multi) {
+        for (modes, 0..) |loop_mode, i| {
+            if (i > 0) try out.writeAll(",");
+            try out.print("{s}@{f}", .{ loopName(loop_mode), addresses[i] });
+        }
+    } else if (mode == .udp_once or mode == .tcp_once) {
+        const address = configured orelse defaultListenerAddress(port);
+        try out.print("{s}@{f}", .{ loopName(mode), address });
+    } else {
+        var single: [7]ServerRunMode = undefined;
+        const count = selection.loopModes(&single);
+        for (single[0..count], 0..) |loop_mode, i| {
+            if (i > 0) try out.writeAll(",");
+            const address = configured orelse defaultListenerAddress(port);
+            try out.print("{s}@{f}", .{ loopName(loop_mode), address });
+        }
+    }
+    if (metrics_addr) |addr| try out.print(" metrics@{f}", .{addr});
+    try out.writeAll(" zones=");
+    for (runtime.zones.items, 0..) |*zone, i| {
+        if (i > 0) try out.writeAll(",");
+        if (zone.soaSerial()) |serial| {
+            try out.print("{s}#{d}", .{ zone.originText(), serial });
+        } else {
+            try out.print("{s}#?", .{zone.originText()});
+        }
+    }
+    try out.writeAll("\n");
+    try out.flush();
+}
+
+test "startup banner carries version, origins and serials" {
+    var runtime = try auth_runtime.Runtime.fromZoneText("$ORIGIN example.\n$TTL 3600\n@ IN SOA ns admin 42 3600 900 1209600 3600\n@ IN NS ns\n");
+    defer runtime.deinit();
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try printStartupBanner(&output.writer, &runtime, null, null, .{}, .none, false, &.{}, &.{}, null, 1053);
+    const text = output.written();
+    try std.testing.expect(std.mem.indexOf(u8, text, build_options.version) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "example.#42") != null);
+}
+
+test "metrics connection serves health and metrics" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var counters = metrics.Counters{};
+    var serving = std.atomic.Value(bool).init(true);
+    inline for (.{ "/healthz", "/metrics" }) |path| {
+        var listen_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        var server = try std.Io.net.IpAddress.listen(&listen_addr, io, .{ .reuse_address = true });
+        defer server.deinit(io);
+        var client = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+        defer client.close(io);
+        var write_buffer: [256]u8 = undefined;
+        var writer = client.writer(io, &write_buffer);
+        try writer.interface.print("GET {s} HTTP/1.1\r\nHost: metrics\r\n\r\n", .{path});
+        try writer.interface.flush();
+        const stream = try server.accept(io);
+        serveMetricsConnection(stream, io, &counters, &serving);
+        var read_buffer: [4096]u8 = undefined;
+        var reader = client.reader(io, &read_buffer);
+        const response = try reader.interface.allocRemaining(std.testing.allocator, .limited(4096));
+        defer std.testing.allocator.free(response);
+        try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.0 200 OK"));
+        if (std.mem.eql(u8, path, "/metrics")) {
+            try std.testing.expect(std.mem.indexOf(u8, response, "zimdns_queries_total") != null);
+        }
+    }
+}
 
 fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocator, writer: *std.Io.Writer) !void {
     if (try printHelpIfRequested(args, writer)) return;
@@ -603,6 +876,7 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
     const encrypted_dns_flag = cli.encrypted_dns_flag;
     const tls_cert_file = cli.tls_cert_file;
     const tls_key_file = cli.tls_key_file;
+    const metrics_addr_text = cli.metrics_addr;
 
     const explicit_zone_file = zone_file != null;
     var server_context: ?config_loader.ServerContext = null;
@@ -679,7 +953,10 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
             try writer.writeAll("error: cannot read TLS key file\n");
             try exitUsage(writer);
         };
-        defer allocator.free(key_bytes);
+        defer {
+            std.crypto.secureZero(u8, key_bytes);
+            allocator.free(key_bytes);
+        }
         transport_tls.validatePemPair(cert_bytes, key_bytes) catch {
             try writer.writeAll("error: TLS identity failed validation (certificate must be PEM, key must be nonempty)\n");
             try exitUsage(writer);
@@ -775,7 +1052,71 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
     }
     installReloadHandler(&runtime);
     var counters = metrics.Counters{};
+    // The metrics listener is parsed and validated before any socket binds:
+    // a bad address or a non-loopback address refuses the run outright.
+    var metrics_addr: ?std.Io.net.IpAddress = null;
+    if (metrics_addr_text) |text| {
+        metrics_addr = parseMetricsAddr(text) catch {
+            try writer.writeAll("error: invalid --metrics-addr, want ip:port\n");
+            try exitUsage(writer);
+        };
+        if (!isLoopbackAddress(&metrics_addr.?)) {
+            try writer.writeAll("error: --metrics-addr must be a loopback address for now\n");
+            try exitUsage(writer);
+        }
+    }
+
+    var stop = auth_runtime.SharedStop{};
+    // SIGTERM/SIGINT end the process at once instead of waiting out the
+    // compose stop grace period. No in-flight drain: blocked accepts die
+    // with the process.
+    installTerminateHandlers(&stop);
+    defer signal_stop.store(null, .release);
+
     const odoh_target: ?*const dns_odoh.Target = if (server_context) |*context| if (context.odoh_target) |*target| target else null else null;
+
+    // One startup banner on stderr: version, config path, transports and
+    // addresses, zone origins with serials. No secrets: key paths never print.
+    var banner_buffer: [4096]u8 = undefined;
+    var banner = std.Io.File.stderr().writer(io, &banner_buffer);
+    printStartupBanner(&banner.interface, &runtime, config_file, metrics_addr, selection, mode, multi_loop, loop_modes[0..loop_count], addresses[0..loop_count], configured_address, port) catch {};
+    // The live listener shares the same counters every serve loop uses.
+    var metrics_serving = std.atomic.Value(bool).init(false);
+    var metrics_listener_state: ?MetricsListener = null;
+    var metrics_thread: ?std.Thread = null;
+    // The listener runs on its own backend: the caller's io may be
+    // single-threaded and cannot be shared across threads.
+    var metrics_io_backend: ?std.Io.Threaded = null;
+    defer if (metrics_io_backend) |*backend| backend.deinit();
+    if (metrics_addr) |bind_addr| {
+        metrics_io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{ .concurrent_limit = .limited(4) });
+        metrics_listener_state = .{
+            .io = metrics_io_backend.?.io(),
+            .counters = &counters,
+            .serving = &metrics_serving,
+            .address = bind_addr,
+            .stop = &stop,
+        };
+        metrics_thread = std.Thread.spawn(.{}, MetricsListener.run, .{&metrics_listener_state.?}) catch null;
+        if (metrics_thread == null) {
+            try writer.writeAll("error: cannot start the metrics listener thread\n");
+            try exitUsage(writer);
+        }
+        // Wait for the bind so a colliding address refuses the run instead
+        // of serving DNS with no metrics endpoint.
+        while (!metrics_listener_state.?.bound.load(.acquire)) std.Thread.yield() catch {};
+        if (metrics_listener_state.?.bind_err) |_| {
+            try writer.writeAll("error: cannot bind --metrics-addr\n");
+            try exitUsage(writer);
+        }
+    }
+    // Function-scope join: the metrics thread must live for the whole serve
+    // run, and the counters/stop/backend it reads must outlive it.
+    defer {
+        stop.requestStop();
+        if (metrics_thread) |thread| thread.join();
+    }
+    metrics_serving.store(true, .release);
 
     if (multi_loop) {
         if (max_requests) |count| if (count == 0) {
@@ -795,7 +1136,6 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
         defer io_backend.deinit();
         const loop_io = io_backend.io();
         runtime.io = loop_io;
-        var stop = auth_runtime.SharedStop{};
         runtime.shared_stop = &stop;
         serveConcurrentMulti(loop_io, &runtime, &counters, print_metrics, max_requests, odoh_target, tls_identities[0..tls_identity_count], tls_identity_modes[0..tls_identity_count], encrypted_cert_path, encrypted_key_path, addresses[0..loop_count], loop_modes[0..loop_count], &stop) catch |err| {
             // A duplicate address is a usage error, not a serving failure.
@@ -806,7 +1146,7 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
             return err;
         };
         if (print_metrics) {
-            try metrics.formatPrometheus(counters, writer);
+            try metrics.formatPrometheus(&counters, writer);
         }
         return;
     }
@@ -817,9 +1157,12 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
                 try writer.writeAll("error: --max-queries must be greater than zero\n");
                 try exitUsage(writer);
             }
+            const once_live: ?*metrics.Counters = if (metrics_addr != null) &counters else null;
             if (configured_address) |*address| {
                 if (print_metrics) {
                     try listener.serveUdpCountOnAddressWithMetrics(io, &runtime, address, max_queries, &counters);
+                } else if (once_live) |counting| {
+                    try listener.serveUdpCountOnAddressWithMetrics(io, &runtime, address, max_queries, counting);
                 } else if (max_queries == 1) {
                     try listener.serveUdpOnceOnAddress(io, &runtime, address);
                 } else {
@@ -828,6 +1171,9 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
             } else if (print_metrics) {
                 var address = defaultListenerAddress(port);
                 try listener.serveUdpCountOnAddressWithMetrics(io, &runtime, &address, max_queries, &counters);
+            } else if (once_live) |counting| {
+                var address = defaultListenerAddress(port);
+                try listener.serveUdpCountOnAddressWithMetrics(io, &runtime, &address, max_queries, counting);
             } else if (max_queries == 1) {
                 var address = defaultListenerAddress(port);
                 try listener.serveUdpOnceOnAddress(io, &runtime, &address);
@@ -857,12 +1203,36 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
                 try writer.writeAll("error: --max-requests must be greater than zero\n");
                 try exitUsage(writer);
             };
-            if (print_metrics) {
+            // The live listener shares these counters, so a metrics run
+            // counts even without --print-metrics.
+            const live: ?*metrics.Counters = if (metrics_addr != null) &counters else null;
+            if (max_requests == null) {
+                // The caller's io may be single-threaded; the pool needs its
+                // own threaded backend, and those threads use runtime.io for
+                // recursion and transfer work.
+                var pool_backend = std.Io.Threaded.init(std.heap.page_allocator, .{ .concurrent_limit = .limited(listener.UDP_WORKER_COUNT) });
+                defer pool_backend.deinit();
+                const pool_io = pool_backend.io();
+                runtime.io = pool_io;
+                if (configured_address) |*address| {
+                    try listener.serveUdpPoolOnAddress(pool_io, &runtime, address, &counters);
+                } else {
+                    var address = defaultListenerAddress(port);
+                    try listener.serveUdpPoolOnAddress(pool_io, &runtime, &address, &counters);
+                }
+            } else if (print_metrics) {
                 if (configured_address) |*address| {
                     try listener.serveUdpLoopOnAddressWithMetrics(io, &runtime, address, max_requests, &counters);
                 } else {
                     var address = defaultListenerAddress(port);
                     try listener.serveUdpLoopOnAddressWithMetrics(io, &runtime, &address, max_requests, &counters);
+                }
+            } else if (live) |counting| {
+                if (configured_address) |*address| {
+                    try listener.serveUdpLoopOnAddressWithMetrics(io, &runtime, address, max_requests, counting);
+                } else {
+                    var address = defaultListenerAddress(port);
+                    try listener.serveUdpLoopOnAddressWithMetrics(io, &runtime, &address, max_requests, counting);
                 }
             } else if (configured_address) |*address| {
                 try listener.serveUdpLoopOnAddress(io, &runtime, address, max_requests);
@@ -881,11 +1251,12 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
             });
             defer io_backend.deinit();
             const tcp_io = io_backend.io();
+            const tcp_live: ?*metrics.Counters = if (metrics_addr != null) &counters else null;
             if (configured_address) |*address| {
-                try listener.serveTcpLoopOnAddress(tcp_io, &runtime, address, max_requests);
+                try listener.serveTcpLoopOnAddress(tcp_io, &runtime, address, max_requests, tcp_live);
             } else {
                 var address = defaultListenerAddress(port);
-                try listener.serveTcpLoopOnAddress(tcp_io, &runtime, &address, max_requests);
+                try listener.serveTcpLoopOnAddress(tcp_io, &runtime, &address, max_requests, tcp_live);
             }
         },
         .dot_loop => {
@@ -899,7 +1270,7 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
             const dot_io = io_backend.io();
             // The counters reach the port, so the DoT query counter moves in
             // a metrics run.
-            const dot_counters: ?*metrics.Counters = if (print_metrics) &counters else null;
+            const dot_counters: ?*metrics.Counters = &counters;
             if (configured_address) |*address| {
                 try transport_dot.serveDotLoopOnAddress(dot_io, &runtime, address, &server, max_requests, dot_counters);
             } else {
@@ -932,7 +1303,7 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
             // joined inside serveDoqLoopOnAddress before it returns, so the
             // runtime outlives every use of it. The counters reach the port,
             // so the DoQ query counter moves in a metrics run.
-            const doq_counters: ?*metrics.Counters = if (print_metrics) &counters else null;
+            const doq_counters: ?*metrics.Counters = &counters;
             if (configured_address) |*address| {
                 try transport_doq.serveDoqLoopOnAddress(io, &runtime, address, cert_path, key_path, max_requests, doq_counters);
             } else {
@@ -947,7 +1318,7 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
             // joined inside serveDoh3LoopOnAddress before it returns, so the
             // runtime outlives every use of it. The counters reach the port,
             // so the DoH/3 query counter moves in a metrics run.
-            const doh3_counters: ?*metrics.Counters = if (print_metrics) &counters else null;
+            const doh3_counters: ?*metrics.Counters = &counters;
             if (configured_address) |*address| {
                 try transport_doh3.serveDoh3LoopOnAddress(io, &runtime, address, cert_path, key_path, max_requests, doh3_counters, odoh_target);
             } else {
@@ -975,7 +1346,7 @@ fn handleServer(args: []const []const u8, io: std.Io, allocator: std.mem.Allocat
     }
 
     if (print_metrics) {
-        try metrics.formatPrometheus(counters, writer);
+        try metrics.formatPrometheus(&counters, writer);
     }
 }
 
@@ -1024,24 +1395,30 @@ const LoopRunner = struct {
                 var bind_address = self.address;
                 var socket = try std.Io.net.IpAddress.bind(&bind_address, self.io, .{ .mode = .dgram, .protocol = .udp });
                 defer socket.close(self.io);
-                if (self.print_metrics) {
-                    try listener.serveUdpLoopWithMetrics(&socket, self.io, self.runtime, self.max_requests, self.counters);
+                // Multi loops always count: the live listener shares these
+                // counters, and --print-metrics only adds the end print.
+                // An unbounded run shares the bound socket across the UDP
+                // worker pool so one slow recursion does not stall the
+                // authoritative answers queued behind it.
+                if (self.max_requests == null) {
+                    try listener.serveUdpPoolOnSocket(&socket, self.io, self.runtime, self.counters);
                 } else {
-                    try listener.serveUdpLoop(&socket, self.io, self.runtime, self.max_requests);
+                    try listener.serveUdpLoopWithMetrics(&socket, self.io, self.runtime, self.max_requests, self.counters);
                 }
             },
             .tcp_loop => {
                 var bind_address = self.address;
                 var server = try std.Io.net.IpAddress.listen(&bind_address, self.io, .{ .reuse_address = true });
                 defer server.deinit(self.io);
-                try listener.serveTcpLoop(&server, self.io, self.runtime, self.max_requests);
+                try listener.serveTcpLoop(&server, self.io, self.runtime, self.max_requests, self.counters);
             },
+
             .dot_loop => {
                 const server = self.tls_server orelse return error.MissingTlsIdentity;
                 var bind_address = self.address;
                 var listener_socket = try std.Io.net.IpAddress.listen(&bind_address, self.io, .{ .reuse_address = true });
                 defer listener_socket.deinit(self.io);
-                const dot_counters: ?*metrics.Counters = if (self.print_metrics) self.counters else null;
+                const dot_counters: ?*metrics.Counters = self.counters;
                 try transport_dot.serveDotLoop(&listener_socket, self.io, self.runtime, server, self.max_requests, dot_counters);
             },
             .doh_loop => {
@@ -1055,13 +1432,13 @@ const LoopRunner = struct {
                 const cert_path = self.cert_path orelse return error.MissingTlsIdentity;
                 const key_path = self.key_path orelse return error.MissingTlsIdentity;
                 // The QUIC core observes the shared stop at its own boundary.
-                const doq_counters: ?*metrics.Counters = if (self.print_metrics) self.counters else null;
+                const doq_counters: ?*metrics.Counters = self.counters;
                 try transport_doq.serveDoqLoopOnAddressStop(self.io, self.runtime, &self.address, cert_path, key_path, self.max_requests, doq_counters, self.stop);
             },
             .doh3_loop => {
                 const cert_path = self.cert_path orelse return error.MissingTlsIdentity;
                 const key_path = self.key_path orelse return error.MissingTlsIdentity;
-                const doh3_counters: ?*metrics.Counters = if (self.print_metrics) self.counters else null;
+                const doh3_counters: ?*metrics.Counters = self.counters;
                 try transport_doh3.serveDoh3LoopOnAddressStop(self.io, self.runtime, &self.address, cert_path, key_path, self.max_requests, doh3_counters, self.odoh_target, self.stop);
             },
             .xfr_loop => {

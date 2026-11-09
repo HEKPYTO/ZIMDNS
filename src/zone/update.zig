@@ -623,13 +623,13 @@ test "an update reseals a published ZONEMD" {
 test "an update refuses an unverifiable ZONEMD" {
     var zone = try buildZone(test_zone_text);
     defer zone.deinit();
-    const before = try renderZoneText(std.testing.allocator, "example.com.", zone.records.items);
+    const before = try renderZoneText(std.testing.allocator, "example.com.", zone.records.items[0..zone.records.len]);
     defer std.testing.allocator.free(before);
     var bad = [_]dns_record.ResourceRecord{makeRecord("example.com.", .ZONEMD, CLASS_IN, 3600, .{ .ZONEMD = .{ .serial = 7, .scheme = 1, .hash = 99 } })};
     try std.testing.expectEqual(header.Rcode.refused, zoneRcode(try apply(std.testing.allocator, &zone, "example.com.", &.{}, &bad)));
     var off = [_]dns_record.ResourceRecord{makeRecord("sub.example.com.", .ZONEMD, CLASS_IN, 3600, .{ .ZONEMD = .{ .serial = 7, .scheme = 1, .hash = 1 } })};
     try std.testing.expectEqual(header.Rcode.refused, zoneRcode(try apply(std.testing.allocator, &zone, "example.com.", &.{}, &off)));
-    const after = try renderZoneText(std.testing.allocator, "example.com.", zone.records.items);
+    const after = try renderZoneText(std.testing.allocator, "example.com.", zone.records.items[0..zone.records.len]);
     defer std.testing.allocator.free(after);
     try std.testing.expectEqualStrings(before, after);
 }

@@ -210,6 +210,9 @@ pub const SecondaryState = struct {
     retry_sec: u32 = 0,
     expire_sec: u32 = 0,
     expired: bool = false,
+    /// TSIG key name that signs refresh queries for this apex
+    /// (`secondary-tsig-key <apex> <key>`). Null means unsigned refresh.
+    tsig_key_name: ?[]const u8 = null,
 };
 
 pub const SecondaryFetch = *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, zone_name: []const u8) anyerror!?[]const u8;
@@ -465,8 +468,17 @@ pub const Runtime = struct {
     }
 
     pub fn maybeRefreshSecondaries(self: *Runtime, now_ns: u64, fetch: SecondaryFetch, fetch_ctx: *anyopaque) !void {
-        for (self.secondary_zones.items) |*secondary| {
-            if (secondary.expired) continue;
+        // Snapshot due apexes under the shared lock, fetch outside it, and
+        // install under the exclusive lock. Expiry is terminal but not
+        // final: an expired zone keeps refreshing (retry cadence), answers
+        // SERVFAIL while expired, and clears `expired` only when an install
+        // succeeds. A generation re-check stops a slow fetch from clobbering
+        // a newer install.
+        const Due = struct { apex: []const u8, expired: bool };
+        var due: std.ArrayList(Due) = .empty;
+        defer due.deinit(self.allocator);
+        self.lockShared();
+        for (self.secondary_zones.items) |secondary| {
             const action = xfr_client.refreshDecision(.{
                 .now_ns = @intCast(now_ns),
                 .last_success_ns = secondary.last_success_ns,
@@ -478,65 +490,209 @@ pub const Runtime = struct {
             });
             switch (action) {
                 .idle => {},
-                .expired => {
-                    secondary.expired = true;
-                },
-                .refresh_due, .retry_due => {
-                    secondary.last_attempt_ns = @intCast(now_ns);
-                    const text = fetch(fetch_ctx, self.allocator, secondary.apex) catch {
-                        secondary.last_attempt_failed = true;
-                        continue;
-                    };
-                    if (text) |zone_text| {
-                        defer self.allocator.free(zone_text);
-                        var zone_file = zone_parser.ZoneFile.parse(zone_text) catch {
-                            secondary.last_attempt_failed = true;
-                            continue;
-                        };
-                        defer zone_file.deinit();
-                        var new_zone = zone_index.Zone.fromZoneFile(&zone_file) catch {
-                            secondary.last_attempt_failed = true;
-                            continue;
-                        };
-                        var installed = false;
-                        defer if (!installed) new_zone.deinit();
-                        // swap zone in zones
-                        for (self.zones.items) |*zone| {
-                            if (std.ascii.eqlIgnoreCase(zone.originText(), secondary.apex)) {
-                                zone.deinit();
-                                zone.* = new_zone;
-                                installed = true;
-                                break;
-                            }
-                        }
-                        secondary.last_success_ns = @intCast(now_ns);
-                        secondary.last_attempt_failed = false;
-                    } else {
-                        secondary.last_attempt_failed = true;
-                    }
-                },
+                .expired => due.append(self.allocator, .{ .apex = secondary.apex, .expired = true }) catch {},
+                .refresh_due, .retry_due => due.append(self.allocator, .{ .apex = secondary.apex, .expired = secondary.expired }) catch {},
             }
+        }
+        self.unlockShared();
+        if (due.items.len != 0) {
+            // Newly expired zones are flagged before any fetch, so answers
+            // go SERVFAIL even if this tick's fetch fails. Expired zones
+            // stay in the fetch set: only a successful install clears it.
+            self.lockExclusive();
+            for (due.items) |item| {
+                if (self.zoneIndexForSecondary(item.apex)) |index| {
+                    if (item.expired) self.secondary_zones.items[index].expired = true;
+                    self.secondary_zones.items[index].last_attempt_ns = @intCast(now_ns);
+                }
+            }
+            self.unlockExclusive();
+        }
+        for (due.items) |item| {
+            const attempt_ns: i64 = @intCast(now_ns);
+            const text = fetch(fetch_ctx, self.allocator, item.apex) catch {
+                self.lockExclusive();
+                if (self.zoneIndexForSecondary(item.apex)) |index| self.secondary_zones.items[index].last_attempt_failed = true;
+                self.unlockExclusive();
+                continue;
+            };
+            if (text) |zone_text| {
+                defer self.allocator.free(zone_text);
+                self.installSecondaryText(item.apex, zone_text, attempt_ns);
+            } else {
+                self.lockExclusive();
+                if (self.zoneIndexForSecondary(item.apex)) |index| self.secondary_zones.items[index].last_attempt_failed = true;
+                self.unlockExclusive();
+            }
+        }
+    }
+
+    fn zoneIndexForSecondary(self: *const Runtime, apex: []const u8) ?usize {
+        for (self.secondary_zones.items, 0..) |secondary, index| {
+            if (std.ascii.eqlIgnoreCase(secondary.apex, apex)) return index;
+        }
+        return null;
+    }
+
+    const KeyCopy = struct { owner_len: usize, algorithm: tsig.Algorithm, secret_len: usize };
+
+    /// Copies the named key's owner text, algorithm, and secret bytes into
+    /// caller buffers. The caller must hold the shared (or exclusive) lock:
+    /// the copy is consistent with one keyring generation, so a concurrent
+    /// SIGHUP reload cannot mix an old secret with a new one. Returns null
+    /// when the name is unknown.
+    fn keyringCopySecret(self: *const Runtime, key_name: []const u8, owner_text: *[256]u8, secret_out: *[64]u8) ?KeyCopy {
+        for (self.keyring.keys[0..self.keyring.len]) |*key| {
+            var buffer: [512]u8 = undefined;
+            const text = key.name.toText(&buffer) catch continue;
+            if (!std.ascii.eqlIgnoreCase(text, key_name)) continue;
+            if (text.len > owner_text.len or key.secret_len > secret_out.len) continue;
+            @memcpy(owner_text[0..text.len], text);
+            @memcpy(secret_out[0..key.secret_len], key.secret[0..key.secret_len]);
+            return .{ .owner_len = text.len, .algorithm = key.algorithm, .secret_len = key.secret_len };
+        }
+        return null;
+    }
+
+    fn installSecondaryText(self: *Runtime, apex: []const u8, zone_text: []const u8, attempt_ns: i64) void {
+        var zone_file = zone_parser.ZoneFile.parse(zone_text) catch {
+            self.lockExclusive();
+            defer self.unlockExclusive();
+            if (self.zoneIndexForSecondary(apex)) |index| self.secondary_zones.items[index].last_attempt_failed = true;
+            return;
+        };
+        defer zone_file.deinit();
+        var new_zone = zone_index.Zone.fromZoneFile(&zone_file) catch {
+            self.lockExclusive();
+            defer self.unlockExclusive();
+            if (self.zoneIndexForSecondary(apex)) |index| self.secondary_zones.items[index].last_attempt_failed = true;
+            return;
+        };
+        var installed = false;
+        defer if (!installed) new_zone.deinit();
+        self.lockExclusive();
+        defer self.unlockExclusive();
+        const secondary_index = self.zoneIndexForSecondary(apex) orelse return;
+        const secondary = &self.secondary_zones.items[secondary_index];
+        const new_serial = new_zone.soaSerial() orelse {
+            secondary.last_attempt_failed = true;
+            return;
+        };
+        // A secondary whose startup fetch failed has no served zone yet: the
+        // first successful refresh appends it (and its delta log slot, which
+        // `transfer_delta_logs` keeps parallel to `zones`), so later
+        // refreshes and IXFR deltas have a target.
+        const target = self.zoneIndexForOrigin(apex) orelse {
+            self.zones.append(self.allocator, new_zone) catch {
+                secondary.last_attempt_failed = true;
+                return;
+            };
+            self.transfer_delta_logs.append(self.allocator, .{}) catch {};
+            installed = true;
+            secondary.last_success_ns = attempt_ns;
+            secondary.last_attempt_failed = false;
+            secondary.expired = false;
+            return;
+        };
+        const old_serial = self.zones.items[target].soaSerial() orelse {
+            secondary.last_attempt_failed = true;
+            return;
+        };
+        if (secondary.last_success_ns) |success| {
+            if (attempt_ns <= success) return;
+        }
+        switch (journal_mod.compareSerial(new_serial, old_serial)) {
+            .newer => {},
+            .equal => {
+                secondary.last_success_ns = attempt_ns;
+                secondary.last_attempt_failed = false;
+                secondary.expired = false;
+                return;
+            },
+            .older, .undefined => {
+                secondary.last_attempt_failed = true;
+                return;
+            },
+        }
+        self.zones.items[target].deinit();
+        self.zones.items[target] = new_zone;
+        installed = true;
+        secondary.last_success_ns = attempt_ns;
+        secondary.last_attempt_failed = false;
+        // Only a successful install resurrects the zone: expiry clears here
+        // and the SOA timers relearn from the fresh apex (RFC 1035 7.3).
+        secondary.expired = false;
+        if (self.zones.items[target].soa) |soa_record| {
+            if (zone_parser.parseRData(.SOA, soa_record.rdataText())) |parsed| {
+                if (parsed == .SOA) {
+                    secondary.refresh_sec = parsed.SOA.refresh;
+                    secondary.retry_sec = parsed.SOA.retry;
+                    secondary.expire_sec = parsed.SOA.expire;
+                }
+            } else |_| {}
         }
     }
 
     pub fn fetchSecondaryViaXfr(ctx: *anyopaque, allocator: std.mem.Allocator, zone_name: []const u8) anyerror!?[]const u8 {
         const self: *Runtime = @ptrCast(@alignCast(ctx));
+        // Snapshot everything the fetch needs under the shared lock, then
+        // release before the I/O: never hand a `*Zone` outside the lock.
+        // The serial is copied, not borrowed, so the fetch cannot race a
+        // concurrent install.
+        const Snapshot = struct { primary: std.Io.net.IpAddress, serial: ?u32, has_tsig: bool, tsig_owner_text: [256]u8, tsig_owner_len: usize, tsig_algorithm: u8, tsig_secret: [64]u8, tsig_secret_len: usize };
+        var snapshot: ?Snapshot = null;
+        self.lockShared();
         for (self.secondary_zones.items) |secondary| {
-            if (std.ascii.eqlIgnoreCase(secondary.apex, zone_name)) {
-                const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } };
-                // A served copy asks for only the difference the primary still
-                // holds; without one, or when the primary answers with the
-                // full zone, fall back to AXFR.
-                for (self.zones.items) |*zone| {
-                    if (std.ascii.eqlIgnoreCase(zone.originText(), zone_name)) {
-                        return xfr_client.fetchIxfr(allocator, self.io, &secondary.primary, zone_name, zone, timeout) catch return null;
-                    }
+            if (!std.ascii.eqlIgnoreCase(secondary.apex, zone_name)) continue;
+            var snap = Snapshot{ .primary = secondary.primary, .serial = null, .has_tsig = false, .tsig_owner_text = undefined, .tsig_owner_len = 0, .tsig_algorithm = 0, .tsig_secret = undefined, .tsig_secret_len = 0 };
+            if (self.zoneIndexForOrigin(zone_name)) |index| snap.serial = self.zones.items[index].soaSerial();
+            // A named-but-missing key fails the refresh: falling back to an
+            // unsigned fetch would silently downgrade the operator's policy.
+            if (secondary.tsig_key_name) |key_name| {
+                if (self.keyringCopySecret(key_name, &snap.tsig_owner_text, &snap.tsig_secret)) |found| {
+                    snap.has_tsig = true;
+                    snap.tsig_owner_len = found.owner_len;
+                    snap.tsig_algorithm = @backingInt(found.algorithm);
+                    snap.tsig_secret_len = found.secret_len;
+                } else {
+                    self.unlockShared();
+                    return error.UnknownKey;
                 }
-                const text = xfr_client.fetch(allocator, self.io, &secondary.primary, zone_name, timeout) catch return null;
-                return text;
+            }
+            snapshot = snap;
+            break;
+        }
+        self.unlockShared();
+        const snap = snapshot orelse return null;
+        const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(60), .clock = .awake } };
+        var tsig_key: ?xfr_client.TsigKey = null;
+        var tsig_owner: dns_name_mod.Name = undefined;
+        if (snap.has_tsig) {
+            tsig_owner = dns_name_mod.Name.fromText(snap.tsig_owner_text[0..snap.tsig_owner_len]) catch return null;
+            tsig_key = .{ .owner = tsig_owner, .algorithm = @fromBackingInt(@intCast(snap.tsig_algorithm)), .secret = snap.tsig_secret[0..snap.tsig_secret_len], .now = self.currentTsigTime() };
+        }
+        if (snap.serial != null) {
+            // IXFR applies the delta to the served records: render a text
+            // copy under the shared lock, parse it outside, and fetch
+            // against the copy. Never hand the live `*Zone` to I/O.
+            self.lockShared();
+            var rendered: ?[]u8 = null;
+            if (self.zoneIndexForOrigin(zone_name)) |index| {
+                // The record list may carry spare capacity past `len`;
+                // rendering it would print uninitialized records.
+                rendered = zone_update.renderZoneText(allocator, zone_name, self.zones.items[index].records.items[0..self.zones.items[index].records.len]) catch null;
+            }
+            self.unlockShared();
+            if (rendered) |text| {
+                defer allocator.free(text);
+                var zone_file = zone_parser.ZoneFile.parse(text) catch return null;
+                defer zone_file.deinit();
+                var current = zone_index.Zone.fromZoneFile(&zone_file) catch return null;
+                defer current.deinit();
+                return xfr_client.fetchIxfrSigned(allocator, self.io, &snap.primary, zone_name, &current, timeout, tsig_key) catch return null;
             }
         }
-        return null;
+        return xfr_client.fetchSigned(allocator, self.io, &snap.primary, zone_name, timeout, tsig_key) catch return null;
     }
 
     pub fn deinit(self: *Runtime) void {
@@ -569,7 +725,10 @@ pub const Runtime = struct {
         for (self.notify_targets.items) |target| self.allocator.free(target.apex);
         self.notify_targets.deinit(self.allocator);
         self.notify_targets = .empty;
-        for (self.secondary_zones.items) |*secondary| self.allocator.free(secondary.apex);
+        for (self.secondary_zones.items) |*secondary| {
+            self.allocator.free(secondary.apex);
+            if (secondary.tsig_key_name) |name| self.allocator.free(name);
+        }
         self.secondary_zones.deinit(self.allocator);
         self.secondary_zones = .empty;
         for (self.ddr_rdatas.items) |rdata| self.allocator.free(rdata);
@@ -659,6 +818,20 @@ pub const Runtime = struct {
             .dir = dir,
             .path = owned_path,
         });
+    }
+
+    /// Records the TSIG key that signs refresh queries for the secondary
+    /// apex (`secondary-tsig-key <apex> <key>`). The key name must exist in
+    /// the keyring at load; the fetch copies the secret under the shared
+    /// lock per attempt, so a SIGHUP reload applies to the next refresh.
+    pub fn setSecondaryTsigKey(self: *Runtime, apex: []const u8, key_name: []const u8) !void {
+        for (self.secondary_zones.items) |*secondary| {
+            if (!std.ascii.eqlIgnoreCase(secondary.apex, apex)) continue;
+            if (secondary.tsig_key_name) |old| self.allocator.free(old);
+            secondary.tsig_key_name = try self.allocator.dupe(u8, key_name);
+            return;
+        }
+        return error.UnknownZone;
     }
     /// Records one transfer ACL: the apex and one client CIDR allowed AXFR/IXFR.
     pub fn addTransferAllow(self: *Runtime, origin: []const u8, cidr: config_parser.Cidr) !void {
@@ -1013,10 +1186,21 @@ pub const Runtime = struct {
         var saved_secondary_zones = self.secondary_zones;
         self.secondary_zones = .empty;
         for (consumer.members.items) |member| {
-            var preserved: ?i64 = null;
+            var preserved: ?SecondaryState = null;
             for (saved_secondary_zones.items) |old| {
                 if (std.ascii.eqlIgnoreCase(old.apex, member.name)) {
-                    preserved = old.last_success_ns;
+                    preserved = .{
+                        .apex = "",
+                        .primary = old.primary,
+                        .last_success_ns = old.last_success_ns,
+                        .last_attempt_ns = old.last_attempt_ns,
+                        .last_attempt_failed = old.last_attempt_failed,
+                        .refresh_sec = old.refresh_sec,
+                        .retry_sec = old.retry_sec,
+                        .expire_sec = old.expire_sec,
+                        .expired = old.expired,
+                        .tsig_key_name = null,
+                    };
                     break;
                 }
             }
@@ -1038,10 +1222,13 @@ pub const Runtime = struct {
             self.secondary_zones.append(self.allocator, .{
                 .apex = self.allocator.dupe(u8, member.name) catch return .failed,
                 .primary = consumer.primary,
-                .last_success_ns = if (preserved) |value| value else @as(i64, @intCast(std.Io.Clock.awake.now(io).nanoseconds)),
+                .last_success_ns = if (preserved) |value| value.last_success_ns else @as(i64, @intCast(std.Io.Clock.awake.now(io).nanoseconds)),
+                .last_attempt_ns = if (preserved) |value| value.last_attempt_ns else null,
+                .last_attempt_failed = if (preserved) |value| value.last_attempt_failed else false,
                 .refresh_sec = refresh_sec,
                 .retry_sec = retry_sec,
                 .expire_sec = expire_sec,
+                .expired = if (preserved) |value| value.expired else false,
             }) catch return .failed;
         }
         for (saved_secondary_zones.items) |old| {
@@ -1054,8 +1241,12 @@ pub const Runtime = struct {
             }
             if (is_member) {
                 self.allocator.free(old.apex);
+                if (old.tsig_key_name) |name| self.allocator.free(name);
             } else {
-                self.secondary_zones.append(self.allocator, old) catch self.allocator.free(old.apex);
+                self.secondary_zones.append(self.allocator, old) catch {
+                    self.allocator.free(old.apex);
+                    if (old.tsig_key_name) |name| self.allocator.free(name);
+                };
             }
         }
         saved_secondary_zones.deinit(self.allocator);
@@ -1203,8 +1394,11 @@ pub const Runtime = struct {
         };
         self.lockExclusive();
         defer self.unlockExclusive();
-        // The swap happens under the lock, so a request is verified against
-        // the old keyring or the new one, never a half-built one.
+        // The swap holds the exclusive side while every verifier (parseIncoming
+        // under the shared lock, keyringCopySecret snapshots) holds at most
+        // the shared side: a request verifies against the old keyring or the
+        // new one, never a half-built one, and a SIGHUP mid-verify cannot
+        // produce a spurious BADKEY/BADSIG.
         self.keyring.replace(&ring);
         // The runtime holds the only remaining copy of the new secrets.
         ring.deinit();
@@ -1722,6 +1916,19 @@ pub const Runtime = struct {
                 return err;
             };
         }
+        const is_notify = parsed == .incoming and parsed.incoming.query.header.opcode == .notify;
+        if (is_notify) {
+            // A NOTIFY mutates refresh state (marks the tracked secondary
+            // due), so it serializes against answer readers.
+            self.lockExclusive();
+            defer self.unlockExclusive();
+            const result = self.answerParsed(allocator, query_bytes, output, client, counters, over_tcp, parsed) catch |err| {
+                countAnswerError(counters, err);
+                return err;
+            };
+            if (counters) |value| metrics.bump(&value.responses_total);
+            return result;
+        }
         self.lockShared();
         defer self.unlockShared();
         const result = self.answerParsed(allocator, query_bytes, output, client, counters, over_tcp, parsed) catch |err| {
@@ -1928,11 +2135,18 @@ pub const Runtime = struct {
         // The temporary file is flushed to nonvolatile storage before the
         // rename, so the committed name never refers to a page that only
         // exists in the page cache (RFC 2136 section 3.5).
-        const file = try policy.dir.createFile(io, temp_path, .{ .truncate = true });
+        // Remove any stale temp first, then create it exclusively so a
+        // symlink planted at the temp name cannot redirect the write.
+        policy.dir.deleteFile(io, temp_path) catch {};
+        const file = try policy.dir.createFile(io, temp_path, .{ .truncate = true, .exclusive = true });
         defer file.close(io);
         try file.writeStreamingAll(io, text);
         try file.sync(io);
         try policy.dir.rename(temp_path, policy.dir, policy.path, io);
+        // The rename is only durable once the directory entry is synced.
+        const dir_file = policy.dir.openFile(io, ".", .{ .mode = .read_only, .allow_directory = true }) catch return;
+        defer dir_file.close(io);
+        try dir_file.sync(io);
     }
 
     /// RFC 2136 section 3.8: the response echoes the zone section and carries
@@ -2099,7 +2313,21 @@ pub const Runtime = struct {
                         try self.encodeMessage(try response.buildRefusedResponse(incoming.query), &output);
                     return frameSingle(allocator, single);
                 };
-                // Default deny: no allow-transfer entry for this apex and
+                // An expired secondary is not authoritative for its data
+                // (RFC 1035 section 7.3): answer SERVFAIL, not the stale
+                // zone, from the transfer path exactly as the query path.
+                if (self.secondaryFor(zone.originText())) |secondary| {
+                    if (secondary.expired) {
+                        var failure = try response.buildRefusedResponse(incoming.query);
+                        failure.header.rcode = .servfail;
+                        var output: [transfer.tcp_max_frame_size]u8 = undefined;
+                        const single = if (incoming.auth) |auth|
+                            try self.encodeSignedMessage(failure, &output, auth, 0, &.{}, null)
+                        else
+                            try self.encodeMessage(failure, &output);
+                        return frameSingle(allocator, single);
+                    }
+                }
                 // client means a signed refusal and no zone data encoded.
                 if (!self.transferAllowedFor(zone.originText(), client)) {
                     var output: [transfer.tcp_max_frame_size]u8 = undefined;
@@ -2481,16 +2709,17 @@ pub const Runtime = struct {
             }
             // RFC 1996 section 3.10: a NOTIFY for a served secondary asks
             // it to check its master now rather than at the next SOA
-            // refresh. A null `last_success_ns` is the `refreshDecision`
-            // input that is always due, so the next tick fetches instead
-            // of idling or expiring; clearing `expired` keeps that tick
-            // from being skipped.
+            // refresh. Marking the attempt failed-but-due forces the next
+            // tick to fetch (retry cadence) without touching
+            // `last_success_ns` or `expired`: a blind NOTIFY must never
+            // resurrect stale data, and only a successful install clears
+            // expiry.
             for (@constCast(self).secondary_zones.items) |*secondary| {
                 if (std.ascii.eqlIgnoreCase(secondary.apex, notify_name)) {
                     const from_master = if (notify_source) |source| sameIp(source, &secondary.primary) else false;
                     if (from_master) {
-                        secondary.last_success_ns = null;
-                        secondary.expired = false;
+                        secondary.last_attempt_ns = null;
+                        secondary.last_attempt_failed = true;
                     }
                 }
             }
@@ -2506,6 +2735,13 @@ pub const Runtime = struct {
         // RFC 8914 section 4.21: the server holds no zone for the name and is
         // not configured to recurse for it.
         const selected = self.selectZone(qname_text) orelse return response.buildNotAuthoritativeResponse(query);
+        if (self.secondaryFor(selected.originText())) |secondary| {
+            if (secondary.expired) {
+                var failure = try response.buildRefusedResponse(query);
+                failure.header.rcode = .servfail;
+                return failure;
+            }
+        }
         return response.buildResponseWithPolicy(query, selected, self.answer_policy, self.signingSession(), over_tcp);
     }
 
@@ -3697,7 +3933,7 @@ test "authoritative runtime records metrics for successful, bad, and bit-flagged
 
     var metrics_output = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer metrics_output.deinit();
-    try @import("../metrics.zig").formatPrometheus(counters, &metrics_output.writer);
+    try @import("../metrics.zig").formatPrometheus(&counters, &metrics_output.writer);
     const text = metrics_output.written();
     try std.testing.expect(std.mem.indexOf(u8, text, "zimdns_reserved_bit_queries_total 1\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "zimdns_ad_bit_queries_total 1\n") != null);
@@ -5658,14 +5894,118 @@ test "a NOTIFY for a secondary marks it due for the next refresh tick" {
 
     // A NOTIFY for the tracked secondary marks it due, so the next tick
     // fetches it even though the refresh interval has not elapsed.
+    // It marks the attempt due without touching `last_success_ns`, and it
+    // never clears `expired`: only a successful install resurrects.
     runtime.secondary_zones.items[0].expired = true;
     const secondary_request = try encodeNotifyRequest(arena.allocator(), &request_buffer, "example.", 11, .SOA);
     _ = try runtime.answerFrom(secondary_request, &output, &master);
-    try std.testing.expect(!runtime.secondary_zones.items[0].expired);
+    try std.testing.expect(runtime.secondary_zones.items[0].expired);
+    try std.testing.expectEqual(@as(?i64, 5_000_000_000), runtime.secondary_zones.items[0].last_success_ns);
     try runtime.maybeRefreshSecondaries(6_000_000_000, SecondaryFetchStub.fetch, &stub);
     try std.testing.expectEqual(@as(usize, 1), stub.calls);
     try std.testing.expectEqualStrings("example.", stub.last_zone_name.?);
     try std.testing.expectEqual(@as(?i64, 6_000_000_000), runtime.secondary_zones.items[0].last_success_ns);
+    try std.testing.expect(!runtime.secondary_zones.items[0].expired);
+}
+
+test "a secondary refresh installs only a strictly newer serial" {
+    var runtime = try Runtime.fromZoneText(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 10 3600 900 1209600 3600
+        \\@ IN NS ns.example.
+        \\@ IN A 192.0.2.1
+        \\
+    );
+    defer runtime.deinit();
+    try runtime.secondary_zones.append(runtime.allocator, .{
+        .apex = try runtime.allocator.dupe(u8, "example."),
+        .primary = try std.Io.net.IpAddress.parse("192.0.2.1", 53),
+        .last_success_ns = 0,
+        .refresh_sec = 60,
+        .retry_sec = 30,
+        .expire_sec = 3600,
+    });
+    const Ctx = struct {
+        var serial: u32 = 11;
+        fn fetch(ctx: *anyopaque, allocator: std.mem.Allocator, zone_name: []const u8) anyerror!?[]const u8 {
+            _ = ctx;
+            _ = zone_name;
+            return try std.fmt.allocPrint(allocator, "$ORIGIN example.\n$TTL 3600\n@ IN SOA ns.example. hostmaster.example. {d} 3600 900 1209600 3600\n@ IN NS ns.example.\n@ IN A 192.0.2.1\n", .{serial});
+        }
+    };
+    var fetch_ctx_byte: u8 = 0;
+    // A newer serial installs and its data answers.
+    try runtime.maybeRefreshSecondaries(61_000_000_000, Ctx.fetch, &fetch_ctx_byte);
+    try std.testing.expectEqual(@as(?u32, 11), runtime.zones.items[0].soaSerial());
+    try std.testing.expect(!runtime.secondary_zones.items[0].last_attempt_failed);
+    // An equal serial is a no-op success: the copy still answers serial 11.
+    Ctx.serial = 11;
+    runtime.secondary_zones.items[0].last_success_ns = null;
+    try runtime.maybeRefreshSecondaries(1_000_000_000, Ctx.fetch, &fetch_ctx_byte);
+    try std.testing.expectEqual(@as(?u32, 11), runtime.zones.items[0].soaSerial());
+    try std.testing.expect(!runtime.secondary_zones.items[0].last_attempt_failed);
+    // An older serial is refused: the served copy keeps serial 11 and the
+    // attempt is marked failed so the retry clock applies.
+    Ctx.serial = 9;
+    runtime.secondary_zones.items[0].last_success_ns = null;
+    try runtime.maybeRefreshSecondaries(2_000_000_000, Ctx.fetch, &fetch_ctx_byte);
+    try std.testing.expectEqual(@as(?u32, 11), runtime.zones.items[0].soaSerial());
+    try std.testing.expect(runtime.secondary_zones.items[0].last_attempt_failed);
+}
+
+test "an expired secondary answers SERVFAIL while other zones keep answering" {
+    var runtime = try Runtime.fromZoneTexts(&.{
+        "$ORIGIN example.\n" ++
+            "$TTL 3600\n" ++
+            "@ IN SOA ns.example. hostmaster.example. 10 3600 900 1209600 3600\n" ++
+            "@ IN NS ns.example.\n" ++
+            "www IN A 192.0.2.1\n" ++
+            "\n",
+        "$ORIGIN other.\n" ++
+            "$TTL 3600\n" ++
+            "@ IN SOA ns.other. hostmaster.other. 5 3600 900 1209600 3600\n" ++
+            "@ IN NS ns.other.\n" ++
+            "www IN A 192.0.2.2\n" ++
+            "\n",
+    });
+    defer runtime.deinit();
+    try runtime.secondary_zones.append(runtime.allocator, .{
+        .apex = try runtime.allocator.dupe(u8, "example."),
+        .primary = try std.Io.net.IpAddress.parse("192.0.2.1", 53),
+        .last_success_ns = 0,
+        .refresh_sec = 60,
+        .retry_sec = 30,
+        .expire_sec = 3600,
+    });
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query_buffer: [512]u8 = undefined;
+    var output: [1024]u8 = undefined;
+    // Past the expire interval the tick marks the zone expired. The
+    // primary is unreachable here, so the tick's fetch fails and only the
+    // expiry flag is set — no install clears it.
+    const FailingFetch = struct {
+        fn fetch(ctx: *anyopaque, allocator: std.mem.Allocator, zone_name: []const u8) anyerror!?[]const u8 {
+            _ = ctx;
+            _ = allocator;
+            _ = zone_name;
+            return error.Unreachable;
+        }
+    };
+    var fetch_ctx_byte: u8 = 0;
+    try runtime.maybeRefreshSecondaries(3_601_000_000_000, FailingFetch.fetch, &fetch_ctx_byte);
+    try std.testing.expect(runtime.secondary_zones.items[0].expired);
+    // The expired zone answers SERVFAIL (RFC 1035 section 7.3: the data is
+    // no longer authoritative) instead of its stale records.
+    const expired_request = try encodeDdrQuery(arena.allocator(), &query_buffer, "www.example.", .A);
+    const expired_response = try dns_message.Message.parse(arena.allocator(), try runtime.answer(expired_request, &output));
+    try std.testing.expectEqual(@as(@TypeOf(expired_response.header.rcode), .servfail), expired_response.header.rcode);
+    // The unexpired zone still answers its data.
+    const other_request = try encodeDdrQuery(arena.allocator(), &query_buffer, "www.other.", .A);
+    const other_response = try dns_message.Message.parse(arena.allocator(), try runtime.answer(other_request, &output));
+    try std.testing.expectEqual(@as(@TypeOf(other_response.header.rcode), .no_error), other_response.header.rcode);
+    try std.testing.expectEqual(@as(u16, 1), other_response.header.answer_count);
 }
 
 test "runtime answers NOTIFY by comparing the serial and refuses transfers singly" {
@@ -6037,6 +6377,37 @@ test "transfer without an allow entry is refused" {
     const allowed_len = std.mem.readInt(u16, allowed[0..2], .big);
     const allowed_frame = try dns_message.Message.parse(arena.allocator(), allowed[2..][0..allowed_len]);
     try std.testing.expect(allowed_frame.answers.len > 0);
+}
+
+test "transfer of an expired secondary is SERVFAIL, not the stale zone" {
+    var runtime = try Runtime.fromZoneText(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 10 3600 900 1209600 3600
+        \\@ IN NS ns.example.
+        \\www IN A 192.0.2.1
+        \\
+    );
+    defer runtime.deinit();
+    try runtime.secondary_zones.append(runtime.allocator, .{
+        .apex = try runtime.allocator.dupe(u8, "example."),
+        .primary = try std.Io.net.IpAddress.parse("192.0.2.1", 53),
+        .last_success_ns = 0,
+        .refresh_sec = 60,
+        .retry_sec = 30,
+        .expire_sec = 3600,
+        .expired = true,
+    });
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var loopback = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    try runtime.addTransferAllow("example.", try config_parser.Cidr.parse("127.0.0.0/8"));
+    const blob = try runtime.encodeTransferFrames(std.testing.allocator, &transfer_test_axfr_query, &loopback);
+    defer std.testing.allocator.free(blob);
+    const frame_len = std.mem.readInt(u16, blob[0..2], .big);
+    const frame = try dns_message.Message.parse(arena.allocator(), blob[2..][0..frame_len]);
+    try std.testing.expectEqual(@as(@TypeOf(frame.header.rcode), .servfail), frame.header.rcode);
+    try std.testing.expectEqual(@as(u16, 0), frame.header.answer_count);
 }
 
 const reload_zone =

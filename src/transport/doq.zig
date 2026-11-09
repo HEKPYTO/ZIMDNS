@@ -30,7 +30,8 @@ pub const DOQ_PORT = tls_policy.doq_port;
 /// The application error code a protocol error shuts down a stream with
 /// (RFC 9250 section 4.8, DOQ_PROTOCOL_ERROR).
 pub const DOQ_PROTOCOL_ERROR: u64 = 0x2;
-/// Concurrent streams across every connection this port serves.
+/// Live streams one connection may hold; the registry enforces this cap per
+/// connection id, so worst case per port is MAX_CONNECTIONS * MAX_STREAMS (512).
 pub const MAX_STREAMS: usize = core.Server.MAX_STREAMS_PER_CONN;
 
 /// What the ngtcp2 core hands the DoQ layer for one stream chunk.

@@ -44,7 +44,8 @@ pub const DOH3_ALPN = "h3";
 pub const DOH3_PORT = tls_policy.doh_port;
 pub const MAX_BODY_LEN: usize = doh.MAX_BODY_LEN;
 pub const MAX_HEADER_BYTES: usize = doh.MAX_HEADER_BYTES;
-/// Concurrent request streams across every connection this port serves.
+/// Live streams one connection may hold; the registry enforces this cap per
+/// connection id, so worst case per port is MAX_CONNECTIONS * MAX_STREAMS (512).
 pub const MAX_STREAMS: usize = core.Server.MAX_STREAMS_PER_CONN;
 
 /// One request stream's state. The header rcbufs nghttp3 hands to the

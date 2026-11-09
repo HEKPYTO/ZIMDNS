@@ -338,6 +338,32 @@ pub const AllowUpdate = struct {
         return self.key.text();
     }
 };
+/// One `secondary-tsig-key <apex> <key-name>` line: the secondary zone whose
+/// refresh queries (AXFR/IXFR) are TSIG-signed with the named key, and the
+/// key name that must exist in the keyring.
+pub const max_secondary_tsig_keys = 4;
+pub const SecondaryTsigKeys = struct {
+    items: [max_secondary_tsig_keys]SecondaryTsigKey = undefined,
+    len: usize = 0,
+
+    pub fn append(self: *SecondaryTsigKeys, item: SecondaryTsigKey) Error!void {
+        if (self.len >= max_secondary_tsig_keys) return Error.TooManyItems;
+        self.items[self.len] = item;
+        self.len += 1;
+    }
+};
+pub const SecondaryTsigKey = struct {
+    apex: Text = .{},
+    key: Text = .{},
+
+    pub fn apexText(self: *const SecondaryTsigKey) []const u8 {
+        return self.apex.text();
+    }
+
+    pub fn keyText(self: *const SecondaryTsigKey) []const u8 {
+        return self.key.text();
+    }
+};
 /// One `notify <apex> <address:port>` line: RFC 1996 section 3.8 has the
 /// master notify its secondaries when a zone changes. The address is the
 /// operator's, not one derived from the NS RRset.
@@ -451,6 +477,7 @@ pub const Config = struct {
     blocklists: List(BlocklistFile) = .{},
     allow_transfers: List(AllowTransfer) = .{},
     allow_updates: List(AllowUpdate) = .{},
+    secondary_tsig_keys: SecondaryTsigKeys = .{},
     notifies: List(NotifyTarget) = .{},
     blacklist_zones: List(BlacklistZone) = .{},
     ddr_records: List(DdrRecord) = .{},
@@ -720,6 +747,7 @@ pub const Config = struct {
         if (std.mem.eql(u8, first, "blocklist")) return self.parseBlocklist(&tokens);
         if (std.mem.eql(u8, first, "allow-transfer")) return self.parseAllowTransfer(&tokens);
         if (std.mem.eql(u8, first, "allow-update")) return self.parseAllowUpdate(&tokens);
+        if (std.mem.eql(u8, first, "secondary-tsig-key")) return self.parseSecondaryTsigKey(&tokens);
         if (std.mem.eql(u8, first, "notify")) return self.parseNotify(&tokens);
         if (std.mem.eql(u8, first, "blacklist-zone")) return self.parseBlacklistZone(&tokens);
         if (std.mem.eql(u8, first, "ddr")) return self.parseDdr(&tokens);
@@ -983,6 +1011,16 @@ pub const Config = struct {
             if (std.ascii.eqlIgnoreCase(existing.apexText(), entry.apexText())) return Error.BadDirective;
         }
         try self.allow_updates.append(entry);
+    }
+    fn parseSecondaryTsigKey(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+        var entry = SecondaryTsigKey{};
+        try entry.apex.set(tokens.next() orelse return Error.BadDirective);
+        try entry.key.set(tokens.next() orelse return Error.BadDirective);
+        try requireNoTrailingTokens(tokens);
+        for (self.secondary_tsig_keys.items[0..self.secondary_tsig_keys.len]) |existing| {
+            if (std.ascii.eqlIgnoreCase(existing.apexText(), entry.apexText())) return Error.BadDirective;
+        }
+        try self.secondary_tsig_keys.append(entry);
     }
     fn parseAllowTransfer(self: *Config, tokens: *std.mem.TokenIterator(u8, .any)) !void {
         var entry = AllowTransfer{};
@@ -1446,6 +1484,23 @@ test "allow-update names a zone and its key" {
     try std.testing.expectEqual(@as(usize, 1), config.allow_updates.len);
     try std.testing.expectEqualStrings("example.com.", config.allow_updates.items[0].apexText());
     try std.testing.expectEqualStrings("update-key.", config.allow_updates.items[0].keyText());
+}
+
+test "secondary-tsig-key names a secondary apex and its key" {
+    const config = try Config.parse(
+        \\zone example.com. secondary 192.0.2.1
+        \\secondary-tsig-key example.com. update-key.
+        \\
+    );
+    try std.testing.expectEqual(@as(usize, 1), config.secondary_tsig_keys.len);
+    try std.testing.expectEqualStrings("example.com.", config.secondary_tsig_keys.items[0].apexText());
+    try std.testing.expectEqualStrings("update-key.", config.secondary_tsig_keys.items[0].keyText());
+}
+
+test "secondary-tsig-key rejects a duplicate apex and trailing tokens" {
+    try std.testing.expectError(error.BadDirective, Config.parse("secondary-tsig-key example.com. key.\nsecondary-tsig-key example.com. other.\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("secondary-tsig-key example.com. key. extra\n"));
+    try std.testing.expectError(error.BadDirective, Config.parse("secondary-tsig-key example.com.\n"));
 }
 
 test "allow-update rejects a duplicate apex and a missing key" {

@@ -28,7 +28,7 @@ pub fn bump(counter: *std.atomic.Value(u64)) void {
 }
 
 /// The writer bounds the output by its content, so a new counter cannot overflow it.
-pub fn formatPrometheus(counters: Counters, writer: *std.Io.Writer) !void {
+pub fn formatPrometheus(counters: *const Counters, writer: *std.Io.Writer) !void {
     try writer.print(
         \\# TYPE zimdns_queries_total counter
         \\zimdns_queries_total {d}
@@ -79,7 +79,7 @@ test "metrics format emits prometheus counters" {
     };
     var output = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer output.deinit();
-    try formatPrometheus(counters, &output.writer);
+    try formatPrometheus(&counters, &output.writer);
 
     const expected =
         \\# TYPE zimdns_queries_total counter
@@ -115,7 +115,7 @@ test "metrics text is not bounded by a fixed buffer" {
     const widest = std.math.maxInt(u64);
     var output = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer output.deinit();
-    try formatPrometheus(.{
+    try formatPrometheus(&.{
         .queries_total = .init(widest),
         .responses_total = .init(widest),
         .bad_queries_total = .init(widest),

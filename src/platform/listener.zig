@@ -277,10 +277,21 @@ pub fn serveUdpPoolOnAddressBounded(io: std.Io, runtime: *Runtime, address: *con
     var bind_address = address.*;
     var socket = try std.Io.net.IpAddress.bind(&bind_address, io, .{ .mode = .dgram, .protocol = .udp });
     defer socket.close(io);
+    return serveUdpPoolOnSocketBudgeted(&socket, io, runtime, counters, max_requests);
+}
+
+/// Runs the unbounded pool on an already-bound socket, so a caller that
+/// bound the listener itself (the multi-loop runner) shares the same
+/// serving shape as `serveUdpPoolOnAddress`.
+pub fn serveUdpPoolOnSocket(socket: *const std.Io.net.Socket, io: std.Io, runtime: *Runtime, counters: ?*metrics.Counters) !void {
+    return serveUdpPoolOnSocketBudgeted(socket, io, runtime, counters, null);
+}
+
+fn serveUdpPoolOnSocketBudgeted(socket: *const std.Io.net.Socket, io: std.Io, runtime: *Runtime, counters: ?*metrics.Counters, max_requests: ?usize) !void {
     var budget: std.atomic.Value(usize) = .init(max_requests orelse 0);
     const shared: ?*std.atomic.Value(usize) = if (max_requests == null) null else &budget;
     var workers: [UDP_WORKER_COUNT]UdpPoolWorker = undefined;
-    for (&workers) |*worker| worker.* = .{ .socket = &socket, .io = io, .runtime = runtime, .counters = counters, .remaining = shared };
+    for (&workers) |*worker| worker.* = .{ .socket = socket, .io = io, .runtime = runtime, .counters = counters, .remaining = shared };
     var threads: [UDP_WORKER_COUNT]std.Thread = undefined;
     // A spawn failure must not unwind: unwinding would close the socket and
     // free runtime storage while earlier workers still serve on them. Print
@@ -378,17 +389,17 @@ pub fn acceptWithRetry(server: anytype, io: std.Io) !std.Io.net.Stream {
     }
 }
 
-pub fn serveTcpLoop(server: anytype, io: std.Io, runtime: *Runtime, max_requests: ?usize) !void {
-    return serveTcpLoopWithTimeout(server, io, runtime, max_requests, tcpIdleTimeout());
+pub fn serveTcpLoop(server: anytype, io: std.Io, runtime: *Runtime, max_requests: ?usize, counters: ?*metrics.Counters) !void {
+    return serveTcpLoopWithTimeout(server, io, runtime, max_requests, tcpIdleTimeout(), counters);
 }
 
-fn serveTcpStreamWorker(stream: std.Io.net.Stream, io: std.Io, runtime: *Runtime, timeout: TcpIoTimeout, sources: *SourceCounter) void {
+fn serveTcpStreamWorker(stream: std.Io.net.Stream, io: std.Io, runtime: *Runtime, timeout: TcpIoTimeout, sources: *SourceCounter, counters: ?*metrics.Counters) void {
     defer stream.close(io);
     defer sources.release(&stream.socket.address);
-    serveTcpStreamOnceWithTimeout(stream, io, runtime, timeout, null) catch {};
+    serveTcpStreamOnceWithTimeout(stream, io, runtime, timeout, counters) catch {};
 }
 
-fn serveTcpLoopWithTimeout(server: anytype, io: std.Io, runtime: *Runtime, max_requests: ?usize, timeout: TcpIoTimeout) !void {
+fn serveTcpLoopWithTimeout(server: anytype, io: std.Io, runtime: *Runtime, max_requests: ?usize, timeout: TcpIoTimeout, counters: ?*metrics.Counters) !void {
     var group: std.Io.Group = .init;
     defer group.await(io) catch unreachable;
 
@@ -407,7 +418,7 @@ fn serveTcpLoopWithTimeout(server: anytype, io: std.Io, runtime: *Runtime, max_r
             stream.close(io);
             continue;
         }
-        group.concurrent(io, serveTcpStreamWorker, .{ stream, io, runtime, timeout, &sources }) catch |err| switch (err) {
+        group.concurrent(io, serveTcpStreamWorker, .{ stream, io, runtime, timeout, &sources, counters }) catch |err| switch (err) {
             error.ConcurrencyUnavailable => {
                 sources.release(&stream.socket.address);
                 stream.close(io);
@@ -529,11 +540,11 @@ pub fn frameTimeout(io: std.Io, connection_deadline: ?std.Io.Clock.Timestamp, ti
     };
 }
 
-pub fn serveTcpLoopOnAddress(io: std.Io, runtime: *Runtime, address: *const std.Io.net.IpAddress, max_requests: ?usize) !void {
+pub fn serveTcpLoopOnAddress(io: std.Io, runtime: *Runtime, address: *const std.Io.net.IpAddress, max_requests: ?usize, counters: ?*metrics.Counters) !void {
     var bind_address = address.*;
     var server = try std.Io.net.IpAddress.listen(&bind_address, io, .{ .reuse_address = true });
     defer server.deinit(io);
-    try serveTcpLoop(&server, io, runtime, max_requests);
+    try serveTcpLoop(&server, io, runtime, max_requests, counters);
 }
 
 pub fn serveTcpOnceOnAddress(io: std.Io, runtime: *Runtime, address: *const std.Io.net.IpAddress) !void {
@@ -960,7 +971,7 @@ test "TCP loop rejects truncated frames before serving the next connection" {
     try @import("../cli/query.zig").sendTcpQuery(valid_client, io, query);
     try valid_client.shutdown(io, .send);
 
-    try serveTcpLoopWithTimeout(&server, io, &runtime, 3, .{ .seconds = 0, .microseconds = 100_000 });
+    try serveTcpLoopWithTimeout(&server, io, &runtime, 3, .{ .seconds = 0, .microseconds = 100_000 }, null);
 
     var response_poll_fds = [_]std.posix.pollfd{.{
         .fd = valid_client.socket.handle,
@@ -1001,7 +1012,7 @@ test "TCP loop does not count an empty EOF connection" {
     try @import("../cli/query.zig").sendTcpQuery(valid_client, io, query);
     try valid_client.shutdown(io, .send);
 
-    try serveTcpLoopWithTimeout(&server, io, &runtime, 2, .{ .seconds = 0, .microseconds = 100_000 });
+    try serveTcpLoopWithTimeout(&server, io, &runtime, 2, .{ .seconds = 0, .microseconds = 100_000 }, null);
 
     var response_poll_fds = [_]std.posix.pollfd{.{
         .fd = valid_client.socket.handle,
@@ -1052,7 +1063,7 @@ test "TCP loop rejects a length prefix without payload" {
     defer prefix_server_stream.close(io);
     try std.testing.expectError(Error.BadTcpFrame, serveTcpStreamOnce(prefix_server_stream, io, &runtime));
 
-    try serveTcpLoopWithTimeout(&server, io, &runtime, 1, .{ .seconds = 0, .microseconds = 100_000 });
+    try serveTcpLoopWithTimeout(&server, io, &runtime, 1, .{ .seconds = 0, .microseconds = 100_000 }, null);
 
     var response_poll_fds = [_]std.posix.pollfd{.{
         .fd = valid_client.socket.handle,
@@ -1136,7 +1147,7 @@ test "TCP connection cap serves sixteen frames and closes before the seventeenth
 /// Serves the TCP connections of one listener on a thread of its own, so a
 /// test can watch the connections while the loop accepts them.
 fn serveTcpLoopThread(server: *std.Io.net.Server, io: std.Io, runtime: *Runtime, max_requests: usize) void {
-    serveTcpLoopWithTimeout(server, io, runtime, max_requests, tcpIdleTimeout()) catch {};
+    serveTcpLoopWithTimeout(server, io, runtime, max_requests, tcpIdleTimeout(), null) catch {};
 }
 
 test "TCP loop refuses a connection from a source over the per-source limit" {
@@ -1317,7 +1328,7 @@ test "TCP loop under the default per-source limit serves two connections of one 
     try @import("../cli/query.zig").sendTcpQuery(second, io, second_query);
     try second.shutdown(io, .send);
 
-    try serveTcpLoop(&server, io, &runtime, 2);
+    try serveTcpLoop(&server, io, &runtime, 2, null);
 
     var response_buffer: [512]u8 = undefined;
     const first_response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), first, io, &response_buffer, first_query, false);
@@ -1448,7 +1459,7 @@ test "TCP loop ignores malformed and idle connections before a valid query" {
     try @import("../cli/query.zig").sendTcpQuery(valid_client, io, query);
     try valid_client.shutdown(io, .send);
 
-    try serveTcpLoopWithTimeout(&server, io, &runtime, 3, .{ .seconds = 0, .microseconds = 1_000 });
+    try serveTcpLoopWithTimeout(&server, io, &runtime, 3, .{ .seconds = 0, .microseconds = 1_000 }, null);
 
     var response_buffer: [512]u8 = undefined;
     const response = try @import("../cli/query.zig").receiveTcpResponse(arena.allocator(), valid_client, io, &response_buffer, query, false);

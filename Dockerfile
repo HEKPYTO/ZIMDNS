@@ -59,7 +59,7 @@ EXPOSE 1053/tcp
 VOLUME ["/etc/zimdns"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-    CMD ["/usr/local/bin/zimdns", "query", "@127.0.0.1", "-p", "1053", "dns.home.arpa.", "A"]
+    CMD ["/usr/local/bin/zimdns", "query", "@127.0.0.1", "-p", "1053", "--require-answer", "--tcp", "home.arpa.", "SOA"]
 
 ENTRYPOINT ["/usr/local/bin/zimdns"]
 # Relative --config path: the loader confines all paths beneath the working directory and rejects absolute paths.
