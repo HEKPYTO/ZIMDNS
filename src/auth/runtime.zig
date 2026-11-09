@@ -256,6 +256,8 @@ pub const SharedStop = struct {
 pub const Runtime = struct {
     allocator: std.mem.Allocator = std.heap.page_allocator,
     zones: std.ArrayList(zone_index.Zone) = .empty,
+    zone_order: std.ArrayListUnmanaged(usize) = .empty,
+    zone_order_valid: bool = false,
     blocklist: blocklist_mod.Blocklist = .{},
     resolver: ?resolver_mod.Resolver = null,
     /// RFC 6303/6761/7793/8375 locally served zones, on by default so a
@@ -374,8 +376,9 @@ pub const Runtime = struct {
 
     /// The returned runtime owns every zone value moved from `zones`.
     pub fn fromZones(allocator: std.mem.Allocator, zones: *std.ArrayList(zone_index.Zone), blocklist: blocklist_mod.Blocklist) Runtime {
-        const runtime = Runtime{ .allocator = allocator, .zones = zones.*, .blocklist = blocklist };
+        var runtime = Runtime{ .allocator = allocator, .zones = zones.*, .blocklist = blocklist };
         zones.* = .empty;
+        runtime.rebuildZoneOrder();
         return runtime;
     }
 
@@ -463,15 +466,15 @@ pub const Runtime = struct {
         defer self.maintenance_mutex.unlock(io);
         self.maybeRefreshManagedAnchors(@intCast(std.Io.Clock.real.now(io).nanoseconds));
         _ = self.reloadZoneIfRequested(io);
-        _ = self.refreshCatalogIfRequested(io);
         return true;
     }
 
-    pub fn trySecondaryRefresh(self: *Runtime, io: std.Io) bool {
+    pub fn tryBackgroundRefresh(self: *Runtime, io: std.Io) bool {
         if (!self.secondary_refresh_mutex.tryLock()) return false;
         defer self.secondary_refresh_mutex.unlock(io);
         const tick_ns: u64 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
         _ = self.maybeRefreshSecondaries(io, tick_ns, fetchSecondaryViaXfr, self) catch |err| reportMaintenanceError(io, err);
+        _ = self.refreshCatalogIfRequested(io);
         return true;
     }
 
@@ -604,6 +607,8 @@ pub const Runtime = struct {
                 return;
             };
             self.transfer_delta_logs.append(self.allocator, .{}) catch {};
+            self.zone_order_valid = false;
+            self.rebuildZoneOrder();
             installed = true;
             secondary.last_success_ns = attempt_ns;
             secondary.last_attempt_failed = false;
@@ -725,6 +730,8 @@ pub const Runtime = struct {
         for (self.zones.items) |*zone| zone.deinit();
         self.zones.deinit(self.allocator);
         self.zones = .empty;
+        self.zone_order.deinit(self.allocator);
+        self.zone_order = .empty;
         self.transfer_delta_logs.deinit(self.allocator);
         self.transfer_delta_logs = .empty;
         for (self.reload_sources.items) |source| {
@@ -1122,6 +1129,10 @@ pub const Runtime = struct {
 
         self.lockExclusive();
         defer self.unlockExclusive();
+        // The order is read under the shared lock, so it changes only while
+        // this exclusive lock is held. The rebuild defer runs before unlock.
+        self.zone_order_valid = false;
+        defer self.rebuildZoneOrder();
         if (self.zoneIndexForOrigin(consumer.apex)) |_| {
             const catalog_outcome = self.installZoneLocked(io, consumer.apex, &catalog_zone);
             if (catalog_outcome != .replaced) {
@@ -1296,6 +1307,7 @@ pub const Runtime = struct {
     /// Removes one zone from the served set. The caller holds the exclusive
     /// lock.
     fn removeZoneLocked(self: *Runtime, origin: []const u8) void {
+        self.zone_order_valid = false;
         const index = self.zoneIndexForOrigin(origin) orelse return;
         self.zones.items[index].deinit();
         _ = self.zones.orderedRemove(index);
@@ -1578,7 +1590,37 @@ pub const Runtime = struct {
         return .replaced;
     }
 
+    fn zoneOrderLess(ctx: *const Runtime, a: usize, b: usize) bool {
+        return std.ascii.lessThanIgnoreCase(ctx.zones.items[a].originText(), ctx.zones.items[b].originText());
+    }
+
+    fn rebuildZoneOrder(self: *Runtime) void {
+        self.zone_order.resize(self.allocator, self.zones.items.len) catch {
+            self.zone_order_valid = false;
+            return;
+        };
+        for (self.zone_order.items, 0..) |*slot, index| slot.* = index;
+        std.mem.sort(usize, self.zone_order.items, @as(*const Runtime, self), zoneOrderLess);
+        self.zone_order_valid = true;
+    }
+
+    fn zoneOrderLookup(self: *const Runtime, origin: []const u8) ?usize {
+        var low: usize = 0;
+        var high = self.zone_order.items.len;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            const index = self.zone_order.items[mid];
+            switch (std.ascii.orderIgnoreCase(self.zones.items[index].originText(), origin)) {
+                .lt => low = mid + 1,
+                .gt => high = mid,
+                .eq => return index,
+            }
+        }
+        return null;
+    }
+
     fn zoneIndexForOrigin(self: *const Runtime, origin: []const u8) ?usize {
+        if (self.zone_order_valid) return self.zoneOrderLookup(origin);
         for (self.zones.items, 0..) |zone, index| {
             if (!std.ascii.eqlIgnoreCase(zone.originText(), origin)) continue;
             return index;
@@ -2012,8 +2054,12 @@ pub const Runtime = struct {
     ) ![]const u8 {
         const query = incoming.query;
         // Nothing is enabled: the opcode is not implemented by policy, and the
-        // message body is not inspected.
-        if (self.update_policies.items.len == 0 and self.secondary_zones.items.len == 0) return self.encodeUpdateReply(query, incoming.auth, .notimp, output);
+        // message body is not inspected. The counts are read under the shared
+        // lock because the catalog adds and removes secondaries at runtime.
+        self.lockShared();
+        const updates_enabled = self.update_policies.items.len != 0 or self.secondary_zones.items.len != 0;
+        self.unlockShared();
+        if (!updates_enabled) return self.encodeUpdateReply(query, incoming.auth, .notimp, output);
         const q = query.question orelse return self.encodeUpdateReply(query, incoming.auth, .formerr, output);
         if (!q.qtype.eql(.SOA) or !q.qclass.eql(dns_types.Class.IN)) {
             return self.encodeUpdateReply(query, incoming.auth, .formerr, output);
@@ -2024,11 +2070,19 @@ pub const Runtime = struct {
         // primary when the relay policy allows, and refuses otherwise. The
         // secondary check comes first, so a secondary that also carries a
         // policy for the apex still relays instead of applying locally.
-        if (self.secondaryFor(apex)) |secondary| {
-            return self.forwardSecondaryUpdate(apex, &secondary.primary, query_bytes, incoming, output);
+        // The secondary list is rebuilt under the exclusive lock; copy the
+        // primary address before releasing the shared lock, so the relay
+        // never holds a pointer into a list the catalog can free.
+        var secondary_primary: ?std.Io.net.IpAddress = null;
+        self.lockShared();
+        if (self.secondaryFor(apex)) |secondary| secondary_primary = secondary.primary;
+        const policy = self.updatePolicyFor(apex);
+        self.unlockShared();
+        if (secondary_primary) |primary| {
+            return self.forwardSecondaryUpdate(apex, &primary, query_bytes, incoming, output);
         }
-        if (self.updatePolicyFor(apex)) |policy| {
-            return self.applyPrimaryUpdate(allocator, output, incoming, policy, apex);
+        if (policy) |value| {
+            return self.applyPrimaryUpdate(allocator, output, incoming, value, apex);
         }
         return self.encodeUpdateReply(query, incoming.auth, .notimp, output);
     }
@@ -2070,9 +2124,6 @@ pub const Runtime = struct {
         const key_name = auth.key.name.toText(&key_buffer) catch return self.encodeUpdateReply(query, incoming.auth, .refused, output);
         if (!std.ascii.eqlIgnoreCase(key_name, policy.key_name)) {
             return self.encodeUpdateReply(query, incoming.auth, .refused, output);
-        }
-        if (self.zoneIndexForOrigin(apex) == null) {
-            return self.encodeUpdateReply(query, incoming.auth, .notauth, output);
         }
         // The lock is exclusive from the first read of the zone to the swap:
         // one update at a time, and no answer sees a half-applied change.
@@ -2782,6 +2833,8 @@ pub const Runtime = struct {
     }
 
     fn appendZoneText(self: *Runtime, text: []const u8) !void {
+        self.zone_order_valid = false;
+        defer self.rebuildZoneOrder();
         var zone_file = try zone_parser.ZoneFile.parse(text);
         errdefer zone_file.deinit();
         var zone = try zone_index.Zone.fromZoneFile(&zone_file);
@@ -2793,6 +2846,15 @@ pub const Runtime = struct {
     }
 
     fn selectZone(self: *const Runtime, qname: []const u8) ?*const zone_index.Zone {
+        if (self.zone_order_valid) {
+            var name = qname;
+            while (name.len != 0) {
+                if (self.zoneOrderLookup(name)) |index| return &self.zones.items[index];
+                const dot = std.mem.indexOfScalar(u8, name, '.') orelse break;
+                name = name[dot + 1 ..];
+            }
+            return null;
+        }
         var selected: ?*const zone_index.Zone = null;
         for (self.zones.items) |*zone| {
             if (!zone.contains(qname)) continue;
@@ -6925,4 +6987,47 @@ test "a zone that was not signed is not signed by a reload" {
     try std.testing.expect(!zoneHas(zone, .RRSIG, "example."));
     try std.testing.expect(!zoneHas(zone, .NSEC, "example."));
     try std.testing.expectEqual(@as(usize, 0), zone.generated.len);
+}
+
+test "the maintenance tick leaves secondary fetches to the background" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var runtime = Runtime{};
+    defer runtime.deinit();
+    const now: i64 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
+    try runtime.secondary_zones.append(runtime.allocator, .{
+        .apex = try runtime.allocator.dupe(u8, "one.example."),
+        .primary = try std.Io.net.IpAddress.parse("127.0.0.1", 1),
+        .last_success_ns = now - 2 * std.time.ns_per_s,
+        .refresh_sec = 1,
+        .retry_sec = 1,
+        .expire_sec = 3600,
+    });
+    try std.testing.expect(runtime.tryMaintenanceTick(io));
+    try std.testing.expectEqual(@as(?i64, null), runtime.secondary_zones.items[0].last_attempt_ns);
+    try std.testing.expect(runtime.tryBackgroundRefresh(io));
+    try std.testing.expect(runtime.secondary_zones.items[0].last_attempt_ns != null);
+    try std.testing.expect(runtime.secondary_zones.items[0].last_attempt_failed);
+}
+
+test "the zone order index finds the longest origin" {
+    var runtime = try Runtime.fromZoneText(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns1.example. hostmaster.example. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.example.
+        \\
+    );
+    defer runtime.deinit();
+    try runtime.appendZoneText(
+        \\$ORIGIN sub.example.
+        \\$TTL 3600
+        \\@ IN SOA ns1.sub.example. hostmaster.sub.example. 1 3600 900 1209600 3600
+        \\@ IN NS ns1.sub.example.
+        \\
+    );
+    const zone = runtime.selectZone("WWW.Sub.Example.") orelse return error.MissingZone;
+    try std.testing.expectEqualStrings("sub.example.", zone.originText());
+    try std.testing.expectEqual(@as(usize, 1), runtime.zoneIndexForOrigin("SUB.EXAMPLE.").?);
+    const parent = runtime.selectZone("www.example.") orelse return error.MissingZone;
+    try std.testing.expectEqualStrings("example.", parent.originText());
 }

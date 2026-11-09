@@ -16,6 +16,7 @@ pub const Error = error{
     BadExcludedRange,
     TextTooLong,
     TooManyItems,
+    OutOfMemory,
 };
 
 pub const Transport = enum { udp, tcp, dot, doh, doq, doh3 };
@@ -462,6 +463,33 @@ fn List(comptime T: type) type {
     };
 }
 
+/// Zones are the one list that must grow past a small fixed cap; the other
+/// directives stay inline. The allocator is explicit so a test can use its
+/// own and the loader can free the storage it owns.
+pub const ZoneList = struct {
+    items: []Zone = &.{},
+    len: usize = 0,
+    allocator: std.mem.Allocator = std.heap.page_allocator,
+
+    fn append(self: *ZoneList, item: Zone) Error!void {
+        if (self.len == self.items.len) {
+            const capacity = if (self.items.len == 0) 8 else self.items.len * 2;
+            self.items = if (self.items.len == 0)
+                self.allocator.alloc(Zone, capacity) catch return Error.OutOfMemory
+            else
+                self.allocator.realloc(self.items, capacity) catch return Error.OutOfMemory;
+        }
+        self.items[self.len] = item;
+        self.len += 1;
+    }
+
+    pub fn deinit(self: *ZoneList) void {
+        if (self.items.len != 0) self.allocator.free(self.items);
+        self.items = &.{};
+        self.len = 0;
+    }
+};
+
 pub const RootHint = struct {
     /// Literal address text.
     address: Text = .{},
@@ -473,7 +501,7 @@ pub const Config = struct {
     recursion_allow: List(Cidr) = .{},
     forwarder: ?Forwarder = null,
     cookies: CookieConfig = .{},
-    zones: List(Zone) = .{},
+    zones: ZoneList = .{},
     blocklists: List(BlocklistFile) = .{},
     allow_transfers: List(AllowTransfer) = .{},
     allow_updates: List(AllowUpdate) = .{},
@@ -725,7 +753,12 @@ pub const Config = struct {
     }
 
     pub fn parse(text: []const u8) !Config {
-        var config = Config{};
+        return parseWithAllocator(std.heap.page_allocator, text);
+    }
+
+    pub fn parseWithAllocator(allocator: std.mem.Allocator, text: []const u8) !Config {
+        var config = Config{ .zones = .{ .allocator = allocator } };
+        errdefer config.deinit();
         var lines = std.mem.splitScalar(u8, text, '\n');
         while (lines.next()) |raw_line| {
             const stripped = stripComment(raw_line);
@@ -734,6 +767,10 @@ pub const Config = struct {
             try config.parseLine(line);
         }
         return config;
+    }
+
+    pub fn deinit(self: *Config) void {
+        self.zones.deinit();
     }
 
     fn parseLine(self: *Config, line: []const u8) !void {
@@ -2407,4 +2444,21 @@ test "forwarder-ca-file takes one path and nothing else" {
     try std.testing.expectError(Error.BadDirective, Config.parse("forwarder-ca-file\n"));
     try std.testing.expectError(Error.BadDirective, Config.parse("forwarder-ca-file a.pem b.pem\n"));
     try std.testing.expectError(Error.UnknownDirective, Config.parse("forwarder-ca ca.pem\n"));
+}
+
+test "parses ten thousand zones" {
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(std.testing.allocator);
+    var line: [96]u8 = undefined;
+    for (0..10_000) |index| {
+        try text.appendSlice(std.testing.allocator, try std.fmt.bufPrint(
+            &line,
+            "zone z{d}.example. primary z{d}.zone\n",
+            .{ index, index },
+        ));
+    }
+    var config = try Config.parseWithAllocator(std.testing.allocator, text.items);
+    defer config.deinit();
+    try std.testing.expectEqual(@as(usize, 10_000), config.zones.len);
+    try std.testing.expectEqualStrings("z9999.example.", config.zones.items[9999].nameText());
 }

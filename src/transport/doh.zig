@@ -59,6 +59,7 @@ const resolver_mod = @import("../resolver.zig");
 const zone_index = @import("../zone/index.zig");
 const tcp_deadline = @import("../platform/tcp_deadline.zig");
 const listener = @import("../platform/listener.zig");
+const channel_mod = @import("channel.zig");
 const tls_policy = @import("tls.zig");
 const tls_server = @import("tls_server.zig");
 const ossl = @import("openssl_tls.zig");
@@ -518,53 +519,6 @@ pub fn serveDohStreamOnce(stream: std.Io.net.Stream, io: std.Io, runtime: *Runti
     return serveDohStream(stream, io, runtime, null, null);
 }
 
-/// The end of one DoH connection: the operator may bound the lifetime of a
-/// connection (RFC 9210 section 4.2), and that deadline covers the whole
-/// connection. Null means the connection lives as long as the transport
-/// allows.
-fn connectionDeadline(io: std.Io) ?std.Io.Clock.Timestamp {
-    const seconds = listener.tcpLimits().max_connection_duration orelse return null;
-    return tcp_deadline.deadline(io, .{ .seconds = seconds });
-}
-
-/// One DoH connection: the channel the exchanges travel over and the
-/// deadlines that bound them. On a TLS channel the TLS connection carries
-/// the absolute deadline itself; otherwise the deadline goes to the raw
-/// descriptor under the exchange.
-const DohChannel = struct {
-    io: std.Io,
-    reader: *std.Io.Reader,
-    writer: *std.Io.Writer,
-    deadlines: ?tcp_deadline.FrameDeadlines = null,
-    tls: ?*ossl.Connection = null,
-    timeout: tcp_deadline.Timeout,
-    connection_deadline: ?std.Io.Clock.Timestamp,
-    /// The peer address of the accepted connection: the recursion policy and
-    /// the cookie check need the client the query came from.
-    client: *const std.Io.net.IpAddress,
-
-    /// The deadline of the exchange that starts now: the per-exchange
-    /// timeout, shortened to what is left of the connection's lifetime.
-    /// Null means the connection is over.
-    fn frameDeadline(self: *const DohChannel) ?std.Io.Clock.Timestamp {
-        const frame_timeout = listener.frameTimeout(self.io, self.connection_deadline, self.timeout) orelse return null;
-        return tcp_deadline.deadline(self.io, frame_timeout);
-    }
-
-    /// Bounds the exchange that starts now. On a TLS channel the TLS
-    /// connection carries the absolute deadline itself. False means the
-    /// connection has outlived its duration and ends here.
-    fn applyFrameDeadline(self: *const DohChannel) bool {
-        const frame_deadline = self.frameDeadline() orelse return false;
-        if (self.tls) |conn| {
-            conn.deadline = frame_deadline;
-        } else if (self.deadlines) |deadlines| {
-            deadlines.apply(frame_deadline);
-        }
-        return true;
-    }
-};
-
 fn serveDohStream(stream: std.Io.net.Stream, io: std.Io, runtime: *Runtime, counters: ?*metrics.Counters, odoh_target: ?*const odoh.Target) !void {
     // Same tick as the plaintext and DoT paths: one loop owns it across
     // all loops sharing this runtime, and a DoH-only server runs it here.
@@ -576,13 +530,13 @@ fn serveDohStream(stream: std.Io.net.Stream, io: std.Io, runtime: *Runtime, coun
     var reader = tcp_deadline.DeadlineReader.init(stream.socket.handle, io, &read_buffer, DOH_IO_TIMEOUT);
     var writer = tcp_deadline.DeadlineWriter.init(stream.socket.handle, io, &write_buffer, DOH_IO_TIMEOUT);
     defer writer.interface.flush() catch {};
-    var channel = DohChannel{
+    var channel = channel_mod.Channel{
         .io = io,
         .reader = &reader.interface,
         .writer = &writer.interface,
         .deadlines = .{ .reader = &reader, .writer = &writer },
         .timeout = DOH_IO_TIMEOUT,
-        .connection_deadline = connectionDeadline(io),
+        .connection_deadline = channel_mod.connectionDeadline(io),
         .client = &stream.socket.address,
     };
     try serveDohExchanges(&channel, runtime, counters, odoh_target);
@@ -590,7 +544,7 @@ fn serveDohStream(stream: std.Io.net.Stream, io: std.Io, runtime: *Runtime, coun
 
 /// The exchange loop both channels share: HTTP/1.1 keep-alive over one
 /// connection, bounded by MAX_EXCHANGES_PER_CONNECTION.
-fn serveDohExchanges(channel: *const DohChannel, runtime: *Runtime, counters: ?*metrics.Counters, odoh_target: ?*const odoh.Target) !void {
+fn serveDohExchanges(channel: *const channel_mod.Channel, runtime: *Runtime, counters: ?*metrics.Counters, odoh_target: ?*const odoh.Target) !void {
     var exchanges: usize = 0;
     while (exchanges < MAX_EXCHANGES_PER_CONNECTION) : (exchanges += 1) {
         // One deadline for the whole exchange: a peer that stalls in the
@@ -607,7 +561,7 @@ fn serveDohExchanges(channel: *const DohChannel, runtime: *Runtime, counters: ?*
                 arena.allocator(),
                 runtime,
                 counters,
-                channel.client,
+                channel.client.?,
                 exchanges + 1 == MAX_EXCHANGES_PER_CONNECTION,
                 odoh_target,
             ) catch |err| {
@@ -636,7 +590,7 @@ pub fn serveDohTlsStream(
 
     // RFC 9210 section 4.2: the operator may bound the lifetime of one
     // connection, and that deadline covers the whole connection.
-    const connection_deadline = connectionDeadline(io);
+    const connection_deadline = channel_mod.connectionDeadline(io);
 
     // The handshake is part of the connection, so it shares its deadline:
     // a peer that dribbles into the handshake cannot hold the worker. It
@@ -652,7 +606,7 @@ pub fn serveDohTlsStream(
     var connection_reader = connection.reader(&read_buffer);
     var connection_writer = connection.writer(&write_buffer);
     defer connection_writer.interface.flush() catch {};
-    var channel = DohChannel{
+    var channel = channel_mod.Channel{
         .io = io,
         .reader = &connection_reader.interface,
         .writer = &connection_writer.interface,

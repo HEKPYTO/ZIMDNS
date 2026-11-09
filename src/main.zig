@@ -797,7 +797,8 @@ fn printStartupBanner(out: *std.Io.Writer, runtime: *const auth_runtime.Runtime,
     }
     if (metrics_addr) |addr| try out.print(" metrics@{f}", .{addr});
     try out.writeAll(" zones=");
-    for (runtime.zones.items, 0..) |*zone, i| {
+    const shown = @min(runtime.zones.items.len, 32);
+    for (runtime.zones.items[0..shown], 0..) |*zone, i| {
         if (i > 0) try out.writeAll(",");
         if (zone.soaSerial()) |serial| {
             try out.print("{s}#{d}", .{ zone.originText(), serial });
@@ -805,6 +806,7 @@ fn printStartupBanner(out: *std.Io.Writer, runtime: *const auth_runtime.Runtime,
             try out.print("{s}#?", .{zone.originText()});
         }
     }
+    if (runtime.zones.items.len > shown) try out.print(" ...and {d} more", .{runtime.zones.items.len - shown});
     try out.writeAll("\n");
     try out.flush();
 }
@@ -1356,7 +1358,7 @@ const MaintenanceState = struct {
 
 fn maintenanceLoop(state: *MaintenanceState) void {
     while (!state.stop.load(.acquire)) {
-        _ = state.runtime.trySecondaryRefresh(state.io);
+        _ = state.runtime.tryBackgroundRefresh(state.io);
         _ = state.runtime.tryMaintenanceTick(state.io);
         std.Io.sleep(state.io, .fromMilliseconds(250), .awake) catch {};
     }

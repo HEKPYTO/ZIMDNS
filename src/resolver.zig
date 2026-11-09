@@ -57,7 +57,7 @@ pub const UDP_TIMEOUT: std.Io.Timeout = .{ .duration = .{
 /// Absolute wall-clock budget for one client resolution (RFC 1035 §7: the
 /// resolver gives up rather than retrying forever). An upstream that sends
 /// junk re-arms the 1 s per-receive timeout, so the total caps the whole wait.
-/// policy: global recursion mutex serializes concurrent resolutions; split it if throughput matters.
+/// shortcut: the global recursion mutex serializes concurrent resolutions; split it when forwarding throughput matters.
 pub const RESOLUTION_TIMEOUT: std.Io.Timeout = .{ .duration = .{
     .raw = .fromSeconds(8),
     .clock = .awake,

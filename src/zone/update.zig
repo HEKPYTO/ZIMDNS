@@ -10,6 +10,7 @@ const dns_name = @import("../dns/name.zig");
 const dns_rdata = @import("../dns/rdata.zig");
 const dns_record = @import("../dns/record.zig");
 const RecordType = @import("../dns/types.zig").RecordType;
+const Class = @import("../dns/types.zig").Class;
 const dns_writer = @import("../dns/writer.zig");
 const dnssec = @import("../dns/dnssec.zig");
 const parser = @import("parser.zig");
@@ -23,9 +24,9 @@ pub const Outcome = union(enum) {
     rcode: header.Rcode,
 };
 
-const CLASS_ANY: u16 = 255;
-const CLASS_NONE: u16 = 254;
-const CLASS_IN: u16 = 1;
+const CLASS_ANY: u16 = Class.ANY.value;
+const CLASS_NONE: u16 = Class.NONE.value;
+const CLASS_IN: u16 = Class.IN.value;
 const MAX_RDATA: usize = limits.max_message_bytes;
 const TEXT_BUFFER: usize = 512;
 

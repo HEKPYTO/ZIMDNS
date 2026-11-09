@@ -29,6 +29,7 @@ pub const Channel = struct {
     tls: ?*openssl_tls.Connection = null,
     timeout: tcp_deadline.Timeout,
     connection_deadline: ?std.Io.Clock.Timestamp,
+    client: ?*const std.Io.net.IpAddress = null,
 
     /// The deadline of the frame that starts now: the per-frame timeout,
     /// shortened to what is left of the connection's lifetime. Null means

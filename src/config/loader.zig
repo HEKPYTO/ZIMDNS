@@ -132,7 +132,7 @@ pub const ServerContext = struct {
 
         var context = ServerContext{
             .allocator = allocator,
-            .config = try parser.Config.parse(config_text),
+            .config = try parser.Config.parseWithAllocator(allocator, config_text),
             // A fresh handle, not the caller's: the caller's may close as
             // soon as `load` returns, while reload sources borrow this one
             // until `deinit`.
@@ -716,6 +716,7 @@ pub const ServerContext = struct {
             }
         }
         self.blocklist = .{};
+        self.config.deinit();
         self.config = .{};
         return runtime;
     }
@@ -730,6 +731,7 @@ pub const ServerContext = struct {
         self.zones.deinit(self.allocator);
         self.zones = .empty;
         self.blocklist = .{};
+        self.config.deinit();
         self.keyring.deinit();
         for (self.secondary_zones.items) |*secondary| self.allocator.free(secondary.apex);
         self.secondary_zones.deinit(self.allocator);

@@ -7,6 +7,7 @@ pub const Class = struct {
     value: u16,
 
     pub const IN = Class{ .value = 1 };
+    pub const NONE = Class{ .value = 254 };
     pub const ANY = Class{ .value = 255 };
 
     pub fn fromCode(value: u16) Class {
