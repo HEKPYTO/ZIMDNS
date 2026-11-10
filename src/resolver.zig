@@ -58,7 +58,7 @@ pub const UDP_TIMEOUT: std.Io.Timeout = .{ .duration = .{
 /// Absolute wall-clock budget for one client resolution (RFC 1035 §7: the
 /// resolver gives up rather than retrying forever). An upstream that sends
 /// junk re-arms the 1 s per-receive timeout, so the total caps the whole wait.
-/// shortcut: the global recursion mutex serializes concurrent resolutions; split it when forwarding throughput matters.
+/// shortcut: only iterative/TLS/DoH/DDR answers serialize; split those when their throughput matters.
 pub const RESOLUTION_TIMEOUT: std.Io.Timeout = .{ .duration = .{
     .raw = .fromSeconds(8),
     .clock = .awake,
@@ -1434,9 +1434,16 @@ const Resolution = struct {
 pub const Resolver = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    // One forward at a time keeps the cache and the aggressive cache under a
-    // single lock; split them if concurrent forwarding throughput matters.
-    mutex: std.Io.Mutex = .init,
+    // The shared-state lock guards the cache, the failure cache, the
+    // aggressive cache, the client/server cookies, the chain entries, and the
+    // DDR state. Leaf operations take it for the lookup or the store only,
+    // never across I/O; see the comment on `answer` for what stays
+    // serialized and why.
+    state_mutex: std.Io.Mutex = .init,
+    /// Held across a whole answer for paths whose clients are not
+    /// concurrency-safe (iterative walk, TLS, DoH, DDR); never taken while
+    /// `state_mutex` is held and never nested inside it.
+    serial_mutex: std.Io.Mutex = .init,
     /// True when a managed-state write failed or the state moved after the
     /// last successful write; the next tick retries before doing any work.
     managed_state_dirty: bool = false,
@@ -1794,7 +1801,13 @@ pub const Resolver = struct {
         records: []dns_record.ResourceRecord,
     };
 
+    // Short leaf lock: table scan only. The returned records stay owned by
+    // the table; callers use them before any other table write. Validation
+    // runs serialized under `serial_mutex`, plain forwarding never touches
+    // this table.
     fn lookupChain(self: *Resolver, apex: dns_name.Name, qtype: dns_types.RecordType, now: i64) ?[]const dns_record.ResourceRecord {
+        self.lock();
+        defer self.unlock();
         for (self.chain_entries[0..self.chain_len]) |*entry| {
             if (entry.expires <= now) continue;
             if (!entry.qtype.eql(qtype)) continue;
@@ -1808,6 +1821,9 @@ pub const Resolver = struct {
         if (records.len == 0) return;
         const count = @min(records.len, max_chain_zone_records);
         const copy = try self.allocator.dupe(dns_record.ResourceRecord, records[0..count]);
+        // Short leaf lock: table store only, never across I/O.
+        self.lock();
+        defer self.unlock();
         const expires = now + @as(i64, @min(ttl, max_chain_ttl));
         for (self.chain_entries[0..self.chain_len]) |*entry| {
             if (!entry.qtype.eql(qtype) or !entry.zone.eql(&apex)) continue;
@@ -1849,18 +1865,113 @@ pub const Resolver = struct {
     }
 
     fn lock(self: *Resolver) void {
-        std.Io.Threaded.mutexLockUncancelable(&self.mutex);
+        std.Io.Threaded.mutexLockUncancelable(&self.state_mutex);
     }
 
     fn unlock(self: *Resolver) void {
-        std.Io.Threaded.mutexUnlock(&self.mutex);
+        std.Io.Threaded.mutexUnlock(&self.state_mutex);
     }
 
+    /// Concurrent resolutions share the leaf state under `state_mutex`, each
+    /// leaf taking it only for the lookup or store. Plain-UDP forwarding (no
+    /// TLS, DoH, or DDR) runs unlocked end to end, so overlapping names
+    /// resolve concurrently. What remains serialized, and why: the iterative
+    /// walk touches the delegation/chain/root-server state and runs under
+    /// the lock (see `answerNeedsSerialization`); TLS and DoH reuse
+    /// connection state that is not concurrency-safe, so those paths run
+    /// under the lock; DDR discovery mutates the upstream and policy under
+    /// the lock. Validation-chain fetch/store helpers lock at the leaf.
     pub fn answer(self: *Resolver, query_bytes: []const u8, query: dns_message.Message, client: *const std.Io.net.IpAddress, output: []u8) ![]const u8 {
+        var res = Resolution{ .resolver = self, .deadline_ns = @as(i128, std.Io.Clock.awake.now(self.io).nanoseconds) + RESOLUTION_TIMEOUT.duration.raw.toNanoseconds() };
+        if (self.answerNeedsSerialization(query)) {
+            std.Io.Threaded.mutexLockUncancelable(&self.serial_mutex);
+            defer std.Io.Threaded.mutexUnlock(&self.serial_mutex);
+            return self.answerAtDepth(&res, query_bytes, query, client, output, 0);
+        }
+        return self.answerAtDepth(&res, query_bytes, query, client, output, 0);
+    }
+
+    /// True when the answer path must run under `serial_mutex`: DDR discovery
+    /// mutates the upstream and policy, the iterative walk (no upstream)
+    /// touches delegation/chain state that is not concurrency-safe, TLS/DoH
+    /// reuse connection state that is not concurrency-safe, DNSSEC validation
+    /// harvests shared chain/aggressive state across I/O, and operator
+    /// trust anchors make the validation path single-threaded.
+    /// Plain-UDP forwarding with no anchors and no DO bit answers false and
+    /// runs concurrently. `serial_mutex` is never taken while `state_mutex`
+    /// is held and never across nested answer calls.
+    fn answerNeedsSerialization(self: *const Resolver, query: dns_message.Message) bool {
+        if (self.policy.ddr_client) return true;
+        if (self.upstream == null) return true;
+        // DNS64 lazily writes the synthesized prefix into the policy; keep
+        // that write and the answer path single-threaded.
+        if (self.policy.dns64) return true;
+        if (self.policy.forwarder_tls or self.policy.forwarder_doh) return true;
+        if (self.policy.anchors.len != 0) return true;
+        if (wantsDnssecProofs(query)) return true;
+        return false;
+    }
+
+    /// Locked answer-cache lookup. The lock covers the table read only; the
+    /// hit bytes live in `output` and stay valid after unlock.
+    fn cachedLookup(self: *Resolver, key: *const CacheKey, query: dns_message.Message, now: i64, output: []u8, allow_stale: bool) !?LookupResult {
         self.lock();
         defer self.unlock();
-        var res = Resolution{ .resolver = self, .deadline_ns = @as(i128, std.Io.Clock.awake.now(self.io).nanoseconds) + RESOLUTION_TIMEOUT.duration.raw.toNanoseconds() };
-        return self.answerAtDepth(&res, query_bytes, query, client, output, 0);
+        return try self.cache.lookup(key, query, now, output, allow_stale);
+    }
+
+    /// Locked failure record plus stale-answer lookup. One short lock, no
+    /// I/O; the stale bytes live in `output` and stay valid after unlock.
+    /// `try` runs under `defer self.unlock()` so every error path unlocks.
+    fn noteUpstreamFailure(self: *Resolver, key: CacheKey, query: dns_message.Message, failure: Failure, now: i64, output: []u8) !?LookupResult {
+        self.lock();
+        defer self.unlock();
+        self.cache.failures.put(key, failure, now);
+        return try self.cache.lookup(&key, query, now, output, true);
+    }
+
+    /// Locked denial store for the aggressive-answer path.
+    fn cacheDenial(self: *Resolver, key: CacheKey, message: *dns_message.Message, ttl: u32, now: i64) void {
+        self.lock();
+        defer self.unlock();
+        self.cache.putDenial(key, message, ttl, now) catch {};
+    }
+
+    /// Locked validation-proof harvest. Short leaf lock, no I/O.
+    fn harvestProofs(self: *Resolver, response: dns_message.Message, result: validate.Result, now: i64) void {
+        self.lock();
+        defer self.unlock();
+        self.harvestValidatedProofs(response, result, now);
+    }
+
+    /// Locked validation-failure record. Short leaf lock, no I/O.
+    fn noteValidationFailure(self: *Resolver, key: CacheKey, failure: Failure, now: i64) void {
+        self.lock();
+        defer self.unlock();
+        self.cache.failures.put(key, failure, now);
+    }
+
+    /// Locked aggressive-deny lookup. The denial is copied out under the
+    /// lock. A malformed cache entry returns an error the caller handles
+    /// fail-closed outside the lock. `catch` runs under `defer unlock`.
+    fn cachedDenial(self: *Resolver, name: dns_name.Name, qtype: dns_types.RecordType, now: i64) !?dnssec.ProvenDenial {
+        self.lock();
+        defer self.unlock();
+        return try self.dnssec_aggressive.deny(name, qtype, now);
+    }
+
+    /// Locked aggressive wildcard-answer lookup. Copy-out under the lock.
+    fn cachedWildcard(self: *Resolver, name: dns_name.Name, qtype: dns_types.RecordType, now: i64) ?dnssec.WildcardAnswer {
+        self.lock();
+        defer self.unlock();
+        return self.dnssec_aggressive.wildcardAnswer(name, qtype, now);
+    }
+
+    /// Locked aggressive wildcard-nodata lookup. Copy-out under the lock.
+    fn cachedWildcardNodata(self: *Resolver, name: dns_name.Name, qtype: dns_types.RecordType, now: i64) ?dnssec.WildcardNodata {
+        self.lock();
+        defer self.unlock();
+        return self.dnssec_aggressive.wildcardNodata(name, qtype, now);
     }
 
     /// Time left on the resolution budget, or null when it ran out. Every
@@ -1897,9 +2008,10 @@ pub const Resolver = struct {
         const scope = self.upstreamScope(query);
         if (scope) |value| key.ecs = value;
         const now: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(self.io).nanoseconds, std.time.ns_per_s));
-        if (try self.cache.lookup(&key, query, now, output, false)) |hit| {
+        const hit = try self.cachedLookup(&key, query, now, output, false);
+        if (hit) |h| {
             if (cookie == .valid) return self.addCachedCookie(output, query, cookie.valid);
-            return hit.bytes;
+            return h.bytes;
         }
 
         if (self.upstream == null and self.policy.recursion_allow_len == 0) return Error.NoForwarder;
@@ -1912,7 +2024,10 @@ pub const Resolver = struct {
             if (query.question) |q| q.qtype.eql(.AAAA) else false;
         if (wantsDnssecProofs(query) and !dns64_aaaa) {
             if (query.question) |question| {
-                const denial = self.dnssec_aggressive.deny(question.name, question.qtype, now) catch {
+                // Leaf lock, never across I/O: the aggressive cache lookup
+                // copies its denial out, and the encode below touches only
+                // the copy and the caller's output buffer.
+                const denial = self.cachedDenial(question.name, question.qtype, now) catch {
                     // Fail closed: an exact-owner NSEC or NSEC3 proof is
                     // cached but its bitmap is malformed, so no denial can be
                     // synthesized. Answer SERVFAIL with a DNSSEC-bogus EDE
@@ -1933,28 +2048,34 @@ pub const Resolver = struct {
                 }
                 // RFC 8198 section 5.3: the wildcard the cache holds answers
                 // the name it covers, without an upstream query.
-                if (self.dnssec_aggressive.wildcardAnswer(question.name, question.qtype, now)) |wildcard| {
-                    const bytes = try wildcardAnswer(query, wildcard, key, output);
+                const wildcard = self.cachedWildcard(question.name, question.qtype, now);
+                if (wildcard) |w| {
+                    const bytes = try wildcardAnswer(query, w, key, output);
                     if (cookie == .valid) return self.addCachedCookie(output, query, cookie.valid);
                     return bytes;
                 }
                 // RFC 8198 section 5.3: the same wildcard answers NODATA for
                 // a type it does not hold.
-                if (self.dnssec_aggressive.wildcardNodata(question.name, question.qtype, now)) |nodata| {
-                    const bytes = try self.wildcardNodataAnswer(query, nodata, key, now, output);
+                const nodata = self.cachedWildcardNodata(question.name, question.qtype, now);
+                if (nodata) |n| {
+                    const bytes = try self.wildcardNodataAnswer(query, n, key, now, output);
                     if (cookie == .valid) return self.addCachedCookie(output, query, cookie.valid);
                     return bytes;
                 }
             }
         }
-        // RFC 9520 section 3.2: a cached resolution failure answers the next
-        // client for the same question, and no outgoing query is sent for it.
-        if (self.cache.failures.lookup(&key, now)) |entry| {
+        // Leaf locks: the failure entry is copied out, then the stale lookup
+        // takes its own short lock; `servable` touches only the copy.
+        self.lock();
+        const failure_entry = self.cache.failures.lookup(&key, now);
+        self.unlock();
+        if (failure_entry) |entry| {
             // A stale answer is still better than a failure, and it needs no
             // outgoing query either.
-            if (try self.cache.lookup(&key, query, now, output, true)) |stale| {
+            const stale = try self.cachedLookup(&key, query, now, output, true);
+            if (stale) |s| {
                 if (cookie == .valid) return self.addCachedCookie(output, query, cookie.valid);
-                return stale.bytes;
+                return s.bytes;
             }
             // RFC 4035 section 4.7: a validation failure is answered from the
             // cache only after the question failed to validate more times
@@ -1974,10 +2095,10 @@ pub const Resolver = struct {
                 // answer is a resolution failure, and the next client for the
                 // same question is answered from the cache.
                 const ede: u16 = if (err == Error.NoReachableAuthority) EDE_NO_REACHABLE_AUTHORITY else EDE_NETWORK_ERROR;
-                self.cache.failures.put(key, .{ .rcode = .servfail, .ede = ede }, now);
-                if (try self.cache.lookup(&key, query, now, output, true)) |stale| {
+                const stale = try self.noteUpstreamFailure(key, query, .{ .rcode = .servfail, .ede = ede }, now, output);
+                if (stale) |s| {
                     if (cookie == .valid) return self.addCachedCookie(output, query, cookie.valid);
-                    return stale.bytes;
+                    return s.bytes;
                 }
                 return err;
             },
@@ -2053,7 +2174,7 @@ pub const Resolver = struct {
                     if (wantsDnssecProofs(query)) response.header.authenticated_data = true;
                     // Harvest runs before the client copy is stripped, so it
                     // still sees the full proofs.
-                    self.harvestValidatedProofs(response, result, now);
+                    self.harvestProofs(response, result, now);
                 },
                 // RFC 4035 section 5.5: a response that fails validation MUST
                 // not be returned, and the client gets SERVFAIL carrying the
@@ -2065,7 +2186,7 @@ pub const Resolver = struct {
                 // to validate more times than the threshold of RFC 4035
                 // section 4.7.
                 .bogus => {
-                    self.cache.failures.put(key, .{ .rcode = .servfail, .ede = result.ede, .validation = true }, now);
+                    self.noteValidationFailure(key, .{ .rcode = .servfail, .ede = result.ede, .validation = true }, now);
                     // RFC 9567 section 4.1: the resolver detected the
                     // failure itself, so the code it reports is the one the
                     // validator produced.
@@ -2098,7 +2219,7 @@ pub const Resolver = struct {
                 // the question is not asked upstream again once it has failed
                 // to validate more times than the threshold of RFC 4035
                 // section 4.7.
-                self.cache.failures.put(key, .{ .rcode = .servfail, .ede = ede, .validation = true }, now);
+                self.noteValidationFailure(key, .{ .rcode = .servfail, .ede = ede, .validation = true }, now);
                 // RFC 9567 section 4.1: the resolver detected the failure
                 // itself, so the code it reports is the one the validator
                 // produced.
@@ -2111,33 +2232,42 @@ pub const Resolver = struct {
         if (upstream_report.ede_code != 0) {
             self.sendErrorReport(res, depth, query, client, upstream_report, upstream_report.ede_code);
         }
-        switch (response.header.rcode) {
-            .servfail => {
-                self.cache.failures.put(key, .{ .rcode = .servfail }, now);
-                // RFC 8767 section 4: the first upstream failure is the
-                // moment to answer from a stale entry; the failure cache
-                // covers the queries after it. Without this the triggering
-                // query alone gets SERVFAIL while its stale answer sits in
-                // the cache.
-                if (try self.cache.lookup(&key, query, now, output, true)) |stale| {
-                    if (cookie == .valid) return self.addCachedCookie(output, query, cookie.valid);
-                    return stale.bytes;
-                }
-            },
-            .refused => self.cache.failures.put(key, .{ .rcode = .refused }, now),
-            .formerr => self.cache.failures.put(key, .{ .rcode = .formerr }, now),
-            // RFC 9520 section 3.2: the question resolved, so its failure
-            // count is forgotten and the next failure for it is held for the
-            // operator's minimum again.
-            .no_error, .nxdomain => self.cache.failures.forget(&key),
-            else => {},
+        // One short lock for the rcode bookkeeping and the store: no I/O
+        // inside, and both touch the same tables. Error reports already went
+        // out above, outside the lock, since they recurse into this path.
+        const servfail_stale: ?LookupResult = blk: {
+            self.lock();
+            defer self.unlock();
+            var stale: ?LookupResult = null;
+            switch (response.header.rcode) {
+                .servfail => {
+                    self.cache.failures.put(key, .{ .rcode = .servfail }, now);
+                    stale = try self.cache.lookup(&key, query, now, output, true);
+                },
+                .refused => self.cache.failures.put(key, .{ .rcode = .refused }, now),
+                .formerr => self.cache.failures.put(key, .{ .rcode = .formerr }, now),
+                // RFC 9520 section 3.2: the question resolved, so its failure
+                // count is forgotten and the next failure for it is held for the
+                // operator's minimum again.
+                .no_error, .nxdomain => self.cache.failures.forget(&key),
+                else => {},
+            }
+            // RFC 7871 section 7.3.1: the answer is cached under the network it
+            // was fetched for, which is the /0 of the retry that carried no
+            // ADDRESS, so it is served to the /0 queries only.
+            var answer_key = key;
+            answer_key.ecs = exchange.scope orelse EcsScope{};
+            storeUpstreamAnswer(&self.cache, answer_key, query, &response, now, upstream_scope.store, upstream_scope.report, insecure_ede);
+            break :blk stale;
+        };
+        // RFC 8767 section 4: the first upstream failure is the moment to
+        // answer from a stale entry; the failure cache covers the queries
+        // after it. Without this the triggering query alone gets SERVFAIL
+        // while its stale answer sits in the cache.
+        if (servfail_stale) |s| {
+            if (cookie == .valid) return self.addCachedCookie(output, query, cookie.valid);
+            return s.bytes;
         }
-        // RFC 7871 section 7.3.1: the answer is cached under the network it
-        // was fetched for, which is the /0 of the retry that carried no
-        // ADDRESS, so it is served to the /0 queries only.
-        var answer_key = key;
-        answer_key.ecs = exchange.scope orelse EcsScope{};
-        storeUpstreamAnswer(&self.cache, answer_key, query, &response, now, upstream_scope.store, upstream_scope.report, insecure_ede);
         // RFC 3225 section 3: a query with the DO bit clear must not be answered
         // with DNSSEC security RRs. The cached copy keeps them, so the removal
         // happens on the way out only.
@@ -2674,10 +2804,10 @@ pub const Resolver = struct {
         // the proofs and for the clients that did not, so the next client in
         // the scope is answered from the cache either way.
         if (ttl != 0) {
-            self.cache.putDenial(key, &message, ttl, now) catch {};
+            self.cacheDenial(key, &message, ttl, now);
             var plain_key = key;
             plain_key.dnssec_ok = false;
-            self.cache.putDenial(plain_key, &message, ttl, now) catch {};
+            self.cacheDenial(plain_key, &message, ttl, now);
         }
         return writer.written();
     }
@@ -2901,7 +3031,8 @@ pub const Resolver = struct {
         var randomized_id: [2]u8 = undefined;
         self.io.randomSecure(&randomized_id) catch return Error.UpstreamFailure;
         const now: u32 = @intCast(@divTrunc(std.Io.Clock.real.now(self.io).nanoseconds, std.time.ns_per_s));
-        const upstream_query = try buildUpstreamQuery(query_bytes, query, &query_buffer, &self.policy.anchors, scope, true, try self.outgoingCookie(upstream, now));
+        var cookie_buf: [40]u8 = undefined;
+        const upstream_query = try buildUpstreamQuery(query_bytes, query, &query_buffer, &self.policy.anchors, scope, true, try self.outgoingCookie(upstream, now, &cookie_buf));
         @memcpy(query_buffer[0..2], &randomized_id);
         const expected_id = std.mem.readInt(u16, &randomized_id, .big);
 
@@ -2942,7 +3073,8 @@ pub const Resolver = struct {
         var randomized_id: [2]u8 = undefined;
         self.io.randomSecure(&randomized_id) catch return Error.UpstreamFailure;
         const now: u32 = @intCast(@divTrunc(std.Io.Clock.real.now(self.io).nanoseconds, std.time.ns_per_s));
-        const upstream_query = try buildUpstreamQuery(query_bytes, query, &query_buffer, &self.policy.anchors, scope, true, try self.outgoingCookie(upstream, now));
+        var cookie_buf: [40]u8 = undefined;
+        const upstream_query = try buildUpstreamQuery(query_bytes, query, &query_buffer, &self.policy.anchors, scope, true, try self.outgoingCookie(upstream, now, &cookie_buf));
         @memcpy(query_buffer[0..2], &randomized_id);
         const expected_id = std.mem.readInt(u16, &randomized_id, .big);
 
@@ -2983,7 +3115,8 @@ pub const Resolver = struct {
         var randomized_id: [2]u8 = undefined;
         self.io.randomSecure(&randomized_id) catch return Error.UpstreamFailure;
         const now: u32 = @intCast(@divTrunc(std.Io.Clock.real.now(self.io).nanoseconds, std.time.ns_per_s));
-        const upstream_query = try buildUpstreamQuery(query_bytes, query, &query_buffer, &self.policy.anchors, scope, true, try self.outgoingCookie(upstream, now));
+        var cookie_buf: [40]u8 = undefined;
+        const upstream_query = try buildUpstreamQuery(query_bytes, query, &query_buffer, &self.policy.anchors, scope, true, try self.outgoingCookie(upstream, now, &cookie_buf));
         @memcpy(query_buffer[0..2], &randomized_id);
         const expected_id = std.mem.readInt(u16, &randomized_id, .big);
         return self.queryTcp(res, upstream, query_buffer[0..upstream_query.len], query, expected_id, scope);
@@ -3003,7 +3136,8 @@ pub const Resolver = struct {
             defer socket.close(self.io);
             var randomized_id: [2]u8 = undefined;
             self.io.randomSecure(&randomized_id) catch return Error.UpstreamFailure;
-            const cookie = try self.outgoingCookie(upstream, now);
+            var cookie_buf: [40]u8 = undefined;
+            const cookie = try self.outgoingCookie(upstream, now, &cookie_buf);
             const upstream_query = try buildUpstreamQuery(query_bytes, query, &query_buffer, &self.policy.anchors, scope, dnssec_ok, cookie);
             @memcpy(query_buffer[0..2], &randomized_id);
             const expected_id = std.mem.readInt(u16, &randomized_id, .big);
@@ -3034,7 +3168,8 @@ pub const Resolver = struct {
                             self.learnServerCookie(upstream, received, now);
                             received.deinit();
                             retried_bad_cookie = true;
-                            const retry_cookie = try self.outgoingCookie(upstream, now);
+                            var retry_buf: [40]u8 = undefined;
+                            const retry_cookie = try self.outgoingCookie(upstream, now, &retry_buf);
                             const retry_query = try buildUpstreamQuery(query_bytes, query, &query_buffer, &self.policy.anchors, scope, dnssec_ok, retry_cookie);
                             @memcpy(query_buffer[0..2], &randomized_id);
                             socket.send(self.io, &upstream, query_buffer[0..retry_query.len]) catch break;
@@ -3066,8 +3201,14 @@ pub const Resolver = struct {
 
     /// RFC 7873 section 5.2: the Cookie option to send to `server`. A known
     /// server cookie travels with the client cookie; without one only the
-    /// client cookie is sent, which asks the server for one.
-    fn outgoingCookie(self: *Resolver, server: std.Io.net.IpAddress, now: u32) ![]const u8 {
+    /// client cookie is sent, which asks the server for one. Copied into the
+    /// caller's `out` buffer under the lock, so the returned slice never
+    /// borrows table memory across unlock.
+    fn outgoingCookie(self: *Resolver, server: std.Io.net.IpAddress, now: u32, out: *[40]u8) ![]const u8 {
+        // Short leaf lock: table read only; the one random draw happens once
+        // at startup and never across I/O.
+        self.lock();
+        defer self.unlock();
         if (!self.client_cookie_ready) {
             // RFC 7873 section 5.1: one unpredictable client cookie for every
             // server, so a server can key its state on one value.
@@ -3079,14 +3220,19 @@ pub const Resolver = struct {
             const entry = &self.server_cookies[index];
             if (entry.expires <= now) continue;
             if (!entry.address.eql(&server)) continue;
-            return entry.value[0..entry.len];
+            @memcpy(out[0..entry.len], entry.value[0..entry.len]);
+            return out[0..entry.len];
         }
-        return self.client_cookie[0..self.client_cookie.len];
+        @memcpy(out[0..self.client_cookie.len], &self.client_cookie);
+        return out[0..self.client_cookie.len];
     }
 
     /// RFC 7873 section 5.3: a response carrying a Server Cookie binds it to
     /// this server for the next hour, and the next query uses it.
     fn learnServerCookie(self: *Resolver, server: std.Io.net.IpAddress, response: dns_message.Message, now: u32) void {
+        // Short leaf lock: table store only, never across I/O.
+        self.lock();
+        defer self.unlock();
         const option = findOption(response, COOKIE_OPTION_CODE) orelse return;
         // RFC 7873 section 4: a valid Cookie option is 8 to 40 octets, and a
         // server cookie is at least 8 of them. RFC 7873 section 5.2.3: the
@@ -3137,6 +3283,9 @@ pub const Resolver = struct {
         };
     }
 
+    // Runs under `serial_mutex` from `answer`, so no extra lock: the walk
+    // reads and writes the delegation cache, root servers, and
+    // `iterate_zone`, which are not concurrency-safe.
     fn iterate(self: *Resolver, res: ?*const Resolution, query: dns_message.Message) !dns_message.Message {
         const question = query.question orelse return Error.UpstreamFailure;
         const now: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(self.io).nanoseconds, std.time.ns_per_s));
@@ -3230,6 +3379,9 @@ pub const Resolver = struct {
     /// the plaintext forwarder. A designation is adopted only when the
     /// designated endpoint answers over its encrypted channel with a
     /// certificate whose iPAddress SAN carries this resolver's IP.
+    // Runs under `serial_mutex` from `answer`, so no extra lock: the
+    // discovery mutates `ddr_next_attempt` and calls `applyDdrDesignation`,
+    // which mutates the upstream and policy the serialized paths share.
     fn discoverDdr(self: *Resolver, res: ?*const Resolution, query_bytes: []const u8, query: dns_message.Message, scope: ?EcsScope) !?dns_message.Message {
         if (!self.policy.ddr_client) return null;
         if (self.policy.forwarder_tls or self.policy.forwarder_doh) return null;
@@ -3289,7 +3441,8 @@ pub const Resolver = struct {
             .dnssec_ok = false,
         });
         const now: u32 = @intCast(@divTrunc(std.Io.Clock.real.now(self.io).nanoseconds, std.time.ns_per_s));
-        const cookie = try self.outgoingCookie(upstream, now);
+        var cookie_buf: [40]u8 = undefined;
+        const cookie = try self.outgoingCookie(upstream, now, &cookie_buf);
         if (cookie.len != 0) try appendOption(&request, COOKIE_OPTION_CODE, cookie);
         var bytes: [512]u8 = undefined;
         var writer = dns_writer.Writer.init(&bytes);
@@ -3362,7 +3515,8 @@ pub const Resolver = struct {
         var randomized_id: [2]u8 = undefined;
         self.io.randomSecure(&randomized_id) catch return Error.UpstreamFailure;
         const now: u32 = @intCast(@divTrunc(std.Io.Clock.real.now(self.io).nanoseconds, std.time.ns_per_s));
-        const upstream_query = try buildUpstreamQuery(query_bytes, query, &query_buffer, &self.policy.anchors, scope, true, try self.outgoingCookie(target, now));
+        var cookie_buf: [40]u8 = undefined;
+        const upstream_query = try buildUpstreamQuery(query_bytes, query, &query_buffer, &self.policy.anchors, scope, true, try self.outgoingCookie(target, now, &cookie_buf));
         @memcpy(query_buffer[0..2], &randomized_id);
         const expected_id = std.mem.readInt(u16, &randomized_id, .big);
         const request_bytes = query_buffer[0..upstream_query.len];
@@ -3416,6 +3570,9 @@ pub const Resolver = struct {
     /// Loads the DoT client's trust anchors exactly once: the operator's
     /// confined bundle when `forwarder-ca-file` named one, the platform
     /// store otherwise.
+    // Runs under `serial_mutex` from `answer`, so no extra lock: the TLS
+    // client state is not concurrency-safe and stays serialized. Reads the
+    // flag without the leaf lock; only the serialized path sets it.
     fn ensureTlsClient(self: *Resolver) !void {
         if (self.tls_ready) return;
         if (self.policy.forwarder_ca_dir) |dir| {
@@ -3427,6 +3584,8 @@ pub const Resolver = struct {
     }
 
     /// The DoH counterpart of `ensureTlsClient`.
+    // Same serialization as `ensureTlsClient`: DoH client state is not
+    // concurrency-safe and stays under `serial_mutex`.
     fn ensureDohClient(self: *Resolver) !void {
         if (self.doh_ready) return;
         if (self.policy.forwarder_ca_dir) |dir| {
@@ -3440,10 +3599,11 @@ pub const Resolver = struct {
     /// The verified designation takes over the resolver: the designated
     /// endpoint becomes the upstream for this and every later query, with
     /// no SNI on the wire and the original IP as the certificate name.
+    // Runs under `serial_mutex` from `answer`, so no extra lock: mutates
+    // the upstream and policy the serialized paths share.
     fn applyDdrDesignation(self: *Resolver, upstream: std.Io.net.IpAddress, designation: DdrDesignation) void {
         var ip_buffer: [64]u8 = undefined;
         const ip_text = formatIpAddress(upstream, &ip_buffer) catch return;
-        if (ip_text.len > self.policy.forwarder_tls_name.len) return;
         @memcpy(self.policy.forwarder_tls_name[0..ip_text.len], ip_text);
         self.policy.forwarder_tls_name_len = ip_text.len;
         self.policy.forwarder_tls = !designation.is_doh;
@@ -13973,7 +14133,8 @@ test "RFC 7873 section 5.3: a server cookie is learned only when the client cook
     @memcpy(cookie[8..], &server_cookie_value);
     try setCookieOption(&good, &cookie);
     resolver.learnServerCookie(server, good, now);
-    try std.testing.expectEqualSlices(u8, &cookie, try resolver.outgoingCookie(server, now));
+    var got: [40]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &cookie, try resolver.outgoingCookie(server, now, &got));
 
     // A different client cookie is not this client's answer, so nothing is
     // stored and the old server cookie stays.
@@ -13985,11 +14146,13 @@ test "RFC 7873 section 5.3: a server cookie is learned only when the client cook
     @memcpy(forged_cookie[8..], &forged_server);
     try setCookieOption(&forged, &forged_cookie);
     resolver.learnServerCookie(server, forged, now);
-    try std.testing.expectEqualSlices(u8, &cookie, try resolver.outgoingCookie(server, now));
+    var got2: [40]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &cookie, try resolver.outgoingCookie(server, now, &got2));
 
     // The learned pair expires after the RFC 7873 section 5.2.1 hour, and the
     // query falls back to the client cookie alone.
-    try std.testing.expectEqualSlices(u8, &client_cookie, try resolver.outgoingCookie(server, now + Resolver.server_cookie_ttl + 1));
+    var got3: [40]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &client_cookie, try resolver.outgoingCookie(server, now + Resolver.server_cookie_ttl + 1, &got3));
 }
 
 test "RFC 4035 section 5.4: the harvest keeps the verified proof signature" {
@@ -14326,4 +14489,143 @@ test "RFC 5011 section 2.2: the resolver adopts a new SEP key only after the hol
     try std.testing.expectEqual(managed_mod.State.valid, managed.points.items[0].keys.items[1].state);
     try std.testing.expectEqual(@as(usize, 2), resolver.policy.anchors.len);
     thread.join();
+}
+
+/// The fake upstream a forwarding-overlap test queries: it holds the slow
+/// query without answering until the fast query arrives (the latch), then
+/// answers the fast query immediately and the slow query after. A resolver
+/// that serializes whole resolutions answers the fast query only after the
+/// slow one completes; a concurrent resolver answers it while the slow query
+/// still waits upstream.
+const OverlapUpstream = struct {
+    io: std.Io,
+    udp: *const std.Io.net.Socket,
+    slow_arrived: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    fast_arrived: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    answered: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+};
+
+fn serveOverlapUpstream(args: *OverlapUpstream) void {
+    const timeout: std.Io.Timeout = .{ .duration = .{
+        .raw = .fromSeconds(5),
+        .clock = .awake,
+    } };
+    var request_buffer: [MAX_UPSTREAM_MESSAGE]u8 = undefined;
+    var slow_from: ?std.Io.net.IpAddress = null;
+    var slow_query: ?dns_message.Message = null;
+    var slow_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer slow_arena.deinit();
+    var pending_slow = false;
+    var index: usize = 0;
+    while (index < 4) : (index += 1) {
+        const incoming = args.udp.receiveTimeout(args.io, &request_buffer, timeout) catch return;
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const query = dns_message.Message.parseQuery(arena.allocator(), incoming.data) catch return;
+        const question = query.question orelse return;
+        const slow_name = dns_name.Name.fromText("slow.example.") catch return;
+        const fast_name = dns_name.Name.fromText("fast.example.") catch return;
+        const slow = question.name.eql(&slow_name);
+        const fast = question.name.eql(&fast_name);
+        if (slow and !pending_slow) {
+            // Hold the slow query: no answer until the fast query arrives.
+            slow_from = incoming.from;
+            slow_query = dns_message.Message.parseQuery(slow_arena.allocator(), incoming.data) catch return;
+            pending_slow = true;
+            args.slow_arrived.store(true, .seq_cst);
+            // Wait for the fast query by receiving it, not by spinning: the
+            // spin blocked the only receive, so the fast packet never arrived
+            // and the test's fast answer stayed null. Fall through to the
+            // next receive with the slow query still held.
+            continue;
+        } else if (fast) {
+            args.fast_arrived.store(true, .seq_cst);
+            var answer_slot: [1]dns_record.ResourceRecord = undefined;
+            answer_slot[0] = .{
+                .owner = question.name,
+                .rrtype = .A,
+                .class = .IN,
+                .ttl = 60,
+                .rdata = .{ .A = if (slow) .{ 192, 0, 2, 1 } else .{ 192, 0, 2, 2 } },
+            };
+            var response_buffer: [2048]u8 = undefined;
+            const bytes = buildUpstreamAnswer(&response_buffer, query, answer_slot[0..1], &.{}, &.{}, .no_error, null) catch return;
+            args.udp.send(args.io, &incoming.from, bytes) catch return;
+            _ = args.answered.fetchAdd(1, .seq_cst);
+            if (pending_slow) {
+                // The fast query arrived and was answered; now release slow.
+                const sq = slow_query orelse return;
+                const squestion = sq.question orelse return;
+                var slow_slot: [1]dns_record.ResourceRecord = undefined;
+                slow_slot[0] = .{
+                    .owner = squestion.name,
+                    .rrtype = .A,
+                    .class = .IN,
+                    .ttl = 60,
+                    .rdata = .{ .A = .{ 192, 0, 2, 1 } },
+                };
+                var slow_buffer: [2048]u8 = undefined;
+                const slow_bytes = buildUpstreamAnswer(&slow_buffer, sq, slow_slot[0..1], &.{}, &.{}, .no_error, null) catch return;
+                args.udp.send(args.io, &slow_from.?, slow_bytes) catch return;
+                _ = args.answered.fetchAdd(1, .seq_cst);
+                return;
+            }
+        }
+    }
+}
+
+test "overlapping forwarded queries for distinct names do not serialize" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(4) });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var upstream_socket = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    defer upstream_socket.close(io);
+
+    var upstream = OverlapUpstream{ .io = io, .udp = &upstream_socket };
+    const thread = try std.Thread.spawn(.{}, serveOverlapUpstream, .{&upstream});
+
+    var resolver = try Resolver.init(std.testing.allocator, io, .{
+        .forwarder = .{ .address = upstream_socket.address },
+    });
+    defer resolver.deinit();
+    const client = try std.Io.net.IpAddress.parse("127.0.0.1", 42700);
+
+    const Runner = struct {
+        fn run(res: *Resolver, client_ptr: *const std.Io.net.IpAddress, name_text: []const u8, id: u16, out: *[2048]u8, result: *?[]const u8) void {
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            var query = makeTestQuery(arena.allocator(), id, name_text, false) catch return;
+            defer query.deinit();
+            const encoded = encodeTestMessage(query, out[0..1024]) catch return;
+            result.* = res.answer(encoded, query, client_ptr, out[1024..]) catch return;
+        }
+    };
+    var slow_out: [2048]u8 = undefined;
+    var fast_out: [2048]u8 = undefined;
+    var slow_result: ?[]const u8 = null;
+    var fast_result: ?[]const u8 = null;
+    var slow_thread = try std.Thread.spawn(.{}, Runner.run, .{ &resolver, &client, "slow.example.", 0x4701, &slow_out, &slow_result });
+    // Wait for the slow query to reach the upstream and enter its hold; no
+    // fixed sleep. Bounded so a stuck test fails, not hangs.
+    var spins: usize = 0;
+    while (!upstream.slow_arrived.load(.seq_cst)) : (spins += 1) {
+        if (spins > 500) break;
+        std.Io.sleep(io, .fromMilliseconds(10), .awake) catch unreachable;
+    }
+    try std.testing.expect(upstream.slow_arrived.load(.seq_cst));
+    var fast_thread = try std.Thread.spawn(.{}, Runner.run, .{ &resolver, &client, "fast.example.", 0x4702, &fast_out, &fast_result });
+    fast_thread.join();
+
+    // The fast query answered while the slow one still waited upstream:
+    // non-null before the slow thread joins.
+    try std.testing.expect(fast_result != null);
+    var fast_parsed = try dns_message.Message.parse(std.testing.allocator, fast_result.?);
+    defer fast_parsed.deinit();
+    try std.testing.expectEqual(dns_header.Rcode.no_error, fast_parsed.header.rcode);
+    slow_thread.join();
+    thread.join();
+
+    try std.testing.expect(slow_result != null);
+    try std.testing.expectEqual(@as(usize, 2), upstream.answered.load(.seq_cst));
 }
