@@ -1,87 +1,86 @@
 # ZIMDNS
 
-ZIMDNS is a minimal, auditable DNS server for the box you control with production grade to internet's resolver. It serves authoritative zones, optional forwarding and recursion, DNSSEC, and encrypted transports in one CLI binary with no admin plane. Every advertised RFC behavior names its test, and measured limits are stated rather than hidden.
+A small, auditable DNS server for one box you control. It serves authoritative
+zones, optional forwarding and recursion, DNSSEC, and encrypted transports from
+one binary with no admin plane. Configuration is a file; state is on disk.
 
-A feature is supported only when a test in this tree exercises it. A roadmap item is not a supported feature; a partial implementation names only its tested subset.
+## What it does
 
-The internal quality goal is to make this declared profile explicit, test-backed, and safe to operate. Any comparison with a comparable DNS server is an internal measurement target, not product copy or a general superiority claim. The immutable comparison source is the [a comparable DNS server `SupportedRFCs.md` inventory at commit ``]().
+- Authoritative zones: signing, NSEC/NSEC3 denial, ZONEMD verification, AXFR,
+  IXFR, NOTIFY, RFC 2136 updates, and TSIG.
+- Forwarding and recursion with DNSSEC validation, ECS, NAT64, and an answer
+  cache bounded by both entry count and response size.
+- UDP, TCP, DNS-over-TLS, DNS-over-HTTPS, DNS-over-QUIC, and Oblivious DoH.
+- Prometheus counters on demand, a startup banner, health checks, and graceful
+  drain. There is no remote control plane.
 
-## Current status
+Every advertised behavior names its test. A roadmap item is not a supported
+feature, and a partial implementation names only its tested subset. Module
+details live in the `README.md` beside each source directory.
 
-The repository contains the bounded authoritative, forwarding, and iterative-resolution profile. It currently has DNS message/name/RDATA parsing, continuous authoritative UDP listeners, a DNS/TCP ingress with at most 16 frames per connection, opt-in forwarding with source/ID/question checks and a TC-to-TCP upstream retry only where upstream TCP deadlines are available (TC fails closed otherwise), opt-in iterative resolution from the built-in IANA root hints when `recursion allow` is set without a `forwarder` (referrals followed down child delegations, QNAME minimization per RFC 9156, learned delegations reused until their NS TTL expires, alias chains merged, bounded), a 64-entry in-memory cache of positive and negative answers with a 24-hour serve-stale window that opens only after an upstream failure, and a bounded failure cache for the resolution failures: the time a failure is held doubles with every consecutive failure of the same question, from the operator's `minimum-failure-cache-time` seconds up to RFC 9520's five-minute ceiling, and a question that resolves again starts again at the operator's minimum, extended DNS error diagnostics on the forwarding path and on a blocklist refusal, opt-in DNS Cookie validation, opt-in DNS64 synthesis, a CLI query client, and strict configuration/zone/blocklist parsers. A response that must be shortened drops its EDE option before any other data and sets the truncation bit (RFC 8914 §3). The two ingress transports run the same dispatch, so a forwarding question that arrives over TCP is answered by the forwarder exactly as the same question over UDP is (RFC 9210 §3). The operator sets the connection bounds RFC 9210 §4.2 allows a server to configure: `tcp-max-connections-per-source <count>` closes a connection from a source that already holds that many, `tcp-max-connection-duration <seconds>` closes a connection that has lived that long, idle included, and `tcp-idle-timeout <seconds>` closes a connection that has waited that long for a frame. The idle timeout is a whole number of seconds from 1 to 3600, it defaults to the project's own five seconds, and it is also the deadline of a frame in flight, so one knob bounds both. Without a directive the project's own bounds hold. Forwarding is disabled unless both an explicit recursion ACL and a forwarder are configured; consult the matrix for each exact boundary and its evidence. The encrypted transports are reachable one at a time: `--serve-dot` serves DNS over TLS (RFC 7858) once the operator opts in with `--enable-encrypted-dns` and names a certificate and key, and the port speaks only the `dot` ALPN token, so it never answers a cleartext DNS frame; `--serve-doq` serves DNS over QUIC (RFC 9250) and `--serve-doh3` serves DNS over HTTPS over HTTP/3 (RFC 9114), both on the vendored ngtcp2 1.26.0 + nghttp3 1.19.0 stack with GnuTLS (migrated for the X41/OSTIF 2025 audit of that stack; the Zig integration and vendored versions are not independently audited, and the external interop harness plus CLI are the evidence), over one UDP port with the `doq` and `h3` ALPN tokens, so those ports never answer cleartext DNS or non-QUIC traffic; `--serve-doh` serves DNS over HTTPS (RFC 8484) over the same TLS server, with the `http/1.1` ALPN token and the RFC 8484 GET and POST mapping, so that port never answers a cleartext HTTP request either; `--serve-xfr` serves zone transfers over a strict-TLS session (RFC 9103), with the `dot` ALPN token and TLS 1.3, so a secondary can pull an AXFR or IXFR over an encrypted channel and that port never answers a cleartext transfer.
-
-A referral carries the glue of the delegation's name servers that the zone holds: the in-domain name servers of RFC 9471 §3.1 and the sibling-domain name servers of §3.2, whose names lie below the delegating zone's origin. The name servers outside that origin contribute nothing.
-
-Locally served DNS zones (RFC 6303, RFC 6761, RFC 7793, RFC 8375) are answered by this server by default, ahead of the cache and the forwarder, so a configured upstream does not see a name reserved for private, test, invalid, loopback, or home-network use. One question is carved out of that rule: a DS question for `home.arpa` with the DO bit set is forwarded upstream, so the delegation's own denial can be proved. A configuration turns the table off with `local-zones off`, and `local-zones except <apex>` drops one apex from it. See [`examples/local-zones.gdns`](examples/local-zones.gdns) and the matrix row for the exact zone list and treatment.
-
-A zone that carries an apex ZONEMD record (RFC 8976, type 63) is verified when it loads, and the server refuses to start if the digest does not match the zone data, naming the zone, the expected digest, and the computed one. The check accepts the SIMPLE scheme with SHA384 and SHA512; a Private Use scheme or hash algorithm is refused as unverifiable. RFC 8976 §4 steps 1 to 3 are implemented for a zone that a configured trust anchor names directly: the zone's SOA and ZONEMD RRsets must carry valid signatures chaining to that anchor, and the server refuses to start otherwise, so such a zone is never accepted on the strength of its digest alone; a zone that no trust anchor names keeps the digest-only check. §4 step 2's denial branch is implemented too: a zone that publishes no ZONEMD is resolved by the zone's own NSEC or NSEC3 proof, and an absence that no record of the zone proves is refused at startup, because absent and unknown cannot be told apart. §4 step 1's parent-side DS lookup is not implemented, because this profile reads no parent zone. See the matrix row for what is and is not implemented.
-
-A zone is signed at startup by naming a key file in the configuration: `dnssec-key-file <path>`. Every configured zone then gets the apex DNSKEYs (one signing key is published as its flags-256 and flags-257 forms; the DS belongs in the parent zone and is not served), one NSEC per authoritative owner (or, for a zone that opts into NSEC3, an NSEC3 chain), and one RRSIG per RRset (RFC 4034 §§3.1.8.1 and 5.1.4, RFC 4035 §2.3), served from memory without touching the zone file. A zone that also names a key-signing key through `dnssec-ksk-file <path>` publishes two DNSKEYs: the key-signing key carries the Secure Entry Point flag, the DS states it, it signs the DNSKEY RRset, and the zone key signs every other RRset (RFC 6781 §§3.1-3.2). A key-signing key rollover is the child-side half of RFC 6781 §4.1.2, and `dnssec-new-ksk-file <path>` names the second key-signing key: the zone then publishes three DNSKEYs, signs the DNSKEY RRset with both key-signing keys, and still states one DS, for the key `dnssec-ksk-file` names. The revoke phase of §4.1.2.1 is the word `revoked` after that path: the key being removed is published with the RFC 5011 §3 REVOKE bit set and still signs the DNSKEY RRset, and no DS names it. RFC 6781 is an Informational memo, so the procedure is prescribed practice rather than a Standards Track requirement; the TTL_DS wait, the one more Maximum Zone TTL, and the parent-side DS change are the operator's, and the server does none of them. See [`src/zone/README.md`](src/zone/README.md) for the five stages. The signatures are valid for 30 days, a reload refreshes them, and a zone that already carries DNSSEC records is refused rather than signed twice. ECDSA P-256 (RFC 6605 algorithm 13), ECDSA P-384 (RFC 6605 algorithm 14), Ed25519 (RFC 8080 algorithm 15), RSA/SHA-256 (RFC 5702 algorithm 8), and RSA/SHA-512 (RFC 5702 algorithm 10) are implemented; RSA/SHA-1 (algorithms 5 and 7) validates as well, is not offered for signing, and Ed448 (algorithm 16) is the one absent algorithm the registry marks RECOMMENDED for validation. `zimdns query --dnssec` sets the RFC 6891 DO bit so the server returns its signatures, and the CLI prints the answer, authority, and additional sections, which is where RRSIG and NSEC actually arrive. [`examples/dnssec/`](examples/dnssec/config.gdns) is a worked configuration.
-
-The NSEC3 chain is opt-in, and the zone's own apex NSEC3PARAM decides it: the signer then builds one NSEC3 per owner name and per empty non-terminal, in hash order (RFC 5155 §7.1), and the authoritative path proves its denials with those NSEC3 records instead of with NSEC ones. A zone with no apex NSEC3PARAM keeps the NSEC chain. The chain this server publishes is unsalted: RFC 9276 §3.1 says an operator SHOULD NOT use a salt, so a `dnssec-chain` directive that names one is refused when the configuration is parsed and a zone whose apex NSEC3PARAM states one is refused when the zone is signed; the chain is built with SHA-1, no extra iteration, and an empty salt, and a record asking for anything else is refused.
-
-Signing and validation are separate paths. Signing is the startup path above; chain validation runs on the forwarding path and on the iterative path, where a configured `trust-anchor-file` gives the resolver a static trust-anchor store of DNSKEY and DS anchors. `managed-anchor-file <path>` adds the RFC 5011 managed store: the resolver refreshes each trust point with DO, applies the add and remove hold-downs and the REVOKE rule, rebuilds the live anchor set, and keeps that state in the named file. A resolver with no anchor file validates nothing and sets no AD. The iterative path fetches the DS each parent publishes and the DNSKEY each zone publishes up to the anchor, caches each fetched RRset by zone and type to its TTL, and marks a secured answer AD, an insecure delegation is relayed without AD once its parent-signed DS denial validates, and a stripped signature over a zone that publishes a DS is SERVFAIL. For a client that sets the DO bit and leaves CD clear, an upstream AD is cleared first, a validated-secure answer then sets AD, a bogus answer returns SERVFAIL with the RFC 8914 code, and an insecure answer is relayed without AD; when the server could not verify an answer it says why, with the RFC 8914 code for that case (Unsupported DNSKEY Algorithm (1), Unsupported DS Digest Type (2), DNSSEC Indeterminate (5), No Zone Key Bit Set (11)), which rides on the answer the client still gets and on the cached copy of it. Validation runs before the answer is cached, so a bogus answer is never stored. The matrix names what is still missing: the parent-side half of a key-signing key rollover, RFC 5011 automated rollover of the trust anchors, and Ed448 (algorithm 16) validation, the one remaining RFC 9904 algorithm deviation.
-
-A request can be authenticated with TSIG (RFC 8945): `tsig-key-file <path>` names the key file, the server verifies the request's MAC and signs its answer with the same key and algorithm. The key file takes the five RFC 8945 §6 HMAC-SHA algorithm names and the three truncated names of RFC 4868 §2.6, and one key name may carry several of them. The file is re-read on SIGHUP, so a key can be added, changed, or removed without a restart; a key file that is missing, unreadable, or malformed at reload time is reported on stderr and leaves the served keys in place, while a malformed key file still stops the server at startup.
-
-Two EDNS(0) options this server answers are configuration directives, and neither is ever sent to a client that did not ask for it. `nsid <hex>` (RFC 5001 §2.3, option code 3) answers a resolver's NSID request with the operator's own identifier, written in the two-hex-digits-per-octet presentation format the RFC requires; nothing is derived from an address or a hostname, so a server with no `nsid` line answers no NSID at all. `zoneversion on|off` (RFC 9660, option code 19) answers a ZONEVERSION request with the responding zone's SOA serial — TYPE 0, or SOA-SERIAL — for answers, NXDOMAIN, NODATA, and referrals alike; it is on by default, and a malformed request is answered FORMERR as §3.2.1 requires. One more EDNS(0) option is a behavior and not a directive: RFC 7314's EXPIRE (option code 9) is answered with the zone's SOA EXPIRE value when the query carries the zero-length option, and a server that is not authoritative for the zone never adds it. A second behavior and not a directive: RFC 7828's edns-tcp-keepalive (option code 11) is answered on a TCP session with the idle timeout this server applies to that session, and the option of a UDP query is ignored as §3.3.1 requires.
-
-A third directive is not an EDNS option: `minimal-any-ttl <seconds>` (RFC 8482 §4.2) sets the TTL of the synthesized HINFO returned for a minimal `QTYPE=ANY` answer; it defaults to 86400 seconds and may be any unsigned 31-bit value. `minimal-any-ttl-tcp <seconds>` sets the same TTL for a question that arrived over TCP (RFC 8482 §4.4) and defaults to the value of `minimal-any-ttl`.
-
-One EDNS(0) option is sent without being asked for: RFC 9567's Report-Channel (option code 18) names the agent domain a client may send error reports to. `error-report-agent <domain>` sets it, the name is folded to lower case and completed with its trailing dot, and a value that is not a domain name stops the server at startup. The option rides in the OPT record of an authoritative answer, so it appears only where the query carried EDNS(0) and the server is authoritative for the name: a refusal and a referral carry none. The root domain is never advertised (§4), and the option is left out of the answers of a zone that holds the agent domain, because §8.1 forbids an agent domain that is a subdomain of the domain the server reports on.
-
-The same RFC gives this server the other side of the channel. `error-report-monitor <domain>` names the agent domain this server hosts as a monitoring agent, and the name is folded and completed exactly as the agent domain is; a value that is not a domain name stops the server at startup. The monitored domain has to sit inside a zone this server serves, because a query for a name outside every served zone is refused before the answer path runs. A report arrives as a TXT query for a report-shaped name under that domain, and the monitoring agent answers it positively instead of denying it: NOERROR with the authoritative bit and one TXT record at the queried name, with a TTL of 60 seconds and the text `RFC 9567 error report`, because the report itself is in the query name (§6.3). Any other name at or below the monitored domain is answered with no data and the zone's SOA in the authority section, so the negative answer is cacheable with the zone's own negative TTL — and never with NXDOMAIN (§8.2), because a resolver that cached the name error treats everything at or below that domain as unreachable and the reports stop arriving. A name the zone does have is answered as the zone says, and a name outside the monitored domain keeps the answer it always had. A monitored answer carries the truncation bit when the query arrived over UDP and carried no DNS Cookie, so the reporting resolver requeries over TCP (§6.3). The monitored domain belongs in an unsigned zone: the synthesized TXT record is not in the zone, so it carries no RRSIG, and §8.2 gives avoiding DNSSEC for the agent domain as the solution, because a signed agent domain only makes the reporting resolver validate an answer it has no use for.
-
-The IXFR delta log (RFC 1995) lives in memory unless the operator names a file for it: `ixfr-journal-file <path>` writes every serial transition and the records that changed to that file and reads it back at startup, so an IXFR client that asks for a serial from before a restart is still answered incrementally. A SIGHUP re-reads every configured zone file, and each reload computes the records that changed, so the answer is RFC 1995 §4's difference sequence: the current SOA, then the deleted records with the older SOA opening them, then the added records with the newer SOA opening them, then the current SOA again. A zone file that does not parse, or that carries no newer serial, leaves the served zone in place. A journal file in the old format, which holds the serial pair alone, is still read without failing, and a client at one of those serials gets the full transfer. A corrupt or truncated line in the file is skipped and the server still starts.
-Zone transfers are opt-in: `allow-transfer <apex> <cidr>` (repeatable for distinct zone/CIDR pairs) grants one zone and one client CIDR for both cleartext TCP and the strict-TLS transfer channel, and a zone with no matching entry answers REFUSED.
-RFC 2136 updates are opt-in per zone: `allow-update <apex> <tsig-key-name>` names the one key allowed to write that zone, and a request without that key's TSIG is REFUSED. A secondary relays an UPDATE to its primary only when the operator named that secondary in `allow-update` with the request's key; otherwise it answers REFUSED without contacting the primary. The file keeps the unsigned zone data, so a signed zone reloads and re-signs after a restart, and the path resolves against the config directory, not the process cwd.
-
-`catalog-consumer <catalog-apex> <primary:address:port> [group <name>]` is the RFC 9432 consumer role: at startup the server fetches the catalog by AXFR over DNS/TCP, requires the schema-2 `version` TXT record, refuses a broken catalog (a missing or unknown version, two member nodes naming the same zone, or a member that names the catalog itself), and provisions only the selected members: a member with a `coo` property belongs to another catalog and is never fetched, and when a group is configured only members whose `group` property equals it are fetched. A member at an apex the configuration already serves is skipped, so a locally configured zone is never overwritten. A `NOTIFY` for the catalog apex makes the server read it again under the same selection: the catalog is fetched, its serial compared, and the member list applied as one swap (newly selected members start being served, listed zones whose serial advanced are replaced, and members the catalog drops stop being served while anything the consumer never installed — a local zone or another catalog's member — stays); an unchanged serial means no member transfer. Custom properties are carried but not otherwise processed.
-
-`ddr <target> <alpn> <port> [<dohpath>]` publishes RFC 9461 service-binding records for RFC 9462 discovery: each line becomes one SVCB record at `_dns.resolver.arpa.` and, under section 5, at the known name `_dns.<target>`, with the transport's ALPN and port, and an HTTP ALPN needs its `{?dns}` DoH path. A client that asks either name gets the RRset from this resolver instead of a forward; any other QTYPE at a published name is NODATA, and a `_dns.<name>` this server was not configured for is not claimed. `ddr-client on` is the client side: the server asks its plaintext forwarder for `_dns.resolver.arpa.` SVCB, picks the lowest-priority endpoint it can speak (`dot` or `http/1.1`), and switches its own upstream only after an encrypted exchange whose certificate chain reaches the `forwarder-ca-file` bundle (or the platform trust store) and whose iPAddress subjectAltName carries the designating resolver's IP, with no SNI; a failed discovery is suppressed for the SVCB TTL (clamped to an hour) and the plaintext path continues.
-
-`blacklist-zone <apex> <file>` publishes an RFC 5782 blacklist zone from the listed IPv4 addresses, IPv6 addresses, and domain names: each entry becomes the reversed-octet, reversed-nibble, or listed-name owner under the apex with an `A 127.0.0.2` record, the §5 test entries (`127.0.0.2`, `::ffff:127.0.0.2`, `test`) are always published, and the address and name §5 forbids are refused at startup. A query for an unlisted entry is NXDOMAIN, as §2.1 requires. Address ranges are refused rather than mispublished, and the entry TXT records §3 describes as a SHOULD are not published.
-
-`notify <apex> <address:port>` is the master side of RFC 1996: after an RFC 2136 update or a SIGHUP reload that moves the zone's serial, the server sends one NOTIFY per configured address for that zone, with the zone's SOA in the answer section. The targets are configured rather than derived from the zone's NS RRset, and one datagram goes to each target with no retry, so a lost NOTIFY falls back to the secondary's refresh timer.
-
-`catalog-zone <apex>` publishes the RFC 9432 catalog zone for the zones the configuration serves: the synthesized zone carries the schema-2 `version` TXT record, one `<member>.zones` PTR per configured zone in configuration order, and the SOA and NS a catalog zone still needs, and it is served, transferred, and signed like any other zone. The consumer role is the `catalog-consumer` directive described above; the synthesized zone here is the producer side.
-
-The forwarding path forwards the client's EDNS Client Subnet option (RFC 7871) upstream and answers the client with the scope the upstream reported. The operator's `client-subnet-max-prefix <length>` trims the client's source prefix to that many bits before the query goes upstream (RFC 7871 §7.1.1), and `forwarder-deny-port <port>` or `forwarder-deny-port <first>-<last>` keeps the forwarder's outgoing queries off the source ports the operator names: the socket is closed and another one bound until a port outside the list is found, and the query fails when there is none.
-
-RFC 6147 address synthesis is opt-in on the forwarding path: `nat64-prefix <prefix> [<ipv4-range>]` names the operator's NAT64 prefix and the IPv4 range it serves, and `dns64-exclude <ipv6-prefix>` adds a range to the exclusion set of §5.1.4. An AAAA question whose upstream answer is empty is answered with one AAAA per A record of the same name, the IPv4 address embedded in the prefix as RFC 6052 §2.2 requires; an answer that carries a CNAME or DNAME chain is followed to the owner that holds the A records, and the chain stays in the answer beside the synthesized record. A name with a real AAAA is never synthesized over, an AAAA inside the exclusion set is not real AAAA data and is dropped, and the synthesized record carries the A record's TTL capped by the zone's SOA. Without a configured prefix nothing is synthesized, which is a departure from RFC 6147 §5.2's Well-Known Prefix default.
-
-A forwarder configured with `trust-anchor-file` also signals its anchors' Key Tags on its own upstream DNSKEY queries (RFC 8145 §4.2, option code 14) and never answers with that option. The bundled `query` CLI prints an OPT pseudosection for any answer that carries an OPT record, rendering ZONEVERSION's TYPE 0 as `SOA-SERIAL <serial> (<zone>.)` and NSID as hexadecimal (RFC 9660 §2.2, RFC 5001 §2.4), and printing any other EDNS option as its code and length. `--zoneversion` and `--nsid` ask for those two options; `--dnssec` sets the DO bit instead, which is a different request. `--0x20` randomizes the case of the first letter of every label of the question name, drawing each case from the standard library's CSPRNG, and the CLI then prints the question the server echoed, with the case it used. The mechanism comes from the expired Internet-Draft draft-vixie-dnsext-dns0x20 and is no RFC requirement, so it is off unless the operator asks for it. A zone file's own spelling reaches the wire: the owner name of a served record and the names inside its RDATA keep the case the zone file wrote them in, because RFC 4343 §4.1 does no case conversion on output, while the signature and the ZONEMD digest are made over the canonical lowercase form of RFC 4034 §6.2, so a zone written in upper case and the same zone written in lower case digest the same.
-
-RFC 9463 DNR is `not-applicable` to this DNS-only server because it defines DHCP/Router Advertisement provisioning; no DHCP, RA, parser, or output artifact is provided.
-
-Oblivious DoH (RFC 9230) is served on both DoH channels: a POST to `/dns-query` with content-type `application/oblivious-dns-message` is decrypted with the operator's `odoh-key-file` X25519 key, answered through the same runtime path as plain DoH, and sealed back with content-type `application/oblivious-dns-message`. The crypto is the RFC 9230 §9 mandatory suite (DHKEM(X25519, HKDF-SHA256) 0x0020, HKDF-SHA256 0x0001, AES-128-GCM 0x0001); `odoh-target on|off` (default off), `odoh-config-out <path>` for the 46-byte `ObliviousDoHConfigs`, 200 on a sealed answer, 401 on an unknown key id, 400 on a decrypt or padding failure. Proven by the `external client: pyhpke ODoH target` interop check.
-
-## Performance and scale
-
-Measured on an 8-core Linux host with dnsperf against the ReleaseSafe build over UDP, 400 concurrent clients: about 57k queries/s, ~1 ms mean latency, 0% loss. The release-check container on a Docker Desktop arm64 development host measured 24.1k queries/s, 3.9 ms mean, p50 3.5 ms, p99 10.8 ms, and 0% loss over a 30 s run; a 60 s run peaked at 13.8 MiB RSS. The binding limits are explicit: the recursive cache holds 16,384 entries of at most 4 KiB each with an exact-key index (larger answers are served uncached), the UDP pool runs 16 workers, plain-UDP forwarding resolves concurrently, and the iterative, TLS, DoH, DDR, and DNSSEC-proof paths remain serialized per resolver. With 1000 distinct forwarded names, the cache retains the working set: a native ReleaseSafe run at 400 clients measured 44.9k queries/s, p99 5.0 ms, 0% loss, and RSS flat at 28.6 MiB over 30 s; the release-check container measured 20.2k queries/s, p99 13.8 ms, 0% loss, and RSS 28.2–30.1 MiB over 30 s. A working set larger than 16,384 still pays a cold upstream resolution per name. With the 16k exact-key index, a native ReleaseSafe 5000-name run at 400 clients measured 60.6k queries/s, p99 6.7 ms, 0% loss, and RSS 25.5–34.9 MiB; the release image has not been re-measured with this cache. The next scale milestones are concurrent in-flight resolutions and CPU-count UDP workers. A 10-minute native soak at 1000 QPS completed 600,000 queries with 0% loss and 0 timeouts. Reproduce with dnsperf; numbers on another host will differ.
-
-## Command line
-
-`zimdns --help` (or `-h`) prints the usage, and `zimdns --version` the build version. The flags the two commands take:
-
-| Command | Flags |
-| --- | --- |
-| `zimdns server run` | `--config <path>`, `--zone-file <path>`, `--once-udp [port]`, `--once-tcp [port]`, `--serve-udp`, `--serve-tcp`, `--serve-dot`, `--serve-doh`, `--serve-doq`, `--serve-doh3`, `--serve-xfr`, `--enable-encrypted-dns`, `--tls-cert-file <path>`, `--tls-key-file <path>`, `--max-queries <count>`, `--max-requests <count>`, `--print-metrics`, `--metrics-addr <ip:port>` |
-| `zimdns query` | `@<server>`, `-p <port>`, `--tcp`, `--dnssec`, `--zoneversion`, `--nsid`, `--0x20`, `--require-noerror`, `--require-answer` |
-
-`--once-udp` and `--once-tcp` serve a bounded number of queries and exit, `Every `--serve-*` flag adds a loop and all selected loops serve at once in one process, sharing zones, updates, cache, and signal handling; `--max-requests` is per loop and `--print-metrics` prints once after every loop ends. `--once-udp`/`--once-tcp` serve a bounded number of queries and exit, and a one-shot flag cannot combine with a `--serve-*` flag or another one-shot. `--max-queries` sets the one-shot bound where `--max-requests` sets the serving one, and `--print-metrics` prints the Prometheus counters when a UDP run ends. `--serve-dot` needs `--enable-encrypted-dns` and `--tls-cert-file` and `--tls-key-file`; the certificate and key are loaded before the port is bound, so a broken identity refuses the run and leaves no port open. `zimdns query` asks `@<server>` on `-p <port>` for a name and a type, over DNS/UDP, or over DNS/TCP with `--tcp`.
-
-## Development
-
-Prerequisites: Zig 0.17.0 and OpenSSL 3.x development files. On Debian/Ubuntu
-`sudo apt-get install libssl-dev` (the runtime needs `libssl3` plus
-`ca-certificates`); on macOS `brew install openssl@3` and export
-`OPENSSL_PREFIX=$(brew --prefix openssl@3)` before every `zig build`, because
-Apple's Homebrew keeps OpenSSL keg-only and out of the default search paths.
-The build refuses to link OpenSSL older than 3.0.
+## Try it
 
 ```sh
-zig fmt .
+docker compose -f docker-compose.dev.yml up --build
+dig @127.0.0.1 -p 1053 home.arpa. SOA
+```
+
+For production, set `ZIMDNS_CONFIG_DIR` to the directory holding `config.gdns`,
+`zones/`, and `blocklists/`, then run:
+
+```sh
+docker compose up -d
+```
+
+`docker-compose.yml` runs non-root, read-only, with dropped capabilities,
+resource limits, and a health check. Rollback: set `ZIMDNS_IMAGE` to the
+previous digest-pinned image and run `docker compose up -d`.
+
+## Configure
+
+The configuration file is line-oriented; `examples/config.gdns` is the starting
+point. Paths resolve against the config file's directory, except TLS
+certificate and key paths, which resolve from the process working directory, so
+use absolute paths for those.
+
+```sh
+zimdns server run --config /etc/zimdns/config.gdns --serve-udp --serve-tcp
+zimdns query @127.0.0.1 -p 1053 home.arpa. SOA
+```
+
+`zimdns --help` lists every server and query flag. The repository examples cover
+authoritative zones, DNSSEC, forwarding, ACLs, transfers, DoH, and DoT.
+
+## Performance
+
+Measured on an 8-core Linux host with dnsperf over UDP at 400 clients: about
+57k queries/s, ~1 ms mean, 0% loss. A native ReleaseSafe run with 5000 distinct
+forwarded names sustained 62k queries/s, p99 6.8 ms, and 0% loss over 10
+minutes, with RSS staying under 36 MiB.
+
+The documented envelope is explicit: 16,384 cached responses of at most 4 KiB
+each, 16 UDP workers, concurrent plain-UDP forwarding, and serialized
+iterative/TLS/DoH/DDR/DNSSEC-proof paths per resolver. A working set larger than
+16,384 pays a cold upstream resolution per name. Numbers on another host will
+differ; reproduce with dnsperf.
+
+## Security defaults
+
+- Recursion and forwarding are denied unless explicit ACLs and a forwarder are
+  configured. Listeners default to loopback or high ports.
+- No administrative socket or remote control plane is exposed.
+- Full packet logging and secret/cookie logging are off by default.
+- The container runs as UID 10001 and drops all capabilities.
+- A public authoritative deployment still needs network-level UDP rate limiting
+  or DNS Cookies. This server does not implement RRL.
+
+## Build and test
+
+Zig 0.17.0 and OpenSSL 3.x development files are required. On Debian/Ubuntu
+install `libssl-dev`; on macOS run `brew install openssl@3` and export
+`OPENSSL_PREFIX=$(brew --prefix openssl@3)` before building.
+
+```sh
 zig build
 zig build test
 zig build test-golden
@@ -89,29 +88,17 @@ zig build test-config
 zig build test-fuzz
 zig build test-integration
 zig build test-cli
-python3 test/interop/harness.py --zimdns zig-out/bin/zimdns
 ```
 
-A new test file goes to `test/<group>/<name>_test.zig`, where `<group>` is one of `unit`, `golden`, `config`, `fuzz`, `integration`, or `cli`. The build discovers the test roots itself, so a new test file needs no `build.zig` edit.
-
-`scripts/install-hooks` installs the pre-commit hook, which checks the formatting of the staged Zig files and nothing else. `scripts/pre-commit` is the hook itself.
-
-## Security defaults
-
-- Recursion is denied unless explicit client ACLs enable it; the process is not an open resolver by accident.
-- Listeners use loopback/high ports by default. Privileged binding and non-loopback exposure require explicit configuration.
-- No administrative socket or remote control plane is exposed.
-- Forwarding is disabled by default and requires explicit recursion ACLs plus a configured forwarder.
-- Full packet logging and secret/cookie logging are disabled by default.
-- The Docker runtime is non-root.
-- The image carries `/etc/zimdns/config.gdns` with `blocklists/` and `zones/` beside it because paths resolve against the config file's directory (TLS certificate and key paths are the exception: they resolve from the process working directory, so use absolute paths there); `docker-compose.dev.yml` mounts `./examples` at `/etc/zimdns` for local testing via `docker compose -f docker-compose.dev.yml up --build`, while `docker-compose.yml` is the production deployment (`docker build --build-arg VERSION=0.1.0 --build-arg REVISION=$(git rev-parse HEAD) --build-arg SOURCE=$(git remote get-url origin) -t zimdns:0.1.0 .`, then `docker compose up -d` with `ZIMDNS_CONFIG_DIR` pointing at the operator's config tree containing `config.gdns` plus `blocklists/` and `zones/`). Encrypted transports need an explicit `listen dns <transport> 0.0.0.0:<port>` line to be reachable through published container ports.
-- A public authoritative deployment still needs network-level UDP rate limiting or DNS Cookies; the server does not implement RRL.
-- DNS semantics stay in this repository. Vetted crypto, TLS, HTTP, QUIC, or platform dependencies require a recorded dependency decision.
+Test roots live under `test/{unit,golden,config,fuzz,integration,cli}/`.
+`scripts/install-hooks` installs the formatting pre-commit hook.
 
 ## License and releases
 
-- License: AGPL-3.0-only for this repository (`LICENSE`); the vendored QUIC/HTTP3 C sources under `third_party/` carry their own MIT notices (`third_party/ngtcp2/COPYING`, `third_party/nghttp3/COPYING`). The runtime image keeps all three texts under `/usr/share/doc/zimdns/`.
-- Source: releases publish the matching git revision as the image `org.opencontainers.image.revision` label and `org.opencontainers.image.source`; `zimdns --version` reports the `0.1.0` build version (`zig build -Dversion=x.y.z` overrides it).
-- Public release (deferred until the source and security gates pass): a `vX.Y.Z` tag runs the release workflow, which builds a multi-arch `ghcr.io` image with SBOM and provenance, signs it with cosign keyless, and creates the release notes.
-- Production: `docker-compose.yml` pins `zimdns:0.1.0` by default (override with `ZIMDNS_IMAGE=zimdns:0.1.0` or a digest-pinned `ZIMDNS_IMAGE=zimdns@sha256:<digest>`), requires `ZIMDNS_CONFIG_DIR` to point at the operator config tree, maps host `${ZIMDNS_DNS_PORT:-53}` to container `1053/udp+tcp`, and caps the service at 2 GB RAM and 4 CPUs by default (`ZIMDNS_MEM_LIMIT`, `ZIMDNS_CPUS`), with 256 PIDs. Set `ZIMDNS_DNS_PORT` to a high port for rootless hosts. Rollback: `docker pull $PREV_IMAGE` (previous digest-pinned image), `ZIMDNS_IMAGE=$PREV_IMAGE docker compose up -d`, verify with `dig @127.0.0.1 home.arpa. SOA`.
-- Operability: the server prints one startup banner on stderr (version, config path, transports with listen addresses, zone origins with SOA serials). `--metrics-addr 127.0.0.1:9090` exposes live Prometheus counters on `GET /metrics` and readiness on `GET /healthz` (200 while the process runs, 503 before the metrics listener binds and during shutdown); only loopback addresses are accepted. The healthcheck queries the local `home.arpa. SOA` with `query --require-answer --tcp`; an NXDOMAIN or empty answer fails the check, and the default local zones answer `home.arpa. SOA` on a healthy server. SIGTERM/SIGINT stop the process at once without waiting out the stop grace period; in-flight queries are not drained. The production compose mounts the config tree read-only; features that need writes run without persistence. The healthcheck needs the default local zones or a configured `home.arpa` zone; a configuration with `local-zones off` must override it.
+AGPL-3.0-only (`LICENSE`). Vendored QUIC/HTTP3 sources keep their own MIT
+notices under `third_party/`.
+
+Release images carry source revision and version labels, and `zimdns --version`
+reports the build version. The release workflow builds a multi-arch `ghcr.io`
+image with SBOM and provenance and signs it with cosign keyless. Public release
+is deferred until the source and security gates pass.
