@@ -76,8 +76,9 @@ connections and dead connections leave no state behind.
 
 ## QUIC bounds
 
-- ngtcp2 caps: 32 connections, 16 bidirectional streams per connection,
-  advertised from the same constants (`MAX_CONNECTIONS`,
+- ngtcp2 caps: 32 connections, 4 connections per source address, 16
+  bidirectional streams per connection, advertised from the same
+  constants (`MAX_CONNECTIONS`, `MAX_CONNECTIONS_PER_SOURCE`,
   `MAX_STREAMS_PER_CONN`). The advertised flow windows
   (`INITIAL_MAX_DATA` 1 MiB per connection, `INITIAL_MAX_STREAM_DATA_BIDI`
   128 KiB, `INITIAL_MAX_STREAM_DATA_UNI` 16 KiB) bound the bytes in

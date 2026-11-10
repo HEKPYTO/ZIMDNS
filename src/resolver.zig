@@ -28,8 +28,12 @@ const tcp_deadline = @import("platform/tcp_deadline.zig");
 const tls_client = @import("transport/tls_client.zig");
 const doh_client = @import("transport/doh_client.zig");
 
-// shortcut: linear scan is fine at 1024 entries; add an open-addressing index above ~4096.
-pub const MAX_CACHE_ENTRIES = 1024;
+/// The answer cache holds its entries in allocator-owned arrays, with an
+/// open-addressing index over the entry table for exact lookups.
+pub const MAX_CACHE_ENTRIES = 16384;
+/// One cached response is bounded so 16,384 entries cannot pin ~1 GiB of
+/// upstream-controlled bytes; larger answers are served but not cached.
+pub const MAX_CACHE_ENTRY_BYTES = 4096;
 /// RFC 9520 section 3.2: the resolution-failure cache is bounded too, so a
 /// flood of failing names cannot grow it without limit.
 pub const MAX_FAILURE_CACHE_ENTRIES = 64;
@@ -557,6 +561,20 @@ const CacheKey = struct {
     /// RFC 8020 section 2: the key of a denial stored under the name that
     /// does not exist. The question is the same one, so only the name of the
     /// node the denial belongs to changes.
+    fn hash(self: *const CacheKey, seed: u64) u64 {
+        var h = std.hash.Wyhash.init(seed);
+        h.update(std.mem.asBytes(&self.qtype));
+        h.update(std.mem.asBytes(&self.qclass));
+        h.update(&.{ @intFromBool(self.checking_disabled), @intFromBool(self.dnssec_ok) });
+        h.update(std.mem.asBytes(&self.ecs.family));
+        h.update(&.{self.ecs.prefix});
+        const addr_len = (@as(usize, self.ecs.prefix) + 7) / 8;
+        h.update(self.ecs.address[0..addr_len]);
+        var i: usize = 0;
+        while (i < self.name_len) : (i += 1) h.update(&.{std.ascii.toLower(self.name[i])});
+        return h.final();
+    }
+
     fn withName(self: CacheKey, name: dns_name.Name) CacheKey {
         var key = self;
         @memcpy(key.name[0..name.wire_len], name.asWire());
@@ -888,9 +906,20 @@ const FailureCache = struct {
     }
 };
 
+/// True when `slot` lies on the probe path from `home` to `pos`.
+fn inProbe(home: usize, pos: usize, slot: usize) bool {
+    if (home <= pos) return home <= slot and slot <= pos;
+    return slot >= home or slot <= pos;
+}
+
 const Cache = struct {
     allocator: std.mem.Allocator,
+    hash_seed: u64,
     entries: []CacheEntry,
+    next_empty: usize = 0,
+    /// Open-addressing exact-match index over entries: slot holds entry
+    /// index + 1, or 0 when empty.
+    index: []u32,
     len: usize = 0,
     replacement: usize = 0,
     /// RFC 9520 section 3.2: the resolution failures this resolver holds.
@@ -899,17 +928,23 @@ const Cache = struct {
     fn init(allocator: std.mem.Allocator, failure_ttl: u32) !Cache {
         const entries = try allocator.alloc(CacheEntry, MAX_CACHE_ENTRIES);
         @memset(entries, .{});
-        return .{ .allocator = allocator, .entries = entries, .failures = FailureCache.init(failure_ttl) };
+        const index = allocator.alloc(u32, MAX_CACHE_ENTRIES * 2) catch |err| {
+            allocator.free(entries);
+            return err;
+        };
+        @memset(index, 0);
+        return .{ .allocator = allocator, .hash_seed = @intFromPtr(entries.ptr), .entries = entries, .index = index, .failures = FailureCache.init(failure_ttl) };
     }
 
     fn deinit(self: *Cache) void {
-        var index: usize = 0;
-        while (index < self.len) : (index += 1) {
-            if (self.entries[index].response) |bytes| self.allocator.free(bytes);
-            self.entries[index].response = null;
+        var i: usize = 0;
+        while (i < self.len) : (i += 1) {
+            if (self.entries[i].response) |bytes| self.allocator.free(bytes);
+            self.entries[i].response = null;
         }
         self.len = 0;
         self.allocator.free(self.entries);
+        self.allocator.free(self.index);
     }
 
     /// The scope is the one the upstream answered with (RFC 7871 section 6),
@@ -932,6 +967,70 @@ const Cache = struct {
             .nxdomain = message.header.rcode == .nxdomain,
         }, null, 0, 0);
     }
+    fn indexMask() usize {
+        return MAX_CACHE_ENTRIES * 2 - 1;
+    }
+
+    fn indexFind(self: *Cache, key: *const CacheKey) ?usize {
+        var slot = key.hash(self.hash_seed) & indexMask();
+        var steps: usize = 0;
+        while (steps < self.index.len) : (steps += 1) {
+            const stored = self.index[slot];
+            if (stored == 0) return null;
+            if (self.entries[stored - 1].key.eql(key)) return stored - 1;
+            slot = (slot + 1) & indexMask();
+        }
+        return null;
+    }
+
+    fn indexInsert(self: *Cache, key: *const CacheKey, entry: usize) void {
+        var slot = key.hash(self.hash_seed) & indexMask();
+        while (true) {
+            const stored = self.index[slot];
+            if (stored == 0 or stored - 1 == entry) {
+                self.index[slot] = @intCast(entry + 1);
+                return;
+            }
+            slot = (slot + 1) & indexMask();
+        }
+    }
+
+    /// Backward shift keeps probes of later keys intact after a removal.
+    fn indexShift(self: *Cache, hole_init: usize) void {
+        var hole = hole_init;
+        var next = (hole + 1) & indexMask();
+        while (self.index[next] != 0) {
+            const stored = self.index[next];
+            const home = self.entries[stored - 1].key.hash(self.hash_seed) & indexMask();
+            // The entry at `next` probed through `hole` only when `hole`
+            // lies on its probe path, and then it belongs in `hole`.
+            if (inProbe(home, next, hole)) {
+                self.index[hole] = stored;
+                hole = next;
+            }
+            next = (next + 1) & indexMask();
+        }
+        self.index[hole] = 0;
+    }
+
+    fn indexRemoveEntry(self: *Cache, entry: usize) void {
+        const key = self.entries[entry].key;
+        var slot = key.hash(self.hash_seed) & indexMask();
+        var steps: usize = 0;
+        while (steps < self.index.len) : (steps += 1) {
+            const stored = self.index[slot];
+            if (stored == 0) return;
+            if (stored - 1 == entry) {
+                self.indexShift(slot);
+                return;
+            }
+            slot = (slot + 1) & indexMask();
+        }
+    }
+
+    fn indexRemoveKey(self: *Cache, key: *const CacheKey) void {
+        if (self.indexFind(key)) |entry| self.indexRemoveEntry(entry);
+    }
 
     fn store(self: *Cache, key: CacheKey, message: *dns_message.Message, now: i64, ttl_info: TtlInfo, store_scope: ?u8, report_scope: u8, ede: u16) !void {
         // RFC 7871 section 7.3.1: the entry is stored for the network the
@@ -944,44 +1043,65 @@ const Cache = struct {
         stripOptions(message);
         var writer = dns_writer.Writer.init(&raw);
         message.encode(&writer) catch return Error.ResponseTooLarge;
+        if (writer.written().len > MAX_CACHE_ENTRY_BYTES) return;
 
+        // The fast path finds the exact key; the scan below only recycles
+        // a free or expired slot, so a duplicate entry can never orphan
+        // the index.
+        const stored = try self.allocator.dupe(u8, writer.written());
         var slot: usize = 0;
-        var index: usize = 0;
+        var found = false;
         var empty: ?usize = null;
         var expired: ?usize = null;
-        while (index < self.len) : (index += 1) {
-            if (self.entries[index].response == null) {
-                if (empty == null) empty = index;
-                continue;
-            }
-            const elapsed = @max(@as(i64, 0), now - self.entries[index].stored_at);
-            if (elapsed >= @as(i64, self.entries[index].ttl) and expired == null) expired = index;
-            if (self.entries[index].key.eql(&cached_key)) {
-                slot = index;
-                break;
-            }
+        if (self.indexFind(&cached_key)) |hit| {
+            slot = hit;
+            found = true;
         } else {
+            // Cold-fill hint: an empty slot below the high-water mark is
+            // reused without scanning the whole table.
+            var hint = self.next_empty;
+            while (hint < self.len and self.entries[hint].response != null) : (hint += 1) {}
+            if (hint < self.len) {
+                empty = hint;
+                self.next_empty = hint + 1;
+            } else if (self.len < MAX_CACHE_ENTRIES) {
+                // The append branch below takes len; only record the hint.
+                self.next_empty = self.len;
+            } else {
+                var scan: usize = 0;
+                while (scan < self.len) : (scan += 1) {
+                    if (self.entries[scan].response == null) {
+                        if (empty == null) empty = scan;
+                        continue;
+                    }
+                    const elapsed = @max(@as(i64, 0), now - self.entries[scan].stored_at);
+                    if (elapsed >= @as(i64, self.entries[scan].ttl) and expired == null) expired = scan;
+                }
+                self.next_empty = @min(self.len + 1, MAX_CACHE_ENTRIES);
+            }
             if (empty) |free| {
                 slot = free;
             } else if (expired) |old| {
                 // An entry past its TTL is only useful to the stale path,
                 // which is best effort, so a new answer takes its slot before
                 // a live entry is overwritten.
+                self.indexRemoveEntry(old);
                 slot = old;
             } else if (self.len < MAX_CACHE_ENTRIES) {
                 slot = self.len;
                 self.len += 1;
             } else {
+                self.indexRemoveEntry(self.replacement);
                 slot = self.replacement;
                 self.replacement = (self.replacement + 1) % MAX_CACHE_ENTRIES;
             }
         }
+        if (!found) self.indexRemoveKey(&cached_key);
 
         if (self.entries[slot].response) |bytes| {
             self.allocator.free(bytes);
             self.entries[slot] = .{};
         }
-        const stored = try self.allocator.dupe(u8, writer.written());
         self.entries[slot] = .{
             .response = stored,
             .key = cached_key,
@@ -992,61 +1112,99 @@ const Cache = struct {
             .ecs_scope = report_scope,
             .ede = ede,
         };
+        self.indexInsert(&cached_key, slot);
+    }
+
+    fn serveEntry(self: *Cache, entry_index: usize, key: *const CacheKey, query: dns_message.Message, now: i64, output: []u8, allow_stale: bool, arena: std.mem.Allocator) !?LookupResult {
+        const entry = &self.entries[entry_index];
+        const elapsed = @max(@as(i64, 0), now - entry.stored_at);
+        const fresh = elapsed < @as(i64, entry.ttl);
+        const stale = !fresh and elapsed <= @as(i64, entry.ttl) + STALE_WINDOW_SECONDS;
+        if (!fresh and (!allow_stale or !stale)) return null;
+        var message = dns_message.Message.parse(arena, entry.response.?) catch return null;
+        ageMessage(&message, @intCast(elapsed), if (fresh) null else STALE_TTL);
+        if (fresh and entry.negative) applyNegativeTtl(&message, remainingTtl(entry, elapsed));
+        message.header.id = query.header.id;
+        message.header.recursion_desired = query.header.recursion_desired;
+        message.header.recursion_available = true;
+        message.header.checking_disabled = query.header.checking_disabled;
+        message.question = query.question;
+        stripProofsForClient(&message, query);
+        if (query.edns != null) try appendOpt(&message, query.edns.?);
+        try appendEcsScope(&message, key.ecs, entry.ecs_scope);
+        // RFC 8914: the code that says why the answer is not signed
+        // verified rides with the cached copy, so every client of the
+        // entry is told the same thing.
+        if (entry.ede != 0) try appendEde(&message, entry.ede);
+        if (!fresh) try appendEde(&message, if (entry.nxdomain) EDE_STALE_NXDOMAIN else EDE_STALE_ANSWER);
+        var writer = dns_writer.Writer.init(output);
+        message.encode(&writer) catch return Error.ResponseTooLarge;
+        return .{ .stale = !fresh, .bytes = writer.written() };
     }
 
     fn lookup(self: *Cache, key: *const CacheKey, query: dns_message.Message, now: i64, output: []u8, allow_stale: bool) !?LookupResult {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
+        // Exact fast path by index; scopes need the scan below because a
+        // covering answer is not an equal key.
+        if (self.indexFind(key)) |entry_index| {
+            const entry = &self.entries[entry_index];
+            if (entry.response != null) {
+                if (try self.serveEntry(entry_index, key, query, now, output, allow_stale, arena.allocator())) |hit| return hit;
+                if (entry.response == null) {
+                    self.indexRemoveEntry(entry_index);
+                } else if (!allow_stale) {
+                    // Expired beyond the stale window: drop it now so the
+                    // scope scan below does not trip over it.
+                    const elapsed = @max(@as(i64, 0), now - entry.stored_at);
+                    if (elapsed > @as(i64, entry.ttl) + STALE_WINDOW_SECONDS) {
+                        self.indexRemoveEntry(entry_index);
+                        self.allocator.free(entry.response.?);
+                        entry.* = .{};
+                    }
+                }
+            }
+        }
+        // RFC 7871 section 7.3.2: a scope-0 entry covers every client, so an
+        // ECS query can use it without the full scope scan.
+        var zero_key = key.*;
+        zero_key.ecs = .{};
+        if (self.indexFind(&zero_key)) |entry_index| {
+            if (self.entries[entry_index].response != null) {
+                if (try self.serveEntry(entry_index, key, query, now, output, allow_stale, arena.allocator())) |hit| return hit;
+            }
+        }
+        // shortcut: NXDOMAIN/cut misses still scan the table; add a cut index
+        // if miss-path p99 becomes the cache bottleneck.
         // RFC 7871 section 7.3.2: the answer with the longest scope that
         // covers the client's network is the one that answers. An entry
         // whose scope is 0 covers every client.
         var attempts: usize = 0;
         while (attempts <= self.len) : (attempts += 1) {
             var best: ?usize = null;
-            var index: usize = 0;
-            while (index < self.len) : (index += 1) {
-                const candidate = &self.entries[index];
+            var scan: usize = 0;
+            while (scan < self.len) : (scan += 1) {
+                const candidate = &self.entries[scan];
                 if (candidate.response == null) continue;
                 if (!candidate.key.matches(key)) continue;
-                if (best == null or candidate.key.ecs.prefix > self.entries[best.?].key.ecs.prefix) best = index;
+                if (best == null or candidate.key.ecs.prefix > self.entries[best.?].key.ecs.prefix) best = scan;
             }
             const chosen = best orelse break;
+            if (try self.serveEntry(chosen, key, query, now, output, allow_stale, arena.allocator())) |hit| return hit;
+            // RFC 9520 section 4: an expired entry is still served when
+            // resolution fails, so a fresh lookup keeps it for the stale
+            // window instead of evicting it. An entry past the window is
+            // gone, and a narrower answer may still cover the client.
             const entry = &self.entries[chosen];
             const elapsed = @max(@as(i64, 0), now - entry.stored_at);
-            const fresh = elapsed < @as(i64, entry.ttl);
-            const stale = !fresh and elapsed <= @as(i64, entry.ttl) + STALE_WINDOW_SECONDS;
-            if (!fresh and (!allow_stale or !stale)) {
-                // RFC 9520 section 4: an expired entry is still served when
-                // resolution fails, so a fresh lookup keeps it for the stale
-                // window instead of evicting it. An entry past the window is
-                // gone, and a narrower answer may still cover the client.
-                if (!stale) {
-                    self.allocator.free(entry.response.?);
-                    entry.* = .{};
-                    continue;
-                }
-                break;
+            const stale = elapsed >= @as(i64, entry.ttl) and elapsed <= @as(i64, entry.ttl) + STALE_WINDOW_SECONDS;
+            if (!stale) {
+                self.indexRemoveEntry(chosen);
+                self.allocator.free(entry.response.?);
+                entry.* = .{};
+                continue;
             }
-
-            var message = dns_message.Message.parse(arena.allocator(), entry.response.?) catch return null;
-            ageMessage(&message, @intCast(elapsed), if (fresh) null else STALE_TTL);
-            if (fresh and entry.negative) applyNegativeTtl(&message, remainingTtl(entry, elapsed));
-            message.header.id = query.header.id;
-            message.header.recursion_desired = query.header.recursion_desired;
-            message.header.recursion_available = true;
-            message.header.checking_disabled = query.header.checking_disabled;
-            message.question = query.question;
-            stripProofsForClient(&message, query);
-            if (query.edns != null) try appendOpt(&message, query.edns.?);
-            try appendEcsScope(&message, key.ecs, entry.ecs_scope);
-            // RFC 8914: the code that says why the answer is not signed
-            // verified rides with the cached copy, so every client of the
-            // entry is told the same thing.
-            if (entry.ede != 0) try appendEde(&message, entry.ede);
-            if (!fresh) try appendEde(&message, if (entry.nxdomain) EDE_STALE_NXDOMAIN else EDE_STALE_ANSWER);
-            var writer = dns_writer.Writer.init(output);
-            message.encode(&writer) catch return Error.ResponseTooLarge;
-            return .{ .stale = !fresh, .bytes = writer.written() };
+            break;
         }
         return self.cutLookup(key, query, now, output, arena.allocator());
     }
@@ -5342,7 +5500,7 @@ test "resolver ACL and cookie contracts" {
 }
 
 test "cache ages positive and negative responses and emits stale EDE" {
-    try std.testing.expectEqual(@as(usize, 1024), MAX_CACHE_ENTRIES);
+    try std.testing.expectEqual(@as(usize, 16384), MAX_CACHE_ENTRIES);
     try std.testing.expectEqual(@as(i64, 86400), STALE_WINDOW_SECONDS);
     try std.testing.expectEqual(@as(u32, 30), STALE_TTL);
 
@@ -5439,23 +5597,24 @@ test "cache reuses an expired slot instead of evicting a live entry" {
     defer cache.deinit();
     var output: [2048]u8 = undefined;
 
-    var queries: [MAX_CACHE_ENTRIES]dns_message.Message = undefined;
-    var responses: [MAX_CACHE_ENTRIES]dns_message.Message = undefined;
+    const queries = try std.testing.allocator.alloc(dns_message.Message, MAX_CACHE_ENTRIES);
+    defer std.testing.allocator.free(queries);
+    const responses = try std.testing.allocator.alloc(dns_message.Message, MAX_CACHE_ENTRIES);
+    defer std.testing.allocator.free(responses);
     defer {
-        for (&queries) |*message| message.deinit();
-        for (&responses) |*message| message.deinit();
+        for (queries) |*message| message.deinit();
+        for (responses) |*message| message.deinit();
     }
-    var keys: [MAX_CACHE_ENTRIES]CacheKey = undefined;
+    const keys = try std.testing.allocator.alloc(CacheKey, MAX_CACHE_ENTRIES);
+    defer std.testing.allocator.free(keys);
 
     var name_buffer: [32]u8 = undefined;
     var index: usize = 0;
     while (index < MAX_CACHE_ENTRIES) : (index += 1) {
         const name_text = try std.fmt.bufPrint(&name_buffer, "host{d}.example.", .{index});
         const name = try dns_name.Name.fromText(name_text);
-        queries[index] = try makeTestQuery(arena.allocator(), @intCast(0x3000 + index), name_text, false);
-        responses[index] = try makeTestQuery(arena.allocator(), @intCast(0x3000 + index), name_text, false);
-        responses[index].header.qr = true;
-        responses[index].header.recursion_available = true;
+        queries[index] = try makeTestQuery(arena.allocator(), @intCast(0x3000 + (index & 0xffff)), name_text, false);
+        responses[index] = try makeTestQuery(arena.allocator(), @intCast(0x3000 + (index & 0xffff)), name_text, false);
         try responses[index].answers.append(.{
             .owner = name,
             .rrtype = .A,
@@ -5494,6 +5653,81 @@ test "cache reuses an expired slot instead of evicting a live entry" {
     try std.testing.expect(!survivor.stale);
     const fresh = (try cache.lookup(&newcomer_key, newcomer, 1062, &output, false)).?;
     try std.testing.expect(!fresh.stale);
+}
+
+test "cache index survives overwrite and expiry churn" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cache = try Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    defer cache.deinit();
+    var output: [2048]u8 = undefined;
+
+    var first = try makeTestQuery(arena.allocator(), 0x4100, "churn.example.", false);
+    defer first.deinit();
+    const first_key = try CacheKey.fromQuestion(first);
+    var first_response = try makePositiveResponseFor(arena.allocator(), "churn.example.", 60);
+    defer first_response.deinit();
+    try cache.put(first_key, &first_response, 1000, 0, 0, 0);
+
+    var second = try makeTestQuery(arena.allocator(), 0x4101, "steady.example.", false);
+    defer second.deinit();
+    const second_key = try CacheKey.fromQuestion(second);
+    var second_response = try makePositiveResponseFor(arena.allocator(), "steady.example.", 3600);
+    defer second_response.deinit();
+    try cache.put(second_key, &second_response, 1000, 0, 0, 0);
+    try std.testing.expectEqual(@as(usize, 2), cache.len);
+
+    // An overwrite keeps one entry and serves the latest copy.
+    var overwrite = try makePositiveResponseFor(arena.allocator(), "churn.example.", 3600);
+    defer overwrite.deinit();
+    try cache.put(first_key, &overwrite, 1010, 0, 0, 0);
+    try std.testing.expectEqual(@as(usize, 2), cache.len);
+    const again = (try cache.lookup(&first_key, first, 1020, &output, false)).?;
+    try std.testing.expect(!again.stale);
+    const again_message = try dns_message.Message.parse(arena.allocator(), again.bytes);
+    try std.testing.expectEqual(@as(u32, 3590), again_message.answers.items[0].ttl);
+
+    // Expiring a short-lived entry evicts it without losing the others.
+    var short = try makeTestQuery(arena.allocator(), 0x4102, "short.example.", false);
+    defer short.deinit();
+    const short_key = try CacheKey.fromQuestion(short);
+    var short_response = try makePositiveResponseFor(arena.allocator(), "short.example.", 60);
+    defer short_response.deinit();
+    try cache.put(short_key, &short_response, 1000, 0, 0, 0);
+    try std.testing.expect((try cache.lookup(&short_key, short, 1000 + 60 + STALE_WINDOW_SECONDS + 1, &output, false)) == null);
+    try std.testing.expect(cache.indexFind(&short_key) == null);
+    try std.testing.expect(cache.indexFind(&second_key) != null);
+    try std.testing.expect(cache.indexFind(&first_key) != null);
+    const kept = (try cache.lookup(&second_key, second, 1500, &output, false)).?;
+    try std.testing.expect(!kept.stale);
+    const kept_first = (try cache.lookup(&first_key, first, 1500, &output, false)).?;
+    try std.testing.expect(!kept_first.stale);
+}
+
+test "cache refuses an oversized upstream response" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var query = try makeTestQuery(arena.allocator(), 0x4200, "big.example.", false);
+    defer query.deinit();
+    const key = try CacheKey.fromQuestion(query);
+    var cache = try Cache.init(std.testing.allocator, DEFAULT_FAILURE_CACHE_SECONDS);
+    defer cache.deinit();
+    var response = try makePositiveResponseFor(arena.allocator(), "big.example.", 3600);
+    defer response.deinit();
+    const owner = response.question.?.name;
+    var index: usize = 0;
+    while (index < 500) : (index += 1) {
+        try response.answers.append(.{
+            .owner = owner,
+            .rrtype = .A,
+            .class = .IN,
+            .ttl = 3600,
+            .rdata = .{ .A = .{ 192, 0, 2, 1 } },
+        });
+    }
+    response.header.answer_count = @intCast(response.answers.len);
+    try cache.put(key, &response, 1000, 0, 0, 0);
+    try std.testing.expectEqual(@as(usize, 0), cache.len);
 }
 
 test "RFC 8020 section 2: a cached NXDOMAIN cuts the names below it" {

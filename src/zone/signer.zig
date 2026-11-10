@@ -1692,6 +1692,7 @@ fn install(allocator: std.mem.Allocator, zone: *zone_index.Zone, generated: []co
     zone.generated = combined[original_len..];
     zone.generated_allocation = combined;
     zone.generated_allocator = allocator;
+    zone.rebuildOwnerIndex() catch return Error.OutOfMemory;
 }
 
 /// Appends records to an already-signed zone, keeping the split between the
@@ -1708,6 +1709,7 @@ fn appendGenerated(allocator: std.mem.Allocator, zone: *zone_index.Zone, extra: 
     zone.generated = combined[original_len..];
     zone.generated_allocation = combined;
     zone.generated_allocator = allocator;
+    zone.rebuildOwnerIndex() catch return Error.OutOfMemory;
 }
 
 // ------------------------------------------------------------------- vectors

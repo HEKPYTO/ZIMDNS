@@ -29,3 +29,7 @@ TSIG: request authentication and the responses that answer it.
   transfer sequence is built. The decision runs under the shared lock; a
   non-shorter journal chain is drained under the exclusive lock after the
   read.
+- A request copies its TSIG key under the keyring shared lock, so a SIGHUP
+  key reload cannot clear the key mid-verify.
+- At most four whole-zone transfers encode concurrently; the cap bounds the
+  frame array plus the response blob.

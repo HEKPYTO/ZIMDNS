@@ -319,6 +319,8 @@ pub const Server = struct {
     /// Hard cap on live connections per listener. Enforced with a
     /// stateless close, never by dropping state.
     pub const MAX_CONNECTIONS: usize = 32;
+    /// One source address cannot occupy the whole listener.
+    pub const MAX_CONNECTIONS_PER_SOURCE: usize = 4;
     /// One client may open this many bidirectional streams per
     /// connection; matches the advertised transport parameters.
     pub const MAX_STREAMS_PER_CONN: usize = 16;
@@ -348,6 +350,8 @@ pub const Server = struct {
     /// Live connection count. `conns` holds ~2-3 SCID aliases per
     /// connection, so the cap is enforced on this, not the map size.
     conn_count: usize = 0,
+    peer_addrs: [MAX_CONNECTIONS]std.posix.sockaddr.storage = undefined,
+    peer_count: usize = 0,
     idle_timeout: abi.duration,
     rx_buf: [65527]u8 = undefined,
     tx_buf: [65527]u8 = undefined,
@@ -398,6 +402,7 @@ pub const Server = struct {
             const kv = kit.next() orelse break;
             const holder = kv.value_ptr.*;
             self.unindexConnection(holder);
+            self.forgetPeer(&holder.peer_addr);
             destroyConnection(self.allocator, holder);
             self.conn_count -= 1;
         }
@@ -579,6 +584,10 @@ pub const Server = struct {
             self.sendClose(hd, peer, peer_len, now);
             return;
         }
+        if (self.activeForPeer(peer) >= MAX_CONNECTIONS_PER_SOURCE) {
+            self.sendClose(hd, peer, peer_len, now);
+            return;
+        }
         // Explicit cleanup: this function returns void, so errdefer
         // never fires here — each failure path frees what it owns.
         const holder = self.allocator.create(Connection) catch return;
@@ -700,6 +709,7 @@ pub const Server = struct {
         holder.conn = qconn;
         abi.conn_set_tls_native_handle(qconn, holder.session.session);
         self.conn_count += 1;
+        self.rememberPeer(peer);
         self.indexConnection(holder);
         // Remember the client's DCID so its retransmitted Initials find
         // this holder while the handshake is still in flight.
@@ -788,6 +798,10 @@ pub const Server = struct {
     }
 
     fn feed(self: *Server, holder: *Connection, data: []u8, peer: *const std.posix.sockaddr.storage, peer_len: std.posix.socklen_t, now: abi.tstamp) void {
+        if (!peerIpEqual(&holder.peer_addr, peer)) {
+            self.forgetPeer(&holder.peer_addr);
+            self.rememberPeer(peer);
+        }
         holder.peer_addr = peer.*;
         holder.peer_len = peer_len;
         holder.storage.remote_addrbuf.sa = peer.*;
@@ -1049,8 +1063,51 @@ pub const Server = struct {
             }
             const holder = found orelse break;
             self.unindexConnection(holder);
+            self.forgetPeer(&holder.peer_addr);
             destroyConnection(self.allocator, holder);
             self.conn_count -= 1;
+        }
+    }
+
+    fn peerIpEqual(a: *const std.posix.sockaddr.storage, b: *const std.posix.sockaddr.storage) bool {
+        if (a.family != b.family) return false;
+        return switch (a.family) {
+            std.posix.AF.INET => blk: {
+                const a4: *const std.posix.sockaddr.in = @ptrCast(@alignCast(a));
+                const b4: *const std.posix.sockaddr.in = @ptrCast(@alignCast(b));
+                break :blk a4.addr == b4.addr;
+            },
+            std.posix.AF.INET6 => blk: {
+                const a6: *const std.posix.sockaddr.in6 = @ptrCast(@alignCast(a));
+                const b6: *const std.posix.sockaddr.in6 = @ptrCast(@alignCast(b));
+                break :blk std.mem.eql(u8, std.mem.asBytes(&a6.addr), std.mem.asBytes(&b6.addr));
+            },
+            else => false,
+        };
+    }
+
+    fn activeForPeer(self: *const Server, peer: *const std.posix.sockaddr.storage) usize {
+        var count: usize = 0;
+        for (self.peer_addrs[0..self.peer_count]) |*known| {
+            if (peerIpEqual(known, peer)) count += 1;
+        }
+        return count;
+    }
+
+    fn rememberPeer(self: *Server, peer: *const std.posix.sockaddr.storage) void {
+        if (self.peer_count < self.peer_addrs.len) {
+            self.peer_addrs[self.peer_count] = peer.*;
+            self.peer_count += 1;
+        }
+    }
+
+    fn forgetPeer(self: *Server, peer: *const std.posix.sockaddr.storage) void {
+        var index: usize = 0;
+        while (index < self.peer_count) : (index += 1) {
+            if (!peerIpEqual(&self.peer_addrs[index], peer)) continue;
+            self.peer_count -= 1;
+            self.peer_addrs[index] = self.peer_addrs[self.peer_count];
+            return;
         }
     }
 };
@@ -1355,5 +1412,7 @@ test "pending queue answers and resets without growing" {
 
 test "QUIC caps keep the advertised limits consistent" {
     try std.testing.expectEqual(@as(usize, 32), Server.MAX_CONNECTIONS);
+    try std.testing.expectEqual(@as(usize, 4), Server.MAX_CONNECTIONS_PER_SOURCE);
+    try std.testing.expect(Server.MAX_CONNECTIONS_PER_SOURCE < Server.MAX_CONNECTIONS);
     try std.testing.expectEqual(@as(usize, 16), Server.MAX_STREAMS_PER_CONN);
 }

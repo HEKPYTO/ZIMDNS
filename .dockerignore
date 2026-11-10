@@ -7,3 +7,9 @@ data
 *.log
 *.tmp
 .DS_Store
+
+# Build context never needs repository metadata or docs.
+.*
+*.md
+docs
+dist

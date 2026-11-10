@@ -2256,6 +2256,8 @@ const unix_tcp_deadlines = if (TCP_DEADLINES_SUPPORTED) struct {
         counters: ?*metrics.Counters,
     ) !void {
         if (counters) |value| metrics.bump(&value.queries_total);
+        if (!runtime.beginTransfer()) return error.TransferBusy;
+        defer runtime.endTransfer();
         const blob = try runtime.encodeTransferFrames(std.heap.page_allocator, request, &stream.socket.address);
         defer std.heap.page_allocator.free(blob);
         const write_deadline = tcp_deadline.deadline(io, timeout);

@@ -57,12 +57,26 @@ pub const LookupResult = struct {
     }
 };
 
+pub const OwnerRecords = std.ArrayListUnmanaged(parser.ZoneRecord);
+
 pub const Zone = struct {
     backing: []u8,
     origin: []const u8 = &.{},
     records: parser.RecordList = .{},
     soa: ?parser.ZoneRecord = null,
-    /// Records the DNSSEC signer appended after the zone file was indexed. They
+    /// Exact-owner index: lowercased owner -> records. Owned via page_allocator.
+    owner_index: std.StringHashMapUnmanaged(OwnerRecords) = .{},
+    /// Suffix-walk indexes rebuilt with owner_index: lowercased owners holding
+    /// non-NSEC3 data (nodeExists exact hits), reversed-owner strings sorted
+    /// for descendant checks, longest-suffix delegation owners, DNAME owners,
+    /// and NSEC3 hashed owners. Zone is immutable after build, so lookups
+    /// need no locks.
+    live_owners: std.StringHashMapUnmanaged(void) = .empty,
+    rev_owners: std.ArrayListUnmanaged([]const u8) = .empty,
+    rev_sorted: bool = false,
+    delegations: std.StringHashMapUnmanaged(void) = .empty,
+    dnames: std.StringHashMapUnmanaged(void) = .empty,
+    hashed_owners: std.StringHashMapUnmanaged(void) = .empty,
     /// live outside `backing`: `generated` is the appended tail to release
     /// field by field, and `generated_allocation` is the whole array the
     /// allocator must be given back. The loaded records are slices of
@@ -88,7 +102,142 @@ pub const Zone = struct {
             if (record.rrtype.eql(.SOA)) zone.soa = record;
         }
         registerZoneSize(&zone);
+        errdefer zone.deinit();
+        try zone.rebuildOwnerIndex();
         return zone;
+    }
+
+    fn lowerOwnerKey(allocator: std.mem.Allocator, owner: []const u8) ![]u8 {
+        const key = try allocator.alloc(u8, owner.len);
+        for (owner, 0..) |c, i| key[i] = std.ascii.toLower(c);
+        return key;
+    }
+
+    fn freeKeySet(map: *std.StringHashMapUnmanaged(void), alloc: std.mem.Allocator) void {
+        var it = map.iterator();
+        while (it.next()) |entry| alloc.free(entry.key_ptr.*);
+        map.deinit(alloc);
+    }
+
+    fn putKey(map: *std.StringHashMapUnmanaged(void), alloc: std.mem.Allocator, owner: []const u8) !void {
+        const key = try lowerOwnerKey(alloc, owner);
+        const gop = map.getOrPut(alloc, key) catch |err| {
+            alloc.free(key);
+            return err;
+        };
+        if (gop.found_existing) alloc.free(key);
+    }
+
+    // Reversed-label form so a descendant check is a prefix test.
+    fn reverseLabels(owner: []const u8, buf: []u8) []u8 {
+        var len: usize = 0;
+        var end: usize = owner.len;
+        if (end != 0 and owner[end - 1] == '.') end -= 1;
+        while (end > 0) {
+            var start = end;
+            while (start > 0 and owner[start - 1] != '.') start -= 1;
+            const label = owner[start..end];
+            @memcpy(buf[len .. len + label.len], label);
+            len += label.len;
+            buf[len] = '.';
+            len += 1;
+            if (start == 0) break;
+            end = start - 1;
+        }
+        return buf[0..len];
+    }
+
+    fn freeOwnerIndex(map: *std.StringHashMapUnmanaged(OwnerRecords), alloc: std.mem.Allocator) void {
+        var it = map.iterator();
+        while (it.next()) |entry| {
+            alloc.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(alloc);
+        }
+        map.deinit(alloc);
+    }
+
+    /// Rebuilds owner_index from records transactionally; signer calls after
+    /// replacing records. A failed rebuild leaves the old index untouched.
+    pub fn rebuildOwnerIndex(self: *Zone) !void {
+        const alloc = std.heap.smp_allocator;
+        var next: std.StringHashMapUnmanaged(OwnerRecords) = .{};
+        var live: std.StringHashMapUnmanaged(void) = .empty;
+        var revs: std.ArrayListUnmanaged([]const u8) = .empty;
+        var delegs: std.StringHashMapUnmanaged(void) = .empty;
+        var dnames: std.StringHashMapUnmanaged(void) = .empty;
+        var hashed: std.StringHashMapUnmanaged(void) = .empty;
+        var built = false;
+        defer {
+            if (!built) freeOwnerIndex(&next, alloc);
+            if (!built) freeKeySet(&live, alloc);
+            if (!built) freeKeySet(&delegs, alloc);
+            if (!built) freeKeySet(&dnames, alloc);
+            if (!built) freeKeySet(&hashed, alloc);
+            if (!built) {
+                for (revs.items) |r| alloc.free(r);
+                revs.deinit(alloc);
+            }
+        }
+        for (self.records.items[0..self.records.len]) |record| {
+            const key = try lowerOwnerKey(alloc, record.ownerText());
+            const gop = next.getOrPut(alloc, key) catch |err| {
+                alloc.free(key);
+                return err;
+            };
+            const found = gop.found_existing;
+            if (!found) {
+                gop.value_ptr.* = .empty;
+            } else {
+                alloc.free(key);
+            }
+            gop.value_ptr.append(alloc, record) catch |err| {
+                if (!found) {
+                    _ = next.remove(key);
+                    alloc.free(key);
+                }
+                return err;
+            };
+            if (record.rrtype.eql(.NSEC3)) {
+                try putKey(&hashed, alloc, record.ownerText());
+            } else {
+                try putKey(&live, alloc, record.ownerText());
+                var rev_buf: [1024]u8 = undefined;
+                if (record.ownerText().len < rev_buf.len) {
+                    var low: [1024]u8 = undefined;
+                    for (record.ownerText(), 0..) |c, i| low[i] = std.ascii.toLower(c);
+                    const rev = reverseLabels(low[0..record.ownerText().len], &rev_buf);
+                    const owned = try alloc.dupe(u8, rev);
+                    revs.append(alloc, owned) catch |err| {
+                        alloc.free(owned);
+                        return err;
+                    };
+                }
+            }
+            if (record.rrtype.eql(.NS) and !std.ascii.eqlIgnoreCase(record.ownerText(), self.originText())) {
+                try putKey(&delegs, alloc, record.ownerText());
+            }
+            if (record.rrtype.eql(.DNAME)) try putKey(&dnames, alloc, record.ownerText());
+        }
+        std.mem.sort([]const u8, revs.items, {}, struct {
+            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.lessThan);
+        freeOwnerIndex(&self.owner_index, alloc);
+        freeKeySet(&self.live_owners, alloc);
+        for (self.rev_owners.items) |r| alloc.free(r);
+        self.rev_owners.deinit(alloc);
+        freeKeySet(&self.delegations, alloc);
+        freeKeySet(&self.dnames, alloc);
+        freeKeySet(&self.hashed_owners, alloc);
+        self.owner_index = next;
+        self.live_owners = live;
+        self.rev_owners = revs;
+        self.rev_sorted = true;
+        self.delegations = delegs;
+        self.dnames = dnames;
+        self.hashed_owners = hashed;
+        built = true;
     }
 
     pub fn deinit(self: *Zone) void {
@@ -102,6 +251,13 @@ pub const Zone = struct {
             self.generated_allocation = &.{};
             self.generated_allocator = null;
         }
+        freeOwnerIndex(&self.owner_index, std.heap.smp_allocator);
+        freeKeySet(&self.live_owners, std.heap.smp_allocator);
+        for (self.rev_owners.items) |r| std.heap.smp_allocator.free(r);
+        self.rev_owners.deinit(std.heap.smp_allocator);
+        freeKeySet(&self.delegations, std.heap.smp_allocator);
+        freeKeySet(&self.dnames, std.heap.smp_allocator);
+        freeKeySet(&self.hashed_owners, std.heap.smp_allocator);
         std.heap.page_allocator.free(self.backing);
         self.backing = &.{};
         self.records = .{};
@@ -153,7 +309,8 @@ pub const Zone = struct {
         }
 
         const closest = self.closestEncloser(qname);
-        var wildcard_text: [512]u8 = undefined;
+        if (labelCount(qname) != labelCount(closest) + 1) return result;
+        var wildcard_text: [1024]u8 = undefined;
         const wildcard_owner = makeWildcardName(closest, &wildcard_text) catch return result;
         if (self.hasOwner(wildcard_owner)) {
             result.records = .{};
@@ -161,17 +318,16 @@ pub const Zone = struct {
             result.soa = self.soa;
             var saw_owner = false;
             var saw_cname = false;
-            var index: usize = 0;
-            while (index < self.records.len) : (index += 1) {
-                const record = self.records.items[index];
-                if (!std.ascii.eqlIgnoreCase(record.ownerText(), wildcard_owner)) continue;
-                saw_owner = true;
-                if (record.rrtype.eql(qtype)) {
-                    result.records.append(allocator, record) catch return failResult(&result, allocator);
-                    result.kind = .answer;
-                } else if (record.rrtype.eql(.CNAME) and !qtype.eql(.CNAME)) {
-                    result.records.append(allocator, record) catch return failResult(&result, allocator);
-                    saw_cname = true;
+            if (self.recordsAtOwner(wildcard_owner)) |owners| {
+                for (owners) |record| {
+                    saw_owner = true;
+                    if (record.rrtype.eql(qtype)) {
+                        result.records.append(allocator, record) catch return failResult(&result, allocator);
+                        result.kind = .answer;
+                    } else if (record.rrtype.eql(.CNAME) and !qtype.eql(.CNAME)) {
+                        result.records.append(allocator, record) catch return failResult(&result, allocator);
+                        saw_cname = true;
+                    }
                 }
             }
             if (result.kind == .answer or saw_cname) {
@@ -225,13 +381,20 @@ pub const Zone = struct {
         }
         return false;
     }
+    fn recordsAtOwner(self: *const Zone, owner: []const u8) ?[]const parser.ZoneRecord {
+        var key_buf: [1024]u8 = undefined;
+        if (owner.len > key_buf.len) return null;
+        for (owner, 0..) |c, i| key_buf[i] = std.ascii.toLower(c);
+        const list = self.owner_index.get(key_buf[0..owner.len]) orelse return null;
+        return list.items[0..list.items.len];
+    }
 
     fn lookupExact(self: *const Zone, allocator: std.mem.Allocator, qname: []const u8, qtype: RecordType, result: *LookupResult) ?LookupKind {
         var owner_exists = false;
         var saw_cname = false;
         var saw_dname = false;
         var current_buffer: [256]u8 = undefined;
-        var dname_target_buffer: [512]u8 = undefined;
+        var dname_target_buffer: [1024]u8 = undefined;
         var current = qname;
         var hops: usize = 0;
         var visited: [MaxAliasHops]dns_name.Name = undefined;
@@ -243,20 +406,43 @@ pub const Zone = struct {
             // The owner of an NSEC3 record names nothing in the zone, and
             // neither does the signature over it (RFC 5155 section 7.2.8).
             const hashed_owner = self.ownerIsHashed(current);
-            var index: usize = 0;
-            while (index < self.records.len) : (index += 1) {
-                const record = self.records.items[index];
-                if (!std.ascii.eqlIgnoreCase(record.ownerText(), current)) continue;
-                if (hashed_owner) continue;
-                owner_exists = true;
-                matched = true;
-                if (record.rrtype.eql(qtype)) {
-                    result.records.append(allocator, record) catch return .servfail;
-                    exact_match = true;
-                } else if (record.rrtype.eql(.CNAME) and !qtype.eql(.CNAME)) {
-                    result.records.append(allocator, record) catch return .servfail;
-                    cname = record;
-                    saw_cname = true;
+            // Exact-owner fast path: records at this owner only. Falls back to
+            // the full scan if the index lacks the key (e.g. signer replaced
+            // records without rebuilding) so semantics never change.
+            const at_owner = self.recordsAtOwner(current);
+            if (at_owner) |owners| {
+                if (!hashed_owner) {
+                    for (owners) |record| {
+                        owner_exists = true;
+                        matched = true;
+                        if (record.rrtype.eql(qtype)) {
+                            result.records.append(allocator, record) catch return .servfail;
+                            exact_match = true;
+                        } else if (record.rrtype.eql(.CNAME) and !qtype.eql(.CNAME)) {
+                            result.records.append(allocator, record) catch return .servfail;
+                            cname = record;
+                            saw_cname = true;
+                        }
+                    }
+                } else if (owners.len != 0) {
+                    owner_exists = false;
+                }
+            } else {
+                var index: usize = 0;
+                while (index < self.records.len) : (index += 1) {
+                    const record = self.records.items[index];
+                    if (!std.ascii.eqlIgnoreCase(record.ownerText(), current)) continue;
+                    if (hashed_owner) continue;
+                    owner_exists = true;
+                    matched = true;
+                    if (record.rrtype.eql(qtype)) {
+                        result.records.append(allocator, record) catch return .servfail;
+                        exact_match = true;
+                    } else if (record.rrtype.eql(.CNAME) and !qtype.eql(.CNAME)) {
+                        result.records.append(allocator, record) catch return .servfail;
+                        cname = record;
+                        saw_cname = true;
+                    }
                 }
             }
 
@@ -325,7 +511,38 @@ pub const Zone = struct {
         return null;
     }
 
+    // Suffix walks use recordsAtOwner over indexed owners; the Zone is
+    // immutable after build so no locks are needed.
     fn appendDelegation(self: *const Zone, allocator: std.mem.Allocator, result: *LookupResult, owner: []const u8) !void {
+        if (self.recordsAtOwner(owner)) |owners| {
+            for (owners) |record| {
+                if (!record.rrtype.eql(.NS)) continue;
+                try result.authorities.append(allocator, record);
+                const target = dns_name.Name.fromText(record.rdataText()) catch continue;
+                var target_text: [256]u8 = undefined;
+                const target_name = target.toText(&target_text) catch continue;
+                // RFC 9471 Â§3.1 (in-domain) and Â§3.2 (sibling-domain) glue:
+                // the zone attaches addresses it holds for targets inside
+                // its own origin. Anything outside that bailiwick (RFC 5452
+                // Â§6) contributes nothing, even if a record exists for it.
+                if (!isSubdomainOrEqual(target_name, self.originText())) continue;
+                if (self.recordsAtOwner(target_name)) |glues| {
+                    for (glues) |glue| {
+                        if (glue.rrtype.eql(.A) or glue.rrtype.eql(.AAAA)) try result.additionals.append(allocator, glue);
+                    }
+                    continue;
+                }
+                // shortcut: unindexed owner (signer replaced records); fall back to scan
+                var glue_index: usize = 0;
+                while (glue_index < self.records.len) : (glue_index += 1) {
+                    const glue = self.records.items[glue_index];
+                    if (!std.ascii.eqlIgnoreCase(glue.ownerText(), target_name)) continue;
+                    if (glue.rrtype.eql(.A) or glue.rrtype.eql(.AAAA)) try result.additionals.append(allocator, glue);
+                }
+                continue;
+            }
+            return;
+        }
         var index: usize = 0;
         while (index < self.records.len) : (index += 1) {
             const record = self.records.items[index];
@@ -349,40 +566,83 @@ pub const Zone = struct {
         }
     }
 
-    fn findDelegation(self: *const Zone, qname: []const u8) ?[]const u8 {
-        var selected: ?[]const u8 = null;
-        var index: usize = 0;
-        while (index < self.records.len) : (index += 1) {
-            const record = self.records.items[index];
-            if (!record.rrtype.eql(.NS) or std.ascii.eqlIgnoreCase(record.ownerText(), self.originText())) continue;
-            if (isSubdomainOrEqual(qname, record.ownerText())) {
-                if (selected == null or record.ownerText().len > selected.?.len) selected = record.ownerText();
+    fn lowerCmpBuf(owner: []const u8, buf: []u8) []u8 {
+        for (owner, 0..) |c, i| buf[i] = std.ascii.toLower(c);
+        return buf[0..owner.len];
+    }
+
+    fn suffixOwnerText(self: *const Zone, qname: []const u8, buf: []u8) []const u8 {
+        // Longest indexed owner that is a suffix of qname (walk up labels).
+        var candidate = qname;
+        while (true) {
+            var low: [1024]u8 = undefined;
+            if (candidate.len <= low.len) {
+                const key = lowerCmpBuf(candidate, &low);
+                if (self.owner_index.get(key)) |list| {
+                    if (list.items.len != 0) {
+                        @memcpy(buf[0..candidate.len], candidate);
+                        return buf[0..candidate.len];
+                    }
+                }
             }
+            if (std.ascii.eqlIgnoreCase(candidate, self.originText())) return self.originText();
+            const dot = std.mem.indexOfScalar(u8, candidate, '.') orelse return self.originText();
+            candidate = candidate[dot + 1 ..];
         }
-        return selected;
+    }
+
+    fn findDelegation(self: *const Zone, qname: []const u8) ?[]const u8 {
+        // Longest-suffix delegation: strip labels and probe the delegation set.
+        var candidate = qname;
+        var low: [1024]u8 = undefined;
+        while (true) {
+            if (!std.ascii.eqlIgnoreCase(candidate, self.originText()) and candidate.len <= low.len) {
+                const key = lowerCmpBuf(candidate, &low);
+                if (self.delegations.contains(key)) {
+                    if (self.recordsAtOwner(candidate)) |owners| {
+                        for (owners) |record| {
+                            if (record.rrtype.eql(.NS)) return record.ownerText();
+                        }
+                    }
+                }
+            }
+            if (std.ascii.eqlIgnoreCase(candidate, self.originText())) return null;
+            const dot = std.mem.indexOfScalar(u8, candidate, '.') orelse return null;
+            candidate = candidate[dot + 1 ..];
+        }
     }
 
     fn findDname(self: *const Zone, qname: []const u8) ?parser.ZoneRecord {
-        var selected: ?parser.ZoneRecord = null;
-        var index: usize = 0;
-        while (index < self.records.len) : (index += 1) {
-            const record = self.records.items[index];
-            if (!record.rrtype.eql(.DNAME)) continue;
-            if (std.ascii.eqlIgnoreCase(record.ownerText(), qname)) continue;
-            if (isStrictSubdomain(qname, record.ownerText())) {
-                if (selected == null or record.ownerText().len > selected.?.ownerText().len) selected = record;
+        // Closest-encloser DNAME: strip labels, longest match wins (loop bound:
+        // one probe per label, no record scan).
+        var candidate = qname;
+        const dot0 = std.mem.indexOfScalar(u8, candidate, '.') orelse return null;
+        candidate = candidate[dot0 + 1 ..];
+        var low: [1024]u8 = undefined;
+        while (true) {
+            if (candidate.len <= low.len) {
+                const key = lowerCmpBuf(candidate, &low);
+                if (self.dnames.contains(key)) {
+                    if (self.recordsAtOwner(candidate)) |owners| {
+                        for (owners) |record| {
+                            if (record.rrtype.eql(.DNAME)) return record;
+                        }
+                    }
+                }
             }
+            if (std.ascii.eqlIgnoreCase(candidate, self.originText())) return null;
+            const dot = std.mem.indexOfScalar(u8, candidate, '.') orelse return null;
+            candidate = candidate[dot + 1 ..];
         }
-        return selected;
     }
 
     /// True when any record in this zone has this exact owner name. An
     /// empty non-terminal has descendants but no record of its own.
     pub fn hasOwner(self: *const Zone, owner: []const u8) bool {
         if (self.ownerIsHashed(owner)) return false;
-        for (self.records.items[0..self.records.len]) |record| {
-            if (std.ascii.eqlIgnoreCase(record.ownerText(), owner)) return true;
-        }
+        if (self.recordsAtOwner(owner)) |owners| return owners.len != 0;
+        var low: [1024]u8 = undefined;
+        if (owner.len <= low.len and self.live_owners.contains(lowerCmpBuf(owner, &low))) return true;
         return false;
     }
 
@@ -390,9 +650,40 @@ pub const Zone = struct {
     /// of an NSEC3 record is the hash of another name, so it names nothing in
     /// the zone (RFC 5155 section 7.2.8).
     fn ownerIsHashed(self: *const Zone, owner: []const u8) bool {
-        for (self.records.items[0..self.records.len]) |record| {
-            if (!record.rrtype.eql(.NSEC3)) continue;
-            if (std.ascii.eqlIgnoreCase(record.ownerText(), owner)) return true;
+        // NSEC3 owners name nothing (RFC 5155 section 7.2.8); hashed-owner skip.
+        var low: [1024]u8 = undefined;
+        if (owner.len > low.len) {
+            for (self.records.items[0..self.records.len]) |record| {
+                if (!record.rrtype.eql(.NSEC3)) continue;
+                if (std.ascii.eqlIgnoreCase(record.ownerText(), owner)) return true;
+            }
+            return false;
+        }
+        return self.hashed_owners.contains(lowerCmpBuf(owner, &low));
+    }
+
+    fn hasDescendant(self: *const Zone, name: []const u8) bool {
+        // Sorted reversed-owner prefix probe: O(log owners + labels).
+        if (!self.rev_sorted or self.rev_owners.items.len == 0) return false;
+        var low: [1024]u8 = undefined;
+        if (name.len > low.len) return false;
+        for (name, 0..) |c, i| low[i] = std.ascii.toLower(c);
+        var rev: [1024]u8 = undefined;
+        const needle = reverseLabels(low[0..name.len], &rev);
+        var lo: usize = 0;
+        var hi: usize = self.rev_owners.items.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (std.mem.lessThan(u8, self.rev_owners.items[mid], needle)) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if (lo < self.rev_owners.items.len) {
+            const cand = self.rev_owners.items[lo];
+            if (cand.len <= needle.len) return false;
+            if (std.mem.startsWith(u8, cand, needle)) return true;
         }
         return false;
     }
@@ -400,17 +691,21 @@ pub const Zone = struct {
     fn nodeExists(self: *const Zone, name: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(name, self.originText())) return true;
         if (self.ownerIsHashed(name)) return false;
-        for (self.records.items[0..self.records.len]) |record| {
-            if (record.rrtype.eql(.NSEC3)) continue;
-            if (std.ascii.eqlIgnoreCase(record.ownerText(), name) or isStrictSubdomain(record.ownerText(), name)) return true;
-        }
-        return false;
+        var low: [1024]u8 = undefined;
+        if (name.len <= low.len and self.live_owners.contains(lowerCmpBuf(name, &low))) return true;
+        // Empty non-terminal: some live owner strictly below this name.
+        return self.hasDescendant(name);
     }
 
     fn closestEncloser(self: *const Zone, qname: []const u8) []const u8 {
+        // Suffix walk over indexed owners: one probe per label, no record scan.
+        // An empty non-terminal exists via its descendants, so each label
+        // checks live owners first and the descendant index second.
         var candidate = qname;
+        var low: [1024]u8 = undefined;
         while (true) {
-            if (self.nodeExists(candidate)) return candidate;
+            if (candidate.len <= low.len and self.live_owners.contains(lowerCmpBuf(candidate, &low))) return candidate;
+            if (self.hasDescendant(candidate)) return candidate;
             if (std.ascii.eqlIgnoreCase(candidate, self.originText())) return self.originText();
             const dot = std.mem.indexOfScalar(u8, candidate, '.') orelse return self.originText();
             candidate = candidate[dot + 1 ..];
@@ -507,6 +802,18 @@ fn isStrictSubdomain(name: []const u8, parent: []const u8) bool {
     return !std.ascii.eqlIgnoreCase(name, parent);
 }
 
+fn labelCount(name: []const u8) usize {
+    var count: usize = 0;
+    var index: usize = 0;
+    while (index < name.len) {
+        while (index < name.len and name[index] == '.') index += 1;
+        if (index == name.len) break;
+        count += 1;
+        while (index < name.len and name[index] != '.') index += 1;
+    }
+    return count;
+}
+
 fn isSubdomainOrEqual(name: []const u8, parent: []const u8) bool {
     if (std.ascii.eqlIgnoreCase(name, parent)) return true;
     if (parent.len >= name.len or !std.ascii.eqlIgnoreCase(name[name.len - parent.len ..], parent)) return false;
@@ -527,6 +834,46 @@ fn synthesizeDnameTarget(qname: []const u8, owner: []const u8, target: []const u
     @memcpy(buffer[0..prefix_len], qname[0..prefix_len]);
     @memcpy(buffer[prefix_len .. prefix_len + target.len], target);
     return buffer[0 .. prefix_len + target.len];
+}
+
+test "zone index suffix walks use indexes for delegation dname nsec3" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var zone_file = try parser.ZoneFile.parse(
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+        \\@ IN NS ns.example.
+        \\ns IN A 192.0.2.1
+        \\sub IN NS ns.other.
+        \\alias IN DNAME target.example.
+        \\target.example. IN A 192.0.2.9
+        \\sub.target.example. IN A 192.0.2.11
+        \\*.example. IN A 192.0.2.3
+        \\
+    );
+    var zone = try Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+
+    // Delegation: referral for names at and below the cut, DS stays authoritative.
+    var ref = zone.lookup(arena.allocator(), "www.sub.example.", .A);
+    defer ref.deinit(arena.allocator());
+    try std.testing.expectEqual(LookupKind.referral, ref.kind);
+    var ds = zone.lookup(arena.allocator(), "sub.example.", .DS);
+    defer ds.deinit(arena.allocator());
+    try std.testing.expect(ds.kind != .referral);
+
+    // DNAME: closest-encloser match synthesizes the target.
+    var dn = zone.lookup(arena.allocator(), "sub.alias.example.", .A);
+    defer dn.deinit(arena.allocator());
+    try std.testing.expect(dn.kind == .dname or dn.kind == .answer);
+    try std.testing.expect(dn.records.len >= 2);
+
+    // Empty non-terminal: parent of leaf with no records of its own is nodata.
+    var ent = zone.lookup(arena.allocator(), "alias.example.", .MX);
+    defer ent.deinit(arena.allocator());
+    try std.testing.expect(ent.kind == .nodata or ent.kind == .dname);
 }
 
 test "zone index answers exact A lookup" {
@@ -640,6 +987,12 @@ test "zone index applies closest-encloser wildcard and empty non-terminal rules"
     var empty_non_terminal = zone.lookup(arena.allocator(), "branch.example.", .A);
     defer empty_non_terminal.deinit(arena.allocator());
     try std.testing.expectEqual(LookupKind.nodata, empty_non_terminal.kind);
+
+    // A wildcard at the closest encloser matches exactly one label; a
+    // deeper name must not inherit it (RFC 4592 section 2.2.1).
+    var deep = zone.lookup(arena.allocator(), "deep.child.example.", .A);
+    defer deep.deinit(arena.allocator());
+    try std.testing.expectEqual(LookupKind.nxdomain, deep.kind);
 
     var wrong_type = zone.lookup(arena.allocator(), "other.example.", .AAAA);
     defer wrong_type.deinit(arena.allocator());
@@ -998,4 +1351,33 @@ test "zone index returns nodata for a missing DS at the cut" {
     defer ds.deinit(arena.allocator());
     try std.testing.expectEqual(LookupKind.nodata, ds.kind);
     try std.testing.expect(ds.soa != null);
+}
+
+test "exact-owner index answers a 100k-record zone" {
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(std.testing.allocator);
+    try text.appendSlice(std.testing.allocator,
+        \\$ORIGIN example.
+        \\$TTL 3600
+        \\@ IN SOA ns.example. hostmaster.example. 1 3600 900 1209600 300
+        \\@ IN NS ns.example.
+        \\ns IN A 192.0.2.1
+        \\
+    );
+    var name_buffer: [64]u8 = undefined;
+    var index: usize = 0;
+    while (index < 100_000) : (index += 1) {
+        const line = try std.fmt.bufPrint(&name_buffer, "host{d} IN A 192.0.2.10\n", .{index});
+        try text.appendSlice(std.testing.allocator, line);
+    }
+    var zone_file = try parser.ZoneFile.parse(text.items);
+    var zone = try Zone.fromZoneFile(&zone_file);
+    defer zone.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const result = zone.lookup(arena.allocator(), "host99999.example.", .A);
+    try std.testing.expectEqual(LookupKind.answer, result.kind);
+    try std.testing.expectEqual(@as(usize, 1), result.records.len);
+    const missing = zone.lookup(arena.allocator(), "missing.example.", .A);
+    try std.testing.expectEqual(LookupKind.nxdomain, missing.kind);
 }

@@ -170,7 +170,9 @@ pub const KeyReloadOutcome = enum {
 
 const TsigAuth = struct {
     final: tsig.FinalAdditional,
-    key: *const keyring_mod.Key,
+    /// Owned copy: a SIGHUP key reload frees the keyring slot, so a request
+    /// must not retain a pointer into it.
+    key: keyring_mod.Key,
     request_mac: tsig.Mac,
 };
 
@@ -186,7 +188,7 @@ const FailureCode = enum {
 const Failure = struct {
     code: FailureCode,
     final: ?tsig.FinalAdditional = null,
-    key: ?*const keyring_mod.Key = null,
+    key: ?keyring_mod.Key = null,
     request_mac: ?tsig.Mac = null,
 };
 
@@ -230,6 +232,9 @@ pub const SecondaryFetch = *const fn (ctx: *anyopaque, allocator: std.mem.Alloca
 /// supervisor restarts it instead of leaving a sibling to serve half the
 /// transports. No thread ever wakes or joins another loop, and no listener
 /// fd is ever touched from a thread that does not own it.
+/// Whole-zone transfers are memory-heavy; the TCP listener has 64 workers.
+const MAX_CONCURRENT_TRANSFERS = 4;
+
 pub const SharedStop = struct {
     stopped: std.atomic.Value(bool) = .init(false),
 
@@ -324,6 +329,13 @@ pub const Runtime = struct {
     /// Set by the SIGHUP handler and cleared by the reload that answers it.
     /// The handler only stores the flag; the file is read outside it.
     reload_requested: std.atomic.Value(bool) = .init(false),
+    /// Guards the keyring independently of the zone state lock: request
+    /// parsing copies one key under the shared side, reload swaps under
+    /// the exclusive side.
+    keyring_lock: std.Io.RwLock = .init,
+    /// AXFR/IXFR builds a whole-zone frame array plus a blob; cap concurrent
+    /// transfers so allowed clients cannot multiply that memory 64 ways.
+    active_transfers: std.atomic.Value(usize) = .init(0),
     // ceiling: global runtime lock serializes all zone reads; use per-zone or read/write locks if contention matters.
     mutex: std.Io.RwLock = .init,
     /// Set by the multi-loop owner; every loop observes it and every
@@ -1432,11 +1444,13 @@ pub const Runtime = struct {
         };
         self.lockExclusive();
         defer self.unlockExclusive();
-        // The swap holds the exclusive side while every verifier (parseIncoming
-        // under the shared lock, keyringCopySecret snapshots) holds at most
-        // the shared side: a request verifies against the old keyring or the
-        // new one, never a half-built one, and a SIGHUP mid-verify cannot
-        // produce a spurious BADKEY/BADSIG.
+        // The swap holds the keyring lock while request parsing copies one
+        // key under its shared side: a request verifies against the old key
+        // or the new one, never a cleared slot, and a SIGHUP mid-verify
+        // cannot produce a spurious BADKEY/BADSIG.
+        const keyring_lock = @constCast(&self.keyring_lock);
+        keyring_lock.lockUncancelable(self.io);
+        defer keyring_lock.unlock(self.io);
         self.keyring.replace(&ring);
         // The runtime holds the only remaining copy of the new secrets.
         ring.deinit();
@@ -1725,7 +1739,14 @@ pub const Runtime = struct {
         // RFC 8945 sections 4.2 and 5.2.1: the key name may carry several
         // algorithms, so every key holding the name is a candidate and the
         // algorithm the request names selects the one that authenticates it.
-        const key = self.keyring.findAlgorithm(final_record.owner, algorithm) orelse {
+        const key_copy = blk: {
+            const keyring_lock = @constCast(&self.keyring_lock);
+            keyring_lock.lockSharedUncancelable(self.io);
+            defer keyring_lock.unlockShared(self.io);
+            const found = self.keyring.findAlgorithm(final_record.owner, algorithm) orelse break :blk null;
+            break :blk found.*;
+        };
+        const key = key_copy orelse {
             return .{ .failure = .{ .code = .badkey, .final = final_record } };
         };
         // An operator-configured expiry makes the key unusable, and RFC 8945
@@ -2294,6 +2315,21 @@ pub const Runtime = struct {
         ) catch return Error.EncodeFailed;
         tsig.patchMac(@constCast(truncated), final, signed.slice()) catch return Error.EncodeFailed;
         return truncated;
+    }
+
+    /// Hold a transfer slot from before encoding until after the blob is
+    /// written and freed; the blob, not just the encode, is the memory cost.
+    pub fn beginTransfer(self: *const Runtime) bool {
+        const active = @constCast(&self.active_transfers);
+        if (active.fetchAdd(1, .monotonic) >= MAX_CONCURRENT_TRANSFERS) {
+            _ = active.fetchSub(1, .monotonic);
+            return false;
+        }
+        return true;
+    }
+
+    pub fn endTransfer(self: *const Runtime) void {
+        _ = @constCast(&self.active_transfers).fetchSub(1, .monotonic);
     }
 
     /// Serves one AXFR/IXFR query as an owned length-prefixed TCP blob, one
