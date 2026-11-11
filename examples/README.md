@@ -12,6 +12,7 @@ Configuration and zone files that the test suite and the README use.
 
 ## Rules
 
-- Every file here is a working input. Nothing in this directory is illustrative.
+- Every configuration, key, zone, and blocklist file here is a working input.
+  Nothing in this directory is illustrative.
 - A zone with DNSSEC material carries the key that signs it. The anchor that
   validates it belongs to the operator's trust-anchor file, not to this folder.

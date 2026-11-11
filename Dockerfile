@@ -22,7 +22,7 @@ RUN set -eux; \
 ARG VERSION=0.1.0
 WORKDIR /workspace
 COPY . .
-RUN /opt/zig/zig build -Doptimize=ReleaseSafe -Dversion="$VERSION"
+RUN /opt/zig/zig build -Doptimize=ReleaseSafe -Dcpu=baseline -Dversion="$VERSION"
 
 FROM alpine:3.22@sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f AS runtime
 
@@ -59,8 +59,8 @@ EXPOSE 1053/tcp
 VOLUME ["/etc/zimdns"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-    CMD ["/usr/local/bin/zimdns", "query", "@127.0.0.1", "-p", "1053", "--require-answer", "--tcp", "home.arpa.", "SOA"]
+    CMD /usr/local/bin/zimdns query @127.0.0.1 -p 1053 --require-noerror --tcp "${ZIMDNS_HEALTH_NAME:-localhost.}" A
 
 ENTRYPOINT ["/usr/local/bin/zimdns"]
-# Relative --config path: the loader confines all paths beneath the working directory and rejects absolute paths.
+# The example config and its referenced inputs live under /etc/zimdns.
 CMD ["server", "run", "--config", "etc/zimdns/config.gdns", "--serve-udp", "--serve-tcp"]

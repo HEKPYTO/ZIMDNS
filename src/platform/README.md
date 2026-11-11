@@ -5,7 +5,7 @@ Sockets, listeners, and deadlines.
 | File | Owns |
 |---|---|
 | `listener.zig` | Binding, accepting, the per-source connection limit, and the per-frame deadline. |
-| `tcp_deadline.zig` | The raw-descriptor poll deadline shared by every transport. |
+| `tcp_deadline.zig` | The raw-descriptor poll deadline shared by every TCP-family transport. |
 
 ## Rules
 

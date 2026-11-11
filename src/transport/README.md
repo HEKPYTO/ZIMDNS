@@ -93,11 +93,12 @@ The QUIC stack is ngtcp2 1.26.0 + nghttp3 1.19.0, vendored under
 `third_party/` and compiled with the Zig C compiler, with the GnuTLS crypto
 backend and system GnuTLS linked at build time. The migration from the
 pure-Zig QUIC dependency was motivated by the X41/OSTIF 2025 audit of the
-ngtcp2-family stack; neither the Zig integration nor the vendored versions
-are independently audited. DoQ and DoH/3 are proven by the external interop
-harness (`test/interop/harness.py`, aioquic client), not by in-process
-drivers. This repository owns the operator's identity paths,
-the `doq` ALPN token, the opt-in gate, and the RFC 9250 §4 framing.
+ngtcp2-family stack; that audit covers the upstream stack, not this
+repository's Zig integration or its build. DoQ and DoH/3 have external
+interop proof in `test/interop/harness.py` (kdig and aioquic); the in-process
+tests cover their framing and refusal paths. This repository owns the
+operator's identity paths, the `doq` ALPN token, the opt-in gate, and the
+RFC 9250 §4 framing.
 
 The invariants that hold whichever transport is served: no cleartext on a
 port the operator configured as encrypted, ALPN `dot` selected on a
@@ -125,16 +126,18 @@ paths, the ALPN token, the opt-in gate, and the refusal of a transport
 that has no listener. No test-only bypass exists outside tests: production
 paths never set `insecure`.
 
-## What the DoT slice still owes
+## External interop
 
-Reaching `supported` for the DoT row needs: the pinned dependency (done),
-a handshake-before-parse accept loop (done), a `dot`-token test (done), and
-loopback interop with an outside client (`openssl s_client`, `kdig`) — the
-interop run is still open. The RFC 9103 §7.2 TLS 1.3 floor applies to the
-strict-TLS transfer channel, so the transfer row stays `partial` until
-that channel exists. DoH is served over HTTP/1.1 (RFC 8484 §5.2 makes HTTP/2 the minimum RECOMMENDED version, so this is a disclosed deviation and not a broken MUST). ALPN
-note: the `dot` token comes from the IANA registry (ref RFC 7858), not
-RFC 7858 §3.1; RFC 9103 §§7.1–7.2 scope to transfers.
+`test/interop/harness.py` drives the built binary from outside: `kdig` over
+DoT and DoQ, `curl` over DoH, `aioquic` over DoH/3, and `kdig` over the
+strict-TLS transfer channel. The in-process tests cover the ALPN refusal,
+the cleartext refusal, and the framing bounds. A missing external tool is a
+hard failure, not a skip; the requirements are in `test/interop/README.md`.
+
+DoH is served over HTTP/1.1 (RFC 8484 §5.2 makes HTTP/2 the minimum
+RECOMMENDED version, so this is a disclosed deviation and not a broken
+MUST). ALPN note: the `dot` token comes from the IANA registry (ref RFC
+7858), not RFC 7858 §3.1; RFC 9103 §§7.1–7.2 scope to transfers.
 
 ### The ALPN objection no longer holds (re-checked 2026-10-21)
 
@@ -157,7 +160,7 @@ The tree once had no dependencies, and every path from `planned` to a
 `supported` encrypted-transport row added one: a TLS server for DoT and DoH,
 an HTTP/2 implementation for DoH as well (RFC 8484 §5.2 makes HTTP/2 the
 minimum RECOMMENDED version; an HTTP/1.1-only DoH breaks no RFC but will not
-interoperate with mainstream clients), and a QUIC stack for DoQ (RFC 9250,
+interoperate with clients that require HTTP/2), and a QUIC stack for DoQ (RFC 9250,
 which cannot be approximated by TCP plus TLS). The owner first chose one
 pinned MIT TLS dependency, `tls.zig`; on 2026-11-05 that choice was
 superseded by the system OpenSSL 3.x stack above, and the vendored `tls.zig`

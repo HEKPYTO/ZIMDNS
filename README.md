@@ -2,7 +2,8 @@
 
 A small, auditable DNS server for one box you control. It serves authoritative
 zones, optional forwarding and recursion, DNSSEC, and encrypted transports from
-one binary with no admin plane. Configuration is a file; state is on disk.
+one binary with no admin plane. Configuration is a file; durable state is on
+disk.
 
 ## What it does
 
@@ -11,12 +12,12 @@ one binary with no admin plane. Configuration is a file; state is on disk.
 - Forwarding and recursion with DNSSEC validation, ECS, NAT64, and an answer
   cache bounded by both entry count and response size.
 - UDP, TCP, DNS-over-TLS, DNS-over-HTTPS, DNS-over-QUIC, and Oblivious DoH.
-- Prometheus counters on demand, a startup banner, health checks, and graceful
-  drain. There is no remote control plane.
+- Prometheus counters on demand, a startup banner, readiness checks, and
+  immediate SIGTERM/SIGINT shutdown. There is no remote control plane.
 
-Every advertised behavior names its test. A roadmap item is not a supported
-feature, and a partial implementation names only its tested subset. Module
-details live in the `README.md` beside each source directory.
+The test suite exercises the documented behavior. A roadmap item is not a
+supported feature, and a partial implementation names only its tested subset.
+Module details live in the `README.md` beside each source directory.
 
 ## Try it
 
@@ -25,16 +26,21 @@ docker compose -f docker-compose.dev.yml up --build
 dig @127.0.0.1 -p 1053 home.arpa. SOA
 ```
 
-For production, set `ZIMDNS_CONFIG_DIR` to the directory holding `config.gdns`,
-`zones/`, and `blocklists/`, then run:
+For production, pin a release image by digest and point `ZIMDNS_CONFIG_DIR` at
+the directory holding `config.gdns`, `zones/`, and `blocklists/`:
 
 ```sh
+export ZIMDNS_IMAGE=ghcr.io/hekpyto/zimdns@sha256:<digest>
+export ZIMDNS_CONFIG_DIR=/srv/zimdns
 docker compose up -d
 ```
 
 `docker-compose.yml` runs non-root, read-only, with dropped capabilities,
-resource limits, and a health check. Rollback: set `ZIMDNS_IMAGE` to the
-previous digest-pinned image and run `docker compose up -d`.
+resource limits, and a health check. The health check queries `localhost. A`
+from the RFC 6761 local zones; if you disable local zones, set
+`ZIMDNS_HEALTH_NAME` to a name that exists in a zone you serve. Rollback: set
+`ZIMDNS_IMAGE` to the previous digest-pinned image and run
+`docker compose up -d`.
 
 ## Configure
 
@@ -48,13 +54,15 @@ zimdns server run --config /etc/zimdns/config.gdns --serve-udp --serve-tcp
 zimdns query @127.0.0.1 -p 1053 home.arpa. SOA
 ```
 
-`zimdns --help` lists every server and query flag. The repository examples cover
-authoritative zones, DNSSEC, forwarding, ACLs, transfers, DoH, and DoT.
+`zimdns --help` lists the server and query flags. The repository examples cover
+authoritative zones, DNSSEC, forwarding, blocklists, and local zones; ACLs,
+transfers, and encrypted listeners are documented by `zimdns --help` and the
+module READMEs.
 
 ## Performance
 
 Measured on an 8-core Linux host with dnsperf over UDP at 400 clients: about
-57k queries/s, ~1 ms mean, 0% loss. A native ReleaseSafe run with 5000 distinct
+56k queries/s, ~1 ms mean, 0% loss. A native ReleaseSafe run with 5000 distinct
 forwarded names sustained 62k queries/s, p99 6.8 ms, and 0% loss over 10
 minutes, with RSS staying under 36 MiB.
 
@@ -69,15 +77,17 @@ differ; reproduce with dnsperf.
 - Recursion and forwarding are denied unless explicit ACLs and a forwarder are
   configured. Listeners default to loopback or high ports.
 - No administrative socket or remote control plane is exposed.
-- Full packet logging and secret/cookie logging are off by default.
-- The container runs as UID 10001 and drops all capabilities.
-- A public authoritative deployment still needs network-level UDP rate limiting
-  or DNS Cookies. This server does not implement RRL.
+- Packet payloads, keys, and cookies are never logged.
+- The compose service runs as UID 10001 with all capabilities dropped.
+- A public authoritative deployment still needs network-level UDP rate
+  limiting; DNS Cookies reduce spoofed traffic but are not a rate limit. This
+  server does not implement RRL.
 
 ## Build and test
 
-Zig 0.17.0 and OpenSSL 3.x development files are required. On Debian/Ubuntu
-install `libssl-dev`; on macOS run `brew install openssl@3` and export
+Zig 0.17.0, OpenSSL 3.x, and GnuTLS development files are required. On
+Debian/Ubuntu install `libssl-dev libgnutls28-dev`; on macOS run
+`brew install openssl@3 gnutls` and export
 `OPENSSL_PREFIX=$(brew --prefix openssl@3)` before building.
 
 ```sh
@@ -99,6 +109,20 @@ AGPL-3.0-only (`LICENSE`). Vendored QUIC/HTTP3 sources keep their own MIT
 notices under `third_party/`.
 
 Release images carry source revision and version labels, and `zimdns --version`
-reports the build version. The release workflow builds a multi-arch `ghcr.io`
-image with SBOM and provenance and signs it with cosign keyless. Public release
-is deferred until the source and security gates pass.
+reports the build version. Pushing a `v*` tag to GitHub runs the gated release
+workflow; it can also be started manually:
+
+```sh
+gh workflow run Release --repo HEKPYTO/ZIMDNS --ref v0.1.0
+```
+
+The workflow builds a multi-arch `ghcr.io/hekpyto/zimdns` image with SBOM and
+provenance, signs it with cosign keyless, and creates the GitHub release. Set
+the GHCR package visibility to public when the repository becomes public;
+package visibility is separate. Verify the digest before deployment:
+
+```sh
+cosign verify ghcr.io/hekpyto/zimdns@sha256:<digest> \
+  --certificate-identity-regexp 'https://github.com/HEKPYTO/ZIMDNS/.github/workflows/release.yml@refs/tags/v.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```

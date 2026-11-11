@@ -6,10 +6,10 @@ Use the Zig standard library for raw-wire TSIG over the RFC 8945 section 6
 HMAC-SHA family (HMAC-SHA1, SHA-224, SHA-256, SHA-384, SHA-512): wire
 parsing, MAC construction, verification, request/response chaining,
 strict key-file loading, ordinary authoritative query authentication, and
-response signing. No third-party crypto dependency — the tree already uses
-stdlib HMAC and timing-safe comparison for DNS Cookies. Secrets are cleared
-at keyring deinit and never logged. Accepted 2026-08-20; re-check stdlib
-crypto APIs at each compiler bump.
+response signing. The TSIG path uses no third-party crypto dependency — the
+tree already uses stdlib HMAC and timing-safe comparison for DNS Cookies.
+Secrets are cleared at keyring deinit and never logged. Accepted 2026-08-20;
+re-check stdlib crypto APIs at each compiler bump.
 
 ## TSIG vectors
 
@@ -91,7 +91,7 @@ applies the add/remove hold-downs and the §2.1 revocation rules, and rebuilds
 the live anchor set (`src/dns/managed_anchors.zig`). Still deferred by decision:
 the parent-side DS change that starts a key-signing rollover (it belongs to the
 parent zone's operator, not this server) and the zone-signing key rollover
-tooling. Matrix rows 51, 91, 92, 117, and 126 describe the shipped split.
+tooling.
 
 ## Oblivious DoH target crypto (RFC 9230)
 

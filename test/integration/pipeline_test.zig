@@ -21,6 +21,29 @@ const TestTimeout = std.Io.Timeout{ .duration = .{
     .clock = .awake,
 } };
 
+/// Binds UDP and TCP to the same loopback port. The ephemeral UDP port can
+/// collide with an unrelated TCP listener, so retry the pair on AddressInUse.
+fn bindUdpTcp(io: std.Io, udp: *std.Io.net.Socket, tcp: *std.Io.net.Server) !void {
+    var attempt: usize = 0;
+    while (attempt < 64) : (attempt += 1) {
+        var udp_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        udp.* = std.Io.net.IpAddress.bind(&udp_addr, io, .{ .mode = .dgram, .protocol = .udp }) catch |err| switch (err) {
+            error.AddressInUse => continue,
+            else => return err,
+        };
+        var tcp_addr = udp.address;
+        tcp.* = std.Io.net.IpAddress.listen(&tcp_addr, io, .{ .reuse_address = true }) catch |err| {
+            udp.close(io);
+            switch (err) {
+                error.AddressInUse => continue,
+                else => return err,
+            }
+        };
+        return;
+    }
+    return error.AddressInUse;
+}
+
 const ResponseBytes = struct {
     bytes: [512]u8 = undefined,
     len: usize = 0,
@@ -1800,11 +1823,10 @@ test "resolver accepts only an exact UDP upstream response" {
 
 test "resolver falls back from UDP truncation to one TCP exchange" {
     const io = std.Io.Threaded.global_single_threaded.io();
-    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
-    var udp = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    var udp: std.Io.net.Socket = undefined;
+    var tcp: std.Io.net.Server = undefined;
+    try bindUdpTcp(io, &udp, &tcp);
     defer udp.close(io);
-    var tcp_addr = udp.address;
-    var tcp = try std.Io.net.IpAddress.listen(&tcp_addr, io, .{ .reuse_address = true });
     defer tcp.deinit(io);
 
     var args = UpstreamArgs{ .io = io, .udp = &udp, .tcp = &tcp, .mode = .truncated_tcp };
@@ -1829,11 +1851,10 @@ test "resolver falls back from UDP truncation to one TCP exchange" {
 
 test "trickle TCP upstream cannot extend one absolute frame deadline" {
     const io = std.Io.Threaded.global_single_threaded.io();
-    var upstream_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
-    var udp = try std.Io.net.IpAddress.bind(&upstream_addr, io, .{ .mode = .dgram, .protocol = .udp });
+    var udp: std.Io.net.Socket = undefined;
+    var tcp: std.Io.net.Server = undefined;
+    try bindUdpTcp(io, &udp, &tcp);
     defer udp.close(io);
-    var tcp_addr = udp.address;
-    var tcp = try std.Io.net.IpAddress.listen(&tcp_addr, io, .{ .reuse_address = true });
     defer tcp.deinit(io);
 
     var args = UpstreamArgs{ .io = io, .udp = &udp, .tcp = &tcp, .mode = .trickle_tcp };

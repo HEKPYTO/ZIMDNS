@@ -23,7 +23,6 @@ The server and the CLI. One binary. The commands are `server run` and `query`.
 ## Conventions
 
 - A new public function carries a doc comment that states the rule it implements,
-  not the mechanics. (The tree is not uniform here yet: 59 of its 187 public
-  functions carry none.)
+  not the mechanics.
 - A capability with no reachable caller is a defect, not a style note.
 - `zig fmt` is the only formatter; the pre-commit hook enforces it.

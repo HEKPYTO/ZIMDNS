@@ -10,7 +10,8 @@ server that serves the same zone file.
 
 - `zig build` produced `zig-out/bin/zimdns`.
 - External tools on `PATH`: `dig`, `delv`, `named`, `named-checkzone`,
-  `nsupdate`, `kdig`, `kzonecheck`, `ldns-verify-zone`, `curl`, `openssl`.
+  `dnssec-keygen`, `dnssec-verify`, `nsupdate`, `kdig`, `kzonecheck`,
+  `ldns-verify-zone`, `curl`, `openssl`.
   macOS: `brew install bind knot ldns`.
 - `dnspython`, `aioquic`, `pyhpke`, `cryptography`: create a virtual environment once. `aioquic` proves DoH/3, `pyhpke` (with `cryptography`) proves ODoH, and `cryptography` proves BIND RSA key conversion.
 

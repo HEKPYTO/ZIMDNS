@@ -2,10 +2,11 @@
 
 The golden group. `zig build test-golden` runs it.
 
-Each fixture is three blocks: `input_hex` holds the query bytes, `response_hex`
-holds the exact bytes of the answer, and `expect:` states what the parsed
-query must look like — `parse_ok`, `id`, `qname`, `qtype`, `qclass`. The test
-answers the query and compares the answer byte for byte.
+Each fixture carries `input_hex` with the query bytes and `expect:` with the
+parsed-query fields — `parse_ok`, `id`, `qname`, `qtype`, `qclass`. Most
+fixtures also carry `response_hex`, the exact answer bytes; the test that
+loads one answers the query and compares the answer byte for byte. The
+simple query fixture has no response and checks the parse expectations only.
 
 ## Rules
 

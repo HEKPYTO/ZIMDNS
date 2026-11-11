@@ -14,9 +14,12 @@ The configuration grammar and the loader that reads it.
   `Error.BadDirective`; a directive the grammar does not know is
   `Error.UnknownDirective`. Neither is a warning and neither is a silent
   default.
-- A file the configuration names must stay inside the configuration's own
-  directory. A path that leaves it is `Error.InvalidReferencedPath`, and a
-  file that is not there is `Error.MissingReferencedFile`.
+- A file the configuration names for zones, keys, blocklists, journals,
+  trust anchors, ODoH, or the forwarder CA must stay inside the
+  configuration's own directory. A path that leaves it is
+  `Error.InvalidReferencedPath`, and a file that is not there is
+  `Error.MissingReferencedFile`. The TLS certificate and key paths are the
+  exception: they resolve from the process working directory.
 - The loader opens its own handles on that directory for reload sources,
   managed-anchor state, and the forwarder CA bundle, so the caller's handle
   may close as soon as `load` returns; `takeRuntime` transfers those handles
@@ -33,8 +36,8 @@ The configuration grammar and the loader that reads it.
   `forwarder <address>:<port> doh <name> <path>` sends recursion over DNS
   over HTTPS (RFC 8484 POST, `application/dns-message`); the name is the SNI
   and certificate name and the path must start at the root. This client
-  speaks HTTP/1.1, so a provider whose DoH endpoint requires HTTP/2 answers
-  with a non-200 status and the hop fails closed.
+  speaks HTTP/1.1, so a provider whose DoH endpoint requires HTTP/2 cannot
+  serve the hop and it fails closed.
 - `forwarder-ca-file <path>` replaces the platform trust store for that
   forwarder's DoT and DoH certificate verification with one PEM bundle
   inside the configuration directory. Without it the platform store is used.
@@ -46,7 +49,8 @@ The configuration grammar and the loader that reads it.
   and `http/1.1` ALPNs and the `port` values 853 and 443; a designation that
   asks for anything else is ignored. `ddr-client-port <port>` (repeatable)
   adds an operator-authorized port to that set, for an endpoint that cannot
-  use the registered ones; up to eight ports are accepted.
+  use the registered ones; the runtime accepts at most eight, and a ninth
+  refuses startup.
 - `odoh-target on|off` (default off, RFC 9230) enables this server as an
   Oblivious DoH target. `odoh-key-file <path>` is required when on: 64 hex
   characters (32 bytes) with surrounding whitespace allowed. `odoh-config-out
